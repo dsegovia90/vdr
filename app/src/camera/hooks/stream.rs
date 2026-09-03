@@ -1,8 +1,8 @@
 //! Opening a camera and keeping it pumping into a slot.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -44,16 +44,17 @@ pub fn use_camera_stream(
 
     // Bumped on every source change. `open_source` cannot be cancelled, so a
     // rapid A -> B -> A switch leaves connect threads running; tagging each
-    // attempt lets us discard the stale results when they land.
-    let generation = use_hook(|| Arc::new(AtomicU64::new(0)));
+    // attempt lets us discard the stale results when they land. Only the copy
+    // in `Connect` crosses to a thread, so this stays `Rc<Cell<_>>`.
+    let generation = use_hook(|| Rc::new(Cell::new(0u64)));
 
     let ops = use_hook(|| Rc::new(RefCell::new(None::<JoinHandle<()>>)));
 
     let tx = use_channel({
         let pump_cell = Rc::clone(&pump_cell);
-        let generation = Arc::clone(&generation);
+        let generation = Rc::clone(&generation);
         move |connect: Connect| {
-            if connect.generation != generation.load(Ordering::Relaxed) {
+            if connect.generation != generation.get() {
                 // Silence before dropping, or a camera nobody asked for
                 // keeps painting.
                 if let Ok((running, _)) = &connect.result {
@@ -73,12 +74,13 @@ pub fn use_camera_stream(
 
     {
         let pump_cell = Rc::clone(&pump_cell);
-        let generation = Arc::clone(&generation);
+        let generation = Rc::clone(&generation);
         let ops = Rc::clone(&ops);
         let slot = slot.clone();
         use_effect(move || {
             let requested = source.read().clone();
-            let attempt = generation.fetch_add(1, Ordering::Relaxed) + 1;
+            let attempt = generation.get() + 1;
+            generation.set(attempt);
 
             let previous = take(&pump_cell, &slot);
 

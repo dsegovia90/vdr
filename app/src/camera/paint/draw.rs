@@ -3,7 +3,7 @@
 use dioxus::native::{CustomPaintCtx, TextureHandle};
 
 use super::active::Active;
-use super::fit::{bytemuck_cast, contain};
+use super::fit::{contain, uniform_bytes};
 
 pub(super) struct Target {
     width: u32,
@@ -67,11 +67,8 @@ impl Active {
 
         if let Some(source) = source {
             let fit = contain(source.width, source.height, width, height);
-            self.queue.write_buffer(
-                &self.uniforms,
-                0,
-                bytemuck_cast(&[fit[0], fit[1], 1.0, 0.0]),
-            );
+            self.queue
+                .write_buffer(&self.uniforms, 0, &uniform_bytes([fit[0], fit[1], 1.0, 0.0]));
         }
 
         let mut encoder = self

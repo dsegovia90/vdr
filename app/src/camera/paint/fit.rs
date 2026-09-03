@@ -33,15 +33,13 @@ pub(super) fn row_stride(len: usize, width: u32, height: u32) -> u32 {
     }
 }
 
-pub(super) fn bytemuck_cast(values: &[f32; 4]) -> &[u8] {
-    // SAFETY: `f32` has no padding or invalid bit patterns, so any `[f32; 4]`
-    // is valid to read as the same number of bytes.
-    unsafe {
-        std::slice::from_raw_parts(
-            values.as_ptr().cast::<u8>(),
-            std::mem::size_of::<[f32; 4]>(),
-        )
+/// Packs the shader uniforms into the bytes `write_buffer` wants.
+pub(super) fn uniform_bytes(values: [f32; 4]) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    for (chunk, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+        chunk.copy_from_slice(&value.to_ne_bytes());
     }
+    bytes
 }
 
 #[cfg(test)]
@@ -129,6 +127,17 @@ mod tests {
         // Divides evenly but is narrower than one packed row, so it cannot
         // be a stride.
         assert_eq!(row_stride(100 * 480, 640, 480), 2560);
+    }
+
+    #[test]
+    fn uniform_bytes_keeps_the_values_in_order() {
+        // A transposition here is invisible until the picture is wrong, since
+        // every component is a plausible float.
+        let packed = uniform_bytes([1.0, 2.0, 3.0, 4.0]);
+        for (index, value) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
+            let start = index * 4;
+            assert_eq!(&packed[start..start + 4], &value.to_ne_bytes());
+        }
     }
 
     #[test]
