@@ -15,12 +15,10 @@ fn main() {
 
 /// Complains if the app was built without dx, which leaves it unstyled.
 ///
-/// `asset!` compiles to a placeholder that only dx substitutes. Nothing
-/// downstream treats that as an error: the resolver answers the bogus path with
-/// a 404 whose *body* is the text "Not Found", dioxus-native logs that as a
-/// success, and Blitz parses it as a stylesheet. The single symptom is an
-/// unstyled window, which is why this check exists rather than a `tracing`
-/// feature flag.
+/// `asset!` compiles to a placeholder only dx substitutes, and nothing
+/// downstream treats the leftover as an error -- the resolver answers it with a
+/// 404 whose *body* Blitz then parses as a stylesheet. Enabling dioxus-native's
+/// `tracing` does not catch this; see README.
 fn warn_if_unbundled() {
     if TAILWIND_CSS.to_string().contains("replaced by dx") {
         tracing::error!(

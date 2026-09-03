@@ -8,16 +8,20 @@ use dioxus::prelude::*;
 use super::{Dropdown, DropdownOption};
 use crate::camera::{use_camera_stream, use_shared_devices, CameraPaintSource, FrameSlot};
 
-/// Requested capture format.
+/// What we ask the camera for, before `camera::format::negotiate` narrows it to
+/// a mode the device actually reports.
+///
+/// 1280x720 comfortably covers a canvas that has never measured wider than
+/// ~900px, and is a mode every webcam offers. Driving this from the real canvas
+/// size needs task 11 settled first -- if `render`'s width/height turn out to be
+/// logical pixels, the demand on a Retina display is double what it looks.
 ///
 /// BGRA costs no CPU conversion at all: the bytes upload verbatim into a
 /// `Bgra8Unorm` texture and the GPU swaps channels when the shader samples it.
-/// Every other format (NV12, YUYV, MJPEG) goes through `cameras::to_rgba8` on
-/// the CPU first, allocating a fresh buffer per frame.
+/// On macOS it is also the only thing on offer -- the backend hardcodes its
+/// output to 32BGRA whatever the device's native format.
 ///
-/// Not a signal, so changing this does not reopen a running camera. Both test
-/// cameras ignore the 1280x720 request and deliver 1920x1080 regardless -- see
-/// task 15, which replaces this with `probe()` + `best_format()`.
+/// Not a signal, so changing this does not reopen a running camera.
 const CONFIG: StreamConfig = StreamConfig {
     resolution: Resolution {
         width: 1280,

@@ -8,10 +8,8 @@ edition = "2021"
 cameras = "0.3.2"
 dioxus = { version = "0.7.10", features = ["native"] }
 # Not used directly. Named only to turn on dioxus-native's `tracing` feature,
-# which makes `RUST_LOG=dioxus_native=trace` show which asset path was actually
-# requested. Note it does NOT make a missing asset loud: the resolver answers an
-# unknown path with a 404 that dioxus-native logs as a success. `main.rs`'s
-# `warn_if_unbundled` is what covers that.
+# so `RUST_LOG=dioxus_native=trace` shows which asset path was requested. It
+# does not make a missing asset loud -- `warn_if_unbundled` covers that.
 dioxus-native = { version = "0.7.10", features = ["tracing"] }
 futures-channel = "0.3"
 futures-util = { version = "0.3", default-features = false }

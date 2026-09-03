@@ -12,6 +12,7 @@ use dioxus::prelude::*;
 
 use super::channel::use_channel;
 use super::StreamStatus;
+use crate::camera::format::negotiate;
 use crate::camera::FrameSlot;
 
 /// Handle returned by [`use_camera_stream`].
@@ -53,8 +54,8 @@ pub fn use_camera_stream(
         let generation = Arc::clone(&generation);
         move |connect: Connect| {
             if connect.generation != generation.load(Ordering::Relaxed) {
-                // Superseded by a later attempt. Silence it before it drops,
-                // or a camera nobody asked for keeps painting.
+                // Silence before dropping, or a camera nobody asked for
+                // keeps painting.
                 if let Ok((running, _)) = &connect.result {
                     running.silence();
                 }
@@ -96,9 +97,9 @@ pub fn use_camera_stream(
             let tx = tx.clone();
             let slot = slot.clone();
             queue(&ops, "camera-connect", move || {
-                // The device is not free until the old worker has actually
-                // exited, so this join has to happen before `open_source`.
+                // The device is not free until the old worker has exited.
                 join(previous);
+                let config = negotiate(&requested, config);
                 let result = open_source(requested, config).map(|camera| {
                     let live = Arc::new(AtomicBool::new(true));
                     let pump = pump::spawn(camera, {
@@ -134,11 +135,8 @@ pub fn use_camera_stream(
 /// Takes the running camera out of `pump_cell` and blanks what it left behind.
 ///
 /// Silence first: dropping a pump alone only signals its worker, which still
-/// has one frame in flight. Clearing the slot afterwards is what makes the
-/// canvas go black and stay black.
-///
-/// Returns the camera rather than dropping it, because the caller still has to
-/// [`join`] it and that must not happen here -- this runs on the UI thread.
+/// has one frame in flight. Returns the camera rather than dropping it, since
+/// [`join`] must not run here on the UI thread.
 #[must_use]
 fn take(pump_cell: &Rc<RefCell<Option<Running>>>, slot: &FrameSlot) -> Option<Running> {
     let previous = pump_cell.borrow_mut().take();
@@ -159,15 +157,10 @@ fn join(previous: Option<Running>) {
 
 /// Runs `op` on a worker thread, after every camera operation queued before it.
 ///
-/// Teardown and open must not overlap. `stop_and_join` waits for the capture
-/// thread to notice the shutdown flag, which it only checks between frames --
-/// up to `DEFAULT_FRAME_TIMEOUT`, 500ms in `cameras`. Calling `open_source`
-/// inside that window fails with `DeviceInUse`, and turning the camera off and
-/// straight back on is a normal thing for a user to do.
-///
-/// A mutex would not be enough: it hands out access in arbitrary order, and
-/// what this needs is *sequence*. Each operation joining its predecessor gives
-/// that by construction.
+/// Teardown and open must not overlap: a worker can hold the device for up to
+/// one frame timeout (500ms) after being told to stop, and `open_source` inside
+/// that window fails with `DeviceInUse`. A mutex would not do -- it grants
+/// access in arbitrary order, and what this needs is sequence.
 fn queue(
     ops: &Rc<RefCell<Option<JoinHandle<()>>>>,
     name: &'static str,
@@ -182,8 +175,8 @@ fn queue(
     });
     match spawned {
         Ok(handle) => *ops.borrow_mut() = Some(handle),
-        // The chain is broken but nothing is stuck: any thread already running
-        // is simply no longer waited on. See task 8 for the status it strands.
+        // Ordering is lost until the next successful spawn, but nothing
+        // hangs. See task 8 for the status this strands.
         Err(error) => tracing::warn!("could not spawn {name} thread: {error}"),
     }
 }
@@ -196,10 +189,8 @@ struct Connect {
 
 /// A running pump, plus the switch that stops its frames reaching the slot.
 ///
-/// The two halves stop the camera on different timescales. `silence` is
-/// immediate and safe on the UI thread, so the canvas can blank at once.
-/// `stop_and_join` is what actually frees the device, but it blocks for as
-/// long as the worker takes to notice.
+/// Stopping happens on two timescales: `silence` is immediate and UI-thread
+/// safe, `stop_and_join` blocks but is what actually frees the device.
 struct Running {
     pump: Pump,
     live: Arc<AtomicBool>,

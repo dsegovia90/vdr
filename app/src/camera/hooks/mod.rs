@@ -11,9 +11,8 @@ mod devices;
 mod status;
 mod stream;
 
-// Globs, not named re-exports: this is a binary crate, so naming a type that
-// nothing happens to mention -- `UseDevices`, `UseCameraStream` -- warns as an
-// unused import. Same reason `camera/mod.rs` globs this module.
+// Globs because this is a binary crate: naming a type nothing mentions warns
+// as an unused import. Same reason `camera/mod.rs` globs this module.
 pub use devices::*;
 pub use status::*;
 pub use stream::*;

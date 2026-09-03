@@ -1,5 +1,6 @@
 //! Camera capture and GPU presentation.
 
+mod format;
 mod frames;
 mod hooks;
 mod paint;

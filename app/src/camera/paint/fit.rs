@@ -60,10 +60,8 @@ mod tests {
 
     #[test]
     fn contain_matching_aspect_has_no_bars() {
-        // Both sides exactly 16:9, so the video fills the canvas and neither
-        // axis samples past the edge. Asserted exactly, not approximately:
-        // the divide-then-multiply round trip does land on 1.0 for these, and
-        // a change that only *nearly* does is worth failing on.
+        // Exact, not approximate: the round trip does land on 1.0 for these,
+        // and a change that only *nearly* does is worth failing on.
         for (dw, dh) in [(736, 414), (1280, 720), (160, 90), (1920, 1080)] {
             assert_eq!(contain(1920, 1080, dw, dh), [1.0, 1.0], "{dw}x{dh}");
         }
@@ -71,8 +69,7 @@ mod tests {
 
     #[test]
     fn contain_wide_canvas_pillarboxes() {
-        // Canvas is 2.00:1 against the video's 1.78:1, so the x axis samples
-        // 12.5% beyond the texture and the bars land left and right.
+        // 2.00:1 canvas against 1.78:1 video, so x samples 12.5% past.
         assert_close(contain(1920, 1080, 800, 400), [1.125, 1.0]);
     }
 
@@ -84,8 +81,8 @@ mod tests {
 
     #[test]
     fn contain_pins_exactly_one_axis_to_one() {
-        // The invariant the shader depends on. Both axes above 1.0 would mean
-        // sampling past the edge on all four sides -- the crop bug's signature.
+        // Both axes above 1.0 means sampling past the edge on all four
+        // sides -- the crop bug's signature.
         for (sw, sh) in [(1920, 1080), (640, 480), (1080, 1920), (1, 1000)] {
             for (dw, dh) in [(736, 414), (800, 400), (400, 400), (200, 113), (1, 1)] {
                 let [x, y] = contain(sw, sh, dw, dh);
@@ -100,9 +97,9 @@ mod tests {
 
     #[test]
     fn contain_survives_zero_dimensions() {
-        // A canvas is zero-sized before first layout, and `render` is called
-        // then. Dividing through would be a NaN uv scale, not a crash, which
-        // is worse -- it paints nothing and explains nothing.
+        // A canvas is zero-sized before first layout and `render` still runs.
+        // Dividing through gives a NaN uv scale: paints nothing, explains
+        // nothing.
         for args in [(0, 1080, 736, 414), (1920, 0, 736, 414), (1920, 1080, 0, 414), (1920, 1080, 736, 0)] {
             let (sw, sh, dw, dh) = args;
             assert_eq!(contain(sw, sh, dw, dh), [1.0, 1.0], "{args:?}");
@@ -116,9 +113,8 @@ mod tests {
 
     #[test]
     fn row_stride_keeps_real_padding() {
-        // Rows padded past width*4: the real stride has to reach wgpu, or
-        // every row after the first is read at the wrong offset and the image
-        // shears.
+        // The real stride has to reach wgpu, or every row after the first is
+        // read at the wrong offset and the image shears.
         assert_eq!(row_stride(2600 * 480, 640, 480), 2600);
     }
 
@@ -130,8 +126,8 @@ mod tests {
 
     #[test]
     fn row_stride_falls_back_when_buffer_is_too_small() {
-        // Divides evenly but is narrower than one packed row, so it cannot be
-        // a stride. `upload` rejects the frame afterwards on the length check.
+        // Divides evenly but is narrower than one packed row, so it cannot
+        // be a stride.
         assert_eq!(row_stride(100 * 480, 640, 480), 2560);
     }
 
