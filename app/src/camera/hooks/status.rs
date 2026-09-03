@@ -27,6 +27,36 @@ pub enum StreamStatus {
         /// Why the camera could not be opened.
         error: cameras::Error,
     },
+    /// Frames stopped arriving from a camera that was streaming.
+    ///
+    /// Inferred from silence, not reported: the pump's worker thread exits on
+    /// any non-timeout error -- unplugged, claimed by another app, driver
+    /// fault -- and `Pump` exposes no completion signal. Terminal for this
+    /// source; the worker is gone and will not resume.
+    Lost {
+        /// Human-readable name of the source that went quiet.
+        label: String,
+    },
+    /// The attempt could not even be started, because the OS refused a thread.
+    ///
+    /// Distinct from `Failed`, which means the *camera* said no. Kept separate
+    /// rather than folded into it because `cameras::Error` is
+    /// `#[non_exhaustive]` and cannot be constructed to describe our own fault.
+    Unavailable {
+        /// What went wrong on our side.
+        reason: String,
+    },
+}
+
+impl StreamStatus {
+    /// Whether the user is looking at something that went wrong, as opposed to
+    /// a normal resting state.
+    pub fn is_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed { .. } | Self::Lost { .. } | Self::Unavailable { .. }
+        )
+    }
 }
 
 impl PartialEq for StreamStatus {
@@ -39,6 +69,8 @@ impl PartialEq for StreamStatus {
             (Self::Failed { error: a }, Self::Failed { error: b }) => {
                 a.to_string() == b.to_string()
             }
+            (Self::Lost { label: a }, Self::Lost { label: b }) => a == b,
+            (Self::Unavailable { reason: a }, Self::Unavailable { reason: b }) => a == b,
             _ => false,
         }
     }
@@ -51,6 +83,8 @@ impl fmt::Display for StreamStatus {
             Self::Connecting { label } => write!(f, "Connecting to {label}..."),
             Self::Streaming { label } => write!(f, "Streaming: {label}"),
             Self::Failed { error } => write!(f, "Could not open camera: {error}"),
+            Self::Lost { label } => write!(f, "Lost {label} -- pick a camera to retry"),
+            Self::Unavailable { reason } => write!(f, "Could not start camera: {reason}"),
         }
     }
 }

@@ -106,6 +106,15 @@ pub fn Camera() -> Element {
         "Scanning..."
     };
     let can_stream = !options.is_empty();
+    // "Camera off" is the user's own doing; a vanished device or a dead
+    // capture thread is not.
+    let status_class = if !camera_enabled() {
+        "text-sm text-neutral-400"
+    } else if missing || stream.status.read().is_error() {
+        "text-sm text-red-400"
+    } else {
+        "text-sm text-neutral-400"
+    };
 
     rsx! {
         // Blitz sorts z-index among siblings only -- it has no stacking
@@ -141,7 +150,7 @@ pub fn Camera() -> Element {
         div { class: "flex w-full max-w-4xl aspect-video rounded-lg bg-black -z-1",
             canvas { class: "flex-1 self-stretch", "src": paint_source_id }
         }
-        p { class: "text-sm text-neutral-400",
+        p { class: status_class,
             if !camera_enabled() {
                 "Camera off"
             } else if missing {

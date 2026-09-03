@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use cameras::pump::{self, Pump};
 use cameras::{open_source, source_label, CameraSource, StreamConfig};
@@ -14,6 +15,16 @@ use super::channel::use_channel;
 use super::StreamStatus;
 use crate::camera::format::negotiate;
 use crate::camera::FrameSlot;
+
+/// How often the watchdog samples the frame counter.
+const WATCHDOG_TICK: Duration = Duration::from_secs(1);
+
+/// Silence longer than this while `Streaming` means the capture thread is gone.
+///
+/// The pump tolerates 500ms gaps itself (`DEFAULT_FRAME_TIMEOUT`) and the
+/// slowest mode any test camera offers is 5fps, so this is ~15 missed frames --
+/// far outside anything a working camera produces.
+const LOST_AFTER: Duration = Duration::from_secs(3);
 
 /// Handle returned by [`use_camera_stream`].
 #[derive(Copy, Clone, PartialEq)]
@@ -86,7 +97,9 @@ pub fn use_camera_stream(
 
             let Some(requested) = requested else {
                 status.set(StreamStatus::Idle);
-                queue(&ops, "camera-release", move || join(previous));
+                if let Err(error) = queue(&ops, "camera-release", move || join(previous)) {
+                    tracing::warn!("could not spawn release thread: {error}");
+                }
                 return;
             };
 
@@ -98,7 +111,7 @@ pub fn use_camera_stream(
 
             let tx = tx.clone();
             let slot = slot.clone();
-            queue(&ops, "camera-connect", move || {
+            let spawned = queue(&ops, "camera-connect", move || {
                 // The device is not free until the old worker has exited.
                 join(previous);
                 let config = negotiate(&requested, config);
@@ -119,15 +132,61 @@ pub fn use_camera_stream(
                     result,
                 });
             });
+            // Nothing will ever send a `Connect`, so without this the status
+            // sits on `Connecting` forever with no way out -- changing camera
+            // just queues another spawn that may fail the same way.
+            if let Err(error) = spawned {
+                tracing::warn!("could not spawn connect thread: {error}");
+                status.set(StreamStatus::Unavailable {
+                    reason: error.to_string(),
+                });
+            }
         });
     }
 
     {
         let pump_cell = Rc::clone(&pump_cell);
         let ops = Rc::clone(&ops);
+        let slot = slot.clone();
         use_drop(move || {
             let previous = take(&pump_cell, &slot);
-            queue(&ops, "camera-release", move || join(previous));
+            let _ = queue(&ops, "camera-release", move || join(previous));
+        });
+    }
+
+    // A dead capture thread is silent, so it can only be inferred from frames
+    // stopping. `published` is monotonic across camera switches, which is what
+    // makes sampling it enough -- no extra bookkeeping in the hot path.
+    {
+        let slot = slot.clone();
+        let mut watchdog = Watchdog::new(slot.published());
+        let tick = use_channel(move |()| {
+            if !watchdog.observe(slot.published(), Instant::now()) {
+                return;
+            }
+            // Only `Streaming` can go quiet unexpectedly. `Connecting` has not
+            // started yet and `Idle` is the user's own doing.
+            let label = match &*status.peek() {
+                StreamStatus::Streaming { label } => label.clone(),
+                _ => return,
+            };
+            tracing::warn!("no frames from {label} for {LOST_AFTER:?}; treating as lost");
+            status.set(StreamStatus::Lost { label });
+        });
+
+        use_hook(move || {
+            // Exits on its own once the component unmounts and the receiver
+            // goes with it.
+            let spawned = std::thread::Builder::new()
+                .name("camera-watchdog".into())
+                .spawn(move || {
+                    while tick.unbounded_send(()).is_ok() {
+                        std::thread::sleep(WATCHDOG_TICK);
+                    }
+                });
+            if let Err(error) = spawned {
+                tracing::warn!("could not spawn watchdog thread: {error}");
+            }
         });
     }
 
@@ -167,7 +226,7 @@ fn queue(
     ops: &Rc<RefCell<Option<JoinHandle<()>>>>,
     name: &'static str,
     op: impl FnOnce() + Send + 'static,
-) {
+) -> std::io::Result<()> {
     let previous = ops.borrow_mut().take();
     let spawned = std::thread::Builder::new().name(name.into()).spawn(move || {
         if let Some(previous) = previous {
@@ -176,10 +235,42 @@ fn queue(
         op();
     });
     match spawned {
-        Ok(handle) => *ops.borrow_mut() = Some(handle),
-        // Ordering is lost until the next successful spawn, but nothing
-        // hangs. See task 8 for the status this strands.
-        Err(error) => tracing::warn!("could not spawn {name} thread: {error}"),
+        Ok(handle) => {
+            *ops.borrow_mut() = Some(handle);
+            Ok(())
+        }
+        // Ordering is lost until the next successful spawn, but nothing hangs:
+        // a thread already running is simply no longer waited on.
+        Err(error) => Err(error),
+    }
+}
+
+/// Watches the frame counter for a capture thread that has stopped delivering.
+///
+/// Split out from the tick handler so the timing can be tested without a
+/// camera: silence is the only evidence available, and getting the reset wrong
+/// would either cry wolf on every reconnect or never fire at all.
+struct Watchdog {
+    seen: u64,
+    since: Instant,
+}
+
+impl Watchdog {
+    fn new(published: u64) -> Self {
+        Self {
+            seen: published,
+            since: Instant::now(),
+        }
+    }
+
+    /// Returns whether the stream has now been silent long enough to be dead.
+    fn observe(&mut self, published: u64, now: Instant) -> bool {
+        if published != self.seen {
+            self.seen = published;
+            self.since = now;
+            return false;
+        }
+        now.duration_since(self.since) >= LOST_AFTER
     }
 }
 
@@ -208,5 +299,47 @@ impl Running {
     /// the device free and the indicator light goes out.
     fn stop_and_join(self) {
         pump::stop_and_join(self.pump);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_delivering_camera_is_never_lost() {
+        let start = Instant::now();
+        let mut watchdog = Watchdog::new(0);
+        for frame in 1..100 {
+            let now = start + LOST_AFTER * frame;
+            assert!(!watchdog.observe(frame as u64, now), "frame {frame}");
+        }
+    }
+
+    #[test]
+    fn silence_past_the_threshold_is_lost() {
+        let start = Instant::now();
+        let mut watchdog = Watchdog::new(7);
+        assert!(!watchdog.observe(7, start));
+        assert!(watchdog.observe(7, start + LOST_AFTER));
+    }
+
+    #[test]
+    fn silence_short_of_the_threshold_is_not() {
+        let start = Instant::now();
+        let mut watchdog = Watchdog::new(7);
+        assert!(!watchdog.observe(7, start + LOST_AFTER - Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn a_resumed_counter_restarts_the_clock() {
+        // The reconnect case. Frames stop while the old camera is torn down,
+        // then the new one starts counting from where the old left off -- the
+        // clock has to reset, or the next tick reports a camera that is fine.
+        let start = Instant::now();
+        let mut watchdog = Watchdog::new(7);
+        assert!(!watchdog.observe(7, start + LOST_AFTER - Duration::from_millis(1)));
+        assert!(!watchdog.observe(8, start + LOST_AFTER));
+        assert!(!watchdog.observe(8, start + LOST_AFTER + Duration::from_millis(1)));
     }
 }
