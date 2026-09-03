@@ -11,10 +11,10 @@ use cameras::pump::{self, Pump};
 use cameras::{open_source, source_label, CameraSource, StreamConfig};
 use dioxus_native::prelude::*;
 
-use super::channel::use_channel;
 use super::StreamStatus;
 use crate::camera::format::negotiate;
-use crate::camera::{from_capture, FrameSlot};
+use crate::camera::{from_capture, FrameSlot, FrameTap};
+use crate::channel::use_channel;
 
 /// How often the watchdog samples the frame counter.
 const WATCHDOG_TICK: Duration = Duration::from_secs(1);
@@ -34,7 +34,11 @@ pub struct UseCameraStream {
     pub status: Signal<StreamStatus>,
 }
 
-/// Opens `source` and pumps its frames into `slot`.
+/// Opens `source` and pumps its frames into `slot`, and into `tap` if one is
+/// given.
+///
+/// The tap is the network path's branch of the fan-out; see [`FrameTap`] for
+/// why it is not another reader of the slot.
 ///
 /// Reopens whenever `source` changes and tears the camera down on unmount.
 /// Setting `source` to `None` **releases the device**, that is the only way
@@ -45,6 +49,7 @@ pub fn use_camera_stream(
     slot: FrameSlot,
     source: Signal<Option<CameraSource>>,
     config: StreamConfig,
+    tap: Option<FrameTap>,
 ) -> UseCameraStream {
     let mut status = use_signal(|| StreamStatus::Idle);
 
@@ -88,6 +93,7 @@ pub fn use_camera_stream(
         let generation = Rc::clone(&generation);
         let ops = Rc::clone(&ops);
         let slot = slot.clone();
+        let tap = tap.clone();
         use_effect(move || {
             let requested = source.read().clone();
             let attempt = generation.get() + 1;
@@ -111,6 +117,7 @@ pub fn use_camera_stream(
 
             let tx = tx.clone();
             let slot = slot.clone();
+            let tap = tap.clone();
             let spawned = queue(&ops, "camera-connect", move || {
                 // The device is not free until the old worker has exited.
                 join(previous);
@@ -120,12 +127,19 @@ pub fn use_camera_stream(
                     let pump = pump::spawn(camera, {
                         let live = Arc::clone(&live);
                         move |frame| {
-                            if live.load(Ordering::Relaxed) {
-                                // The one place every captured frame passes
-                                // through, and so where task 2's encoder tap
-                                // will go.
-                                slot.publish(from_capture(&frame));
+                            if !live.load(Ordering::Relaxed) {
+                                return;
                             }
+                            // The one place every captured frame passes
+                            // through, which is why the fan-out is here
+                            // (task 2). Convert once and share: the clone is a
+                            // refcount bump, a second `from_capture` would be
+                            // a second conversion.
+                            let frame = from_capture(&frame);
+                            if let Some(tap) = &tap {
+                                tap.publish(frame.clone());
+                            }
+                            slot.publish(frame);
                         }
                     });
                     (Running { pump, live }, label)
@@ -231,12 +245,14 @@ fn queue(
     op: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<()> {
     let previous = ops.borrow_mut().take();
-    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || {
-        if let Some(previous) = previous {
-            let _ = previous.join();
-        }
-        op();
-    });
+    let spawned = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            if let Some(previous) = previous {
+                let _ = previous.join();
+            }
+            op();
+        });
     match spawned {
         Ok(handle) => {
             *ops.borrow_mut() = Some(handle);

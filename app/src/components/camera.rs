@@ -5,7 +5,9 @@ use cameras::{CameraSource, DeviceId, PixelFormat, Resolution, StreamConfig};
 use dioxus_native::prelude::*;
 
 use super::{Dropdown, DropdownOption, ParticipantVideo};
+use crate::args::Args;
 use crate::camera::{use_camera_stream, use_shared_devices, FrameSlot, Mirror};
+use crate::net::use_remote;
 
 /// What we ask the camera for, before `camera::format::negotiate` narrows it to
 /// a mode the device actually reports.
@@ -42,7 +44,10 @@ pub fn Camera() -> Element {
     // Shared between the capture thread that fills it and the paint source that
     // drains it on the render thread.
     let slot = use_hook(FrameSlot::default);
-    let stream = use_camera_stream(slot.clone(), source, CONFIG);
+    // A peer's video, or our own round-tripped through the codec when there is
+    // no peer to call. Either way it arrives decoded, in its own slot.
+    let remote = use_remote();
+    let stream = use_camera_stream(slot.clone(), source, CONFIG, Some(remote.tap.clone()));
 
     // Chooses once, so a later rescan cannot relocate the user's choice. Not a
     // signal: nothing renders off it.
@@ -53,8 +58,16 @@ pub fn Camera() -> Element {
             if chosen_once.get() {
                 return;
             }
-            if let Some(first) = devices.devices.read().first() {
-                selected.set(Some(first.id.clone()));
+            let devices = devices.devices.read();
+            // `--camera` first, so two instances on one machine can be pointed
+            // at different devices; otherwise the first the OS reports, which
+            // is still arbitrary until task 17 persists the choice.
+            let chosen = devices
+                .iter()
+                .find(|device| Args::get().wants_camera(&device.name))
+                .or_else(|| devices.first());
+            if let Some(chosen) = chosen {
+                selected.set(Some(chosen.id.clone()));
                 chosen_once.set(true);
             }
         }
@@ -145,6 +158,18 @@ pub fn Camera() -> Element {
             // preview. Remote participants get `Mirror::None`.
             mirror: Mirror::SelfView,
             class: "w-full max-w-4xl -z-1",
+        }
+        ParticipantVideo {
+            label: "remote",
+            slot: remote.slot,
+            // Not a self-view: these frames took the path a peer's would, and
+            // mirroring them would be the bug task 9 removed.
+            mirror: Mirror::None,
+            class: "w-full max-w-4xl -z-1",
+        }
+        p {
+            class: if remote.status.read().is_error() { "text-sm text-red-400" } else { "text-sm text-neutral-400" },
+            "{remote.status}"
         }
         p { class: status_class,
             if !camera_enabled() {

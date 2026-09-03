@@ -6,7 +6,6 @@
 //!
 //! [`FrameSlot`]: super::FrameSlot
 
-mod channel;
 mod devices;
 mod status;
 mod stream;

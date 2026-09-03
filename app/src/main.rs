@@ -1,5 +1,8 @@
+mod args;
 mod camera;
+mod channel;
 mod components;
+mod net;
 
 use dioxus_native::prelude::*;
 

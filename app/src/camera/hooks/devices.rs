@@ -3,7 +3,7 @@
 use cameras::Device;
 use dioxus_native::prelude::*;
 
-use super::channel::use_channel;
+use crate::channel::use_channel;
 
 /// Handle returned by [`use_devices_provider`].
 #[derive(Copy, Clone, PartialEq)]

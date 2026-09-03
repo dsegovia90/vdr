@@ -1,4 +1,4 @@
-//! The plumbing both hooks need to get work off the UI thread and back.
+//! The plumbing every path needs to get work off the UI thread and back.
 
 use dioxus_native::prelude::*;
 use futures_channel::mpsc::{unbounded, UnboundedSender};
@@ -11,10 +11,10 @@ use futures_util::StreamExt;
 /// the returned sender to those threads.
 ///
 /// Covers the channel setup only, deliberately. `use_devices` spawns a thread
-/// per refresh while `use_camera_stream` spawns one per source change and tags
-/// it with a generation counter; a helper that also owned the threading policy
-/// would fit neither.
-pub(super) fn use_channel<T, F>(mut on_message: F) -> UnboundedSender<T>
+/// per refresh, `use_camera_stream` spawns one per source change and tags it
+/// with a generation counter, and `net` spawns one that outlives every render;
+/// a helper that also owned the threading policy would fit none of them.
+pub(crate) fn use_channel<T, F>(mut on_message: F) -> UnboundedSender<T>
 where
     T: 'static,
     F: FnMut(T) + 'static,
