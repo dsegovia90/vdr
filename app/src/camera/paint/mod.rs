@@ -7,8 +7,8 @@ mod pipeline;
 mod rate;
 mod upload;
 
-use dioxus::native::{CustomPaintCtx, CustomPaintSource, DeviceHandle, TextureHandle};
-use dioxus::prelude::*;
+use dioxus_native::{CustomPaintCtx, CustomPaintSource, DeviceHandle, TextureHandle};
+use dioxus_native::prelude::*;
 
 use active::Active;
 use rate::FrameRate;
@@ -28,7 +28,7 @@ pub fn use_pipeline_cache() -> PipelineCache {
         // `provide_context` would be wrong here: it installs at the *calling*
         // scope, so every stream would get its own cache.
         try_consume_context::<PipelineCache>()
-            .unwrap_or_else(|| dioxus::core::provide_root_context(PipelineCache::default()))
+            .unwrap_or_else(|| dioxus_core::provide_root_context(PipelineCache::default()))
     })
 }
 

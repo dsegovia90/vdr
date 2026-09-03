@@ -1,6 +1,6 @@
 //! Second half of a frame's journey: source texture -> target texture.
 
-use dioxus::native::{CustomPaintCtx, TextureHandle};
+use dioxus_native::{CustomPaintCtx, TextureHandle};
 
 use super::active::Active;
 use super::fit::{contain, uniform_bytes, Mirror};

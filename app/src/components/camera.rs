@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use cameras::{CameraSource, DeviceId, PixelFormat, Resolution, StreamConfig};
-use dioxus::prelude::*;
+use dioxus_native::prelude::*;
 
 use super::{Dropdown, DropdownOption, ParticipantVideo};
 use crate::camera::{use_camera_stream, use_shared_devices, FrameSlot, Mirror};

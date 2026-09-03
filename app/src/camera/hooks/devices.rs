@@ -1,7 +1,7 @@
 //! Enumerating the cameras the machine can see.
 
 use cameras::Device;
-use dioxus::prelude::*;
+use dioxus_native::prelude::*;
 
 use super::channel::use_channel;
 

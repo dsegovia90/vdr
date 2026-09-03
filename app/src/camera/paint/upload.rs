@@ -1,6 +1,7 @@
 //! First half of a frame's journey: CPU buffer -> source texture.
 
-use cameras::{to_rgba8, Frame, PixelFormat};
+use bytes::Bytes;
+use moq_media::format::{FrameData, PixelFormat, VideoFrame};
 
 use super::active::Active;
 use super::fit::row_stride;
@@ -15,34 +16,31 @@ pub(super) struct Source {
 
 impl Active {
     /// Returns whether the frame made it onto the GPU.
-    pub(super) fn upload(&mut self, frame: &Frame) -> bool {
-        let (width, height) = (frame.width, frame.height);
+    pub(super) fn upload(&mut self, frame: &VideoFrame) -> bool {
+        let (width, height) = (frame.width(), frame.height());
         if width == 0 || height == 0 {
             return false;
         }
 
         // BGRA is what we ask the camera for, and wgpu samples it straight into
-        // RGBA in the shader, so it needs no CPU conversion at all. Anything
-        // else (NV12, YUYV, MJPEG) goes through the CPU decoder first.
+        // RGBA in the shader, so it needs no CPU conversion at all. A decoder's
+        // planar output goes through `rgba_image` first.
         let packed;
-        let (format, data, bytes_per_row) = match frame.pixel_format {
-            PixelFormat::Bgra8 => (
-                wgpu::TextureFormat::Bgra8Unorm,
-                &frame.plane_primary[..],
-                frame.stride.max(width * 4),
-            ),
+        let (format, data) = match &frame.data {
+            FrameData::Packed {
+                pixel_format: PixelFormat::Bgra,
+                data,
+            } => (wgpu::TextureFormat::Bgra8Unorm, &data[..]),
+            FrameData::Packed {
+                pixel_format: PixelFormat::Rgba,
+                data,
+            } => (wgpu::TextureFormat::Rgba8Unorm, &data[..]),
             _ => {
-                packed = match to_rgba8(frame) {
-                    Ok(rgba) => rgba,
-                    Err(error) => {
-                        tracing::warn!("frame conversion failed: {error}");
-                        return false;
-                    }
-                };
-                let stride = row_stride(packed.len(), width, height);
-                (wgpu::TextureFormat::Rgba8Unorm, &packed[..], stride)
+                packed = Bytes::copy_from_slice(frame.rgba_image().as_raw());
+                (wgpu::TextureFormat::Rgba8Unorm, &packed[..])
             }
         };
+        let bytes_per_row = row_stride(data.len(), width, height);
 
         if data.len() < (bytes_per_row as usize) * (height as usize) {
             tracing::warn!("frame buffer too small for {width}x{height}");

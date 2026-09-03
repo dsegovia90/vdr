@@ -1,5 +1,5 @@
-use dioxus::native::use_wgpu;
-use dioxus::prelude::*;
+use dioxus_native::use_wgpu;
+use dioxus_native::prelude::*;
 
 use crate::camera::{use_pipeline_cache, FrameSlot, Mirror, VideoPaintSource};
 

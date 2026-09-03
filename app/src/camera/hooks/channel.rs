@@ -1,6 +1,6 @@
 //! The plumbing both hooks need to get work off the UI thread and back.
 
-use dioxus::prelude::*;
+use dioxus_native::prelude::*;
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::StreamExt;
 

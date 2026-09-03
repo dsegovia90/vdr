@@ -1,4 +1,4 @@
-use dioxus::prelude::*;
+use dioxus_native::prelude::*;
 
 /// One choice in a [`Dropdown`]: a stable value plus the text shown for it.
 ///
@@ -56,9 +56,15 @@ pub fn Dropdown(props: DropdownProps) -> Element {
                     }
                 }
                 if open() {
-                    // Catches clicks anywhere else on the page so the menu closes.
-                    div { class: "fixed inset-0 z-10", onclick: move |_| open.set(false) }
-                    div { class: "absolute inset-x-0 top-11 z-20 rounded-md border border-neutral-700 bg-neutral-900 p-1",
+                    // In normal flow, not absolute, which pushes the content below
+                    // it down while open. That is deliberate and it is not a
+                    // style choice: in this blitz revision an absolutely
+                    // positioned menu that overflows its parent paints but never
+                    // receives clicks. Tried and rejected -- a stacking context
+                    // on the parent, dropping the menu's z-index, removing the
+                    // click-catcher, removing the video tile. Only normal flow
+                    // works. See backlog ticket 0.
+                    div { class: "w-full mt-1 rounded-md border border-neutral-700 bg-neutral-900 p-1",
                         for option in props.options.iter() {
                             div {
                                 class: if Some(&option.value) == props.selected.as_ref() {

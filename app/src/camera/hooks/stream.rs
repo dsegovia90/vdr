@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use cameras::pump::{self, Pump};
 use cameras::{open_source, source_label, CameraSource, StreamConfig};
-use dioxus::prelude::*;
+use dioxus_native::prelude::*;
 
 use super::channel::use_channel;
 use super::StreamStatus;
 use crate::camera::format::negotiate;
-use crate::camera::FrameSlot;
+use crate::camera::{from_capture, FrameSlot};
 
 /// How often the watchdog samples the frame counter.
 const WATCHDOG_TICK: Duration = Duration::from_secs(1);
@@ -121,7 +121,10 @@ pub fn use_camera_stream(
                         let live = Arc::clone(&live);
                         move |frame| {
                             if live.load(Ordering::Relaxed) {
-                                slot.publish(frame);
+                                // The one place every captured frame passes
+                                // through, and so where task 2's encoder tap
+                                // will go.
+                                slot.publish(from_capture(&frame));
                             }
                         }
                     });
