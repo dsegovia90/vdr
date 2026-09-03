@@ -64,6 +64,14 @@ impl FrameSlot {
     }
 }
 
+/// Identity, not contents: two handles to the same slot are the same stream.
+/// Comparing the pending frame would be both expensive and meaningless.
+impl PartialEq for FrameSlot {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.frame, &other.frame)
+    }
+}
+
 impl std::fmt::Debug for FrameSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FrameSlot")

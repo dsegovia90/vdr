@@ -3,15 +3,34 @@
 mod active;
 mod draw;
 mod fit;
+mod pipeline;
 mod rate;
 mod upload;
 
 use dioxus::native::{CustomPaintCtx, CustomPaintSource, DeviceHandle, TextureHandle};
+use dioxus::prelude::*;
 
 use active::Active;
 use rate::FrameRate;
 
 pub use fit::Mirror;
+pub use pipeline::PipelineCache;
+
+/// The pipeline cache every stream in this app shares.
+///
+/// Self-provisioning: the first caller installs it at the root, so there is no
+/// provider to wire up and none to forget. A forgotten provider here would not
+/// fail loudly -- every stream would just quietly build its own pipeline, which
+/// is exactly the state this replaces.
+pub fn use_pipeline_cache() -> PipelineCache {
+    use_hook(|| {
+        // `provide_root_context` is not in dioxus's prelude, only dioxus_core's.
+        // `provide_context` would be wrong here: it installs at the *calling*
+        // scope, so every stream would get its own cache.
+        try_consume_context::<PipelineCache>()
+            .unwrap_or_else(|| dioxus::core::provide_root_context(PipelineCache::default()))
+    })
+}
 
 use super::FrameSlot;
 
@@ -32,6 +51,8 @@ pub struct VideoPaintSource {
     /// Fixed for this stream's lifetime: mirroring is about whose face it is,
     /// which does not change.
     mirror: Mirror,
+    /// Shared with every other stream, so they do not each recompile the shader.
+    cache: PipelineCache,
     /// Last `slot.cleared()` value acted on. When it moves, the camera was
     /// released and the last frame must come off the screen.
     last_cleared: u64,
@@ -43,7 +64,12 @@ enum State {
 }
 
 impl VideoPaintSource {
-    pub fn new(label: impl Into<String>, slot: FrameSlot, mirror: Mirror) -> Self {
+    pub fn new(
+        label: impl Into<String>,
+        slot: FrameSlot,
+        mirror: Mirror,
+        cache: PipelineCache,
+    ) -> Self {
         let rate = FrameRate::new(slot.published());
         let last_cleared = slot.cleared();
         Self {
@@ -53,15 +79,18 @@ impl VideoPaintSource {
             rate,
             last_cleared,
             mirror,
+            cache,
         }
     }
 }
 
 impl CustomPaintSource for VideoPaintSource {
     fn resume(&mut self, device_handle: &DeviceHandle) {
+        let pipeline = self.cache.get_or_build(&device_handle.device);
         self.state = State::Active(Box::new(Active::new(
             device_handle.device.clone(),
             device_handle.queue.clone(),
+            pipeline,
         )));
         tracing::info!("[{}] paint source resumed", self.label);
     }

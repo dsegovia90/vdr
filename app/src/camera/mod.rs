@@ -7,4 +7,6 @@ mod paint;
 
 pub use frames::FrameSlot;
 pub use hooks::*;
-pub use paint::{Mirror, VideoPaintSource};
+// Glob for the same reason `hooks` is globbed: naming a type nothing happens
+// to mention warns as an unused import in a binary crate.
+pub use paint::*;

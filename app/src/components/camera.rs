@@ -2,11 +2,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use cameras::{CameraSource, DeviceId, PixelFormat, Resolution, StreamConfig};
-use dioxus::native::use_wgpu;
 use dioxus::prelude::*;
 
-use super::{Dropdown, DropdownOption};
-use crate::camera::{use_camera_stream, use_shared_devices, FrameSlot, Mirror, VideoPaintSource};
+use super::{Dropdown, DropdownOption, ParticipantVideo};
+use crate::camera::{use_camera_stream, use_shared_devices, FrameSlot, Mirror};
 
 /// What we ask the camera for, before `camera::format::negotiate` narrows it to
 /// a mode the device actually reports.
@@ -43,14 +42,7 @@ pub fn Camera() -> Element {
     // Shared between the capture thread that fills it and the paint source that
     // drains it on the render thread.
     let slot = use_hook(FrameSlot::default);
-    let paint_source_id = use_wgpu({
-        let slot = slot.clone();
-        // Self-view: mirrored, because that is what people expect of their own
-        // preview. Remote participants get `Mirror::None`.
-        move || VideoPaintSource::new("camera", slot, Mirror::SelfView)
-    });
-
-    let stream = use_camera_stream(slot, source, CONFIG);
+    let stream = use_camera_stream(slot.clone(), source, CONFIG);
 
     // Chooses once, so a later rescan cannot relocate the user's choice. Not a
     // signal: nothing renders off it.
@@ -146,11 +138,13 @@ pub fn Camera() -> Element {
                 }
             }
         }
-        // A canvas has no intrinsic size and blitz reads the parent height as
-        // indefinite, so a percentage height would collapse it to 0px and it
-        // would never be painted. Flex stretch sizes it without percentages.
-        div { class: "flex w-full max-w-4xl aspect-video rounded-lg bg-black -z-1",
-            canvas { class: "flex-1 self-stretch", "src": paint_source_id }
+        ParticipantVideo {
+            label: "camera",
+            slot,
+            // Mirrored, because that is what people expect of their own
+            // preview. Remote participants get `Mirror::None`.
+            mirror: Mirror::SelfView,
+            class: "w-full max-w-4xl -z-1",
         }
         p { class: status_class,
             if !camera_enabled() {

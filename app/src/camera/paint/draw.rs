@@ -97,7 +97,7 @@ impl Active {
                 occlusion_query_set: None,
             });
             if let Some(source) = source {
-                pass.set_pipeline(&self.pipeline);
+                pass.set_pipeline(&self.pipeline.pipeline);
                 pass.set_bind_group(0, &source.bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }

@@ -68,7 +68,7 @@ impl Active {
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("camera-frame"),
-                layout: &self.bind_group_layout,
+                layout: &self.pipeline.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -76,7 +76,7 @@ impl Active {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        resource: wgpu::BindingResource::Sampler(&self.pipeline.sampler),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,

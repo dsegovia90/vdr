@@ -159,7 +159,7 @@ pub fn use_camera_stream(
     // makes sampling it enough -- no extra bookkeeping in the hot path.
     {
         let slot = slot.clone();
-        let mut watchdog = Watchdog::new(slot.published());
+        let mut watchdog = Watchdog::new(slot.published(), Instant::now());
         let tick = use_channel(move |()| {
             if !watchdog.observe(slot.published(), Instant::now()) {
                 return;
@@ -256,10 +256,13 @@ struct Watchdog {
 }
 
 impl Watchdog {
-    fn new(published: u64) -> Self {
+    /// Takes `now` rather than reading the clock, so the timing is testable:
+    /// an internal `Instant::now()` here lands microseconds after the caller's
+    /// and silently shortens the first interval.
+    fn new(published: u64, now: Instant) -> Self {
         Self {
             seen: published,
-            since: Instant::now(),
+            since: now,
         }
     }
 
@@ -309,7 +312,7 @@ mod tests {
     #[test]
     fn a_delivering_camera_is_never_lost() {
         let start = Instant::now();
-        let mut watchdog = Watchdog::new(0);
+        let mut watchdog = Watchdog::new(0, start);
         for frame in 1..100 {
             let now = start + LOST_AFTER * frame;
             assert!(!watchdog.observe(frame as u64, now), "frame {frame}");
@@ -319,7 +322,7 @@ mod tests {
     #[test]
     fn silence_past_the_threshold_is_lost() {
         let start = Instant::now();
-        let mut watchdog = Watchdog::new(7);
+        let mut watchdog = Watchdog::new(7, start);
         assert!(!watchdog.observe(7, start));
         assert!(watchdog.observe(7, start + LOST_AFTER));
     }
@@ -327,7 +330,7 @@ mod tests {
     #[test]
     fn silence_short_of_the_threshold_is_not() {
         let start = Instant::now();
-        let mut watchdog = Watchdog::new(7);
+        let mut watchdog = Watchdog::new(7, start);
         assert!(!watchdog.observe(7, start + LOST_AFTER - Duration::from_millis(1)));
     }
 
@@ -337,7 +340,7 @@ mod tests {
         // then the new one starts counting from where the old left off -- the
         // clock has to reset, or the next tick reports a camera that is fine.
         let start = Instant::now();
-        let mut watchdog = Watchdog::new(7);
+        let mut watchdog = Watchdog::new(7, start);
         assert!(!watchdog.observe(7, start + LOST_AFTER - Duration::from_millis(1)));
         assert!(!watchdog.observe(8, start + LOST_AFTER));
         assert!(!watchdog.observe(8, start + LOST_AFTER + Duration::from_millis(1)));
