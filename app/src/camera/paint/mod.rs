@@ -66,7 +66,7 @@ impl CustomPaintSource for CameraPaintSource {
         mut ctx: CustomPaintCtx<'_>,
         width: u32,
         height: u32,
-        _scale: f64,
+        scale: f64,
     ) -> Option<TextureHandle> {
         let State::Active(active) = &mut self.state else {
             return None;
@@ -77,7 +77,7 @@ impl CustomPaintSource for CameraPaintSource {
 
         // A resized canvas means a brand new, blank target, so the last frame
         // has to be drawn into it again even if the camera has not moved on.
-        let resized = active.ensure_target(&mut ctx, width, height);
+        let resized = active.ensure_target(&mut ctx, width, height, scale);
 
         // Releasing the camera must blank the canvas: a frozen last frame
         // reads as still being on camera.

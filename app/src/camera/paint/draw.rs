@@ -19,6 +19,7 @@ impl Active {
         ctx: &mut CustomPaintCtx<'_>,
         width: u32,
         height: u32,
+        scale: f64,
     ) -> bool {
         if matches!(&self.target, Some(t) if t.width == width && t.height == height) {
             return false;
@@ -46,7 +47,7 @@ impl Active {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let handle = ctx.register_texture(texture);
-        tracing::debug!("camera target resized to {width}x{height}");
+        tracing::debug!("camera target resized to {width}x{height} at scale {scale}");
 
         self.target = Some(Target {
             width,

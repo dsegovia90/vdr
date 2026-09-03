@@ -12,9 +12,8 @@ use crate::camera::{use_camera_stream, use_shared_devices, CameraPaintSource, Fr
 /// a mode the device actually reports.
 ///
 /// 1280x720 comfortably covers a canvas that has never measured wider than
-/// ~900px, and is a mode every webcam offers. Driving this from the real canvas
-/// size needs task 11 settled first -- if `render`'s width/height turn out to be
-/// logical pixels, the demand on a Retina display is double what it looks.
+/// ~900px, and is a mode every webcam offers. The canvas size is known only in
+/// the paint source, and reacting to it needs hysteresis -- see task 15.
 ///
 /// BGRA costs no CPU conversion at all: the bytes upload verbatim into a
 /// `Bgra8Unorm` texture and the GPU swaps channels when the shader samples it.
