@@ -206,6 +206,7 @@ pub fn use_camera_stream(
             };
 
             let label = source_label(&requested);
+            tracing::info!("opening camera: {label}");
             status.set(StreamStatus::Connecting {
                 label: label.clone(),
             });

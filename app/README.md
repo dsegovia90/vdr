@@ -1,53 +1,76 @@
-# Development
+# vid
 
-Your new jumpstart project includes basic organization with an organized `assets` folder and a `components` folder.
-If you chose to develop with the router feature, you will also have a `views` folder.
+A camera preview built on [Dioxus 0.7](https://dioxuslabs.com/learn/0.7) running on
+**dioxus-native** ([Blitz](https://github.com/DioxusLabs/blitz)) — Stylo for CSS,
+Vello for painting. There is no webview and no JavaScript engine in this build.
 
-```
-project/
-├─ assets/ # Any assets that are used by the app should be placed here
-├─ src/
-│  ├─ main.rs # The entrypoint for the app.
-│  ├─ components/
-│  │  ├─ mod.rs # Defines the components module
-│  │  ├─ hero.rs # The Hero component for use in the home page
-├─ Cargo.toml # The Cargo.toml file defines the dependencies and feature flags for your project
-```
+## Running
 
-### Automatic Tailwind (Dioxus 0.7+)
-
-As of Dioxus 0.7, there no longer is a need to manually install tailwind. Simply `dx serve` and you're good to go!
-
-Automatic tailwind is supported by checking for a file called `tailwind.css` in your app's manifest directory (next to Cargo.toml). To customize the file, use the dioxus.toml:
-
-```toml
-[application]
-tailwind_input = "my.css"
-tailwind_output = "assets/out.css"
+```sh
+dx serve --renderer native       # regenerates Tailwind, then builds
+dx build --renderer native       # one-shot build
+cargo run                        # fine on its own, but see Styling below
+RUST_LOG=vdr=debug cargo run     # frame rate + texture logging
 ```
 
-### Tailwind Manual Install
+## Styling
 
-To use tailwind plugins or manually customize tailwind, you can can install the Tailwind CLI and use it directly.
+Tailwind v4, via dx's built-in Tailwind (no npm needed). `tailwind.css` next to
+`Cargo.toml` is the input; dx compiles it to `assets/tailwind.css`, which
+`main.rs` pulls in with `include_str!` and injects as a `<style>` element.
 
-1. Install npm: https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
-2. Install the Tailwind CSS CLI: https://tailwindcss.com/docs/installation/tailwind-cli
-3. Run the following command in the root of the project to start the Tailwind CSS compiler:
+That means **`assets/tailwind.css` is a committed build artifact**: `cargo run`
+alone will not regenerate it, so run `dx build`/`dx serve` after changing or
+adding classes. Injecting it directly, rather than through `asset!`, is what
+lets a plain `cargo build` work at all.
 
-```bash
-npx @tailwindcss/cli -i ./input.css -o ./assets/tailwind.css --watch
+## How the video path works
+
+Frames never touch a DOM. The chain is:
+
+```
+cameras::pump (worker thread)
+  -> FrameSlot            src/camera/frames.rs   newest-frame-wins handoff
+  -> CameraPaintSource    src/camera/paint.rs    CustomPaintSource, uploads to wgpu
+  -> vello                                       composites the texture
 ```
 
-### Serving Your App
+`use_wgpu` registers the paint source and returns a `u64`, which RSX references as
+`canvas { "src": paint_source_id }`.
 
-Run the following command in the root of your project to start developing with the default platform:
+## Notes for future work
 
-```bash
-dx serve
-```
-
-To run for a different platform, use the `--platform platform` flag. E.g.
-```bash
-dx serve --platform desktop
-```
-
+- **Why not `dioxus-cameras`.** It renders previews by running a loopback HTTP
+  server and injecting a WebGL2 `<script>`. Blitz has no JS engine, so that path
+  cannot work here. Its `Registry` also exposes no public frame *reader* — only
+  `publish_frame` — so its frames are unreachable except over that HTTP server.
+  We depend on the underlying `cameras` crate directly instead.
+- **`wgpu` is pinned to 26** to match dioxus-native 0.7.10 -> anyrender_vello 0.6.
+  Textures are handed to vello, so both must be the same wgpu version.
+- **No `<select>`.** Blitz ships no interactive select widget, hence
+  `components/dropdown.rs`.
+- **A canvas has zero intrinsic size** in blitz and its parent height reads as
+  indefinite, so percentage heights collapse it to 0px and it is never painted.
+  Size it with flex stretch (see `.preview` in `assets/styling/main.css`).
+- **Tailwind v4 renders correctly**, including `@layer`, `@property`,
+  `color-mix()` and `oklch()` colours — Blitz styles through Stylo, which is
+  Firefox's engine, so the modern CSS surface is well covered.
+- **There are no stacking contexts.** Blitz sorts `z-index` among direct
+  siblings only (`blitz-dom` `layout/damage.rs`), so a `z-index` deep inside one
+  subtree never competes with content in another. An overlay has to carry its
+  z-index on whichever ancestor is a sibling of what it must cover — see the
+  controls row in `components/camera.rs`. The same ordering drives hit-testing,
+  so getting this wrong sends clicks to the wrong element too.
+- **`border-radius` does not clip the canvas.** `rounded-lg` on the video
+  container leaves the frame's own corners square.
+- **BGRA frames skip the CPU entirely** — they upload straight into a
+  `Bgra8Unorm` texture and the shader samples them as RGBA. Other formats
+  (NV12, YUYV, MJPEG) still go through `cameras::to_rgba8` on the CPU.
+- **The preview sits at ~24fps** at 1080p, and that is the *camera's* delivery
+  rate, not a renderer limit. With one stream the counters read
+  `camera 24.0 fps -> preview 24.0 fps (0 dropped)` — nothing is being dropped.
+  Run with `RUST_LOG=vdr=debug` to see it.
+- **Multi-stream is where it gets expensive.** Three streams roughly halves the
+  paint rate: each paint does 3x (8MB upload + render pass + submit) at full
+  1080p to fill ~700px tiles. Capturing nearer to display size is the fix — see
+  `tasklist.md` task 15.

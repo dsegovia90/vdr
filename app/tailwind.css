@@ -1,1 +1,12 @@
 @import "tailwindcss";
+
+/* Blitz renders into a bare html/body, so the page surface is set here rather
+   than with utilities -- there is no element of ours to hang them on. */
+@layer base {
+    html,
+    body {
+        height: 100%;
+        background-color: #0f1116;
+        color: #e8eaed;
+    }
+}
