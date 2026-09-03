@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cameras::pump::{self, Pump};
@@ -93,7 +93,9 @@ fn use_devices() -> UseDevices {
 /// Lifecycle of the stream driven by [`use_camera_stream`].
 #[derive(Clone, Debug)]
 pub enum StreamStatus {
-    /// No source selected.
+    /// Nothing is open. The camera has not failed -- there is simply no source
+    /// to stream, because none was found. "The user turned video off" is *not*
+    /// this state: intent is held separately, outside `StreamStatus`.
     Idle,
     /// Opening the camera on a worker thread.
     Connecting {
@@ -131,7 +133,7 @@ impl PartialEq for StreamStatus {
 impl fmt::Display for StreamStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Idle => f.write_str("No camera selected"),
+            Self::Idle => f.write_str("No camera found"),
             Self::Connecting { label } => write!(f, "Connecting to {label}..."),
             Self::Streaming { label } => write!(f, "Streaming: {label}"),
             Self::Failed { error } => write!(f, "Could not open camera: {error}"),
@@ -142,28 +144,29 @@ impl fmt::Display for StreamStatus {
 /// Handle returned by [`use_camera_stream`].
 #[derive(Copy, Clone, PartialEq)]
 pub struct UseCameraStream {
-    /// Where the stream is in its lifecycle.
+    /// Where the stream is in its lifecycle. Purely descriptive of the
+    /// hardware, never of what the user asked for.
     pub status: Signal<StreamStatus>,
-    /// Whether the pump is delivering frames. Setting this to `false` parks the
-    /// pump but keeps the camera open, so resuming is instant.
-    pub active: Signal<bool>,
 }
 
 /// Opens `source` and pumps its frames into `slot`.
 ///
 /// Reopens whenever `source` changes and tears the camera down on unmount.
+/// Setting `source` to `None` **releases the device**, that is the only way
+/// to guarantee the OS camera indicator goes out, so it is how turning video
+/// off is expressed. The cost is that turning it back on pays a full
+/// `open_source()` reconnect, which `StreamStatus::Connecting` covers in the UI.
 pub fn use_camera_stream(
     slot: FrameSlot,
     source: Signal<Option<CameraSource>>,
     config: StreamConfig,
 ) -> UseCameraStream {
     let mut status = use_signal(|| StreamStatus::Idle);
-    let active = use_signal(|| true);
 
     // Non-reactive state: nothing should re-render when the pump changes. `Rc`
     // rather than `Arc` because this never leaves the UI thread -- the pump is
     // built on the connect thread and handed over, but only ever stored here.
-    let pump_cell = use_hook(|| Rc::new(RefCell::new(None::<Pump>)));
+    let pump_cell = use_hook(|| Rc::new(RefCell::new(None::<Running>)));
 
     // Bumped on every source change. `open_source` cannot be cancelled, so a
     // rapid A -> B -> A switch leaves connect threads running; tagging each
@@ -178,12 +181,16 @@ pub fn use_camera_stream(
             spawn(async move {
                 while let Some(connect) = rx.next().await {
                     if connect.generation != generation.load(Ordering::Relaxed) {
+                        // Superseded by a later attempt. Silence it before it
+                        // drops, or a camera nobody asked for keeps painting.
+                        if let Ok((running, _)) = &connect.result {
+                            running.silence();
+                        }
                         continue;
                     }
                     match connect.result {
-                        Ok((pump, label)) => {
-                            pump::set_active(&pump, *active.peek());
-                            *pump_cell.borrow_mut() = Some(pump);
+                        Ok((running, label)) => {
+                            *pump_cell.borrow_mut() = Some(running);
                             status.set(StreamStatus::Streaming { label });
                         }
                         Err(error) => status.set(StreamStatus::Failed { error }),
@@ -194,17 +201,6 @@ pub fn use_camera_stream(
         }
     });
 
-    // Pause and resume without closing the camera.
-    {
-        let pump_cell = Rc::clone(&pump_cell);
-        use_effect(move || {
-            let is_active = *active.read();
-            if let Some(pump) = pump_cell.borrow().as_ref() {
-                pump::set_active(pump, is_active);
-            }
-        });
-    }
-
     {
         let pump_cell = Rc::clone(&pump_cell);
         let generation = Arc::clone(&generation);
@@ -213,9 +209,13 @@ pub fn use_camera_stream(
             let requested = source.read().clone();
             let attempt = generation.fetch_add(1, Ordering::Relaxed) + 1;
 
-            // Dropping the pump signals its worker to stop and frees the
-            // camera before we try to open the next one.
-            *pump_cell.borrow_mut() = None;
+            // Silence first, then drop: dropping alone only signals the
+            // worker, which still has one frame in flight. Clearing the slot
+            // afterwards is what makes the canvas go black and stay black.
+            let previous = pump_cell.borrow_mut().take();
+            if let Some(previous) = previous {
+                previous.silence();
+            }
             slot.clear();
 
             let Some(requested) = requested else {
@@ -235,8 +235,16 @@ pub fn use_camera_stream(
                 .name("camera-connect".into())
                 .spawn(move || {
                     let result = open_source(requested, config).map(|camera| {
-                        let pump = pump::spawn(camera, move |frame| slot.publish(frame));
-                        (pump, label)
+                        let live = Arc::new(AtomicBool::new(true));
+                        let pump = pump::spawn(camera, {
+                            let live = Arc::clone(&live);
+                            move |frame| {
+                                if live.load(Ordering::Relaxed) {
+                                    slot.publish(frame);
+                                }
+                            }
+                        });
+                        (Running { pump, live }, label)
                     });
                     let _ = tx.unbounded_send(Connect {
                         generation: attempt,
@@ -252,16 +260,41 @@ pub fn use_camera_stream(
     {
         let pump_cell = Rc::clone(&pump_cell);
         use_drop(move || {
-            *pump_cell.borrow_mut() = None;
+            let previous = pump_cell.borrow_mut().take();
+            if let Some(previous) = previous {
+                previous.silence();
+            }
             slot.clear();
         });
     }
 
-    UseCameraStream { status, active }
+    UseCameraStream { status }
 }
 
 /// Result of one connect attempt, tagged so stale ones can be dropped.
 struct Connect {
     generation: u64,
-    result: Result<(Pump, String), cameras::Error>,
+    result: Result<(Running, String), cameras::Error>,
+}
+
+/// A running pump, plus the switch that stops its frames reaching the slot.
+///
+/// Dropping a `Pump` only *signals* its worker; a capture already in flight
+/// still delivers one more frame, which repaints the canvas after the camera
+/// has supposedly been released. `pump::stop_and_join` would close that window
+/// too, but it blocks until the worker exits and so cannot run on the UI
+/// thread (see task 7). This switch is synchronous and costs one atomic.
+struct Running {
+    /// Held only for its `Drop`, which signals the capture worker to stop.
+    /// Task 7 replaces that with `pump::stop_and_join` on a worker thread.
+    #[allow(dead_code)]
+    pump: Pump,
+    live: Arc<AtomicBool>,
+}
+
+impl Running {
+    /// Stop frames reaching the slot, effective before this returns.
+    fn silence(&self) {
+        self.live.store(false, Ordering::Relaxed);
+    }
 }

@@ -15,6 +15,9 @@ pub struct CameraPaintSource {
     slot: FrameSlot,
     state: State,
     rate: FrameRate,
+    /// Last `slot.cleared()` value acted on. When it moves, the camera was
+    /// released and the last frame must come off the screen.
+    last_cleared: u64,
 }
 
 enum State {
@@ -53,11 +56,13 @@ struct Target {
 impl CameraPaintSource {
     pub fn new(label: impl Into<String>, slot: FrameSlot) -> Self {
         let rate = FrameRate::new(slot.published());
+        let last_cleared = slot.cleared();
         Self {
             label: label.into(),
             slot,
             state: State::Suspended,
             rate,
+            last_cleared,
         }
     }
 }
@@ -94,6 +99,15 @@ impl CustomPaintSource for CameraPaintSource {
         // has to be drawn into it again even if the camera has not moved on.
         let resized = active.ensure_target(&mut ctx, width, height);
 
+        // Releasing the camera must blank the canvas: a frozen last frame
+        // reads as still being on camera.
+        let cleared = self.slot.cleared();
+        let blanked = cleared != self.last_cleared;
+        if blanked {
+            self.last_cleared = cleared;
+            active.source = None;
+        }
+
         let uploaded = match self.slot.take() {
             Some(frame) => {
                 let uploaded = active.upload(&frame);
@@ -105,7 +119,7 @@ impl CustomPaintSource for CameraPaintSource {
             None => false,
         };
 
-        if uploaded || resized {
+        if uploaded || resized || blanked {
             active.draw(width, height);
         }
 
@@ -357,17 +371,22 @@ impl Active {
         true
     }
 
+    /// Draws the current frame into the target, or clears the target to black
+    /// when there is no frame -- the camera has been released.
     fn draw(&mut self, width: u32, height: u32) {
-        let (Some(source), Some(target)) = (&self.source, &self.target) else {
+        let Some(target) = self.target.as_ref() else {
             return;
         };
+        let source = self.source.as_ref();
 
-        let fit = contain(source.width, source.height, width, height);
-        self.queue.write_buffer(
-            &self.uniforms,
-            0,
-            bytemuck_cast(&[fit[0], fit[1], 1.0, 0.0]),
-        );
+        if let Some(source) = source {
+            let fit = contain(source.width, source.height, width, height);
+            self.queue.write_buffer(
+                &self.uniforms,
+                0,
+                bytemuck_cast(&[fit[0], fit[1], 1.0, 0.0]),
+            );
+        }
 
         let mut encoder = self
             .device
@@ -390,9 +409,11 @@ impl Active {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &source.bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            if let Some(source) = source {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &source.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
         }
         self.queue.submit(Some(encoder.finish()));
     }

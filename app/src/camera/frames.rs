@@ -20,6 +20,10 @@ pub struct FrameSlot {
     /// Total frames ever published. Compared against the renderer's own count
     /// to tell "the camera is slow" apart from "we are dropping frames".
     published: Arc<AtomicU64>,
+    /// Bumped on every [`FrameSlot::clear`]. Lets the renderer tell "no new
+    /// frame yet, keep showing the last one" apart from "the source went away,
+    /// stop showing it" -- an empty slot alone cannot distinguish the two.
+    cleared: Arc<AtomicU64>,
 }
 
 impl FrameSlot {
@@ -37,6 +41,13 @@ impl FrameSlot {
     /// Drop any pending frame, so a stale image does not outlive its source.
     pub fn clear(&self) {
         *self.lock() = None;
+        self.cleared.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many times this slot has been cleared. Only changes are meaningful:
+    /// a reader that sees a new value should discard whatever it was showing.
+    pub fn cleared(&self) -> u64 {
+        self.cleared.load(Ordering::Relaxed)
     }
 
     /// How many frames the camera has delivered since this slot was created.

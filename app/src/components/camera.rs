@@ -30,10 +30,11 @@ const CONFIG: StreamConfig = StreamConfig {
 #[component]
 pub fn Camera() -> Element {
     let devices = use_shared_devices();
-    // Identified by `DeviceId`, never by position: enumeration order differs
-    // between launches, and a device disappearing shifts every later index down
-    // by one. An index would silently move the user to a different camera.
+    // Never a position: enumeration order is not stable across launches, and a
+    // device disappearing shifts every later index down by one.
     let mut selected = use_signal::<Option<DeviceId>>(|| None);
+    // User intent, kept out of `StreamStatus` so the two can disagree.
+    let mut camera_enabled = use_signal(|| true);
     let mut source = use_signal::<Option<CameraSource>>(|| None);
 
     // Shared between the capture thread that fills it and the paint source that
@@ -46,9 +47,8 @@ pub fn Camera() -> Element {
 
     let stream = use_camera_stream(slot, source, CONFIG);
 
-    // Default to the first camera the first time a scan finds one, then never
-    // move the selection again -- a rescan must not relocate the user's choice.
-    // Not a signal: nothing renders off it.
+    // Chooses once, so a later rescan cannot relocate the user's choice. Not a
+    // signal: nothing renders off it.
     let chosen_once = use_hook(|| Rc::new(Cell::new(false)));
     use_effect({
         let chosen_once = Rc::clone(&chosen_once);
@@ -63,13 +63,17 @@ pub fn Camera() -> Element {
         }
     });
 
-    // Resolve the chosen id against the current list. Unknown id -> `None`,
-    // which stops the stream rather than falling through to another camera.
+    // `None` either way stops the stream: it never falls through to whatever
+    // other camera happens to be present.
     use_effect(move || {
-        let wanted = selected.read().clone();
-        let next = wanted
-            .and_then(|id| devices.devices.read().iter().find(|d| d.id == id).cloned())
-            .map(CameraSource::Usb);
+        let next = if !camera_enabled() {
+            None
+        } else {
+            let wanted = selected.read().clone();
+            wanted
+                .and_then(|id| devices.devices.read().iter().find(|d| d.id == id).cloned())
+                .map(CameraSource::Usb)
+        };
         // Signals notify on every write, even a redundant one, so writing
         // unguarded here would reopen the camera on each rerender.
         if *source.peek() != next {
@@ -86,9 +90,7 @@ pub fn Camera() -> Element {
             label: device.name.clone(),
         })
         .collect();
-    // A selection the current list no longer contains: the device went away
-    // while still chosen. Kept rather than cleared, so replugging it
-    // reconnects on its own.
+    // Kept rather than cleared, so replugging the device reconnects it.
     let missing = selected
         .read()
         .as_ref()
@@ -123,11 +125,10 @@ pub fn Camera() -> Element {
                 button {
                     class: "rounded-md bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-500",
                     onclick: move |_| {
-                        let mut active = stream.active;
-                        let next = !*active.peek();
-                        active.set(next);
+                        let next = !*camera_enabled.peek();
+                        camera_enabled.set(next);
                     },
-                    if *stream.active.read() { "Pause" } else { "Resume" }
+                    if camera_enabled() { "Turn camera off" } else { "Turn camera on" }
                 }
             }
         }
@@ -138,7 +139,13 @@ pub fn Camera() -> Element {
             canvas { class: "flex-1 self-stretch", "src": paint_source_id }
         }
         p { class: "text-sm text-neutral-400",
-            if missing { "Camera disconnected" } else { "{stream.status}" }
+            if !camera_enabled() {
+                "Camera off"
+            } else if missing {
+                "Camera disconnected"
+            } else {
+                "{stream.status}"
+            }
         }
     }
 }
