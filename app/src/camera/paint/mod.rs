@@ -11,18 +11,27 @@ use dioxus::native::{CustomPaintCtx, CustomPaintSource, DeviceHandle, TextureHan
 use active::Active;
 use rate::FrameRate;
 
+pub use fit::Mirror;
+
 use super::FrameSlot;
 
-/// Scales camera frames into a canvas-sized texture and hands it to vello.
+/// Scales video frames into a canvas-sized texture and hands it to vello.
 ///
 /// Registered through `use_wgpu`, then referenced from RSX as
 /// `canvas { "src": paint_source_id }`.
-pub struct CameraPaintSource {
+///
+/// Knows nothing about cameras: it drains a [`FrameSlot`] and scales whatever
+/// turns up. One of these per stream -- a local capture publishing into the
+/// slot, or eventually a decoder doing the same for a remote participant.
+pub struct VideoPaintSource {
     /// Identifies this stream in logs; several may run at once.
     label: String,
     slot: FrameSlot,
     state: State,
     rate: FrameRate,
+    /// Fixed for this stream's lifetime: mirroring is about whose face it is,
+    /// which does not change.
+    mirror: Mirror,
     /// Last `slot.cleared()` value acted on. When it moves, the camera was
     /// released and the last frame must come off the screen.
     last_cleared: u64,
@@ -33,8 +42,8 @@ enum State {
     Active(Box<Active>),
 }
 
-impl CameraPaintSource {
-    pub fn new(label: impl Into<String>, slot: FrameSlot) -> Self {
+impl VideoPaintSource {
+    pub fn new(label: impl Into<String>, slot: FrameSlot, mirror: Mirror) -> Self {
         let rate = FrameRate::new(slot.published());
         let last_cleared = slot.cleared();
         Self {
@@ -43,11 +52,12 @@ impl CameraPaintSource {
             state: State::Suspended,
             rate,
             last_cleared,
+            mirror,
         }
     }
 }
 
-impl CustomPaintSource for CameraPaintSource {
+impl CustomPaintSource for VideoPaintSource {
     fn resume(&mut self, device_handle: &DeviceHandle) {
         self.state = State::Active(Box::new(Active::new(
             device_handle.device.clone(),
@@ -58,7 +68,7 @@ impl CustomPaintSource for CameraPaintSource {
 
     fn suspend(&mut self) {
         self.state = State::Suspended;
-        tracing::info!("camera paint source suspended");
+        tracing::info!("[{}] paint source suspended", self.label);
     }
 
     fn render(
@@ -100,7 +110,7 @@ impl CustomPaintSource for CameraPaintSource {
         };
 
         if uploaded || resized || blanked {
-            active.draw(width, height);
+            active.draw(width, height, self.mirror);
         }
 
         active.target.as_ref().map(|t| t.handle.clone())

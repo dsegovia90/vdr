@@ -3,7 +3,7 @@
 use dioxus::native::{CustomPaintCtx, TextureHandle};
 
 use super::active::Active;
-use super::fit::{contain, uniform_bytes};
+use super::fit::{contain, uniform_bytes, Mirror};
 
 pub(super) struct Target {
     width: u32,
@@ -60,7 +60,7 @@ impl Active {
 
     /// Draws the current frame into the target, or clears the target to black
     /// when there is no frame -- the camera has been released.
-    pub(super) fn draw(&mut self, width: u32, height: u32) {
+    pub(super) fn draw(&mut self, width: u32, height: u32, mirror: Mirror) {
         let Some(target) = self.target.as_ref() else {
             return;
         };
@@ -68,8 +68,11 @@ impl Active {
 
         if let Some(source) = source {
             let fit = contain(source.width, source.height, width, height);
-            self.queue
-                .write_buffer(&self.uniforms, 0, &uniform_bytes([fit[0], fit[1], 1.0, 0.0]));
+            self.queue.write_buffer(
+                &self.uniforms,
+                0,
+                &uniform_bytes([fit[0], fit[1], mirror.as_uniform(), 0.0]),
+            );
         }
 
         let mut encoder = self

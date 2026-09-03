@@ -44,7 +44,7 @@ Frames never touch a DOM. The chain is:
 ```
 cameras::pump (worker thread)
   -> FrameSlot            src/camera/frames.rs   newest-frame-wins handoff
-  -> CameraPaintSource    src/camera/paint.rs    CustomPaintSource, uploads to wgpu
+  -> VideoPaintSource     src/camera/paint/      CustomPaintSource, uploads to wgpu
   -> vello                                       composites the texture
 ```
 

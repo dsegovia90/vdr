@@ -7,4 +7,4 @@ mod paint;
 
 pub use frames::FrameSlot;
 pub use hooks::*;
-pub use paint::CameraPaintSource;
+pub use paint::{Mirror, VideoPaintSource};

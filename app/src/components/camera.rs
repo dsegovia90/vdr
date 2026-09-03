@@ -6,7 +6,7 @@ use dioxus::native::use_wgpu;
 use dioxus::prelude::*;
 
 use super::{Dropdown, DropdownOption};
-use crate::camera::{use_camera_stream, use_shared_devices, CameraPaintSource, FrameSlot};
+use crate::camera::{use_camera_stream, use_shared_devices, FrameSlot, Mirror, VideoPaintSource};
 
 /// What we ask the camera for, before `camera::format::negotiate` narrows it to
 /// a mode the device actually reports.
@@ -45,7 +45,9 @@ pub fn Camera() -> Element {
     let slot = use_hook(FrameSlot::default);
     let paint_source_id = use_wgpu({
         let slot = slot.clone();
-        move || CameraPaintSource::new("camera", slot)
+        // Self-view: mirrored, because that is what people expect of their own
+        // preview. Remote participants get `Mirror::None`.
+        move || VideoPaintSource::new("camera", slot, Mirror::SelfView)
     });
 
     let stream = use_camera_stream(slot, source, CONFIG);

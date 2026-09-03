@@ -33,6 +33,35 @@ pub(super) fn row_stride(len: usize, width: u32, height: u32) -> u32 {
     }
 }
 
+/// Whether to flip the video horizontally.
+///
+/// A presentation choice for the local self-view, not a property of the video.
+/// People expect their own preview mirrored and nobody else's, and what we
+/// encode and send must never be mirrored -- otherwise everyone sees everyone
+/// backwards and any writing held up to a camera reads reversed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mirror {
+    /// The local preview of your own camera.
+    SelfView,
+    /// Remote participants, and anything bound for an encoder.
+    ///
+    /// Unconstructed until task 2a puts a decoder behind a `FrameSlot`. It
+    /// exists now because the alternative was leaving mirroring hardcoded on,
+    /// which is a bug the moment there is a second stream.
+    #[allow(dead_code)]
+    None,
+}
+
+impl Mirror {
+    /// `preview.wgsl` flips when this lands above 0.5 in `fit.z`.
+    pub(super) fn as_uniform(self) -> f32 {
+        match self {
+            Self::SelfView => 1.0,
+            Self::None => 0.0,
+        }
+    }
+}
+
 /// Packs the shader uniforms into the bytes `write_buffer` wants.
 pub(super) fn uniform_bytes(values: [f32; 4]) -> [u8; 16] {
     let mut bytes = [0u8; 16];
@@ -127,6 +156,14 @@ mod tests {
         // Divides evenly but is narrower than one packed row, so it cannot
         // be a stride.
         assert_eq!(row_stride(100 * 480, 640, 480), 2560);
+    }
+
+    #[test]
+    fn mirror_matches_the_shader_threshold() {
+        // `preview.wgsl` reads `if (uniforms.fit.z > 0.5)`. Pinned here because
+        // the two halves of that contract live in different languages.
+        assert!(Mirror::SelfView.as_uniform() > 0.5);
+        assert!(Mirror::None.as_uniform() <= 0.5);
     }
 
     #[test]
