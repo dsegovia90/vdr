@@ -15,6 +15,8 @@ fn main() {
 
 #[component]
 fn App() -> Element {
+    camera::use_devices_provider();
+
     rsx! {
         document::Title { "Vdr "}
         style { {STYLES} }

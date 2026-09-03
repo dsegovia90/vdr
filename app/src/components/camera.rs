@@ -6,7 +6,7 @@ use dioxus::native::use_wgpu;
 use dioxus::prelude::*;
 
 use super::{Dropdown, DropdownOption};
-use crate::camera::{use_camera_stream, use_devices, CameraPaintSource, FrameSlot};
+use crate::camera::{use_camera_stream, use_shared_devices, CameraPaintSource, FrameSlot};
 
 /// Requested capture format.
 ///
@@ -29,7 +29,7 @@ const CONFIG: StreamConfig = StreamConfig {
 
 #[component]
 pub fn Camera() -> Element {
-    let devices = use_devices();
+    let devices = use_shared_devices();
     // Identified by `DeviceId`, never by position: enumeration order differs
     // between launches, and a device disappearing shifts every later index down
     // by one. An index would silently move the user to a different camera.
