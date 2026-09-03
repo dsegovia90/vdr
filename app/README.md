@@ -9,20 +9,33 @@ Vello for painting. There is no webview and no JavaScript engine in this build.
 ```sh
 dx serve --renderer native       # regenerates Tailwind, then builds
 dx build --renderer native       # one-shot build
-cargo run                        # fine on its own, but see Styling below
-RUST_LOG=vdr=debug cargo run     # frame rate + texture logging
+RUST_LOG=vdr=debug dx serve --renderer native    # frame rate + texture logging
 ```
+
+**`cargo run` is not a supported entry point.** It builds and runs, but the
+window comes up unstyled -- see Styling. The app logs an error at startup when
+that happens, so it is at least never a mystery. `cargo build`, `cargo clippy`
+and `cargo test` are all fine; it is only *running* that needs dx.
 
 ## Styling
 
 Tailwind v4, via dx's built-in Tailwind (no npm needed). `tailwind.css` next to
-`Cargo.toml` is the input; dx compiles it to `assets/tailwind.css`, which
-`main.rs` pulls in with `include_str!` and injects as a `<style>` element.
+`Cargo.toml` is the input; dx compiles it to `assets/tailwind.css` and bundles
+that under a content-hashed name, which `main.rs` references through
+`asset!` + `document::Stylesheet`. `assets/tailwind.css` is generated and
+gitignored -- do not edit or commit it.
 
-That means **`assets/tailwind.css` is a committed build artifact**: `cargo run`
-alone will not regenerate it, so run `dx build`/`dx serve` after changing or
-adding classes. Injecting it directly, rather than through `asset!`, is what
-lets a plain `cargo build` work at all.
+Under `dx serve` a class change hot-reloads. Under `dx build` it needs a
+rebuild.
+
+**Why `cargo run` cannot work.** `asset!` compiles to a placeholder string that
+only dx substitutes with the real bundled path. Nothing downstream treats the
+leftover placeholder as an error: `dioxus_asset_resolver` answers the bogus path
+with a 404 whose *body* is the text "Not Found", dioxus-native logs that as a
+success, and Blitz parses those nine bytes as a stylesheet. The only symptom
+would be an unstyled window, so `main.rs` checks the asset path at startup and
+logs an error instead. `RUST_LOG=dioxus_native=trace` shows the path actually
+requested, which is the fastest way to tell a bundling problem from a CSS one.
 
 ## How the video path works
 
