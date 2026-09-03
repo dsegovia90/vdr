@@ -1,20 +1,14 @@
 [package]
-name = "app"
+name = "vdr"
 version = "0.1.0"
 authors = ["Daniel Segovia <segoarce90@gmail.com>"]
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-dioxus = { version = "0.7.1", features = [] }
-dioxus-cameras = "0.3"
-
-[features]
-default = ["desktop"]
-# The feature that are only required for the web = ["dioxus/web"] build target should be optional and only enabled in the web = ["dioxus/web"] feature
-web = ["dioxus/web"]
-# The feature that are only required for the desktop = ["dioxus/desktop"] build target should be optional and only enabled in the desktop = ["dioxus/desktop"] feature
-desktop = ["dioxus/desktop"]
-# The feature that are only required for the mobile = ["dioxus/mobile"] build target should be optional and only enabled in the mobile = ["dioxus/mobile"] feature
-mobile = ["dioxus/mobile"]
+cameras = "0.3.2"
+dioxus = { version = "0.7.10", features = ["native"] }
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+wgpu = "26"
