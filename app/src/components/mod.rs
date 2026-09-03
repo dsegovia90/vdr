@@ -4,4 +4,4 @@ mod camera;
 mod dropdown;
 
 pub use camera::Camera;
-pub use dropdown::Dropdown;
+pub use dropdown::{Dropdown, DropdownOption};

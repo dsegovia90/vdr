@@ -1,12 +1,23 @@
-use cameras::{CameraSource, PixelFormat, Resolution, StreamConfig};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use cameras::{CameraSource, DeviceId, PixelFormat, Resolution, StreamConfig};
 use dioxus::native::use_wgpu;
 use dioxus::prelude::*;
 
-use super::Dropdown;
+use super::{Dropdown, DropdownOption};
 use crate::camera::{use_camera_stream, use_devices, CameraPaintSource, FrameSlot};
 
-/// Requested capture format. BGRA keeps the per-frame CPU conversion down to a
-/// channel shuffle; other formats work but cost more to unpack.
+/// Requested capture format.
+///
+/// BGRA costs no CPU conversion at all: the bytes upload verbatim into a
+/// `Bgra8Unorm` texture and the GPU swaps channels when the shader samples it.
+/// Every other format (NV12, YUYV, MJPEG) goes through `cameras::to_rgba8` on
+/// the CPU first, allocating a fresh buffer per frame.
+///
+/// Not a signal, so changing this does not reopen a running camera. Both test
+/// cameras ignore the 1280x720 request and deliver 1920x1080 regardless -- see
+/// task 15, which replaces this with `probe()` + `best_format()`.
 const CONFIG: StreamConfig = StreamConfig {
     resolution: Resolution {
         width: 1280,
@@ -19,7 +30,10 @@ const CONFIG: StreamConfig = StreamConfig {
 #[component]
 pub fn Camera() -> Element {
     let devices = use_devices();
-    let mut selected = use_signal(|| 0usize);
+    // Identified by `DeviceId`, never by position: enumeration order differs
+    // between launches, and a device disappearing shifts every later index down
+    // by one. An index would silently move the user to a different camera.
+    let mut selected = use_signal::<Option<DeviceId>>(|| None);
     let mut source = use_signal::<Option<CameraSource>>(|| None);
 
     // Shared between the capture thread that fills it and the paint source that
@@ -32,13 +46,29 @@ pub fn Camera() -> Element {
 
     let stream = use_camera_stream(slot, source, CONFIG);
 
-    // Follows the dropdown, and picks up the first camera once a scan lands.
+    // Default to the first camera the first time a scan finds one, then never
+    // move the selection again -- a rescan must not relocate the user's choice.
+    // Not a signal: nothing renders off it.
+    let chosen_once = use_hook(|| Rc::new(Cell::new(false)));
+    use_effect({
+        let chosen_once = Rc::clone(&chosen_once);
+        move || {
+            if chosen_once.get() {
+                return;
+            }
+            if let Some(first) = devices.devices.read().first() {
+                selected.set(Some(first.id.clone()));
+                chosen_once.set(true);
+            }
+        }
+    });
+
+    // Resolve the chosen id against the current list. Unknown id -> `None`,
+    // which stops the stream rather than falling through to another camera.
     use_effect(move || {
-        let next = devices
-            .devices
-            .read()
-            .get(selected())
-            .cloned()
+        let wanted = selected.read().clone();
+        let next = wanted
+            .and_then(|id| devices.devices.read().iter().find(|d| d.id == id).cloned())
             .map(CameraSource::Usb);
         // Signals notify on every write, even a redundant one, so writing
         // unguarded here would reopen the camera on each rerender.
@@ -47,13 +77,25 @@ pub fn Camera() -> Element {
         }
     });
 
-    let options: Vec<String> = devices
+    let options: Vec<DropdownOption> = devices
         .devices
         .read()
         .iter()
-        .map(|device| device.name.clone())
+        .map(|device| DropdownOption {
+            value: device.id.0.clone(),
+            label: device.name.clone(),
+        })
         .collect();
-    let placeholder = if *devices.ready.read() {
+    // A selection the current list no longer contains: the device went away
+    // while still chosen. Kept rather than cleared, so replugging it
+    // reconnects on its own.
+    let missing = selected
+        .read()
+        .as_ref()
+        .is_some_and(|id| !devices.devices.read().iter().any(|device| &device.id == id));
+    let placeholder = if missing {
+        "Camera disconnected"
+    } else if *devices.ready.read() {
         "No cameras found"
     } else {
         "Scanning..."
@@ -68,9 +110,9 @@ pub fn Camera() -> Element {
             Dropdown {
                 label: "Camera",
                 options,
-                selected: selected(),
+                selected: selected.read().as_ref().map(|id| id.0.clone()),
                 placeholder: placeholder.to_string(),
-                onchange: move |index| selected.set(index),
+                onchange: move |value: String| selected.set(Some(DeviceId(value))),
             }
             button {
                 class: "rounded-md bg-neutral-800 px-4 py-2 text-sm text-neutral-100 hover:bg-neutral-700",
@@ -95,6 +137,8 @@ pub fn Camera() -> Element {
         div { class: "flex w-full max-w-4xl aspect-video rounded-lg bg-black -z-1",
             canvas { class: "flex-1 self-stretch", "src": paint_source_id }
         }
-        p { class: "text-sm text-neutral-400", "{stream.status}" }
+        p { class: "text-sm text-neutral-400",
+            if missing { "Camera disconnected" } else { "{stream.status}" }
+        }
     }
 }
