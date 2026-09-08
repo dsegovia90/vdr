@@ -7,7 +7,7 @@
 //! ```text
 //!                        |-> FrameSlot -> VideoPaintSource -> local preview
 //! cameras::pump --frame--|
-//!                        |-> FrameTap -> encoder -> iroh/moq -> a peer
+//!                        |-> FrameTap -> encoder -> moq -> a peer
 //! ```
 //!
 //! and the right-hand branch has two implementations that differ only in the
@@ -19,8 +19,6 @@
 mod call;
 mod loopback;
 mod runtime;
-mod sink;
-mod source;
 mod status;
 
 use dioxus_native::prelude::*;

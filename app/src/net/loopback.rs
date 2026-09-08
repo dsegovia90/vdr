@@ -10,8 +10,9 @@
 //! are the failures worth telling apart before a peer is involved, because over
 //! a connection they all look the same from the outside -- a black tile.
 //!
-//! `call.rs` is still on the older stack, so `source.rs` and `sink.rs` carry
-//! conversions between the two frame types until it catches up.
+//! `call.rs` now runs the same stack, so the two differ only in the transport:
+//! this one hands the encoder's output straight back to a decoder in-process,
+//! and that one puts a connection in between.
 
 use super::runtime::runtime;
 use crate::camera::{from_decoded, FrameFeed, FrameSlot};

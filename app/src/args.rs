@@ -56,14 +56,13 @@ pub struct Args {
 }
 
 impl Args {
-    /// Parses the command line once, and installs `--secret` where iroh-live
-    /// looks for it.
+    /// Parses the command line once, and installs `--secret` in the
+    /// environment.
     ///
-    /// `Live::from_env` reads the secret key from `IROH_SECRET` and generates a
-    /// throwaway one if it is unset, so `--secret` is forwarded into the
-    /// environment rather than parsed here. That keeps one code path for the
-    /// key -- the env var keeps working on its own, and there is no second
-    /// place for the two to disagree.
+    /// `--secret` is forwarded into `IROH_SECRET` rather than parsed here, and
+    /// `net::call` reads it back when it builds the endpoint. That keeps one
+    /// code path for the key -- the env var keeps working on its own, and there
+    /// is no second place for the two to disagree.
     ///
     /// Bad input is reported and then ignored: a mistyped key should leave a
     /// video app running in loopback with a line in the log, not refuse to
@@ -89,8 +88,8 @@ impl Args {
                     None => tracing::error!("--dial needs an endpoint id"),
                 },
                 "--secret" => match args.next() {
-                    // Read back by `Live::from_env` on the call thread, which
-                    // has not started yet -- this runs before the first render.
+                    // Read back by `net::call` on the call thread, which has
+                    // not started yet -- this runs before the first render.
                     Some(secret) => std::env::set_var("IROH_SECRET", secret),
                     None => tracing::error!("--secret needs a hex-encoded key"),
                 },

@@ -30,8 +30,13 @@ pub enum RemoteStatus {
     },
     /// Connected, and the peer's video is arriving.
     Connected {
-        /// The peer's endpoint id.
-        peer: String,
+        /// The peer's endpoint id, when we know it.
+        ///
+        /// `None` on the accepting side: iroh exposes no client identity to a
+        /// server, so `--listen` genuinely does not learn who called until
+        /// something above the transport says so. Naming it anyway would be
+        /// inventing information.
+        peer: Option<String>,
     },
     /// The call ended. Terminal: nothing here redials.
     Ended,
@@ -58,7 +63,8 @@ impl fmt::Display for RemoteStatus {
             Self::AwaitingCamera => write!(f, "Waiting for the camera..."),
             Self::Listening { me } => write!(f, "Waiting for a call. Your key: {me}"),
             Self::Dialing { peer } => write!(f, "Dialing {peer}..."),
-            Self::Connected { peer } => write!(f, "Connected to {peer}"),
+            Self::Connected { peer: Some(peer) } => write!(f, "Connected to {peer}"),
+            Self::Connected { peer: None } => write!(f, "Connected"),
             Self::Ended => write!(f, "Call ended"),
             Self::Failed { error } => write!(f, "Call failed: {error}"),
         }
