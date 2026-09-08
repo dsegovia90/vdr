@@ -1,2 +1,22 @@
 [application]
 name = "Vdr"
+
+
+[bundle]
+identifier = "com.example"
+publisher = "exampleinc"
+
+# macOS kills any bundled app that touches the camera without this key -- not a
+# prompt, not a denial, an immediate crash on the first AVFoundation call. It
+# does not bite while developing, because running the binary from a terminal
+# makes the terminal the responsible process and it already holds the grant. It
+# bites the first person you hand the .app to.
+#
+# This covers `dx build`, which is what we ship. `dx bundle` does NOT read it --
+# it hands off to tauri-bundler, which writes its own minimal Info.plist. If a
+# .dmg is ever wanted, the way that works (verified) is a real plist file plus:
+#
+#   [bundle.macos]
+#   info_plist_path = "Info.plist"
+[macos.plist]
+NSCameraUsageDescription = "Vdr shows your camera in the call and sends it to the person you are calling."

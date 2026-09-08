@@ -1,1 +1,17 @@
 /target
+
+# --- dstack: kept out of the repo for now -------------------------------
+# Planning artifacts: the living doc, the ticket DAG, findings, archives.
+/doc/dstack/
+
+# The toolkit itself, as installed by dstack-update.
+/.dstack-version
+/dstack-update
+/llm-coding-workflow.md
+/.claude/skills/dstack/
+/.claude/commands/dstack-*.md
+# ------------------------------------------------------------------------
+
+CLAUDE.md
+
+.DS_Store
