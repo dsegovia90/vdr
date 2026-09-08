@@ -3,8 +3,130 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use std::time::Duration;
+
 use bytes::Bytes;
-use moq_media::format::{PixelFormat, VideoFrame};
+
+/// How a frame's pixels are laid out.
+///
+/// Two shapes, because the two producers genuinely differ and flattening them
+/// would cost real work:
+///
+/// - **Packed** is what `cameras` delivers. It uploads straight into a
+///   `Bgra8Unorm`/`Rgba8Unorm` texture with no conversion at all, which is the
+///   preview's fast path and worth preserving exactly.
+/// - **I420** is what a decoder produces. `moq_video::Surface` has *no* packed
+///   CPU variant -- only `I420` plus platform GPU handles -- so adopting
+///   `moq_video::Frame` as the slot's type would mean a CPU BGRA->I420
+///   conversion on every captured frame purely to satisfy a type.
+#[derive(Clone)]
+pub enum Pixels {
+    /// Tightly packed BGRA8, `width * 4` bytes per row.
+    Bgra(Bytes),
+    /// Tightly packed RGBA8, `width * 4` bytes per row.
+    Rgba(Bytes),
+    /// Planar 4:2:0: `width * height` luma, then two `(width/2) * (height/2)`
+    /// chroma planes, in one buffer. `moq_video::Surface::into_i420` hands it
+    /// over exactly this way.
+    I420(Bytes),
+}
+
+/// The neutral frame both producers meet on.
+///
+/// The slot cannot hold `cameras::Frame` (it is `#[non_exhaustive]`, so a
+/// decoder could never build one), and it cannot hold `moq_video::Frame`
+/// (see [`Pixels`]). So it holds this.
+#[derive(Clone)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub timestamp: Duration,
+    pub pixels: Pixels,
+}
+
+impl Frame {
+    /// Bytes an I420 buffer must have for these dimensions.
+    pub fn i420_len(width: u32, height: u32) -> usize {
+        let (w, h) = (width as usize, height as usize);
+        w * h + 2 * ((w / 2) * (h / 2))
+    }
+
+    /// Converts to the planar surface an encoder wants.
+    ///
+    /// **Not via `moq_video::Surface::rgba`.** That is not a constructor -- it
+    /// calls `I420::from_rgba` immediately -- and it assumes RGBA channel
+    /// order, so BGRA input silently comes out with red and blue swapped.
+    /// `I420::from_nv12` is `pub(crate)` upstream, so the conversion is ours
+    /// either way.
+    ///
+    /// Rows are already tightly packed here: `from_capture` repacks a padded
+    /// camera frame before it ever reaches this type.
+    pub fn to_i420_surface(&self) -> Option<moq_video::Surface> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w < 2 || h < 2 {
+            return None;
+        }
+        // Odd dimensions have no well-defined 4:2:0 chroma plane.
+        let (cw, ch) = (w / 2, h / 2);
+
+        let data = match &self.pixels {
+            Pixels::I420(data) => data.to_vec(),
+            Pixels::Bgra(src) | Pixels::Rgba(src) => {
+                if src.len() < w * h * 4 {
+                    return None;
+                }
+                let (ri, bi) = match self.pixels {
+                    Pixels::Bgra(_) => (2usize, 0usize),
+                    _ => (0usize, 2usize),
+                };
+                let at = |x: usize, y: usize| -> (f32, f32, f32) {
+                    let p = (y * w + x) * 4;
+                    (src[p + ri] as f32, src[p + 1] as f32, src[p + bi] as f32)
+                };
+
+                // BT.601 limited range, the inverse of `preview.wgsl`'s I420
+                // branch. Keep the two in step or colours drift.
+                let mut out = vec![0u8; Self::i420_len(self.width, self.height)];
+                for y in 0..h {
+                    for x in 0..w {
+                        let (r, g, b) = at(x, y);
+                        out[y * w + x] =
+                            (0.257 * r + 0.504 * g + 0.098 * b + 16.0).clamp(0.0, 255.0) as u8;
+                    }
+                }
+                let (u_off, v_off) = (w * h, w * h + cw * ch);
+                for cy in 0..ch {
+                    for cx in 0..cw {
+                        // Averaged, not point sampled: point sampling shimmers.
+                        let (mut rs, mut gs, mut bs) = (0.0, 0.0, 0.0);
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let (r, g, b) = at(cx * 2 + dx, cy * 2 + dy);
+                                rs += r;
+                                gs += g;
+                                bs += b;
+                            }
+                        }
+                        let (r, g, b) = (rs / 4.0, gs / 4.0, bs / 4.0);
+                        out[u_off + cy * cw + cx] =
+                            (-0.148 * r - 0.291 * g + 0.439 * b + 128.0).clamp(0.0, 255.0) as u8;
+                        out[v_off + cy * cw + cx] =
+                            (0.439 * r - 0.368 * g - 0.071 * b + 128.0).clamp(0.0, 255.0) as u8;
+                    }
+                }
+                out
+            }
+        };
+
+        match moq_video::I420::new(self.width, self.height, data) {
+            Ok(i420) => Some(moq_video::Surface::I420(i420)),
+            Err(error) => {
+                tracing::warn!("I420 conversion failed: {error}");
+                None
+            }
+        }
+    }
+}
 
 /// Holds the newest captured frame for the paint source to pick up.
 ///
@@ -17,7 +139,7 @@ use moq_media::format::{PixelFormat, VideoFrame};
 /// only be retrieved over its loopback HTTP server.
 #[derive(Clone, Default)]
 pub struct FrameSlot {
-    frame: Arc<Mutex<Option<VideoFrame>>>,
+    frame: Arc<Mutex<Option<Frame>>>,
     /// Total frames ever published. Compared against the renderer's own count
     /// to tell "the camera is slow" apart from "we are dropping frames".
     published: Arc<AtomicU64>,
@@ -29,13 +151,13 @@ pub struct FrameSlot {
 
 impl FrameSlot {
     /// Replace the pending frame. Called from the capture thread.
-    pub fn publish(&self, frame: VideoFrame) {
+    pub fn publish(&self, frame: Frame) {
         *self.lock() = Some(frame);
         self.published.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Take the pending frame, leaving the slot empty. Called from the renderer.
-    pub fn take(&self) -> Option<VideoFrame> {
+    pub fn take(&self) -> Option<Frame> {
         self.lock().take()
     }
 
@@ -60,7 +182,7 @@ impl FrameSlot {
 
     /// A poisoned slot only means a capture thread panicked mid-publish; the
     /// frame it held is still structurally fine to replace.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<VideoFrame>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Frame>> {
         self.frame.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -84,56 +206,80 @@ impl std::fmt::Debug for FrameSlot {
 
 /// Converts a captured frame into the neutral frame type the slot carries.
 ///
-/// The slot cannot hold `cameras::Frame`: it is `#[non_exhaustive]`, so a
-/// decoder could never construct one, and remote video has to reach the same
-/// renderer as local capture. `moq_media`'s `VideoFrame` is what the decoder
-/// produces, so it is the type both ends can meet on.
-///
 /// Free of copies in the common case -- both sides are `Bytes` -- except when
-/// the camera pads its rows, which `VideoFrame` has no way to express.
-pub fn from_capture(frame: &cameras::Frame) -> VideoFrame {
-    let packed = frame.width * 4;
-    let pixel_format = match frame.pixel_format {
-        cameras::PixelFormat::Bgra8 => Some(PixelFormat::Bgra),
-        cameras::PixelFormat::Rgba8 => Some(PixelFormat::Rgba),
+/// the camera pads its rows, which the packed variants cannot express.
+pub fn from_capture(frame: &cameras::Frame) -> Frame {
+    let packed_row = frame.width * 4;
+    let packed = match frame.pixel_format {
+        cameras::PixelFormat::Bgra8 => Some(true),
+        cameras::PixelFormat::Rgba8 => Some(false),
         _ => None,
     };
 
-    if let Some(pixel_format) = pixel_format {
-        let data = if frame.stride == packed {
+    if let Some(is_bgra) = packed {
+        let data = if frame.stride == packed_row {
             frame.plane_primary.clone()
         } else {
-            // Padded rows: repack, since `VideoFrame` assumes tight packing and
-            // would otherwise shear every row after the first.
+            // Repack: the packed variants assume tight rows and would
+            // otherwise shear every row after the first.
             let stride = frame.stride as usize;
-            let mut tight = Vec::with_capacity((packed * frame.height) as usize);
+            let mut tight = Vec::with_capacity((packed_row * frame.height) as usize);
             for row in 0..frame.height as usize {
                 let start = row * stride;
-                tight.extend_from_slice(&frame.plane_primary[start..start + packed as usize]);
+                tight.extend_from_slice(&frame.plane_primary[start..start + packed_row as usize]);
             }
             Bytes::from(tight)
         };
-        return VideoFrame::new_packed(
-            data,
-            frame.width,
-            frame.height,
-            pixel_format,
-            frame.timestamp,
-        );
+        return Frame {
+            width: frame.width,
+            height: frame.height,
+            timestamp: frame.timestamp,
+            pixels: if is_bgra { Pixels::Bgra(data) } else { Pixels::Rgba(data) },
+        };
     }
 
     // NV12, YUYV, MJPEG and friends: the CPU decoder is the only way through.
+    // NV12 is what both cameras natively offer and what we would rather have,
+    // but `cameras` hardcodes BGRA on macOS and ignores the request.
     match cameras::to_rgba8(frame) {
-        Ok(rgba) => VideoFrame::new_packed(
-            Bytes::from(rgba),
-            frame.width,
-            frame.height,
-            PixelFormat::Rgba,
-            frame.timestamp,
-        ),
+        Ok(rgba) => Frame {
+            width: frame.width,
+            height: frame.height,
+            timestamp: frame.timestamp,
+            pixels: Pixels::Rgba(Bytes::from(rgba)),
+        },
         Err(error) => {
             tracing::warn!("frame conversion failed: {error}");
-            VideoFrame::new_packed(Bytes::new(), 0, 0, PixelFormat::Rgba, frame.timestamp)
+            Frame {
+                width: 0,
+                height: 0,
+                timestamp: frame.timestamp,
+                pixels: Pixels::Rgba(Bytes::new()),
+            }
+        }
+    }
+}
+
+/// Converts a decoded frame into the neutral type.
+///
+/// `Surface::into_i420` is a CPU readback on macOS, where the decoder hands
+/// back an IOSurface-backed `PixelBuffer`. Importing that handle into a wgpu
+/// texture directly would avoid the round trip, at the cost of unsafe
+/// per-platform interop.
+pub fn from_decoded(frame: moq_video::Frame) -> Option<Frame> {
+    let width = frame.surface.width();
+    let height = frame.surface.height();
+    let timestamp = Duration::from_micros(frame.timestamp.as_micros() as u64);
+    match frame.surface.into_i420() {
+        Ok(data) => Some(Frame {
+            width,
+            height,
+            timestamp,
+            pixels: Pixels::I420(data),
+        }),
+        Err(error) => {
+            tracing::warn!("decoded frame conversion failed: {error}");
+            None
         }
     }
 }
@@ -160,7 +306,7 @@ pub fn from_capture(frame: &cameras::Frame) -> VideoFrame {
 /// matches what `rusty-capture`'s own sources document: `pop_frame` "always
 /// returns the most recent frame, avoiding latency buildup".
 ///
-/// Cloning a [`VideoFrame`] in is a refcount bump on `Bytes`, not a pixel copy.
+/// Cloning a [`Frame`] in is a refcount bump on `Bytes`, not a pixel copy.
 pub struct FrameTap {
     shared: Arc<Tapped>,
 }
@@ -173,7 +319,7 @@ pub struct FrameFeed {
 /// The single frame in flight, and what the reader needs to know about it.
 #[derive(Default)]
 struct Tapped {
-    frame: Mutex<Option<VideoFrame>>,
+    frame: Mutex<Option<Frame>>,
     /// Wakes [`FrameFeed::wait`], which blocks before an encoder can be built.
     arrived: std::sync::Condvar,
     /// Live [`FrameTap`]s. At zero no frame can ever arrive again, which is
@@ -201,7 +347,7 @@ impl FrameTap {
     ///
     /// Never blocks: this runs on the capture thread, and stalling there would
     /// stall the preview too -- the failure the fan-out exists to avoid.
-    pub fn publish(&self, frame: VideoFrame) {
+    pub fn publish(&self, frame: Frame) {
         let replaced = self.shared.lock().replace(frame).is_some();
         if replaced {
             let dropped = self.shared.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -242,7 +388,7 @@ impl FrameFeed {
     /// [`FrameTap`] is gone and no frame will ever arrive. That distinction is
     /// what shuts an encoder pipeline down -- it treats the error as the end of
     /// its source and exits, which in turn closes everything downstream.
-    pub fn take(&mut self) -> anyhow::Result<Option<VideoFrame>> {
+    pub fn take(&mut self) -> anyhow::Result<Option<Frame>> {
         match self.shared.lock().take() {
             Some(frame) => Ok(Some(frame)),
             // Ordering matters: a frame published just before the last tap
@@ -260,7 +406,7 @@ impl FrameFeed {
     /// Needed because a source's pixel format and dimensions are only knowable
     /// from a frame: on macOS the device overrides the resolution we asked for
     /// (see `format.rs`), so the request is not evidence of anything.
-    pub fn wait(&mut self) -> Option<VideoFrame> {
+    pub fn wait(&mut self) -> Option<Frame> {
         let mut pending = self.shared.lock();
         loop {
             if let Some(frame) = pending.take() {
@@ -281,7 +427,7 @@ impl FrameFeed {
 impl Tapped {
     /// A poisoned tap only means a thread panicked mid-publish; the frame it
     /// held is still structurally fine to replace.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<VideoFrame>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Frame>> {
         self.frame.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -292,8 +438,13 @@ mod tap_tests {
 
     use super::*;
 
-    fn frame(width: u32) -> VideoFrame {
-        VideoFrame::new_packed(Bytes::new(), width, 2, PixelFormat::Bgra, Duration::ZERO)
+    fn frame(width: u32) -> Frame {
+        Frame {
+            width,
+            height: 2,
+            timestamp: Duration::ZERO,
+            pixels: Pixels::Bgra(Bytes::new()),
+        }
     }
 
     #[test]
@@ -306,7 +457,7 @@ mod tap_tests {
         tap.publish(frame(2));
         tap.publish(frame(3));
         let taken = feed.take().unwrap().expect("a frame is pending");
-        assert_eq!(taken.dimensions[0], 3, "the newest, not the first");
+        assert_eq!(taken.width, 3, "the newest, not the first");
         assert!(feed.take().unwrap().is_none(), "only ever one frame deep");
     }
 
@@ -343,7 +494,7 @@ mod tap_tests {
     fn wait_returns_a_frame_published_before_it() {
         let (tap, mut feed) = frame_tap();
         tap.publish(frame(7));
-        assert_eq!(feed.wait().expect("published").dimensions[0], 7);
+        assert_eq!(feed.wait().expect("published").width, 7);
     }
 
     #[test]
@@ -353,7 +504,7 @@ mod tap_tests {
             std::thread::sleep(Duration::from_millis(20));
             tap.publish(frame(9));
         });
-        assert_eq!(feed.wait().expect("published late").dimensions[0], 9);
+        assert_eq!(feed.wait().expect("published late").width, 9);
         publisher.join().unwrap();
     }
 }

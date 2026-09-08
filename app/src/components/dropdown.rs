@@ -63,7 +63,7 @@ pub fn Dropdown(props: DropdownProps) -> Element {
                     // receives clicks. Tried and rejected -- a stacking context
                     // on the parent, dropping the menu's z-index, removing the
                     // click-catcher, removing the video tile. Only normal flow
-                    // works. See backlog ticket 0.
+                    // works.
                     div { class: "w-full mt-1 rounded-md border border-neutral-700 bg-neutral-900 p-1",
                         for option in props.options.iter() {
                             div {

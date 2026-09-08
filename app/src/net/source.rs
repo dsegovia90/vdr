@@ -45,7 +45,7 @@ impl TapSource {
         let first = feed.wait()?;
         let format = VideoFormat {
             pixel_format: pixel_format(&first),
-            dimensions: first.dimensions,
+            dimensions: [first.width, first.height],
         };
         Some(Self {
             name: name.into(),
@@ -61,11 +61,29 @@ impl TapSource {
 /// honest answer here. Capture frames are always packed -- `camera::from_capture`
 /// converts anything else to RGBA -- so the fallback is unreachable today, and
 /// says RGBA because that is what that conversion produces.
-fn pixel_format(frame: &VideoFrame) -> PixelFormat {
-    match &frame.data {
-        moq_media::format::FrameData::Packed { pixel_format, .. } => *pixel_format,
+fn pixel_format(frame: &crate::camera::Frame) -> PixelFormat {
+    match &frame.pixels {
+        crate::camera::Pixels::Bgra(_) => PixelFormat::Bgra,
         _ => PixelFormat::Rgba,
     }
+}
+
+/// Bridges the neutral frame type back to what `moq-media` wants.
+///
+/// **Temporary**, for as long as `call.rs` stays on the older stack. A refcount
+/// bump for packed frames; I420 never reaches here, because the tap is fed from
+/// capture and `from_capture` only produces packed.
+fn to_moq_media(frame: crate::camera::Frame) -> VideoFrame {
+    use crate::camera::Pixels;
+    let (data, pixel_format) = match frame.pixels {
+        Pixels::Bgra(data) => (data, PixelFormat::Bgra),
+        Pixels::Rgba(data) => (data, PixelFormat::Rgba),
+        Pixels::I420(_) => {
+            tracing::warn!("planar frame on the capture tap; dropping");
+            (bytes::Bytes::new(), PixelFormat::Rgba)
+        }
+    };
+    VideoFrame::new_packed(data, frame.width, frame.height, pixel_format, frame.timestamp)
 }
 
 impl VideoSource for TapSource {
@@ -78,7 +96,7 @@ impl VideoSource for TapSource {
     }
 
     fn pop_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
-        self.feed.take()
+        Ok(self.feed.take()?.map(to_moq_media))
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
@@ -99,9 +117,14 @@ mod tests {
     use super::*;
     use crate::camera::frame_tap;
 
-    fn frame(width: u32, height: u32) -> VideoFrame {
+    fn frame(width: u32, height: u32) -> crate::camera::Frame {
         let data = Bytes::from(vec![0u8; (width * height * 4) as usize]);
-        VideoFrame::new_packed(data, width, height, PixelFormat::Bgra, Duration::ZERO)
+        crate::camera::Frame {
+            width,
+            height,
+            timestamp: Duration::ZERO,
+            pixels: crate::camera::Pixels::Bgra(data),
+        }
     }
 
     #[test]

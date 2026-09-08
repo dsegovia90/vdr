@@ -131,10 +131,10 @@ pub fn use_camera_stream(
                                 return;
                             }
                             // The one place every captured frame passes
-                            // through, which is why the fan-out is here
-                            // (task 2). Convert once and share: the clone is a
-                            // refcount bump, a second `from_capture` would be
-                            // a second conversion.
+                            // through, which is why the fan-out is here.
+                            // Convert once and share: the clone is a refcount
+                            // bump, a second `from_capture` would be a second
+                            // conversion.
                             let frame = from_capture(&frame);
                             if let Some(tap) = &tap {
                                 tap.publish(frame.clone());

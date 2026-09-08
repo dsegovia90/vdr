@@ -71,7 +71,13 @@ impl Active {
             self.queue.write_buffer(
                 &self.uniforms,
                 0,
-                &uniform_bytes([fit[0], fit[1], mirror.as_uniform(), 0.0]),
+                // fit.w selects the shader branch: 1.0 = I420, 0.0 = packed.
+                &uniform_bytes([
+                    fit[0],
+                    fit[1],
+                    mirror.as_uniform(),
+                    if source.planar { 1.0 } else { 0.0 },
+                ]),
             );
         }
 

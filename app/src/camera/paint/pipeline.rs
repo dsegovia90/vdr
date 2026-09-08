@@ -11,6 +11,10 @@ pub(super) struct Pipeline {
     pub(super) pipeline: wgpu::RenderPipeline,
     pub(super) bind_group_layout: wgpu::BindGroupLayout,
     pub(super) sampler: wgpu::Sampler,
+    /// A 1x1 R8 texture bound to the chroma slots in packed mode. A bind group
+    /// must supply every binding its layout declares, even ones the shader
+    /// branch does not read.
+    pub(super) blank_plane: wgpu::TextureView,
 }
 
 /// Shared handle to [`Pipeline`], built on first use.
@@ -73,8 +77,43 @@ impl Pipeline {
                     },
                     count: None,
                 },
+                // Chroma planes for I420. A bind group must satisfy its whole
+                // layout, so packed frames bind `blank_plane` here.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
+
+        // Shared by every stream, for the chroma slots of a packed frame.
+        let blank = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("camera-blank-plane"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let blank_plane = blank.create_view(&wgpu::TextureViewDescriptor::default());
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("camera-preview"),
@@ -124,6 +163,7 @@ impl Pipeline {
             pipeline,
             bind_group_layout,
             sampler,
+            blank_plane,
         }
     }
 }

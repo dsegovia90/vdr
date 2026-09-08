@@ -24,7 +24,7 @@ use crate::args::Peering;
 use crate::camera::{FrameFeed, FrameSlot};
 
 /// What the peer sees us publish. Matches the loopback's preset, and is the
-/// only rendition we offer -- simulcast is a later ticket.
+/// only rendition we offer -- simulcast is not built yet.
 const PRESET: VideoPreset = VideoPreset::P720;
 
 /// Runs a call on its own thread for the lifetime of the process.
@@ -144,8 +144,8 @@ async fn run(
     });
 
     // Video only. `RemoteBroadcast::media` would also want an `AudioBackend`,
-    // and audio is unscoped work with its own design (backlog task 18) -- a
-    // jitter buffer, not a slot.
+    // and audio needs its own design -- a jitter buffer, not a slot, because
+    // dropping a buffer is audible where dropping a frame is not.
     let video = call
         .remote()
         .video_ready()

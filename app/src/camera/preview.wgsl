@@ -11,13 +11,18 @@ struct VertexOutput {
 };
 
 // x, y: canvas-to-video uv scale. z: 1.0 to mirror horizontally.
+// w: 0.0 = plane0 is packed BGRA/RGBA, 1.0 = planes are I420 (Y, U, V).
 struct Uniforms {
     fit: vec4<f32>,
 };
 
+// Packed BGRA/RGBA, or the Y plane when fit.w selects I420.
 @group(0) @binding(0) var frame_texture: texture_2d<f32>;
 @group(0) @binding(1) var frame_sampler: sampler;
 @group(0) @binding(2) var<uniform> uniforms: Uniforms;
+// Chroma planes. 1x1 dummies in packed mode.
+@group(0) @binding(3) var u_texture: texture_2d<f32>;
+@group(0) @binding(4) var v_texture: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
@@ -42,6 +47,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Outside the video is letterbox, not edge-clamped smear.
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
+    if (uniforms.fit.w > 0.5) {
+        // BT.601 limited range, the inverse of `Frame::to_i420_surface`.
+        let y = (textureSample(frame_texture, frame_sampler, uv).r - 0.0625) * 1.164;
+        let u = textureSample(u_texture, frame_sampler, uv).r - 0.5;
+        let v = textureSample(v_texture, frame_sampler, uv).r - 0.5;
+        return vec4<f32>(
+            clamp(y + 1.596 * v, 0.0, 1.0),
+            clamp(y - 0.391 * u - 0.813 * v, 0.0, 1.0),
+            clamp(y + 2.018 * u, 0.0, 1.0),
+            1.0,
+        );
     }
 
     return textureSample(frame_texture, frame_sampler, uv);

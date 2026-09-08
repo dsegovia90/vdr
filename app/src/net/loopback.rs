@@ -1,44 +1,27 @@
 //! The network path with the network taken out.
 //!
-//! Camera frames go through a real H.264 encode, a real packet channel and a
+//! Camera frames go through a real H.264 encode, a real MoQ broadcast and a
 //! real decode, and come back out as frames for a second tile. Everything here
-//! except `media_pipe` is what a call will use; swapping the pipe for a MoQ
-//! session over iroh is the next step, and nothing upstream or downstream of it
-//! has to change.
+//! except the missing connection is what a call will use.
 //!
 //! What it proves, and the order it proves it in: that the pump's fan-out feeds
 //! an encoder without disturbing the preview, that a decoded frame reaches
 //! `VideoPaintSource` and paints, and that the two tiles stay in step. Those
 //! are the failures worth telling apart before a peer is involved, because over
 //! a connection they all look the same from the outside -- a black tile.
-
-use moq_media::codec::{DynamicVideoDecoder, VideoCodec};
-use moq_media::format::{DecodeConfig, VideoEncoderConfig, VideoPreset};
-use moq_media::pipeline::{PipelineContext, VideoDecoderPipeline, VideoEncoderPipeline};
-use moq_media::stats::EncodeOpts;
-use moq_media::subscribe::VideoTrack;
-use moq_media::traits::{VideoEncoder, VideoSource};
-use moq_media::transport::media_pipe;
+//!
+//! `call.rs` is still on the older stack, so `source.rs` and `sink.rs` carry
+//! conversions between the two frame types until it catches up.
 
 use super::runtime::runtime;
-use super::sink::drain;
-use super::source::TapSource;
-use crate::camera::{FrameFeed, FrameSlot};
-
-/// What the encoder aims for, before `ScaleMode::Fit` narrows it to the source's
-/// aspect ratio.
-///
-/// 720p and not the capture resolution: a 1080p capture that macOS refuses to
-/// narrow (see `camera::format`) should not become a 1080p encode as well. This
-/// is where "capture max, send less" actually happens today.
-const PRESET: VideoPreset = VideoPreset::P720;
+use crate::camera::{from_decoded, FrameFeed, FrameSlot};
 
 /// Runs a loopback on its own thread for the lifetime of the process.
 ///
 /// Teardown is by cascade rather than by signal: when the last
-/// [`FrameTap`](crate::camera::FrameTap) drops, `TapSource::pop_frame` starts
-/// erroring, the encoder pipeline ends, its sink closes, the decoder follows,
-/// and the drain loop sees the track close and returns.
+/// [`FrameTap`](crate::camera::FrameTap) drops, `FrameFeed::take` starts
+/// erroring, the encode loop ends, the producer finishes, and the decode task
+/// sees the track close and returns.
 pub(super) fn spawn(feed: FrameFeed, slot: FrameSlot) {
     let spawned = std::thread::Builder::new()
         .name("loopback".into())
@@ -48,75 +31,121 @@ pub(super) fn spawn(feed: FrameFeed, slot: FrameSlot) {
     }
 }
 
-/// Owns the pipelines for as long as frames keep coming.
-///
-/// Both halves must be held here: `VideoEncoderPipeline` cancels its worker on
-/// drop, so letting it fall out of scope after construction would encode
-/// nothing and leave the tile black with no error anywhere.
-fn run(feed: FrameFeed, slot: FrameSlot) {
+fn run(mut feed: FrameFeed, slot: FrameSlot) {
     let Some(runtime) = runtime() else {
         return;
     };
 
     // Blocks until the camera produces something, which may be never -- the
     // user can start with the camera off. That is why this is a thread and not
-    // part of the hook.
-    let Some(source) = TapSource::wait_for_first("loopback", feed) else {
+    // part of the hook. The encoder is sized from a real frame rather than from
+    // the request, because macOS discards the request entirely.
+    let Some(first) = feed.wait() else {
         tracing::debug!("loopback: the camera closed before a frame arrived");
         return;
     };
+    let (width, height) = (first.width, first.height);
 
-    let built = {
-        // Only construction needs the runtime in context: the decode pipeline
-        // spawns a packet-forwarding task. The guard must not still be held at
-        // `block_on` below -- tokio refuses to block a thread that has entered
-        // a runtime.
-        let _guard = runtime.enter();
-        build(source)
-    };
-    let (_encoder, track) = match built {
-        Ok(built) => built,
-        Err(error) => {
-            tracing::error!("loopback: could not build the pipeline: {error:#}");
-            return;
+    runtime.block_on(async move {
+        if let Err(error) = pump(feed, slot, width, height).await {
+            tracing::error!("loopback: {error:#}");
         }
-    };
-    tracing::info!("loopback: decoding with {}", track.decoder_name());
-
-    runtime.block_on(drain(track, slot));
-    tracing::info!("loopback: stopped");
+        tracing::info!("loopback: stopped");
+    });
 }
 
-/// Wires encoder -> pipe -> decoder and returns the two ends to keep alive.
-fn build(source: TapSource) -> anyhow::Result<(VideoEncoderPipeline, VideoTrack)> {
-    let [width, height] = source.format().dimensions;
-    // `ScaleMode::Fit` never upscales, so a camera below the preset is encoded
-    // at its own size rather than blown up to 720p and back down for display.
-    let target = VideoEncoderConfig::from_preset(PRESET).resolve_for_source(width, height);
-    let (encoded_width, encoded_height) = (target.width, target.height);
-    let encoder = VideoCodec::H264.create_encoder(target)?;
+/// Wires encoder -> broadcast -> decoder and runs until the camera goes away.
+async fn pump(
+    mut feed: FrameFeed,
+    slot: FrameSlot,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<()> {
+    // Framerate is the encoder's pacing hint, not a promise.
+    let config = moq_video::encode::Config::new(width, height, 30);
+    // `probe` asks the encoder what it will emit, so the catalog is published
+    // before anything is encoded -- which is what lets the decoder below open
+    // against a track nothing has written to yet.
+    let rendition = config.probe().await?;
+    let mut encoder = moq_video::encode::Encoder::new(&config)?;
     tracing::info!(
-        "loopback: encoding {width}x{height} as {encoded_width}x{encoded_height} with {}",
-        encoder.name(),
+        "loopback: encoding {width}x{height} with {}",
+        encoder.name()
     );
 
-    // The decoder is configured from the encoder rather than from a catalog,
-    // which is the one thing a call will do differently: there the config
-    // arrives over the wire, and the two sides can disagree.
-    let config = encoder.config();
-    let (sink, packets) = media_pipe(32);
-    let encoder = VideoEncoderPipeline::new(source, encoder, sink, EncodeOpts::default());
-    let decoder = VideoDecoderPipeline::new::<DynamicVideoDecoder>(
-        "loopback".to_string(),
-        packets,
-        &config,
-        &DecodeConfig::default(),
-        PipelineContext {
-            stats: Default::default(),
-            // No audio yet, so there is no clock to sync to; the decoder paces
-            // on presentation timestamps instead.
-            sync: None,
-        },
+    let origin = moq_net::Origin::random().produce();
+    let mut broadcast = origin.create_broadcast(
+        "loopback.hang",
+        moq_net::broadcast::Route::new().with_announce(true),
     )?;
-    Ok((encoder, VideoTrack::from_pipeline(decoder)))
+    let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
+    let track = broadcast.create_track("video.avc3", catalog.track_info())?;
+    let mut producer =
+        moq_video::encode::Producer::with_track(track, catalog, rendition.clone())?;
+
+    // In-process, so the producer's own consumer is the whole "network". A call
+    // resolves the rendition from the catalog it receives instead.
+    let consumer_broadcast = broadcast.consume();
+    let decode = tokio::spawn(async move {
+        let mut consumer = match moq_video::decode::Consumer::new(
+            &consumer_broadcast,
+            &rendition,
+            "video.avc3",
+            moq_video::decode::Config::default(),
+        )
+        .await
+        {
+            Ok(consumer) => consumer,
+            Err(error) => {
+                tracing::error!("loopback: no decoder: {error:#}");
+                return;
+            }
+        };
+        tracing::info!("loopback: decoding with {}", consumer.name());
+
+        while let Ok(Some(frame)) = consumer.read().await {
+            if let Some(frame) = from_decoded(frame) {
+                slot.publish(frame);
+            }
+        }
+        // The producer is gone, so the last frame must come off the screen
+        // rather than sit there looking live.
+        slot.clear();
+    });
+
+    loop {
+        // `take` errors only when every tap has dropped: the camera going away
+        // for good, rather than a gap between frames.
+        let frame = match feed.take() {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                continue;
+            }
+            Err(_) => break,
+        };
+
+        let Some(surface) = frame.to_i420_surface() else {
+            continue;
+        };
+        // The encoder paces on these, so a wrong one stalls the stream.
+        let Ok(timestamp) = moq_net::Timestamp::from_micros(frame.timestamp.as_micros() as u64)
+        else {
+            tracing::warn!("frame timestamp out of range; skipping");
+            continue;
+        };
+        let encoded = encoder.encode(&moq_video::Frame::new(surface, timestamp))?;
+        if !encoded.is_empty() {
+            producer.publish(&encoded)?;
+        }
+    }
+
+    if let Ok(flushed) = encoder.flush() {
+        if !flushed.is_empty() {
+            producer.publish(&flushed).ok();
+        }
+    }
+    producer.finish().ok();
+    decode.await.ok();
+    Ok(())
 }
