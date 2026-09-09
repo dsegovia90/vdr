@@ -3,6 +3,7 @@ mod camera;
 mod channel;
 mod components;
 mod net;
+mod settings;
 
 use dioxus_native::prelude::*;
 

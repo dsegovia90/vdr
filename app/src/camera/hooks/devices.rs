@@ -56,7 +56,18 @@ fn use_devices() -> UseDevices {
             .name("camera-enumerate".into())
             .spawn(move || match cameras::devices() {
                 Ok(list) => {
-                    tracing::debug!("enumerated {} camera(s)", list.len());
+                    // Ids as well as names: enumeration *order* is not stable
+                    // across launches (task 17), so a log that only says "2
+                    // cameras" cannot be compared between runs, and the id is
+                    // what `settings` actually persists.
+                    tracing::debug!(
+                        "enumerated {} camera(s): {}",
+                        list.len(),
+                        list.iter()
+                            .map(|d| format!("{} ({})", d.name, d.id.0))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                     let _ = tx.unbounded_send(list);
                 }
                 Err(error) => tracing::warn!("device enumeration failed: {error}"),

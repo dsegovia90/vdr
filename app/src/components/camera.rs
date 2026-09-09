@@ -8,6 +8,7 @@ use super::{Dropdown, DropdownOption, ParticipantVideo};
 use crate::args::Args;
 use crate::camera::{use_camera_stream, use_shared_devices, FrameSlot, Mirror};
 use crate::net::use_remote;
+use crate::settings::{self, Settings};
 
 /// What we ask the camera for, before `camera::format::negotiate` narrows it to
 /// a mode the device actually reports.
@@ -49,25 +50,30 @@ pub fn Camera() -> Element {
     let remote = use_remote();
     let stream = use_camera_stream(slot.clone(), source, CONFIG, Some(remote.tap.clone()));
 
+    // What the user chose last launch. Read once: the file is ours, nothing
+    // else writes it while we run.
+    let saved = use_hook(Settings::load);
+
     // Chooses once, so a later rescan cannot relocate the user's choice. Not a
     // signal: nothing renders off it.
     let chosen_once = use_hook(|| Rc::new(Cell::new(false)));
     use_effect({
         let chosen_once = Rc::clone(&chosen_once);
+        let persisted = saved.camera.clone().map(DeviceId);
         move || {
             if chosen_once.get() {
                 return;
             }
             let devices = devices.devices.read();
-            // `--camera` first, so two instances on one machine can be pointed
-            // at different devices; otherwise the first the OS reports, which
-            // is still arbitrary until task 17 persists the choice.
-            let chosen = devices
-                .iter()
-                .find(|device| Args::get().wants_camera(&device.name))
-                .or_else(|| devices.first());
+            // `--camera`, then the remembered device, then whatever the OS
+            // listed first. `settings::choose` documents the order and why.
+            let chosen = settings::initial_device(
+                &devices,
+                persisted.as_ref(),
+                Args::get().camera.as_deref(),
+            );
             if let Some(chosen) = chosen {
-                selected.set(Some(chosen.id.clone()));
+                selected.set(Some(chosen));
                 chosen_once.set(true);
             }
         }
@@ -133,7 +139,13 @@ pub fn Camera() -> Element {
                 options,
                 selected: selected.read().as_ref().map(|id| id.0.clone()),
                 placeholder: placeholder.to_string(),
-                onchange: move |value: String| selected.set(Some(DeviceId(value))),
+                onchange: move |value: String| {
+                    // Saved here rather than in an effect watching `selected`:
+                    // this is the one place a *person* changes the camera, and
+                    // signals notify on redundant writes.
+                    Settings { camera: Some(value.clone()) }.save();
+                    selected.set(Some(DeviceId(value)));
+                },
             }
             button {
                 class: "rounded-md bg-neutral-800 px-4 py-2 text-sm text-neutral-100 hover:bg-neutral-700",

@@ -27,6 +27,18 @@ futures-channel = "0.3"
 # with the set `moq-native` already asks for, so this adds nothing to the build.
 iroh = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false }
+# Settings persistence (ticket 17). `directories` gives the per-platform config
+# location -- `data_local_dir()`, which is what dioxus-sdk-storage's own desktop
+# backend uses, so this is the conventional spot and not one we invented.
+# `serde`/`serde_json` are already in the tree via the moq stack, so declaring
+# them direct adds no packages; `directories` adds three.
+#
+# NOT `dioxus-sdk-storage`, the official crate: it needs the `dioxus` umbrella
+# (31 packages) and `unwrap()`s every filesystem error, which would take the app
+# down on a read-only home directory. See `doc/dstack/vid/tickets/17.md`.
+directories = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # The decode pipeline calls `tokio::spawn`, so building one needs a runtime in
 # context even for the in-process loopback -- there is no non-async way in.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

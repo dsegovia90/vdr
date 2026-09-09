@@ -102,14 +102,4 @@ impl Args {
         }
         Self { peering, camera }
     }
-
-    /// Whether `name` is the camera that was asked for.
-    ///
-    /// With no `--camera`, nothing is preferred and the caller keeps its own
-    /// default.
-    pub fn wants_camera(&self, name: &str) -> bool {
-        self.camera
-            .as_ref()
-            .is_some_and(|wanted| name.to_lowercase().contains(wanted))
-    }
 }
