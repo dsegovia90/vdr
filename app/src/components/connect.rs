@@ -72,7 +72,7 @@ pub fn ConnectRow(
             // precisely when the key has to be handed to someone, and it used
             // to vanish at exactly that moment.
             div { class: "flex flex-row items-center gap-3",
-                span { class: "text-sm text-neutral-400", "Your key" }
+                span { class: "text-sm text-neutral-400 whitespace-nowrap", "Your key" }
                 code { class: "text-xs text-neutral-200", {me.read().clone().unwrap_or_else(|| "binding...".to_string())} }
                 if me.read().is_some() {
                     Button {
