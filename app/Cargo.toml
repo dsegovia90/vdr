@@ -36,6 +36,13 @@ futures-util = { version = "0.3", default-features = false }
 # NOT `dioxus-sdk-storage`, the official crate: it needs the `dioxus` umbrella
 # (31 packages) and `unwrap()`s every filesystem error, which would take the app
 # down on a read-only home directory. See `doc/dstack/vid/tickets/17.md`.
+# The Copy button for our own key. dioxus-native's `convert_clipboard_data` is
+# `unimplemented!()` and blitz's clipboard is private to its keyboard handler,
+# so writing to the clipboard needs this directly. Already compiled underneath
+# blitz-shell, so declaring it adds no packages.
+# `default-features = false` drops `image-data`, which would pull jpeg/tiff
+# decoders for a clipboard we only ever put text on.
+arboard = { version = "3", default-features = false }
 directories = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -15,10 +15,16 @@
 //! anything about the key itself.
 //!
 //! ```sh
+//! vdr                                     # idle: shows your key, waits for you
 //! vdr --secret <hex> --listen             # prints its endpoint id and waits
 //! vdr --secret <hex> --dial <peer-id>     # dials it
+//! vdr --loopback                          # no network; the codec round trip
 //! vdr --camera facetime                   # picks a camera by name
 //! ```
+//!
+//! **The command line is not going away.** In-app key entry (19c) is a second
+//! way in, not a replacement: driving two instances from a script is how the
+//! network path gets tested, and a headless session has no other way to do it.
 //!
 //! `--secret` makes the endpoint id stable across launches, so the peer's id
 //! can be written down once instead of copied every run.
@@ -37,8 +43,15 @@ use iroh::EndpointId;
 /// Who this instance is trying to reach.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Peering {
+    /// No decision yet: bind an endpoint, show our key, and wait for the user
+    /// to dial someone or choose to wait for a call. The default (ticket 19c).
+    Idle,
     /// No peer: the second tile shows our own camera round-tripped through the
     /// codec instead. See [`super::loopback`].
+    ///
+    /// Was the default until 19c. Kept behind `--loopback` because it is the
+    /// diagnostic that tells a broken pipeline apart from a broken connection --
+    /// 20d-1 was measured on it.
     Loopback,
     /// Wait for someone to dial us.
     Listen,
@@ -77,11 +90,12 @@ impl Args {
 
     fn parse() -> Self {
         let mut args = std::env::args().skip(1);
-        let mut peering = Peering::Loopback;
+        let mut peering = Peering::Idle;
         let mut camera = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
+                "--loopback" => peering = Peering::Loopback,
                 "--dial" => match args.next().as_deref().map(str::parse::<EndpointId>) {
                     Some(Ok(peer)) => peering = Peering::Dial(peer),
                     Some(Err(error)) => tracing::error!("--dial is not an endpoint id: {error}"),

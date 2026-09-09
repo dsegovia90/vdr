@@ -38,6 +38,20 @@ pub struct Remote {
     pub slot: FrameSlot,
     /// What the connection is doing, for the UI to show.
     pub status: Signal<RemoteStatus>,
+    /// Our own endpoint id once bound, for the UI to show and copy.
+    ///
+    /// `None` until the endpoint is up, and forever in `--loopback`, which
+    /// binds nothing.
+    pub me: Signal<Option<String>>,
+    /// Chooses who to talk to.
+    ///
+    pub connect: Callback<Peering>,
+    /// Takes back a choice that has not become a call yet, returning to idle.
+    ///
+    /// Only meaningful while [`RemoteStatus::is_cancellable`] -- once a peer is
+    /// connected, stopping is a hang-up and there is no channel on which to
+    /// tell them. Ticket 29.
+    pub cancel: Callback<()>,
 }
 
 /// Starts whichever remote path the command line asked for.
@@ -51,19 +65,70 @@ pub struct Remote {
 /// that does not exist yet, and each is a decision rather than a detail.
 pub fn use_remote() -> Remote {
     let mut status = use_signal(|| RemoteStatus::Binding);
+    let mut me = use_signal(|| Option::<String>::None);
     // Status crosses from the call thread, which cannot touch a signal.
-    let updates = use_channel(move |next: RemoteStatus| status.set(next));
+    let updates = use_channel(move |next: RemoteStatus| {
+        // The key arrives inside a status rather than on its own channel: the
+        // call thread already reports it that way, and a second channel would
+        // be a second thing to keep in step.
+        if let RemoteStatus::Idle { me: bound } = &next {
+            me.set(Some(bound.clone()));
+        }
+        status.set(next);
+    });
 
     use_hook(|| {
         let (tap, feed) = frame_tap();
         let slot = FrameSlot::default();
+        // The decision, not the feed, is what gets deferred. The call thread
+        // takes the feed at startup and parks on this receiver after binding,
+        // so there is no window where two pipelines could own one feed --
+        // `frame_tap` has a single slot and would let them steal from each
+        // other.
+        //
+        // A stream rather than a one-shot: a choice can be taken back while it
+        // is still only a choice (`Peering::Idle` means "cancel"). Once a peer
+        // is connected the UI stops offering it -- stopping then is a hang-up,
+        // which the peer would have to be told about. Ticket 29.
+        let (decide, decided) = futures_channel::mpsc::unbounded::<Peering>();
+
         match Args::get().peering.clone() {
             Peering::Loopback => {
                 status.set(RemoteStatus::Loopback);
                 loopback::spawn(feed, slot.clone());
             }
-            peering => call::spawn(peering, feed, slot.clone(), updates),
+            peering => {
+                call::spawn(decided, feed, slot.clone(), updates);
+                // `--listen` / `--dial` decide immediately; `Idle` waits for the
+                // UI. The CLI path is deliberately unchanged: it is how two
+                // instances get driven from a script.
+                if peering != Peering::Idle {
+                    let _ = decide.unbounded_send(peering);
+                }
+            }
         }
-        Remote { tap, slot, status }
+
+        let connect = Callback::new({
+            let decide = decide.clone();
+            move |peering: Peering| {
+                // Failure means the call thread is gone, which the status line
+                // will already be saying.
+                let _ = decide.unbounded_send(peering);
+            }
+        });
+        // Takes back a choice that has not become a call yet. Same channel, so
+        // the call thread sees the two in the order they were pressed.
+        let cancel = Callback::new(move |()| {
+            let _ = decide.unbounded_send(Peering::Idle);
+        });
+
+        Remote {
+            tap,
+            slot,
+            status,
+            me,
+            connect,
+            cancel,
+        }
     })
 }

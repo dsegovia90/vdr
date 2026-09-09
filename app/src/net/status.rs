@@ -15,6 +15,20 @@ pub enum RemoteStatus {
     Loopback,
     /// Binding the iroh endpoint.
     Binding,
+    /// Bound, and waiting for the user to dial or to choose to wait for a call.
+    /// `me` is the key to hand whoever should dial us.
+    Idle {
+        /// Our own endpoint id.
+        me: String,
+    },
+    /// The key typed into the connect field was not an endpoint id.
+    ///
+    /// Recoverable, unlike [`Failed`](Self::Failed): the endpoint is still bound
+    /// and the user can simply try again.
+    BadKey {
+        /// What was wrong with it.
+        reason: String,
+    },
     /// Endpoint is up; waiting for the camera to produce a frame, because the
     /// encoder cannot be built without one to size it from.
     AwaitingCamera,
@@ -51,7 +65,35 @@ pub enum RemoteStatus {
 impl RemoteStatus {
     /// Whether this state should read as a problem rather than as progress.
     pub fn is_error(&self) -> bool {
-        matches!(self, Self::Failed { .. })
+        matches!(self, Self::Failed { .. } | Self::BadKey { .. })
+    }
+
+    /// Whether the user still has a decision to make.
+    ///
+    /// A mistyped key leaves the endpoint bound and the choice open, so it
+    /// counts as waiting rather than as an ending.
+    pub fn is_waiting(&self) -> bool {
+        matches!(self, Self::Idle { .. } | Self::BadKey { .. })
+    }
+
+    /// Whether the choice already made can still be taken back.
+    ///
+    /// Only *before* a peer is on the other end. Once
+    /// [`Connected`](Self::Connected), stopping is a hang-up: the peer has to be
+    /// told, and there is no channel to tell them on — that is ticket 29, and
+    /// deliberately not this.
+    ///
+    /// [`AwaitingCamera`](Self::AwaitingCamera) counts, for two reasons. It is
+    /// the state between choosing and listening — a second or two of camera wait
+    /// and encoder probe — and leaving it out made the controls vanish and come
+    /// back, which read as a flash. It is also **genuinely** cancellable: a
+    /// cancel sent during it waits in the decision channel and is taken by the
+    /// `select!` as soon as that is reached, so the button is not a decoration.
+    pub fn is_cancellable(&self) -> bool {
+        matches!(
+            self,
+            Self::AwaitingCamera | Self::Listening { .. } | Self::Dialing { .. }
+        )
     }
 }
 
@@ -60,6 +102,8 @@ impl fmt::Display for RemoteStatus {
         match self {
             Self::Loopback => write!(f, "Loopback: your own camera, encoded and decoded"),
             Self::Binding => write!(f, "Starting the endpoint..."),
+            Self::Idle { me } => write!(f, "Ready. Your key: {me}"),
+            Self::BadKey { reason } => write!(f, "That is not a key: {reason}"),
             Self::AwaitingCamera => write!(f, "Waiting for the camera..."),
             Self::Listening { me } => write!(f, "Waiting for a call. Your key: {me}"),
             Self::Dialing { peer } => write!(f, "Dialing {peer}..."),

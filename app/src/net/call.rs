@@ -23,6 +23,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use futures_channel::mpsc::UnboundedSender;
+use futures_util::StreamExt as _;
 use moq_mux::catalog::Stream as _;
 
 use super::runtime::runtime;
@@ -53,7 +54,7 @@ const REPORT_EVERY: u32 = 120;
 /// retries, how often, what the tile shows meanwhile -- and guessing at it here
 /// would make the first failure harder to read, not easier. Ticket 19b.
 pub(super) fn spawn(
-    peering: Peering,
+    decisions: futures_channel::mpsc::UnboundedReceiver<Peering>,
     feed: FrameFeed,
     slot: FrameSlot,
     status: UnboundedSender<RemoteStatus>,
@@ -68,7 +69,7 @@ pub(super) fn spawn(
                 return;
             };
             runtime.block_on(async move {
-                match run(peering, feed, slot, &status).await {
+                match run(decisions, feed, slot, &status).await {
                     Ok(()) => {
                         tracing::info!("call ended");
                         let _ = status.unbounded_send(RemoteStatus::Ended);
@@ -91,7 +92,7 @@ pub(super) fn spawn(
 /// several error types, none of which the UI can do anything with beyond
 /// showing the text.
 async fn run(
-    peering: Peering,
+    mut decisions: futures_channel::mpsc::UnboundedReceiver<Peering>,
     feed: FrameFeed,
     slot: FrameSlot,
     status: &UnboundedSender<RemoteStatus>,
@@ -120,13 +121,43 @@ async fn run(
     // and a window is a poor place to copy from.
     tracing::info!("our endpoint id: {me}");
 
+    // Bound once, reused for every attempt below: cancelling a choice must not
+    // cost the endpoint, and our key has to stay the same string the whole time
+    // or anyone we already gave it to is stranded.
+    // Carries a destination chosen while another attempt was still running, so
+    // clicking Connect during a dial redials rather than silently cancelling.
+    let mut queued: Option<Peering> = None;
+    // Parked between attempts: the blocking camera wait needs to own it, and a
+    // cancelled attempt has to give it back for the next one.
+    let mut parked = Some(feed);
+
+    loop {
+    // The decision may already be made (`--listen` / `--dial`) or may be the
+    // user's to make (19c). Either way it is awaited *here*, after binding and
+    // before the camera: our key must be visible while we wait, and waiting on
+    // the camera first would hide it behind a device that may never open.
+    report(RemoteStatus::Idle { me: me.to_string() });
+    let peering = match queued.take() {
+        Some(peering) => peering,
+        None => match decisions.next().await {
+            // `Idle` on this channel means "take that back" -- see the cancel
+            // branch below. Arriving here it just means we are already idle.
+            Some(Peering::Idle) => continue,
+            Some(peering) => peering,
+            None => return Err("the connect control went away".to_string()),
+        },
+    };
+
     // Blocking, and before anything is published: the encoder is sized from a
     // real frame, because macOS overrides the resolution we asked for outright.
     // So a call still cannot be placed while the camera is off -- ticket 19a,
     // deliberately not fixed here.
     report(RemoteStatus::AwaitingCamera);
+    let Some(waiting) = parked.take() else {
+        return Err("the camera feed is gone".to_string());
+    };
     let (mut feed, width, height) = tokio::task::spawn_blocking(move || {
-        let mut feed = feed;
+        let mut feed = waiting;
         // Discarded rather than encoded. Minutes can pass before a peer
         // subscribes, and the publish path anchors its pacing on the first
         // frame it is given -- encoding this one would peg the stream's clock
@@ -180,10 +211,10 @@ async fn run(
             let url: url::Url = format!("iroh://{peer}")
                 .parse()
                 .map_err(|error| format!("could not build a dial url: {error}"))?;
-            let client = client_config
+            let client = moq_native::ClientConfig::default()
                 .init()
                 .map_err(|error| format!("could not build a client: {error:#}"))?
-                .with_iroh(endpoint);
+                .with_iroh(endpoint.clone());
             let session = client
                 .with_publisher(&outbound)
                 .with_subscriber(inbound.clone())
@@ -206,7 +237,7 @@ async fn run(
             let server = server_config
                 .init()
                 .map_err(|error| format!("could not build a server: {error:#}"))?
-                .with_iroh(endpoint);
+                .with_iroh(endpoint.clone());
             let publish = outbound.consume();
             let subscribe = inbound.clone();
             Box::pin(async move {
@@ -216,8 +247,9 @@ async fn run(
                 }
             })
         }
-        // `use_remote` routes this case to the loopback and never gets here.
-        Peering::Loopback => return Err("no peer to call".to_string()),
+        // `use_remote` routes the loopback elsewhere, and `Idle` is what the
+        // receiver above resolves *away from* -- neither can arrive here.
+        Peering::Loopback | Peering::Idle => return Err("no peer to call".to_string()),
     };
 
     let peer_label = match &peering {
@@ -228,17 +260,30 @@ async fn run(
     };
     let decode = tokio::spawn(subscribe(
         inbound.consume(),
-        slot,
+        slot.clone(),
         status.clone(),
         peer_label,
     ));
 
     // The encode loop and the transport both run until the call ends; whichever
     // stops first ends the call, and the decode task follows when its track
-    // closes.
+    // closes. The third branch is the user taking it back.
     let outcome = tokio::select! {
-        error = transport => Err(error),
-        result = encode(&mut feed, &mut encoder, &mut producer) => result,
+        error = transport => Some(Err(error)),
+        result = encode(&mut feed, &mut encoder, &mut producer) => Some(result),
+        // Cancel. Only reachable before a peer connects, because the UI only
+        // offers it then: once someone is on the other end, stopping is a
+        // hang-up and the peer would have to be told. Ticket 29.
+        cancelled = decisions.next() => match cancelled {
+            Some(Peering::Idle) => None,
+            // A second destination without cancelling first: treat it as
+            // cancel-and-redial rather than ignoring the click.
+            Some(next) => {
+                queued = Some(next);
+                None
+            }
+            None => Some(Err("the connect control went away".to_string())),
+        },
     };
 
     if let Ok(flushed) = encoder.flush() {
@@ -248,7 +293,20 @@ async fn run(
     }
     producer.finish().ok();
     decode.abort();
-    outcome
+    // The peer's last frame must come off the screen: it is not live any more,
+    // and a frozen tile reads exactly like a working one.
+    slot.clear();
+
+    // Whatever happened, the feed goes back so the next attempt can have it.
+    parked = Some(feed);
+
+    match outcome {
+        Some(outcome) => return outcome,
+        // Cancelled: drop this attempt's transport, encoder and origins, and go
+        // back to offering the choice. The endpoint above outlives all of it.
+        None => tracing::info!("call cancelled; back to idle"),
+    }
+    }
 }
 
 /// Pulls camera frames off the tap, encodes them, and publishes them.

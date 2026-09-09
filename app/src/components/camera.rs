@@ -4,9 +4,9 @@ use std::rc::Rc;
 use cameras::{CameraSource, DeviceId, PixelFormat, Resolution, StreamConfig};
 use dioxus_native::prelude::*;
 
-use super::{Dropdown, DropdownOption, ParticipantVideo};
+use super::{Button, ConnectRow, Dropdown, DropdownOption, ParticipantVideo, Tone};
 use crate::args::Args;
-use crate::camera::{use_camera_stream, use_shared_devices, FrameSlot, Mirror};
+use crate::camera::{FrameSlot, Mirror, use_camera_stream, use_shared_devices};
 use crate::net::use_remote;
 use crate::settings::{self, Settings};
 
@@ -147,14 +147,13 @@ pub fn Camera() -> Element {
                     selected.set(Some(DeviceId(value)));
                 },
             }
-            button {
-                class: "rounded-md bg-neutral-800 px-4 py-2 text-sm text-neutral-100 hover:bg-neutral-700",
+            Button {
                 onclick: move |_| devices.refresh.call(()),
                 "Rescan"
             }
             if can_stream {
-                button {
-                    class: "rounded-md bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-500",
+                Button {
+                    tone: Tone::Primary,
                     onclick: move |_| {
                         let next = !*camera_enabled.peek();
                         camera_enabled.set(next);
@@ -162,6 +161,15 @@ pub fn Camera() -> Element {
                     if camera_enabled() { "Turn camera off" } else { "Turn camera on" }
                 }
             }
+        }
+        // Above the tiles and in normal flow: an overlay would paint but never
+        // receive clicks in this blitz revision (ticket 0). Disappears once a
+        // peer is chosen.
+        ConnectRow {
+            me: remote.me,
+            status: remote.status,
+            connect: remote.connect,
+            cancel: remote.cancel,
         }
         ParticipantVideo {
             label: "camera",
