@@ -14,8 +14,12 @@
 //! this one hands the encoder's output straight back to a decoder in-process,
 //! and that one puts a connection in between.
 
+use std::sync::Arc;
+
+use super::audio;
 use super::runtime::runtime;
-use crate::camera::{from_decoded, FrameFeed, FrameSlot};
+use crate::audio::Controls;
+use crate::camera::{FrameFeed, FrameSlot, from_decoded};
 
 /// Runs a loopback on its own thread for the lifetime of the process.
 ///
@@ -23,16 +27,16 @@ use crate::camera::{from_decoded, FrameFeed, FrameSlot};
 /// [`FrameTap`](crate::camera::FrameTap) drops, `FrameFeed::take` starts
 /// erroring, the encode loop ends, the producer finishes, and the decode task
 /// sees the track close and returns.
-pub(super) fn spawn(feed: FrameFeed, slot: FrameSlot) {
+pub(super) fn spawn(feed: FrameFeed, slot: FrameSlot, controls: Arc<Controls>) {
     let spawned = std::thread::Builder::new()
         .name("loopback".into())
-        .spawn(move || run(feed, slot));
+        .spawn(move || run(feed, slot, controls));
     if let Err(error) = spawned {
         tracing::warn!("could not spawn the loopback thread: {error}");
     }
 }
 
-fn run(mut feed: FrameFeed, slot: FrameSlot) {
+fn run(mut feed: FrameFeed, slot: FrameSlot, controls: Arc<Controls>) {
     let Some(runtime) = runtime() else {
         return;
     };
@@ -48,7 +52,7 @@ fn run(mut feed: FrameFeed, slot: FrameSlot) {
     let (width, height) = (first.width, first.height);
 
     runtime.block_on(async move {
-        if let Err(error) = pump(feed, slot, width, height).await {
+        if let Err(error) = pump(feed, slot, width, height, controls).await {
             tracing::error!("loopback: {error:#}");
         }
         tracing::info!("loopback: stopped");
@@ -61,6 +65,7 @@ async fn pump(
     slot: FrameSlot,
     width: u32,
     height: u32,
+    controls: Arc<Controls>,
 ) -> anyhow::Result<()> {
     // Framerate is the encoder's pacing hint, not a promise.
     let config = moq_video::encode::Config::new(width, height, 30);
@@ -82,7 +87,22 @@ async fn pump(
     let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
     let track = broadcast.create_track("video.avc3", catalog.track_info())?;
     let mut producer =
-        moq_video::encode::Producer::with_track(track, catalog, rendition.clone())?;
+        moq_video::encode::Producer::with_track(track, catalog.clone(), rendition.clone())?;
+
+    let engine = audio::open_playback().await;
+    match audio::publish(broadcast.clone(), catalog, engine.as_ref()) {
+        Ok((publication, driver)) => {
+            controls.attach(publication);
+            audio::drive(driver);
+        }
+        Err(error) => {
+            tracing::warn!("loopback: [audio] the microphone is not being published: {error}")
+        }
+    }
+    let audio_decode = engine.map(|engine| {
+        let broadcast = broadcast.consume();
+        tokio::spawn(audio::subscribe(broadcast, engine, controls.clone()))
+    });
 
     // In-process, so the producer's own consumer is the whole "network". A call
     // resolves the rendition from the catalog it receives instead.
@@ -115,8 +135,6 @@ async fn pump(
     });
 
     loop {
-        // `take` errors only when every tap has dropped: the camera going away
-        // for good, rather than a gap between frames.
         let frame = match feed.take() {
             Ok(Some(frame)) => frame,
             Ok(None) => {
@@ -148,5 +166,9 @@ async fn pump(
     }
     producer.finish().ok();
     decode.await.ok();
+    if let Some(audio_decode) = audio_decode {
+        audio_decode.abort();
+    }
+    controls.detach();
     Ok(())
 }

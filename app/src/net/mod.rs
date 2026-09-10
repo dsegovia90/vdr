@@ -16,16 +16,20 @@
 //! the same [`FrameSlot`], which is why the renderer needs to know nothing
 //! about either.
 
+mod audio;
 mod call;
 mod loopback;
-mod runtime;
+pub(crate) mod runtime;
 mod status;
+
+use std::sync::Arc;
 
 use dioxus_native::prelude::*;
 
 pub use status::RemoteStatus;
 
 use crate::args::{Args, Peering};
+use crate::audio::Controls;
 use crate::camera::{frame_tap, FrameSlot, FrameTap};
 use crate::channel::use_channel;
 
@@ -52,6 +56,13 @@ pub struct Remote {
     /// connected, stopping is a hang-up and there is no channel on which to
     /// tell them. Ticket 29.
     pub cancel: Callback<()>,
+    /// The microphone, and whether the peer is talking.
+    ///
+    /// Shared rather than messaged: the publication's controls are `Send +
+    /// Sync` and only set a flag the capture driver reads, so this thread can
+    /// call them directly. It outlives any one call -- muting while idle stays
+    /// true when the next call starts.
+    pub audio: Arc<Controls>,
 }
 
 /// Starts whichever remote path the command line asked for.
@@ -78,6 +89,7 @@ pub fn use_remote() -> Remote {
     });
 
     use_hook(|| {
+        let audio = Arc::new(Controls::default());
         let (tap, feed) = frame_tap();
         let slot = FrameSlot::default();
         // The decision, not the feed, is what gets deferred. The call thread
@@ -95,10 +107,10 @@ pub fn use_remote() -> Remote {
         match Args::get().peering.clone() {
             Peering::Loopback => {
                 status.set(RemoteStatus::Loopback);
-                loopback::spawn(feed, slot.clone());
+                loopback::spawn(feed, slot.clone(), audio.clone());
             }
             peering => {
-                call::spawn(decided, feed, slot.clone(), updates);
+                call::spawn(decided, feed, slot.clone(), updates, audio.clone());
                 // `--listen` / `--dial` decide immediately; `Idle` waits for the
                 // UI. The CLI path is deliberately unchanged: it is how two
                 // instances get driven from a script.
@@ -129,6 +141,7 @@ pub fn use_remote() -> Remote {
             me,
             connect,
             cancel,
+            audio,
         }
     })
 }

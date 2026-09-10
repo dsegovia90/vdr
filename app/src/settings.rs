@@ -38,6 +38,15 @@ pub struct Settings {
     /// Stored even while that camera is absent — see [`choose`]. Unplugging a
     /// webcam should not permanently forget it.
     pub camera: Option<String>,
+
+    /// The microphone the user last selected, as `moq_audio`'s device id.
+    ///
+    /// `None` means the system default, which is a real choice here rather than
+    /// a missing one: an audio stack that follows whatever the OS considers the
+    /// default is what most calling apps do, and what a user who has never
+    /// opened the picker expects. Kept while absent for the same reason the
+    /// camera is.
+    pub microphone: Option<String>,
 }
 
 impl Settings {
@@ -77,24 +86,33 @@ impl Settings {
         }
     }
 
-    /// Writes the settings file on a worker thread and returns immediately.
+    /// Changes one preference and writes the file, preserving the rest.
+    ///
+    /// **Read, modify, write — not write.** With a single field it was harmless
+    /// to build a fresh `Settings` from the one thing being changed and save
+    /// that. With two it is a silent erase: choosing a camera would forget the
+    /// microphone, and the damage would only show up a launch later. Loading
+    /// first costs a file read on a worker thread and removes the whole class.
     ///
     /// Off the UI thread for the same reason enumeration is: the write is tiny,
     /// but a network-mounted or failing home directory is real and the render
     /// thread is not where that should be discovered. Nothing waits on the
     /// result — a preference that fails to save is worth a log line and nothing
     /// more.
-    pub fn save(&self) {
-        let settings = self.clone();
+    pub fn update(change: impl FnOnce(&mut Self) + Send + 'static) {
         let spawned = std::thread::Builder::new()
             .name("settings-save".into())
-            .spawn(move || settings.write());
+            .spawn(move || {
+                let mut settings = Self::load();
+                change(&mut settings);
+                settings.write();
+            });
         if let Err(error) = spawned {
             tracing::warn!("could not spawn the settings thread: {error}");
         }
     }
 
-    /// The blocking half of [`save`](Self::save).
+    /// The blocking half of [`update`](Self::update).
     fn write(&self) {
         let Some(path) = path() else {
             tracing::warn!("no local-data directory on this platform; not saving settings");
@@ -191,6 +209,37 @@ fn choose(
     devices.first().map(|(id, _)| (*id).clone())
 }
 
+/// Which microphone to publish on startup.
+///
+/// Adapter over [`choose_microphone`], split for the reason
+/// [`initial_device`] is.
+pub fn initial_microphone(
+    devices: &[moq_audio::capture::Device],
+    persisted: Option<&str>,
+) -> Option<String> {
+    let ids: Vec<&str> = devices.iter().map(|device| device.id.as_str()).collect();
+    choose_microphone(&ids, persisted)
+}
+
+/// The microphone-selection rule, over plain data.
+///
+/// Deliberately *not* the camera's rule. That one falls back to the first
+/// device the OS listed, because a camera has no notion of a default and a
+/// preview showing nothing is useless. Audio does have one, and it is a better
+/// answer than an arbitrary pick: `None` here means "whatever the system
+/// considers the default input", which is what the user's other apps use and
+/// what follows them when they plug in a headset mid-call.
+///
+/// So the only rule is: honour the remembered input if it is still connected,
+/// and otherwise fall back to the system default rather than to a guess.
+fn choose_microphone(devices: &[&str], persisted: Option<&str>) -> Option<String> {
+    let wanted = persisted?;
+    devices
+        .iter()
+        .find(|id| **id == wanted)
+        .map(|id| (*id).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +327,7 @@ mod tests {
     fn settings_round_trip_through_json() {
         let settings = Settings {
             camera: Some("c922-uid".into()),
+            microphone: Some("coreaudio:yeti".into()),
         };
         let json = serde_json::to_string(&settings).expect("serialises");
         let back: Settings = serde_json::from_str(&json).expect("deserialises");
@@ -300,6 +350,7 @@ mod tests {
 
         let settings = Settings {
             camera: Some("c922-uid".into()),
+            microphone: Some("coreaudio:yeti".into()),
         };
         settings.write_to(&path);
         assert_eq!(Settings::load_from(&path), settings, "what was written comes back");
@@ -322,5 +373,37 @@ mod tests {
         // What an older build's file looks like once a field is added.
         let back: Settings = serde_json::from_str("{}").expect("an empty object is valid");
         assert_eq!(back, Settings::default());
+    }
+
+    #[test]
+    fn a_file_written_before_microphones_existed_still_loads() {
+        // The actual shape of an older build's file, not a synthetic one.
+        let back: Settings =
+            serde_json::from_str(r#"{"camera":"abc"}"#).expect("an older file is valid");
+        assert_eq!(back.camera.as_deref(), Some("abc"));
+        assert_eq!(back.microphone, None, "a missing microphone is the default");
+    }
+
+    #[test]
+    fn a_remembered_microphone_is_honoured_while_connected() {
+        assert_eq!(
+            choose_microphone(&["coreaudio:one", "coreaudio:two"], Some("coreaudio:two")),
+            Some("coreaudio:two".to_string())
+        );
+    }
+
+    #[test]
+    fn an_absent_microphone_falls_back_to_the_system_default() {
+        // Not to the first device: `None` means "let the OS decide", which is a
+        // better answer than picking someone's webcam microphone for them.
+        assert_eq!(
+            choose_microphone(&["coreaudio:one"], Some("coreaudio:gone")),
+            None
+        );
+    }
+
+    #[test]
+    fn with_nothing_remembered_the_system_default_is_used() {
+        assert_eq!(choose_microphone(&["coreaudio:one"], None), None);
     }
 }

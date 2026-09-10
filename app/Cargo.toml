@@ -62,6 +62,7 @@ tracing-subscriber = "0.3"
 moq-net   = { version = "0.2",  default-features = false }
 moq-mux   = { version = "0.9",  default-features = false }
 moq-video = { version = "0.0.22", default-features = false }
+moq-audio = { version = "0.0.22", default-features = false, features = ["capture", "playback", "aec"] }
 moq-native = { version = "0.19", default-features = false, features = ["iroh", "quinn", "aws-lc-rs"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
 url = "2"

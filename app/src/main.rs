@@ -1,4 +1,5 @@
 mod args;
+mod audio;
 mod camera;
 mod channel;
 mod components;
@@ -35,6 +36,7 @@ fn warn_if_unbundled() {
 #[component]
 fn App() -> Element {
     camera::use_devices_provider();
+    audio::use_microphones_provider();
 
     rsx! {
         document::Title { "Vdr "}

@@ -21,15 +21,18 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures_channel::mpsc::UnboundedSender;
 use futures_util::StreamExt as _;
 use moq_mux::catalog::Stream as _;
 
+use super::audio;
 use super::runtime::runtime;
 use super::status::RemoteStatus;
 use crate::args::Peering;
-use crate::camera::{from_decoded, FrameFeed, FrameSlot};
+use crate::audio::Controls;
+use crate::camera::{FrameFeed, FrameSlot, from_decoded};
 
 /// The broadcast path both sides publish on.
 ///
@@ -58,6 +61,7 @@ pub(super) fn spawn(
     feed: FrameFeed,
     slot: FrameSlot,
     status: UnboundedSender<RemoteStatus>,
+    controls: Arc<Controls>,
 ) {
     let spawned = std::thread::Builder::new()
         .name("call".into())
@@ -69,7 +73,7 @@ pub(super) fn spawn(
                 return;
             };
             runtime.block_on(async move {
-                match run(decisions, feed, slot, &status).await {
+                match run(decisions, feed, slot, &status, controls).await {
                     Ok(()) => {
                         tracing::info!("call ended");
                         let _ = status.unbounded_send(RemoteStatus::Ended);
@@ -96,6 +100,7 @@ async fn run(
     feed: FrameFeed,
     slot: FrameSlot,
     status: &UnboundedSender<RemoteStatus>,
+    controls: Arc<Controls>,
 ) -> Result<(), String> {
     let report = |next: RemoteStatus| {
         let _ = status.unbounded_send(next);
@@ -132,180 +137,175 @@ async fn run(
     let mut parked = Some(feed);
 
     loop {
-    // The decision may already be made (`--listen` / `--dial`) or may be the
-    // user's to make (19c). Either way it is awaited *here*, after binding and
-    // before the camera: our key must be visible while we wait, and waiting on
-    // the camera first would hide it behind a device that may never open.
-    report(RemoteStatus::Idle { me: me.to_string() });
-    let peering = match queued.take() {
-        Some(peering) => peering,
-        None => match decisions.next().await {
-            // `Idle` on this channel means "take that back" -- see the cancel
-            // branch below. Arriving here it just means we are already idle.
-            Some(Peering::Idle) => continue,
+        // The decision may already be made (`--listen` / `--dial`) or may be the
+        // user's to make (19c). Either way it is awaited *here*, after binding and
+        // before the camera: our key must be visible while we wait, and waiting on
+        // the camera first would hide it behind a device that may never open.
+        report(RemoteStatus::Idle { me: me.to_string() });
+        let peering = match queued.take() {
             Some(peering) => peering,
-            None => return Err("the connect control went away".to_string()),
-        },
-    };
+            None => match decisions.next().await {
+                // `Idle` on this channel means "take that back" -- see the cancel
+                // branch below. Arriving here it just means we are already idle.
+                Some(Peering::Idle) => continue,
+                Some(peering) => peering,
+                None => return Err("the connect control went away".to_string()),
+            },
+        };
 
-    // Blocking, and before anything is published: the encoder is sized from a
-    // real frame, because macOS overrides the resolution we asked for outright.
-    // So a call still cannot be placed while the camera is off -- ticket 19a,
-    // deliberately not fixed here.
-    report(RemoteStatus::AwaitingCamera);
-    let Some(waiting) = parked.take() else {
-        return Err("the camera feed is gone".to_string());
-    };
-    let (mut feed, width, height) = tokio::task::spawn_blocking(move || {
-        let mut feed = waiting;
-        // Discarded rather than encoded. Minutes can pass before a peer
-        // subscribes, and the publish path anchors its pacing on the first
-        // frame it is given -- encoding this one would peg the stream's clock
-        // to a moment long gone.
-        let first = feed.wait()?;
-        Some((feed, first.width, first.height))
-    })
-    .await
-    .map_err(|error| format!("the camera wait failed: {error}"))?
-    .ok_or_else(|| "the camera closed before a frame arrived".to_string())?;
+        report(RemoteStatus::AwaitingCamera);
+        let Some(waiting) = parked.take() else {
+            return Err("the camera feed is gone".to_string());
+        };
+        let (mut feed, width, height) = tokio::task::spawn_blocking(move || {
+            let mut feed = waiting;
 
-    // `probe` asks the encoder what it will emit, so the catalog is published
-    // before anything is encoded -- which is what lets a peer open a decoder
-    // against a track nothing has written to yet.
-    let config = moq_video::encode::Config::new(width, height, FRAMERATE);
-    let rendition = config
-        .probe()
+            let first = feed.wait()?;
+            Some((feed, first.width, first.height))
+        })
         .await
-        .map_err(|error| format!("could not probe the encoder: {error:#}"))?;
-    let mut encoder = moq_video::encode::Encoder::new(&config)
-        .map_err(|error| format!("could not build an encoder: {error:#}"))?;
-    tracing::info!("encoding {width}x{height} with {}", encoder.name());
+        .map_err(|error| format!("the camera wait failed: {error}"))?
+        .ok_or_else(|| "the camera closed before a frame arrived".to_string())?;
 
-    let outbound = moq_net::Origin::random().produce();
-    let mut broadcast = outbound
-        .create_broadcast(
-            BROADCAST,
-            moq_net::broadcast::Route::new().with_announce(true),
-        )
-        .map_err(|error| format!("could not create a broadcast: {error:#}"))?;
-    let catalog = moq_mux::catalog::Producer::new(&mut broadcast)
-        .map_err(|error| format!("could not create a catalog: {error:#}"))?;
-    let track = broadcast
-        .create_track(TRACK, catalog.track_info())
-        .map_err(|error| format!("could not create a track: {error:#}"))?;
-    let mut producer = moq_video::encode::Producer::with_track(track, catalog, rendition)
-        .map_err(|error| format!("could not publish video: {error:#}"))?;
+        let config = moq_video::encode::Config::new(width, height, FRAMERATE);
+        let rendition = config
+            .probe()
+            .await
+            .map_err(|error| format!("could not probe the encoder: {error:#}"))?;
+        let mut encoder = moq_video::encode::Encoder::new(&config)
+            .map_err(|error| format!("could not build an encoder: {error:#}"))?;
+        tracing::info!("encoding {width}x{height} with {}", encoder.name());
 
-    let inbound = moq_net::Origin::random().produce();
+        let outbound = moq_net::Origin::random().produce();
+        let mut broadcast = outbound
+            .create_broadcast(
+                BROADCAST,
+                moq_net::broadcast::Route::new().with_announce(true),
+            )
+            .map_err(|error| format!("could not create a broadcast: {error:#}"))?;
+        let catalog = moq_mux::catalog::Producer::new(&mut broadcast)
+            .map_err(|error| format!("could not create a catalog: {error:#}"))?;
+        let track = broadcast
+            .create_track(TRACK, catalog.track_info())
+            .map_err(|error| format!("could not create a track: {error:#}"))?;
+        let mut producer =
+            moq_video::encode::Producer::with_track(track, catalog.clone(), rendition)
+                .map_err(|error| format!("could not publish video: {error:#}"))?;
 
-    // Both arms end in a future that resolves only when the transport is done,
-    // so the select below treats "the connection went away" the same either way.
-    let transport: Pin<Box<dyn Future<Output = String> + Send>> = match peering {
-        Peering::Dial(peer) => {
-            report(RemoteStatus::Dialing {
-                peer: peer.to_string(),
-            });
-            tracing::info!("dialing {peer}");
-            // iroh dials a public key, not a hostname: the URL's host *is* the
-            // endpoint id.
-            let url: url::Url = format!("iroh://{peer}")
-                .parse()
-                .map_err(|error| format!("could not build a dial url: {error}"))?;
-            let client = moq_native::ClientConfig::default()
-                .init()
-                .map_err(|error| format!("could not build a client: {error:#}"))?
-                .with_iroh(endpoint.clone());
-            let session = client
-                .with_publisher(&outbound)
-                .with_subscriber(inbound.clone())
-                .reconnect(url);
-            Box::pin(async move {
-                match session.closed().await {
-                    Ok(()) => "the peer closed the session".to_string(),
-                    Err(error) => format!("{error:#}"),
-                }
-            })
-        }
-        Peering::Listen => {
-            report(RemoteStatus::Listening { me: me.to_string() });
-            let mut server_config = moq_native::ServerConfig::default();
-            // **Bind explicitly.** Unset means `[::]:443`, which every instance
-            // would try to claim (ticket 20b). Nothing dials this listener --
-            // iroh carries the call -- so an ephemeral port is exactly right.
-            server_config.bind = Some("[::]:0".to_string());
-            server_config.tls.generate = vec!["localhost".to_string()];
-            let server = server_config
-                .init()
-                .map_err(|error| format!("could not build a server: {error:#}"))?
-                .with_iroh(endpoint.clone());
-            let publish = outbound.consume();
-            let subscribe = inbound.clone();
-            Box::pin(async move {
-                match server.serve_both(publish, subscribe).await {
-                    Ok(()) => "the listener stopped".to_string(),
-                    Err(error) => format!("{error:#}"),
-                }
-            })
-        }
-        // `use_remote` routes the loopback elsewhere, and `Idle` is what the
-        // receiver above resolves *away from* -- neither can arrive here.
-        Peering::Loopback | Peering::Idle => return Err("no peer to call".to_string()),
-    };
-
-    let peer_label = match &peering {
-        Peering::Dial(peer) => Some(peer.to_string()),
-        // iroh exposes no client identity to the accepting side, so there is
-        // honestly nothing to name here.
-        _ => None,
-    };
-    let decode = tokio::spawn(subscribe(
-        inbound.consume(),
-        slot.clone(),
-        status.clone(),
-        peer_label,
-    ));
-
-    // The encode loop and the transport both run until the call ends; whichever
-    // stops first ends the call, and the decode task follows when its track
-    // closes. The third branch is the user taking it back.
-    let outcome = tokio::select! {
-        error = transport => Some(Err(error)),
-        result = encode(&mut feed, &mut encoder, &mut producer) => Some(result),
-        // Cancel. Only reachable before a peer connects, because the UI only
-        // offers it then: once someone is on the other end, stopping is a
-        // hang-up and the peer would have to be told. Ticket 29.
-        cancelled = decisions.next() => match cancelled {
-            Some(Peering::Idle) => None,
-            // A second destination without cancelling first: treat it as
-            // cancel-and-redial rather than ignoring the click.
-            Some(next) => {
-                queued = Some(next);
-                None
+        let engine = audio::open_playback().await;
+        match audio::publish(broadcast.clone(), catalog, engine.as_ref()) {
+            Ok((publication, driver)) => {
+                controls.attach(publication);
+                audio::drive(driver);
             }
-            None => Some(Err("the connect control went away".to_string())),
-        },
-    };
-
-    if let Ok(flushed) = encoder.flush() {
-        if !flushed.is_empty() {
-            producer.publish(&flushed).ok();
+            Err(error) => tracing::warn!("[audio] the microphone is not being published: {error}"),
         }
-    }
-    producer.finish().ok();
-    decode.abort();
-    // The peer's last frame must come off the screen: it is not live any more,
-    // and a frozen tile reads exactly like a working one.
-    slot.clear();
 
-    // Whatever happened, the feed goes back so the next attempt can have it.
-    parked = Some(feed);
+        let inbound = moq_net::Origin::random().produce();
 
-    match outcome {
-        Some(outcome) => return outcome,
-        // Cancelled: drop this attempt's transport, encoder and origins, and go
-        // back to offering the choice. The endpoint above outlives all of it.
-        None => tracing::info!("call cancelled; back to idle"),
-    }
+        let transport: Pin<Box<dyn Future<Output = String> + Send>> = match peering {
+            Peering::Dial(peer) => {
+                report(RemoteStatus::Dialing {
+                    peer: peer.to_string(),
+                });
+                tracing::info!("dialing {peer}");
+                // iroh dials a public key, not a hostname: the URL's host *is* the
+                // endpoint id.
+                let url: url::Url = format!("iroh://{peer}")
+                    .parse()
+                    .map_err(|error| format!("could not build a dial url: {error}"))?;
+                let client = moq_native::ClientConfig::default()
+                    .init()
+                    .map_err(|error| format!("could not build a client: {error:#}"))?
+                    .with_iroh(endpoint.clone());
+                let session = client
+                    .with_publisher(&outbound)
+                    .with_subscriber(inbound.clone())
+                    .reconnect(url);
+                Box::pin(async move {
+                    match session.closed().await {
+                        Ok(()) => "the peer closed the session".to_string(),
+                        Err(error) => format!("{error:#}"),
+                    }
+                })
+            }
+            Peering::Listen => {
+                report(RemoteStatus::Listening { me: me.to_string() });
+                let mut server_config = moq_native::ServerConfig::default();
+
+                server_config.bind = Some("[::]:0".to_string());
+                server_config.tls.generate = vec!["localhost".to_string()];
+                let server = server_config
+                    .init()
+                    .map_err(|error| format!("could not build a server: {error:#}"))?
+                    .with_iroh(endpoint.clone());
+                let publish = outbound.consume();
+                let subscribe = inbound.clone();
+                Box::pin(async move {
+                    match server.serve_both(publish, subscribe).await {
+                        Ok(()) => "the listener stopped".to_string(),
+                        Err(error) => format!("{error:#}"),
+                    }
+                })
+            }
+            Peering::Loopback | Peering::Idle => return Err("no peer to call".to_string()),
+        };
+
+        let peer_label = match &peering {
+            Peering::Dial(peer) => Some(peer.to_string()),
+            _ => None,
+        };
+        let decode = tokio::spawn(subscribe(
+            inbound.consume(),
+            slot.clone(),
+            status.clone(),
+            peer_label,
+        ));
+
+        let audio_decode = engine.map(|engine| {
+            let inbound = inbound.consume();
+            let controls = controls.clone();
+            tokio::spawn(async move {
+                let Some(broadcast) = inbound.announced_broadcast(BROADCAST).await else {
+                    tracing::warn!("[audio] the peer never announced {BROADCAST}");
+                    return;
+                };
+                audio::subscribe(broadcast, engine, controls).await;
+            })
+        });
+
+        let outcome = tokio::select! {
+            error = transport => Some(Err(error)),
+            result = encode(&mut feed, &mut encoder, &mut producer) => Some(result),
+            cancelled = decisions.next() => match cancelled {
+                Some(Peering::Idle) => None,
+                Some(next) => {
+                    queued = Some(next);
+                    None
+                }
+                None => Some(Err("the connect control went away".to_string())),
+            },
+        };
+
+        if let Ok(flushed) = encoder.flush() {
+            if !flushed.is_empty() {
+                producer.publish(&flushed).ok();
+            }
+        }
+        producer.finish().ok();
+        decode.abort();
+        if let Some(audio_decode) = audio_decode {
+            audio_decode.abort();
+        }
+        controls.detach();
+        slot.clear();
+
+        parked = Some(feed);
+
+        match outcome {
+            Some(outcome) => return outcome,
+            None => tracing::info!("call cancelled; back to idle"),
+        }
     }
 }
 
@@ -427,7 +427,10 @@ async fn subscribe(
         if decoded == REPORT_EVERY {
             let elapsed = since.elapsed().as_secs_f32();
             if elapsed > 0.0 {
-                tracing::debug!("[remote] {:.1} fps decoded from the peer", decoded as f32 / elapsed);
+                tracing::debug!(
+                    "[remote] {:.1} fps decoded from the peer",
+                    decoded as f32 / elapsed
+                );
             }
             decoded = 0;
             since = std::time::Instant::now();

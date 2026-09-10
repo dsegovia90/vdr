@@ -4,7 +4,7 @@ use std::rc::Rc;
 use cameras::{CameraSource, DeviceId, PixelFormat, Resolution, StreamConfig};
 use dioxus_native::prelude::*;
 
-use super::{Button, ConnectRow, Dropdown, DropdownOption, ParticipantVideo, Tone};
+use super::{Button, ConnectRow, Dropdown, DropdownOption, MicrophoneRow, ParticipantVideo, Tone};
 use crate::args::Args;
 use crate::camera::{FrameSlot, Mirror, use_camera_stream, use_shared_devices};
 use crate::net::use_remote;
@@ -143,7 +143,8 @@ pub fn Camera() -> Element {
                     // Saved here rather than in an effect watching `selected`:
                     // this is the one place a *person* changes the camera, and
                     // signals notify on redundant writes.
-                    Settings { camera: Some(value.clone()) }.save();
+                    let chosen = value.clone();
+                    Settings::update(move |settings| settings.camera = Some(chosen));
                     selected.set(Some(DeviceId(value)));
                 },
             }
@@ -165,6 +166,7 @@ pub fn Camera() -> Element {
         // Above the tiles and in normal flow: an overlay would paint but never
         // receive clicks in this blitz revision (ticket 0). Disappears once a
         // peer is chosen.
+        MicrophoneRow { audio: remote.audio.clone() }
         ConnectRow {
             me: remote.me,
             status: remote.status,
