@@ -61,18 +61,36 @@ impl Frame {
     ///
     /// Rows are already tightly packed here: `from_capture` repacks a padded
     /// camera frame before it ever reaches this type.
-    pub fn to_i420_surface(&self) -> Option<moq_video::Surface> {
-        let (w, h) = (self.width as usize, self.height as usize);
+    ///
+    /// `factor` shrinks the output by an integer ratio on the way through -- see
+    /// [`encode_size`], which chooses it. Scaling here rather than in a pass of
+    /// its own is close to free: every input pixel has to be read either way,
+    /// and averaging a block before converting it means the colour maths runs
+    /// `factor * factor` times less often. Downscaling makes this cheaper than
+    /// not downscaling.
+    pub fn to_i420_surface(&self, factor: usize) -> Option<moq_video::Surface> {
+        let factor = factor.max(1);
+        let (sw, sh) = (self.width as usize, self.height as usize);
+        // What comes out, after scaling and after being forced even: 4:2:0 has
+        // no well-defined chroma plane for an odd dimension.
+        let (w, h) = ((sw / factor) & !1, (sh / factor) & !1);
         if w < 2 || h < 2 {
             return None;
         }
-        // Odd dimensions have no well-defined 4:2:0 chroma plane.
         let (cw, ch) = (w / 2, h / 2);
 
         let data = match &self.pixels {
-            Pixels::I420(data) => data.to_vec(),
+            // Already planar, so there is nothing to convert -- and nothing
+            // here scales it either. Only decoded frames arrive in this form
+            // and they are never re-encoded, so a scaled request would be a
+            // caller mistake rather than a case to handle.
+            Pixels::I420(data) if factor == 1 => data.to_vec(),
+            Pixels::I420(_) => {
+                tracing::warn!("cannot scale an already-planar frame");
+                return None;
+            }
             Pixels::Bgra(src) | Pixels::Rgba(src) => {
-                if src.len() < w * h * 4 {
+                if src.len() < sw * sh * 4 {
                     return None;
                 }
                 let (ri, bi) = match self.pixels {
@@ -80,34 +98,44 @@ impl Frame {
                     _ => (0usize, 2usize),
                 };
                 let at = |x: usize, y: usize| -> (f32, f32, f32) {
-                    let p = (y * w + x) * 4;
+                    let p = (y * sw + x) * 4;
                     (src[p + ri] as f32, src[p + 1] as f32, src[p + bi] as f32)
+                };
+                // Mean of the `size * size` source block whose top-left corner
+                // is (`x`, `y`). Averaged rather than point sampled for the
+                // reason the chroma plane always has been: point sampling a
+                // shrinking image shimmers on any fine detail.
+                let block = |x: usize, y: usize, size: usize| -> (f32, f32, f32) {
+                    let (mut rs, mut gs, mut bs) = (0.0, 0.0, 0.0);
+                    for dy in 0..size {
+                        for dx in 0..size {
+                            let (r, g, b) = at((x + dx).min(sw - 1), (y + dy).min(sh - 1));
+                            rs += r;
+                            gs += g;
+                            bs += b;
+                        }
+                    }
+                    let n = (size * size) as f32;
+                    (rs / n, gs / n, bs / n)
                 };
 
                 // BT.601 limited range, the inverse of `preview.wgsl`'s I420
                 // branch. Keep the two in step or colours drift.
-                let mut out = vec![0u8; Self::i420_len(self.width, self.height)];
+                let mut out = vec![0u8; Self::i420_len(w as u32, h as u32)];
                 for y in 0..h {
                     for x in 0..w {
-                        let (r, g, b) = at(x, y);
+                        let (r, g, b) = block(x * factor, y * factor, factor);
                         out[y * w + x] =
                             (0.257 * r + 0.504 * g + 0.098 * b + 16.0).clamp(0.0, 255.0) as u8;
                     }
                 }
                 let (u_off, v_off) = (w * h, w * h + cw * ch);
+                // One chroma sample covers two output pixels each way, so its
+                // source block is twice the luma one.
+                let chroma = factor * 2;
                 for cy in 0..ch {
                     for cx in 0..cw {
-                        // Averaged, not point sampled: point sampling shimmers.
-                        let (mut rs, mut gs, mut bs) = (0.0, 0.0, 0.0);
-                        for dy in 0..2 {
-                            for dx in 0..2 {
-                                let (r, g, b) = at(cx * 2 + dx, cy * 2 + dy);
-                                rs += r;
-                                gs += g;
-                                bs += b;
-                            }
-                        }
-                        let (r, g, b) = (rs / 4.0, gs / 4.0, bs / 4.0);
+                        let (r, g, b) = block(cx * chroma, cy * chroma, chroma);
                         out[u_off + cy * cw + cx] =
                             (-0.148 * r - 0.291 * g + 0.439 * b + 128.0).clamp(0.0, 255.0) as u8;
                         out[v_off + cy * cw + cx] =
@@ -118,7 +146,7 @@ impl Frame {
             }
         };
 
-        match moq_video::I420::new(self.width, self.height, data) {
+        match moq_video::I420::new(w as u32, h as u32, data) {
             Ok(i420) => Some(moq_video::Surface::I420(i420)),
             Err(error) => {
                 tracing::warn!("I420 conversion failed: {error}");
@@ -126,6 +154,73 @@ impl Frame {
             }
         }
     }
+}
+
+/// Widest we are willing to encode at.
+///
+/// Not a quality preference so much as a bitrate one. `moq-video` derives its
+/// default bitrate from the frame size at ~0.07 bits per pixel per second, so
+/// resolution *is* the bitrate knob: 1080p30 asks for 4.35 Mbps, which is far
+/// more than a call between two houses can carry, and spending it is what makes
+/// a real link stutter rather than soften.
+///
+/// 1280 leaves 720p alone and halves 1080p to 960x540, which asks for about
+/// 1.1 Mbps. macOS hands us 1080p whatever we request of the camera, so this is
+/// the only place the decision can currently be made.
+const MAX_ENCODE_WIDTH: u32 = 1280;
+
+/// Bits per pixel per second we encode at.
+///
+/// Replaces `moq-video`'s default of 0.07, which its own comment describes as
+/// matching the JS publisher rather than as a measured figure. 0.07 has to
+/// cover every kind of content, and high-motion video needs roughly three times
+/// what a webcam does at the same size -- so a generic default is necessarily
+/// well above what a call needs.
+///
+/// 0.05 comes from published H.264 figures for webcam content at a target VMAF
+/// of 90, which work out at 0.043 for 1080p, 0.045 for 720p and 0.058 for 360p
+/// (the rate drifts up as frames get smaller, since there is less spatial
+/// redundancy to exploit). 540p sits between the last two. Other vendors'
+/// ladders put the usable band at roughly 0.03 to 0.08.
+///
+/// **Specific to H.264, which is what VideoToolbox gives us.** The same quality
+/// costs about a third as much in AV1, so this number does not survive a codec
+/// change.
+const ENCODE_BITS_PER_PIXEL: f64 = 0.05;
+
+/// Target bitrate in bits per second for a frame size and rate.
+///
+/// This is a ceiling as much as a target: rate control can move the encoder
+/// *down* from what it opened at but never above it, so it wants to be what
+/// good quality costs rather than the least that is tolerable.
+pub fn bitrate_for(width: u32, height: u32, framerate: u32) -> u64 {
+    (width as f64 * height as f64 * framerate as f64 * ENCODE_BITS_PER_PIXEL) as u64
+}
+
+/// The size frames should be encoded at, and the factor that gets them there.
+///
+/// **Integer factors only.** A 2x reduction is an exact 2x2 box average with no
+/// resampler and no half-pixel alignment to get wrong, and it keeps the chroma
+/// plane on whole pixels. An arbitrary ratio would buy a slightly better fit to
+/// the ceiling and cost a filter, which is the wrong trade for a downscale
+/// nobody is looking at closely.
+///
+/// Returns the even dimensions the encoder should be built with, since 4:2:0
+/// has no chroma plane for an odd one.
+pub fn encode_size(width: u32, height: u32) -> (u32, u32, usize) {
+    encode_size_within(width, height, crate::args::Args::get().encode_width.unwrap_or(MAX_ENCODE_WIDTH))
+}
+
+/// [`encode_size`] against an explicit ceiling, which is what the tests use and
+/// what `--encode-width` overrides.
+fn encode_size_within(width: u32, height: u32, ceiling: u32) -> (u32, u32, usize) {
+    let mut factor = 1usize;
+    while width / factor as u32 > ceiling && (height / (factor as u32 * 2)) >= 2 {
+        factor *= 2;
+    }
+    let w = (width / factor as u32) & !1;
+    let h = (height / factor as u32) & !1;
+    (w, h, factor)
 }
 
 /// Holds the newest captured frame for the paint source to pick up.
@@ -429,6 +524,116 @@ impl Tapped {
     /// held is still structurally fine to replace.
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Frame>> {
         self.frame.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod encode_size_tests {
+    use super::*;
+
+    #[test]
+    fn the_encoded_bitrate_lands_where_the_research_says() {
+        // 960x540@30 is what a 1080p camera comes out as, and the published
+        // H.264 webcam figures put that a little under 800 kbps.
+        let bitrate = bitrate_for(960, 540, 30);
+        assert!(
+            (700_000..=850_000).contains(&bitrate),
+            "540p30 should be ~780 kbps, got {bitrate}"
+        );
+    }
+
+    #[test]
+    fn the_bitrate_is_well_under_the_generic_default() {
+        // moq-video would derive 0.07 bits per pixel for the same frame. That
+        // default has to cover high-motion content; a call does not.
+        let ours = bitrate_for(960, 540, 30);
+        let generic = (960.0 * 540.0 * 30.0 * 0.07) as u64;
+        assert!(ours < generic, "{ours} should be below the generic {generic}");
+    }
+
+    #[test]
+    fn seven_twenty_p_is_left_alone() {
+        assert_eq!(encode_size_within(1280, 720, MAX_ENCODE_WIDTH), (1280, 720, 1));
+    }
+
+    #[test]
+    fn ten_eighty_p_is_halved() {
+        // The case that actually happens: macOS gives us 1080p whatever we ask
+        // for, and 1080p is three times the bitrate a call should be spending.
+        assert_eq!(encode_size_within(1920, 1080, MAX_ENCODE_WIDTH), (960, 540, 2));
+    }
+
+    #[test]
+    fn four_k_halves_twice() {
+        assert_eq!(encode_size_within(3840, 2160, MAX_ENCODE_WIDTH), (960, 540, 4));
+    }
+
+    #[test]
+    fn small_frames_are_never_scaled_up() {
+        assert_eq!(encode_size_within(640, 480, MAX_ENCODE_WIDTH), (640, 480, 1));
+    }
+
+    #[test]
+    fn a_raised_ceiling_stops_the_downscale() {
+        // What `--encode-width 1920` does: encode at capture size, for
+        // comparing against the default on a real link.
+        assert_eq!(encode_size_within(1920, 1080, 1920), (1920, 1080, 1));
+    }
+
+    #[test]
+    fn the_result_is_always_even() {
+        // 4:2:0 has no chroma plane for an odd dimension, so a size that would
+        // land odd has to be rounded rather than passed on.
+        let (w, h, _) = encode_size_within(1920, 1081, MAX_ENCODE_WIDTH);
+        assert_eq!(w % 2, 0);
+        assert_eq!(h % 2, 0);
+    }
+
+    fn grey_frame(width: u32, height: u32) -> Frame {
+        // Uniform mid-grey: whatever the scaling does to it, the answer is the
+        // same grey, which is what makes an averaging bug visible.
+        let pixels = vec![128u8; (width * height * 4) as usize];
+        Frame {
+            width,
+            height,
+            timestamp: Duration::ZERO,
+            pixels: Pixels::Bgra(Bytes::from(pixels)),
+        }
+    }
+
+    #[test]
+    fn scaling_produces_the_size_encode_size_promised() {
+        let frame = grey_frame(1920, 1080);
+        let (w, h, factor) = encode_size_within(1920, 1080, MAX_ENCODE_WIDTH);
+        let surface = frame.to_i420_surface(factor).expect("converts");
+        assert_eq!((surface.width(), surface.height()), (w, h));
+    }
+
+    #[test]
+    fn a_flat_image_survives_scaling_unchanged() {
+        // Averaging a block of one colour must give that colour back. A wrong
+        // divisor or an out-of-bounds read shows up here as a shifted level.
+        let unscaled = grey_frame(64, 64).to_i420_surface(1).expect("converts");
+        let scaled = grey_frame(64, 64).to_i420_surface(2).expect("converts");
+        let (a, b) = (
+            unscaled.into_i420().expect("planar"),
+            scaled.into_i420().expect("planar"),
+        );
+        assert_eq!(a[0], b[0], "luma level must not move");
+        // Chroma sits after the luma plane in each buffer.
+        assert_eq!(a[64 * 64], b[32 * 32], "chroma level must not move");
+    }
+
+    #[test]
+    fn an_already_planar_frame_refuses_to_scale() {
+        let frame = Frame {
+            width: 64,
+            height: 64,
+            timestamp: Duration::ZERO,
+            pixels: Pixels::I420(Bytes::from(vec![0u8; Frame::i420_len(64, 64)])),
+        };
+        assert!(frame.to_i420_surface(1).is_some(), "passing through is fine");
+        assert!(frame.to_i420_surface(2).is_none(), "scaling one is not");
     }
 }
 

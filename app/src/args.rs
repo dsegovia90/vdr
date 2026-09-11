@@ -20,6 +20,7 @@
 //! vdr --secret <hex> --dial <peer-id>     # dials it
 //! vdr --loopback                          # no network; the codec round trip
 //! vdr --camera facetime                   # picks a camera by name
+//! vdr --encode-width 1920                 # encode at capture size, for A/B tests
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry (19c) is a second
@@ -66,6 +67,12 @@ pub struct Args {
     pub peering: Peering,
     /// Case-insensitive substring of the camera to start on.
     pub camera: Option<String>,
+    /// Widest the encoder may run, overriding the built-in ceiling.
+    ///
+    /// For comparing sizes on a real link, which is the only place the
+    /// difference shows: locally there is nothing to run out of, so every size
+    /// looks fine. The bitrate follows the size, so this moves both.
+    pub encode_width: Option<u32>,
 }
 
 impl Args {
@@ -92,6 +99,7 @@ impl Args {
         let mut args = std::env::args().skip(1);
         let mut peering = Peering::Idle;
         let mut camera = None;
+        let mut encode_width = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -111,9 +119,19 @@ impl Args {
                     Some(wanted) => camera = Some(wanted.to_lowercase()),
                     None => tracing::error!("--camera needs part of a device name"),
                 },
+                "--encode-width" => match args.next().as_deref().map(str::parse::<u32>) {
+                    Some(Ok(width)) if width >= 2 => encode_width = Some(width),
+                    Some(Ok(width)) => tracing::error!("--encode-width {width} is too small"),
+                    Some(Err(error)) => tracing::error!("--encode-width is not a number: {error}"),
+                    None => tracing::error!("--encode-width needs a pixel count"),
+                },
                 other => tracing::warn!("ignoring unknown argument {other}"),
             }
         }
-        Self { peering, camera }
+        Self {
+            peering,
+            camera,
+            encode_width,
+        }
     }
 }

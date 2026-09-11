@@ -19,7 +19,7 @@ use std::sync::Arc;
 use super::audio;
 use super::runtime::runtime;
 use crate::audio::Controls;
-use crate::camera::{FrameFeed, FrameSlot, from_decoded};
+use crate::camera::{FrameFeed, FrameSlot, encode_size, from_decoded};
 
 /// Runs a loopback on its own thread for the lifetime of the process.
 ///
@@ -68,14 +68,16 @@ async fn pump(
     controls: Arc<Controls>,
 ) -> anyhow::Result<()> {
     // Framerate is the encoder's pacing hint, not a promise.
-    let config = moq_video::encode::Config::new(width, height, 30);
+    let (width, height, scale) = encode_size(width, height);
+    let mut config = moq_video::encode::Config::new(width, height, 30);
+    config.bitrate = Some(crate::camera::bitrate_for(width, height, 30));
     // `probe` asks the encoder what it will emit, so the catalog is published
     // before anything is encoded -- which is what lets the decoder below open
     // against a track nothing has written to yet.
     let rendition = config.probe().await?;
     let mut encoder = moq_video::encode::Encoder::new(&config)?;
     tracing::info!(
-        "loopback: encoding {width}x{height} with {}",
+        "loopback: encoding {width}x{height} with {} ({scale}x downscale)",
         encoder.name()
     );
 
@@ -144,7 +146,7 @@ async fn pump(
             Err(_) => break,
         };
 
-        let Some(surface) = frame.to_i420_surface() else {
+        let Some(surface) = frame.to_i420_surface(scale) else {
             continue;
         };
         // The encoder paces on these, so a wrong one stalls the stream.

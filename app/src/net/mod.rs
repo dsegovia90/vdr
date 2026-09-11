@@ -16,6 +16,7 @@
 //! the same [`FrameSlot`], which is why the renderer needs to know nothing
 //! about either.
 
+mod adapt;
 mod audio;
 mod call;
 mod loopback;

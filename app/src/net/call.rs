@@ -27,12 +27,13 @@ use futures_channel::mpsc::UnboundedSender;
 use futures_util::StreamExt as _;
 use moq_mux::catalog::Stream as _;
 
+use super::adapt;
 use super::audio;
 use super::runtime::runtime;
 use super::status::RemoteStatus;
 use crate::args::Peering;
 use crate::audio::Controls;
-use crate::camera::{FrameFeed, FrameSlot, from_decoded};
+use crate::camera::{FrameFeed, FrameSlot, encode_size, from_decoded};
 
 /// The broadcast path both sides publish on.
 ///
@@ -167,7 +168,16 @@ async fn run(
         .map_err(|error| format!("the camera wait failed: {error}"))?
         .ok_or_else(|| "the camera closed before a frame arrived".to_string())?;
 
-        let config = moq_video::encode::Config::new(width, height, FRAMERATE);
+        // Encoded smaller than captured, when the camera insists on more than the
+    // link can carry. The bitrate follows from the size, so this is where it
+    // gets decided.
+    let (width, height, scale) = encode_size(width, height);
+    let mut config = moq_video::encode::Config::new(width, height, FRAMERATE);
+    let opening_bitrate = crate::camera::bitrate_for(width, height, FRAMERATE);
+    config.bitrate = Some(opening_bitrate);
+    // Filled in by the rate loop below, read by the encode loop. Stays empty
+    // unless this attempt turns out to be one that can measure the link.
+    let target: adapt::Target = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let rendition = config
             .probe()
             .await
@@ -203,6 +213,10 @@ async fn run(
 
         let inbound = moq_net::Origin::random().produce();
 
+        // Set by the dial arm, which is the only one that can reach a bandwidth
+        // estimate -- see `adapt`.
+        let mut rate = None;
+
         let transport: Pin<Box<dyn Future<Output = String> + Send>> = match peering {
             Peering::Dial(peer) => {
                 report(RemoteStatus::Dialing {
@@ -222,6 +236,14 @@ async fn run(
                     .with_publisher(&outbound)
                     .with_subscriber(inbound.clone())
                     .reconnect(url);
+                // Taken before the session moves into the future below. It
+                // survives a reconnect, so the loop keeps following the link
+                // across one rather than being restarted.
+                rate = Some(adapt::spawn(
+                    session.send_bandwidth(),
+                    opening_bitrate,
+                    target.clone(),
+                ));
                 Box::pin(async move {
                     match session.closed().await {
                         Ok(()) => "the peer closed the session".to_string(),
@@ -274,9 +296,41 @@ async fn run(
             })
         });
 
+        // **On a blocking thread, not in the `select!` below.** Converting a
+        // frame and encoding it are synchronous and take a good fraction of the
+        // interval between frames, so a loop doing them yields only when the
+        // camera has nothing ready. Left as a branch here it starves everything
+        // it shares a task with -- which is the transport, so the call does not
+        // connect at all once the machine has no slack, and the cancel channel,
+        // so the button waits on a frame.
+        //
+        // It owns the feed, the encoder and the producer while it runs and
+        // hands all three back on the way out, because the next attempt needs
+        // the feed and this one still has to flush.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut encoding = tokio::task::spawn_blocking({
+            let stop = stop.clone();
+            let target = target.clone();
+            move || {
+                let outcome = encode(&mut feed, &mut encoder, &mut producer, scale, &target, &stop);
+                (feed, encoder, producer, outcome)
+            }
+        });
+
+        // Set when the encode thread is what ended the attempt, so the join
+        // below knows not to await a handle that has already resolved.
+        let mut encoded = None;
+
         let outcome = tokio::select! {
             error = transport => Some(Err(error)),
-            result = encode(&mut feed, &mut encoder, &mut producer) => Some(result),
+            joined = &mut encoding => match joined {
+                Ok(parts) => {
+                    let outcome = parts.3.clone();
+                    encoded = Some(parts);
+                    Some(outcome)
+                }
+                Err(error) => Some(Err(format!("the encode thread failed: {error}"))),
+            },
             cancelled = decisions.next() => match cancelled {
                 Some(Peering::Idle) => None,
                 Some(next) => {
@@ -284,6 +338,18 @@ async fn run(
                     None
                 }
                 None => Some(Err("the connect control went away".to_string())),
+            },
+        };
+
+        // Whatever won the race, the encode thread has to be told to stop and
+        // then waited for: a blocking task cannot be cancelled out from under
+        // itself, and its three values are needed here.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (feed, mut encoder, mut producer) = match encoded {
+            Some((feed, encoder, producer, _)) => (feed, encoder, producer),
+            None => match encoding.await {
+                Ok((feed, encoder, producer, _)) => (feed, encoder, producer),
+                Err(error) => return Err(format!("the encode thread failed: {error}")),
             },
         };
 
@@ -296,6 +362,9 @@ async fn run(
         decode.abort();
         if let Some(audio_decode) = audio_decode {
             audio_decode.abort();
+        }
+        if let Some(rate) = rate {
+            rate.abort();
         }
         controls.detach();
         slot.clear();
@@ -312,24 +381,40 @@ async fn run(
 /// Pulls camera frames off the tap, encodes them, and publishes them.
 ///
 /// The loopback's loop verbatim -- which is the point of having had one.
-async fn encode(
+fn encode(
     feed: &mut FrameFeed,
     encoder: &mut moq_video::encode::Encoder,
     producer: &mut moq_video::encode::Producer,
+    scale: usize,
+    target: &adapt::Target,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
     loop {
+        // The only way out other than the camera going away. Checked per frame
+        // rather than per sleep, so a busy encoder still notices promptly.
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        // Applied here because this thread owns the encoder. A rate arriving
+        // mid-frame waits for the next one, which is well inside what the
+        // control loop ramps over.
+        if let Some(bitrate) = adapt::take(target) {
+            if let Err(error) = encoder.set_bitrate(bitrate) {
+                tracing::warn!("could not move the encoder to {bitrate} bps: {error:#}");
+            }
+        }
         // `take` errors only when every tap has dropped: the camera going away
         // for good, rather than a gap between frames.
         let frame = match feed.take() {
             Ok(Some(frame)) => frame,
             Ok(None) => {
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                std::thread::sleep(std::time::Duration::from_millis(2));
                 continue;
             }
             Err(_) => return Ok(()),
         };
 
-        let Some(surface) = frame.to_i420_surface() else {
+        let Some(surface) = frame.to_i420_surface(scale) else {
             continue;
         };
         // The encoder paces on these, so a wrong one stalls the stream.
