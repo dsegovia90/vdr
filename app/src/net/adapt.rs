@@ -50,6 +50,7 @@ pub(super) fn spawn(
     bandwidth: moq_net::bandwidth::Consumer,
     ceiling: u64,
     target: Target,
+    metrics: Arc<super::Metrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let policy = moq_video::encode::rate::Policy::new(ceiling);
@@ -67,6 +68,7 @@ pub(super) fn spawn(
         loop {
             ticker.tick().await;
             let estimate = bandwidth.peek();
+            metrics.set_estimate_kbps(estimate.map(|bps| (bps / 1000) as u32));
             if reported.elapsed() >= Duration::from_secs(5) {
                 match estimate {
                     Some(bps) => tracing::debug!("[rate] estimate {} kbps", bps / 1000),
@@ -82,6 +84,7 @@ pub(super) fn spawn(
                 next / 1000,
                 estimate.unwrap_or(0) / 1000
             );
+            metrics.set_send_kbps((next / 1000) as u32);
             target.store(next, Ordering::Relaxed);
         }
     })
@@ -93,4 +96,46 @@ pub(super) fn take(target: &Target) -> Option<u64> {
         0 => None,
         bitrate => Some(bitrate),
     }
+}
+
+/// Mirrors a session's send-bandwidth estimate into a persistent producer,
+/// until the session closes.
+///
+/// The dialling side needs nothing like this: `Reconnect` hands out an estimate
+/// that exists before the connection does and survives reconnects, because it
+/// does this forwarding internally. A listener has no such object -- it has a
+/// session, and only once somebody has called. So the estimate handed to
+/// [`spawn`] is one of ours, and this keeps it fed.
+///
+/// Clears the estimate on close rather than leaving the last value standing: a
+/// stale number is worse than none, since the rate policy deliberately holds
+/// its target when the estimate goes away and would otherwise hold one measured
+/// against a connection that no longer exists.
+pub(super) async fn forward(
+    session: moq_net::Session,
+    estimate: moq_net::bandwidth::Producer,
+    metrics: Arc<super::Metrics>,
+) {
+    let source = session.send_bandwidth();
+    if source.is_none() {
+        tracing::debug!("[rate] this session reports no bandwidth estimate");
+    }
+    let mut ticker = tokio::time::interval(SAMPLE);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            error = session.closed() => {
+                tracing::debug!("[rate] session closed, dropping the estimate: {error}");
+                break;
+            }
+            _ = ticker.tick() => {
+                if let Some(source) = source.as_ref() {
+                    let _ = estimate.set(source.peek());
+                }
+                metrics.set_connection(&session.stats());
+            }
+        }
+    }
+    let _ = estimate.set(None);
 }

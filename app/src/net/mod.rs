@@ -19,6 +19,7 @@
 mod adapt;
 mod audio;
 mod call;
+mod metrics;
 mod loopback;
 pub(crate) mod runtime;
 mod status;
@@ -27,6 +28,7 @@ use std::sync::Arc;
 
 use dioxus_native::prelude::*;
 
+pub use metrics::Metrics;
 pub use status::RemoteStatus;
 
 use crate::args::{Args, Peering};
@@ -57,6 +59,8 @@ pub struct Remote {
     /// connected, stopping is a hang-up and there is no channel on which to
     /// tell them. Ticket 29.
     pub cancel: Callback<()>,
+    /// Live numbers for the call: rtt, loss, bitrate, incoming frame rate.
+    pub metrics: Arc<Metrics>,
     /// The microphone, and whether the peer is talking.
     ///
     /// Shared rather than messaged: the publication's controls are `Send +
@@ -91,6 +95,7 @@ pub fn use_remote() -> Remote {
 
     use_hook(|| {
         let audio = Arc::new(Controls::default());
+        let metrics = Arc::new(Metrics::default());
         let (tap, feed) = frame_tap();
         let slot = FrameSlot::default();
         // The decision, not the feed, is what gets deferred. The call thread
@@ -111,7 +116,14 @@ pub fn use_remote() -> Remote {
                 loopback::spawn(feed, slot.clone(), audio.clone());
             }
             peering => {
-                call::spawn(decided, feed, slot.clone(), updates, audio.clone());
+                call::spawn(
+                    decided,
+                    feed,
+                    slot.clone(),
+                    updates,
+                    audio.clone(),
+                    metrics.clone(),
+                );
                 // `--listen` / `--dial` decide immediately; `Idle` waits for the
                 // UI. The CLI path is deliberately unchanged: it is how two
                 // instances get driven from a script.
@@ -143,6 +155,7 @@ pub fn use_remote() -> Remote {
             connect,
             cancel,
             audio,
+            metrics,
         }
     })
 }

@@ -11,6 +11,10 @@
 //! topology switch is built (ticket 22), and ticket 21 already proved a
 //! participant can host one.
 //!
+//! Both arms converge on [`Peer`], so the claim above is structural rather than
+//! a description: anything per-connection is reached the same way whichever
+//! side established it.
+//!
 //! Each side keeps **two origins** -- `outbound` for what we publish, `inbound`
 //! for what arrives. They are separate `Origin`s, so both peers can publish at
 //! the same well-known path without colliding, and neither needs to know the
@@ -32,8 +36,45 @@ use super::audio;
 use super::runtime::runtime;
 use super::status::RemoteStatus;
 use crate::args::Peering;
+use super::Metrics;
 use crate::audio::Controls;
 use crate::camera::{FrameFeed, FrameSlot, encode_size, from_decoded};
+
+/// Aborts a task when it goes out of scope.
+///
+/// `tokio::spawn` detaches, and dropping a `JoinHandle` leaves the task
+/// running -- so a helper spawned inside a task that is itself aborted would
+/// outlive its parent and keep writing. Every per-call helper wants this.
+struct Abort(tokio::task::JoinHandle<()>);
+
+impl Drop for Abort {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// What a connected peer is, whichever side established it.
+///
+/// The two arms differ only in how they reach this: one dials a client, the
+/// other accepts as a server. Everything after is identical -- the module doc
+/// has said so since the first call worked -- and before this type existed the
+/// claim was true of the media and false of the connection, because the arms
+/// converged on a bare "future that resolves when it ends". That erased the
+/// connection itself, so the first thing to need it (a bandwidth estimate, for
+/// rate control) had to be wired inside one arm as a special case.
+///
+/// Anything per-connection belongs here rather than in a branch:
+/// `ConnectionStats` for rtt and loss would be the next one.
+struct Peer {
+    /// Resolves when the connection ends, with why.
+    closed: Pin<Box<dyn Future<Output = String> + Send>>,
+    /// The send-bitrate estimate, when this side can reach one.
+    bandwidth: Option<moq_net::bandwidth::Consumer>,
+    /// Connection figures, when this side has a handle that outlives a single
+    /// session. The listening side reports its own from inside the accept loop
+    /// instead, since its session is what it has.
+    stats: Option<moq_native::ConnectionStatsReader>,
+}
 
 /// The broadcast path both sides publish on.
 ///
@@ -47,9 +88,15 @@ const TRACK: &str = "video.avc3";
 /// The encoder's pacing hint, not a promise. Matches the loopback.
 const FRAMERATE: u32 = 30;
 
-/// How many decoded frames between rate reports. Matches the paint path's
-/// cadence so the two logs are comparable.
+/// How many decoded frames between rate reports in the log. Matches the paint
+/// path's cadence so the two logs are comparable.
 const REPORT_EVERY: u32 = 120;
+
+/// How often the incoming frame rate is published to the interface.
+///
+/// Faster than the log on purpose: the log is for comparing runs afterwards,
+/// this is for watching a link misbehave while it happens.
+const FPS_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Runs a call on its own thread for the lifetime of the process.
 ///
@@ -63,6 +110,7 @@ pub(super) fn spawn(
     slot: FrameSlot,
     status: UnboundedSender<RemoteStatus>,
     controls: Arc<Controls>,
+    metrics: Arc<Metrics>,
 ) {
     let spawned = std::thread::Builder::new()
         .name("call".into())
@@ -74,7 +122,7 @@ pub(super) fn spawn(
                 return;
             };
             runtime.block_on(async move {
-                match run(decisions, feed, slot, &status, controls).await {
+                match run(decisions, feed, slot, &status, controls, metrics).await {
                     Ok(()) => {
                         tracing::info!("call ended");
                         let _ = status.unbounded_send(RemoteStatus::Ended);
@@ -102,6 +150,7 @@ async fn run(
     slot: FrameSlot,
     status: &UnboundedSender<RemoteStatus>,
     controls: Arc<Controls>,
+    metrics: Arc<Metrics>,
 ) -> Result<(), String> {
     let report = |next: RemoteStatus| {
         let _ = status.unbounded_send(next);
@@ -172,6 +221,7 @@ async fn run(
     // link can carry. The bitrate follows from the size, so this is where it
     // gets decided.
     let (width, height, scale) = encode_size(width, height);
+    metrics.set_encode_size(width, height);
     let mut config = moq_video::encode::Config::new(width, height, FRAMERATE);
     let opening_bitrate = crate::camera::bitrate_for(width, height, FRAMERATE);
     config.bitrate = Some(opening_bitrate);
@@ -213,11 +263,7 @@ async fn run(
 
         let inbound = moq_net::Origin::random().produce();
 
-        // Set by the dial arm, which is the only one that can reach a bandwidth
-        // estimate -- see `adapt`.
-        let mut rate = None;
-
-        let transport: Pin<Box<dyn Future<Output = String> + Send>> = match peering {
+        let peer_transport: Peer = match peering {
             Peering::Dial(peer) => {
                 report(RemoteStatus::Dialing {
                     peer: peer.to_string(),
@@ -237,19 +283,20 @@ async fn run(
                     .with_subscriber(inbound.clone())
                     .reconnect(url);
                 // Taken before the session moves into the future below. It
-                // survives a reconnect, so the loop keeps following the link
-                // across one rather than being restarted.
-                rate = Some(adapt::spawn(
-                    session.send_bandwidth(),
-                    opening_bitrate,
-                    target.clone(),
-                ));
-                Box::pin(async move {
-                    match session.closed().await {
-                        Ok(()) => "the peer closed the session".to_string(),
-                        Err(error) => format!("{error:#}"),
-                    }
-                })
+                // survives a reconnect, so the estimate follows the link across
+                // one rather than being restarted.
+                let bandwidth = Some(session.send_bandwidth());
+                let stats = Some(session.stats());
+                Peer {
+                    closed: Box::pin(async move {
+                        match session.closed().await {
+                            Ok(()) => "the peer closed the session".to_string(),
+                            Err(error) => format!("{error:#}"),
+                        }
+                    }),
+                    bandwidth,
+                    stats,
+                }
             }
             Peering::Listen => {
                 report(RemoteStatus::Listening { me: me.to_string() });
@@ -263,15 +310,72 @@ async fn run(
                     .with_iroh(endpoint.clone());
                 let publish = outbound.consume();
                 let subscribe = inbound.clone();
-                Box::pin(async move {
-                    match server.serve_both(publish, subscribe).await {
-                        Ok(()) => "the listener stopped".to_string(),
-                        Err(error) => format!("{error:#}"),
-                    }
-                })
+                // **Our own accept loop, rather than `serve_both`.** That
+                // convenience method is exactly this loop, plus a private
+                // helper that does `request.ok()` and waits -- but it never
+                // hands the session back, and the session is where a bandwidth
+                // estimate lives. Without one, a callee sends at its opening
+                // rate for the whole call however bad the link gets.
+                //
+                // The origins stay on the server rather than moving to each
+                // request: `accept` attaches them, which is why the upstream
+                // helper can get away with a bare `ok()`.
+                let mut server = server.with_publisher(publish).with_subscriber(subscribe);
+                // Persistent, and fed from whichever session is live. The
+                // dialling side gets this shape for free from `Reconnect`;
+                // here it is ours to keep, because an estimate has to exist
+                // before anyone has called.
+                let estimate = moq_net::bandwidth::Producer::new();
+                let bandwidth = Some(estimate.consume());
+                // The accept loop below is an `async move`, so it would take
+                // the shared handle with it and leave the next attempt without
+                // one.
+                let metrics = metrics.clone();
+                Peer {
+                    closed: Box::pin(async move {
+                        while let Some(request) = server.accept().await {
+                            let estimate = estimate.clone();
+                            let metrics = metrics.clone();
+                            tokio::spawn(async move {
+                                match request.ok().await {
+                                    Ok(session) => {
+                                        adapt::forward(session, estimate, metrics).await
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!("a session failed to start: {error:#}")
+                                    }
+                                }
+                            });
+                        }
+                        "the listener stopped".to_string()
+                    }),
+                    bandwidth,
+                    stats: None,
+                }
             }
             Peering::Loopback | Peering::Idle => return Err("no peer to call".to_string()),
         };
+
+        // Below here the two sides are the same, which is the point of `Peer`.
+        let Peer {
+            closed: transport,
+            bandwidth,
+            stats,
+        } = peer_transport;
+        let rate = bandwidth
+            .map(|bandwidth| adapt::spawn(bandwidth, opening_bitrate, target.clone(), metrics.clone()));
+        let reporting = stats.map(|stats| {
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
+                loop {
+                    ticker.tick().await;
+                    if let Some(stats) = stats.stats() {
+                        metrics.set_connection(&stats);
+                    }
+                }
+            })
+        });
 
         let peer_label = match &peering {
             Peering::Dial(peer) => Some(peer.to_string()),
@@ -282,6 +386,7 @@ async fn run(
             slot.clone(),
             status.clone(),
             peer_label,
+            metrics.clone(),
         ));
 
         let audio_decode = engine.map(|engine| {
@@ -366,6 +471,10 @@ async fn run(
         if let Some(rate) = rate {
             rate.abort();
         }
+        if let Some(reporting) = reporting {
+            reporting.abort();
+        }
+        metrics.clear();
         controls.detach();
         slot.clear();
 
@@ -446,6 +555,7 @@ async fn subscribe(
     slot: FrameSlot,
     status: UnboundedSender<RemoteStatus>,
     peer: Option<String>,
+    metrics: Arc<Metrics>,
 ) {
     let Some(broadcast) = inbound.announced_broadcast(BROADCAST).await else {
         tracing::warn!("the peer never announced {BROADCAST}");
@@ -507,7 +617,28 @@ async fn subscribe(
     let mut decoded = 0u32;
     let mut since = std::time::Instant::now();
 
+    // **Counted here, timed elsewhere.** Publishing the rate from inside this
+    // loop would mean it only updates when a frame arrives, so a stalled stream
+    // would leave the last healthy number on screen for as long as it was
+    // stalled -- showing 30 fps through the freeze it is meant to reveal. A
+    // ticker reading a counter reports the truth, which during a stall is zero.
+    let counted = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let _ticker = Abort(tokio::spawn({
+        let counted = counted.clone();
+        let metrics = metrics.clone();
+        async move {
+            let mut ticker = tokio::time::interval(FPS_WINDOW);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let frames = counted.swap(0, std::sync::atomic::Ordering::Relaxed);
+                metrics.set_video_fps(frames as f32 / FPS_WINDOW.as_secs_f32());
+            }
+        }
+    }));
+
     while let Ok(Some(frame)) = consumer.read().await {
+        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         decoded += 1;
         if decoded == REPORT_EVERY {
             let elapsed = since.elapsed().as_secs_f32();

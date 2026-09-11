@@ -4,7 +4,9 @@ use std::rc::Rc;
 use cameras::{CameraSource, DeviceId, PixelFormat, Resolution, StreamConfig};
 use dioxus_native::prelude::*;
 
-use super::{Button, ConnectRow, Dropdown, DropdownOption, MicrophoneRow, ParticipantVideo, Tone};
+use super::{
+    Button, ConnectRow, Dropdown, DropdownOption, MicrophoneRow, ParticipantVideo, StatsRow, Tone,
+};
 use crate::args::Args;
 use crate::camera::{FrameSlot, Mirror, use_camera_stream, use_shared_devices};
 use crate::net::use_remote;
@@ -193,6 +195,7 @@ pub fn Camera() -> Element {
             class: if remote.status.read().is_error() { "text-sm text-red-400" } else { "text-sm text-neutral-400" },
             "{remote.status}"
         }
+        StatsRow { metrics: remote.metrics.clone() }
         p { class: status_class,
             if !camera_enabled() {
                 "Camera off"
