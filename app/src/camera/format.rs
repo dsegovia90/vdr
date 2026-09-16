@@ -44,9 +44,10 @@ pub fn negotiate(source: &CameraSource, wanted: StreamConfig) -> StreamConfig {
             .join(", ")
     );
 
-    // Resolution only, never pixel format: `probe` reports *native* modes, and
-    // the macOS backend delivers BGRA from a device that offers none. Filtering
-    // on format here discards every resolution it has.
+    // Resolution is chosen across every format, never within one: `probe`
+    // reports *native* modes, and the macOS backend delivers BGRA from a device
+    // that offers none. Narrowing to one format first discards resolutions the
+    // device really has.
     let offered: Vec<Resolution> = capabilities
         .formats
         .iter()
@@ -56,29 +57,87 @@ pub fn negotiate(source: &CameraSource, wanted: StreamConfig) -> StreamConfig {
         return wanted;
     };
 
-    let ranges: Vec<(f64, f64)> = capabilities
+    // What each format can sustain at that resolution. Asking for a format the
+    // device does not have is not a no-op: the driver substitutes one of its
+    // own and we inherit *its* ceiling. Observed on v4l2 with a camera offering
+    // YUYV 1280x720 at 10fps and MJPEG 1280x720 at 30 -- a request for BGRA
+    // came back as YUYV, so the preview ran at 10fps while the negotiated
+    // framerate said 30.
+    let candidates: Vec<(cameras::PixelFormat, u32)> = capabilities
         .formats
         .iter()
         .filter(|format| format.resolution == resolution)
-        .map(|format| (format.framerate_range.min, format.framerate_range.max))
+        .map(|format| {
+            let range = (format.framerate_range.min, format.framerate_range.max);
+            (format.pixel_format, pick_framerate(&[range], wanted.framerate))
+        })
         .collect();
-    let framerate = pick_framerate(&ranges, wanted.framerate);
+
+    let (pixel_format, framerate) =
+        pick_format(&candidates, wanted.framerate).unwrap_or((wanted.pixel_format, wanted.framerate));
 
     tracing::info!(
-        "{}: asked {}x{}@{}, opening {}x{}@{}",
+        "{}: asked {}x{}@{} {:?}, opening {}x{}@{} {:?}",
         device.name,
         wanted.resolution.width,
         wanted.resolution.height,
         wanted.framerate,
+        wanted.pixel_format,
         resolution.width,
         resolution.height,
         framerate,
+        pixel_format,
     );
 
     StreamConfig {
         resolution,
         framerate,
-        pixel_format: wanted.pixel_format,
+        pixel_format,
+    }
+}
+
+/// The format to open at the chosen resolution: falling short of the requested
+/// framerate is what disqualifies a candidate first, then distance from the
+/// request, then how cheap it is to get onto the GPU.
+///
+/// Rate beats cost because a format that cannot carry the rate is the defect
+/// this function exists for, and no conversion saving makes up for a third of
+/// the frames.
+///
+/// **Shortfall rather than distance**, which is where this parts company with
+/// [`pick_framerate`]: 5fps is nearer to 30 than 60 is, and a 5fps preview is
+/// useless where a 60fps one merely costs frames the tap then drops.
+fn pick_format(candidates: &[(cameras::PixelFormat, u32)], want: u32) -> Option<(cameras::PixelFormat, u32)> {
+    candidates.iter().copied().min_by_key(|(format, framerate)| {
+        (
+            want.saturating_sub(*framerate),
+            framerate.abs_diff(want),
+            cost(*format),
+        )
+    })
+}
+
+/// What a format costs us per frame, cheapest first.
+///
+/// `Bgra8` and `Rgba8` reach the texture untouched; everything else is
+/// converted on the CPU by `frames::from_capture`, and MJPEG pays a JPEG
+/// decode before that conversion.
+///
+/// **Deliberately not ticket 2b's ordering.** 2b chose NV12 as the capture
+/// format because it is cheaper to *encode* and uploads as planes rather than
+/// 4 bytes per pixel. Neither saving exists yet: captured NV12 goes through the
+/// same CPU conversion to RGBA as everything else, so preferring it here would
+/// cost frames today for a benefit that arrives with the 15a/2b work. Revisit
+/// when capture NV12 has a path that is not `to_rgba8`.
+fn cost(format: cameras::PixelFormat) -> u8 {
+    match format {
+        cameras::PixelFormat::Bgra8 | cameras::PixelFormat::Rgba8 => 0,
+        cameras::PixelFormat::Nv12 | cameras::PixelFormat::Yuyv | cameras::PixelFormat::Rgb8 => 1,
+        cameras::PixelFormat::Mjpeg => 2,
+        // `PixelFormat` is `#[non_exhaustive]`: an unknown format is usable,
+        // since `to_rgba8` is the path for everything here, but it is the last
+        // resort rather than a silent default.
+        _ => 3,
     }
 }
 
@@ -187,5 +246,42 @@ mod tests {
     #[test]
     fn framerate_survives_a_resolution_with_no_ranges() {
         assert_eq!(pick_framerate(&[], 30), 30);
+    }
+
+    use cameras::PixelFormat::{Bgra8, Mjpeg, Nv12, Yuyv};
+
+    #[test]
+    fn takes_the_format_that_carries_the_rate() {
+        // The defect this was written for: a v4l2 camera whose 1280x720 YUYV
+        // mode tops out at 10fps while its MJPEG mode does 30. Asking for BGRA
+        // got YUYV's ceiling.
+        let candidates = [(Yuyv, 10), (Mjpeg, 30)];
+        assert_eq!(pick_format(&candidates, 30), Some((Mjpeg, 30)));
+    }
+
+    #[test]
+    fn prefers_the_cheaper_format_at_equal_rates() {
+        // A JPEG decode per frame is only worth paying for frames it buys.
+        let candidates = [(Mjpeg, 30), (Bgra8, 30), (Nv12, 30)];
+        assert_eq!(pick_format(&candidates, 30), Some((Bgra8, 30)));
+    }
+
+    #[test]
+    fn falls_back_to_the_nearest_rate_when_nothing_reaches_it() {
+        let candidates = [(Yuyv, 10), (Mjpeg, 15)];
+        assert_eq!(pick_format(&candidates, 30), Some((Mjpeg, 15)));
+    }
+
+    #[test]
+    fn overshooting_the_rate_beats_undershooting_it_by_more() {
+        // 60fps-only modes exist (the C922 at 720p), and 60 is nearer 30 than
+        // 5 is.
+        let candidates = [(Yuyv, 5), (Mjpeg, 60)];
+        assert_eq!(pick_format(&candidates, 30), Some((Mjpeg, 60)));
+    }
+
+    #[test]
+    fn a_resolution_with_no_formats_leaves_the_choice_to_the_caller() {
+        assert_eq!(pick_format(&[], 30), None);
     }
 }
