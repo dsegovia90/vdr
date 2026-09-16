@@ -98,12 +98,46 @@ const REPORT_EVERY: u32 = 120;
 /// this is for watching a link misbehave while it happens.
 const FPS_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long the transport may go unheard before the session is declared dead.
+///
+/// The stack's own default is 30 seconds, which suits a publisher feeding a
+/// relay and does not suit a call: **it is the entire delay before anything on
+/// screen changes**, because iroh exposes no keep-alive knob and nothing else
+/// ends a session whose peer has gone quiet. Ten seconds of nothing is already
+/// a broken call to the person watching it, and redialling an endpoint iroh
+/// already knows is cheap.
+///
+/// Set on the endpoint rather than on a connection, so both roles share it.
+///
+/// The opposite error is real -- declaring a congested link dead when it would
+/// have recovered on its own -- so if that shows up this number goes back up
+/// rather than the reconnection coming out.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to keep redialling a dropped peer before giving up on the call.
+const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Retry pacing, shared by both sides.
+///
+/// Only the dialling side redials -- the listener has nothing to dial -- but
+/// both sides read [`moq_native::Backoff::linger`] from the same value, because
+/// what it decides is how long each side holds the *other's* broadcast open
+/// waiting for it to come back. The two have to agree or one side tears down a
+/// call the other is still repairing.
+///
+/// The escalation itself is left alone: 1 s, doubling to 5 s, is a sensible
+/// climb, and the jitter matters even between two peers.
+fn backoff() -> moq_native::Backoff {
+    let mut backoff = moq_native::Backoff::default();
+    backoff.timeout = RETRY_BUDGET;
+    backoff
+}
+
 /// Runs a call on its own thread for the lifetime of the process.
 ///
-/// Terminal by design: when the call ends, the status says so and nothing
-/// redials. Reconnection is a real feature with real questions behind it -- who
-/// retries, how often, what the tile shows meanwhile -- and guessing at it here
-/// would make the first failure harder to read, not easier. Ticket 19b.
+/// The thread outlives any one call: an ending is reported and then the loop
+/// goes back to idle, so a call that drops for good can be replaced without
+/// restarting the app. Only losing the interface itself ends this.
 pub(super) fn spawn(
     decisions: futures_channel::mpsc::UnboundedReceiver<Peering>,
     feed: FrameFeed,
@@ -158,7 +192,12 @@ async fn run(
 
     report(RemoteStatus::Binding);
 
-    let client_config = moq_native::ClientConfig::default();
+    let mut client_config = moq_native::ClientConfig::default();
+    client_config.backoff = backoff();
+    // Read by `bind` below and applied to the endpoint's transport config, which
+    // is what makes it symmetric: the listener shares this endpoint and so
+    // inherits the same timeout without a config of its own.
+    client_config.quic.idle_timeout = Some(IDLE_TIMEOUT);
     let mut iroh = moq_native::iroh::EndpointConfig::default();
     iroh.enabled = Some(true);
     // `--secret` is forwarded into `IROH_SECRET` by `args`; moq-native reads its
@@ -185,13 +224,25 @@ async fn run(
     // Parked between attempts: the blocking camera wait needs to own it, and a
     // cancelled attempt has to give it back for the next one.
     let mut parked = Some(feed);
+    // How the last call ended, shown in place of the idle line until the user
+    // does something else. Reporting `Idle` unconditionally below would replace
+    // it in the same instant, so the reason a call dropped would never be
+    // readable -- which is the whole point of having given up.
+    let mut ending: Option<RemoteStatus> = None;
+    // How long a broadcast outlives losing its session, on both sides. See
+    // `backoff`: it is the retry budget plus a second.
+    let linger = backoff().linger();
 
     loop {
         // The decision may already be made (`--listen` / `--dial`) or may be the
         // user's to make (19c). Either way it is awaited *here*, after binding and
         // before the camera: our key must be visible while we wait, and waiting on
         // the camera first would hide it behind a device that may never open.
-        report(RemoteStatus::Idle { me: me.to_string() });
+        report(
+            ending
+                .take()
+                .unwrap_or_else(|| RemoteStatus::Idle { me: me.to_string() }),
+        );
         let peering = match queued.take() {
             Some(peering) => peering,
             None => match decisions.next().await {
@@ -228,6 +279,11 @@ async fn run(
     // Filled in by the rate loop below, read by the encode loop. Stays empty
     // unless this attempt turns out to be one that can measure the link.
     let target: adapt::Target = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Set when a session comes back, read by the encode loop. A subscriber that
+    // rejoins mid-stream cannot decode until a keyframe arrives, and the encoder
+    // already inserts one every two seconds -- so this only buys back that wait,
+    // but the wait is a frozen tile and worth buying.
+    let keyframe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let rendition = config
             .probe()
             .await
@@ -261,7 +317,17 @@ async fn run(
             Err(error) => tracing::warn!("[audio] the microphone is not being published: {error}"),
         }
 
-        let inbound = moq_net::Origin::random().produce();
+        // **Lingers rather than tearing down.** A session dying abruptly detaches
+        // the peer's broadcast from this origin, and with the default zero
+        // linger that closes it on the spot: our decoder's read ends, the task
+        // returns, the tile goes black -- and nothing ever re-subscribes, so the
+        // transport quietly redialling underneath changes nothing. A linger
+        // keeps the path announced instead, and a session re-attaching within
+        // the window splices into the same broadcast, so the gap is never
+        // observed above this line.
+        let inbound = moq_net::origin::Info::new(moq_net::Origin::random())
+            .with_linger(linger)
+            .produce();
 
         let peer_transport: Peer = match peering {
             Peering::Dial(peer) => {
@@ -274,11 +340,12 @@ async fn run(
                 let url: url::Url = format!("iroh://{peer}")
                     .parse()
                     .map_err(|error| format!("could not build a dial url: {error}"))?;
-                let client = moq_native::ClientConfig::default()
+                let client = client_config
+                    .clone()
                     .init()
                     .map_err(|error| format!("could not build a client: {error:#}"))?
                     .with_iroh(endpoint.clone());
-                let session = client
+                let mut session = client
                     .with_publisher(&outbound)
                     .with_subscriber(inbound.clone())
                     .reconnect(url);
@@ -287,11 +354,44 @@ async fn run(
                 // one rather than being restarted.
                 let bandwidth = Some(session.send_bandwidth());
                 let stats = Some(session.stats());
+                let status = status.clone();
+                let keyframe = keyframe.clone();
+                let label = peer.to_string();
                 Peer {
+                    // **The status stream, not `closed()`.** They end at the
+                    // same place -- the error the retry loop gives up with --
+                    // but this one also says when the link went away and when it
+                    // came back. Without it a drop is invisible: the loop
+                    // underneath has always redialled, it just did it silently,
+                    // and the interface went on claiming a connection that was
+                    // not there.
                     closed: Box::pin(async move {
-                        match session.closed().await {
-                            Ok(()) => "the peer closed the session".to_string(),
-                            Err(error) => format!("{error:#}"),
+                        // The first connect is the subscriber's to report: it
+                        // arrives when the peer's video does, which is what
+                        // "connected" means to a person watching a tile.
+                        let mut connected = false;
+                        loop {
+                            match session.status().await {
+                                Ok(moq_native::Status::Connected) => {
+                                    if connected {
+                                        tracing::info!("reconnected to {label}");
+                                        keyframe
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                                        let _ = status.unbounded_send(RemoteStatus::Connected {
+                                            peer: Some(label.clone()),
+                                        });
+                                    }
+                                    connected = true;
+                                }
+                                Ok(moq_native::Status::Disconnected) => {
+                                    tracing::warn!("the session dropped; redialling {label}");
+                                    let _ = status.unbounded_send(RemoteStatus::Reconnecting);
+                                }
+                                // `Status` is non-exhaustive: a variant added
+                                // upstream is not news we can act on.
+                                Ok(_) => {}
+                                Err(error) => return format!("{error:#}"),
+                            }
                         }
                     }),
                     bandwidth,
@@ -331,23 +431,92 @@ async fn run(
                 // the shared handle with it and leave the next attempt without
                 // one.
                 let metrics = metrics.clone();
-                Peer {
-                    closed: Box::pin(async move {
-                        while let Some(request) = server.accept().await {
-                            let estimate = estimate.clone();
-                            let metrics = metrics.clone();
-                            tokio::spawn(async move {
-                                match request.ok().await {
-                                    Ok(session) => {
-                                        adapt::forward(session, estimate, metrics).await
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!("a session failed to start: {error:#}")
-                                    }
+                let status = status.clone();
+                let keyframe = keyframe.clone();
+                // **Accepting is its own task, not a branch below.** A listener
+                // has to watch two things at once -- new sessions and the ones
+                // it has -- and `accept` parks half-finished handshakes on the
+                // server itself, so dropping it mid-poll to take the other
+                // branch could lose exactly the reconnection being waited for.
+                // `true` says a session began, `false` that one ended; the
+                // channel closing says the server did.
+                let (sessions, mut events) = futures_channel::mpsc::unbounded::<bool>();
+                let accepting = Abort(tokio::spawn(async move {
+                    while let Some(request) = server.accept().await {
+                        let _ = sessions.unbounded_send(true);
+                        let estimate = estimate.clone();
+                        let metrics = metrics.clone();
+                        let sessions = sessions.clone();
+                        tokio::spawn(async move {
+                            match request.ok().await {
+                                Ok(session) => adapt::forward(session, estimate, metrics).await,
+                                Err(error) => {
+                                    tracing::warn!("a session failed to start: {error:#}")
                                 }
-                            });
+                            }
+                            let _ = sessions.unbounded_send(false);
+                        });
+                    }
+                }));
+                Peer {
+                    // Nothing here dials, so "reconnecting" is only ever a count
+                    // of live sessions: the peer redials us. What this adds is
+                    // the ending a listener never had -- before it, a peer that
+                    // dropped or quit outright left the call sitting at
+                    // "connected" on a dead session until the app was restarted.
+                    closed: Box::pin(async move {
+                        // Aborted with this future, which is what stops the
+                        // server when the attempt is over.
+                        let _accepting = accepting;
+                        let mut live = 0usize;
+                        // Only the empty state has a deadline. A listener that
+                        // has never been called waits forever, as it always did.
+                        let mut empty_since: Option<tokio::time::Instant> = None;
+
+                        loop {
+                            let expiry = empty_since.map(|at| at + linger);
+                            let expired = async move {
+                                match expiry {
+                                    Some(at) => tokio::time::sleep_until(at).await,
+                                    None => std::future::pending::<()>().await,
+                                }
+                            };
+                            tokio::select! {
+                                () = expired => return "the peer did not come back".to_string(),
+                                event = events.next() => match event {
+                                    Some(true) => {
+                                        // Reported on the way back only. The
+                                        // first connection is the subscriber's
+                                        // to announce, when the peer's video
+                                        // actually arrives -- a session exists
+                                        // some time before that is true.
+                                        if empty_since.take().is_some() {
+                                            tracing::info!("the peer is back");
+                                            keyframe.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            let _ = status.unbounded_send(
+                                                RemoteStatus::Connected { peer: None },
+                                            );
+                                        }
+                                        live += 1;
+                                    }
+                                    Some(false) => {
+                                        live = live.saturating_sub(1);
+                                        if live == 0 {
+                                            tracing::warn!(
+                                                "the peer's session ended; waiting for it to come back"
+                                            );
+                                            empty_since = Some(tokio::time::Instant::now());
+                                            let _ = status
+                                                .unbounded_send(RemoteStatus::Reconnecting);
+                                        }
+                                    }
+                                    None => return "the listener stopped".to_string(),
+                                },
+                            }
                         }
-                        "the listener stopped".to_string()
                     }),
                     bandwidth,
                     stats: None,
@@ -416,8 +585,17 @@ async fn run(
         let mut encoding = tokio::task::spawn_blocking({
             let stop = stop.clone();
             let target = target.clone();
+            let keyframe = keyframe.clone();
             move || {
-                let outcome = encode(&mut feed, &mut encoder, &mut producer, scale, &target, &stop);
+                let outcome = encode(
+                    &mut feed,
+                    &mut encoder,
+                    &mut producer,
+                    scale,
+                    &target,
+                    &keyframe,
+                    &stop,
+                );
                 (feed, encoder, producer, outcome)
             }
         });
@@ -480,8 +658,19 @@ async fn run(
 
         parked = Some(feed);
 
+        // **An ending is not the end of the thread.** The endpoint is still
+        // bound and our key is still the one we handed out, so a call that
+        // dropped for good can be replaced from the same window -- which is the
+        // difference between a reconnection policy and a restart.
         match outcome {
-            Some(outcome) => return outcome,
+            Some(Ok(())) => {
+                tracing::info!("call ended");
+                ending = Some(RemoteStatus::Ended);
+            }
+            Some(Err(error)) => {
+                tracing::error!("call failed: {error}");
+                ending = Some(RemoteStatus::Failed { error });
+            }
             None => tracing::info!("call cancelled; back to idle"),
         }
     }
@@ -496,6 +685,7 @@ fn encode(
     producer: &mut moq_video::encode::Producer,
     scale: usize,
     target: &adapt::Target,
+    keyframe: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
     loop {
@@ -511,6 +701,13 @@ fn encode(
             if let Err(error) = encoder.set_bitrate(bitrate) {
                 tracing::warn!("could not move the encoder to {bitrate} bps: {error:#}");
             }
+        }
+        // A peer that has just rejoined is holding a frozen tile until it gets
+        // one of these. Asked for on the next frame rather than immediately,
+        // which is the same rule the bitrate above follows and for the same
+        // reason: this thread owns the encoder.
+        if keyframe.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            encoder.keyframe();
         }
         // `take` errors only when every tap has dropped: the camera going away
         // for good, rather than a gap between frames.

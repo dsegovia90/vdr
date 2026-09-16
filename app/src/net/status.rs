@@ -52,9 +52,19 @@ pub enum RemoteStatus {
         /// inventing information.
         peer: Option<String>,
     },
-    /// The call ended. Terminal: nothing here redials.
+    /// The session dropped and the stack is trying to get it back.
+    ///
+    /// Not an error: the transport redials on its own, the peer's broadcast is
+    /// held open meanwhile, and a call that comes back inside the window resumes
+    /// where it left off rather than starting again. It becomes
+    /// [`Failed`](Self::Failed) only when the retry budget runs out.
+    Reconnecting,
+    /// The call ended.
+    ///
+    /// No longer terminal: the endpoint stays bound and our key stays the same,
+    /// so the next call is a choice away rather than a restart.
     Ended,
-    /// Something failed. Terminal for the same reason.
+    /// Something failed. Recoverable in the same way.
     Failed {
         /// What went wrong, already formatted -- the transport's error types
         /// do not survive crossing to the UI thread usefully.
@@ -72,8 +82,15 @@ impl RemoteStatus {
     ///
     /// A mistyped key leaves the endpoint bound and the choice open, so it
     /// counts as waiting rather than as an ending.
+    ///
+    /// So do [`Ended`](Self::Ended) and [`Failed`](Self::Failed), which is what
+    /// makes the controls come back after a call drops for good. They keep their
+    /// own text while they are up, so the status line still says why.
     pub fn is_waiting(&self) -> bool {
-        matches!(self, Self::Idle { .. } | Self::BadKey { .. })
+        matches!(
+            self,
+            Self::Idle { .. } | Self::BadKey { .. } | Self::Ended | Self::Failed { .. }
+        )
     }
 
     /// Whether the choice already made can still be taken back.
@@ -89,10 +106,17 @@ impl RemoteStatus {
     /// back, which read as a flash. It is also **genuinely** cancellable: a
     /// cancel sent during it waits in the decision channel and is taken by the
     /// `select!` as soon as that is reached, so the button is not a decoration.
+    ///
+    /// [`Reconnecting`](Self::Reconnecting) counts too, and for the reason
+    /// `Connected` does not: there is no peer on the other end to tell. Giving
+    /// up on a call that is already down costs nobody an explanation.
     pub fn is_cancellable(&self) -> bool {
         matches!(
             self,
-            Self::AwaitingCamera | Self::Listening { .. } | Self::Dialing { .. }
+            Self::AwaitingCamera
+                | Self::Listening { .. }
+                | Self::Dialing { .. }
+                | Self::Reconnecting
         )
     }
 }
@@ -109,6 +133,7 @@ impl fmt::Display for RemoteStatus {
             Self::Dialing { peer } => write!(f, "Dialing {peer}..."),
             Self::Connected { peer: Some(peer) } => write!(f, "Connected to {peer}"),
             Self::Connected { peer: None } => write!(f, "Connected"),
+            Self::Reconnecting => write!(f, "Connection lost. Reconnecting..."),
             Self::Ended => write!(f, "Call ended"),
             Self::Failed { error } => write!(f, "Call failed: {error}"),
         }

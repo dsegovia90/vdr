@@ -77,8 +77,9 @@ pub struct Remote {
 /// loopback is not a mock: it runs the same encoder, the same decoder and the
 /// same drain, so what it proves carries over.
 ///
-/// Runs once. Redialling, hanging up and calling a second peer all need a UI
-/// that does not exist yet, and each is a decision rather than a detail.
+/// Runs once, and the call thread it starts outlives any one call: an ending
+/// puts the controls back rather than closing the app down. Hanging up on a
+/// live peer and calling a second one still need decisions nothing here makes.
 pub fn use_remote() -> Remote {
     let mut status = use_signal(|| RemoteStatus::Binding);
     let mut me = use_signal(|| Option::<String>::None);
