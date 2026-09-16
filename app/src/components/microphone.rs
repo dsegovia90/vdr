@@ -136,7 +136,7 @@ pub fn MicrophoneRow(props: MicrophoneProps) -> Element {
     };
 
     rsx! {
-        div { class: "relative z-10 flex flex-row items-end gap-3",
+        div { class: "flex flex-row items-end gap-3",
             Dropdown {
                 label: "Microphone",
                 options,

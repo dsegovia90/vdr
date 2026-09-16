@@ -132,10 +132,7 @@ pub fn Camera() -> Element {
     };
 
     rsx! {
-        // Blitz sorts z-index among siblings only -- it has no stacking
-        // contexts -- so the dropdown's own z-20 never competes with the
-        // canvas, which lives under the next sibling. The row has to win here.
-        div { class: "relative z-20 flex flex-row items-end gap-3",
+        div { class: "flex flex-row items-end gap-3",
             Dropdown {
                 label: "Camera",
                 options,
@@ -181,7 +178,7 @@ pub fn Camera() -> Element {
             // Mirrored, because that is what people expect of their own
             // preview. Remote participants get `Mirror::None`.
             mirror: Mirror::SelfView,
-            class: "w-full max-w-4xl -z-1",
+            class: "w-full max-w-4xl",
         }
         ParticipantVideo {
             label: "remote",
@@ -189,7 +186,7 @@ pub fn Camera() -> Element {
             // Not a self-view: these frames took the path a peer's would, and
             // mirroring them would be the bug task 9 removed.
             mirror: Mirror::None,
-            class: "w-full max-w-4xl -z-1",
+            class: "w-full max-w-4xl",
         }
         p {
             class: if remote.status.read().is_error() { "text-sm text-red-400" } else { "text-sm text-neutral-400" },

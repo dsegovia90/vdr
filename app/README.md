@@ -58,7 +58,7 @@ cameras::pump (worker thread)
   cannot work here. Its `Registry` also exposes no public frame *reader* — only
   `publish_frame` — so its frames are unreachable except over that HTTP server.
   We depend on the underlying `cameras` crate directly instead.
-- **`wgpu` is pinned to 26** to match dioxus-native 0.7.10 -> anyrender_vello 0.6.
+- **`wgpu` is 27**, fixed by the pinned blitz revision -> anyrender_vello 0.7.
   Textures are handed to vello, so both must be the same wgpu version.
 - **No `<select>`.** Blitz ships no interactive select widget, hence
   `components/dropdown.rs`.
@@ -68,22 +68,27 @@ cameras::pump (worker thread)
 - **Tailwind v4 renders correctly**, including `@layer`, `@property`,
   `color-mix()` and `oklch()` colours — Blitz styles through Stylo, which is
   Firefox's engine, so the modern CSS surface is well covered.
-- **There are no stacking contexts.** Blitz sorts `z-index` among direct
-  siblings only (`blitz-dom` `layout/damage.rs`), so a `z-index` deep inside one
-  subtree never competes with content in another. An overlay has to carry its
-  z-index on whichever ancestor is a sibling of what it must cover — see the
-  controls row in `components/camera.rs`. The same ordering drives hit-testing,
-  so getting this wrong sends clicks to the wrong element too.
+- **Stacking contexts work.** `Node::is_stacking_context_root` implements the
+  usual rules (opacity, position with a z-index, transforms), painting hoists
+  negative and positive z-index children around the regular ones, and
+  hit-testing consults the same hoisted set — so ordering and clicks agree. An
+  earlier revision sorted `z-index` among direct siblings only, and that is what
+  the z-index classes in `components/camera.rs` were written for.
+- **An absolutely positioned overlay paints but never receives clicks** when it
+  overflows its parent's box — `Node::hit` will not descend into it. This is why
+  the dropdown menu renders in normal flow and pushes the content below it down
+  while open, which looks like a bug and is not. Five alternatives were tried.
 - **`border-radius` does not clip the canvas.** `rounded-lg` on the video
   container leaves the frame's own corners square.
 - **BGRA frames skip the CPU entirely** — they upload straight into a
   `Bgra8Unorm` texture and the shader samples them as RGBA. Other formats
   (NV12, YUYV, MJPEG) still go through `cameras::to_rgba8` on the CPU.
-- **The preview sits at ~24fps** at 1080p, and that is the *camera's* delivery
-  rate, not a renderer limit. With one stream the counters read
-  `camera 24.0 fps -> preview 24.0 fps (0 dropped)` — nothing is being dropped.
-  Run with `RUST_LOG=vdr=debug` to see it.
-- **Multi-stream is where it gets expensive.** Three streams roughly halves the
-  paint rate: each paint does 3x (8MB upload + render pass + submit) at full
-  1080p to fill ~700px tiles. Capturing nearer to display size is the fix — see
-  `tasklist.md` task 15.
+- **The preview runs at whatever the camera delivers**, not at a renderer limit.
+  The counters say which: `camera 30.0 fps -> preview 30.0 fps (0 dropped)` under
+  `RUST_LOG=vdr=debug`. A low camera number is capture; a low preview number
+  against a healthy camera number is the paint path.
+- **Capture size is what makes multi-stream expensive.** Each paint uploads every
+  visible stream in full, so capturing far above the size of the tile it fills is
+  the cost that matters. Frames reaching the encoder are downscaled by an integer
+  factor first (`camera/frames.rs`, `encode_size`); capture itself is still
+  negotiated against a fixed request in `components/camera.rs`.
