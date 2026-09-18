@@ -8755,6 +8755,7 @@ dependencies = [
  "futures-util",
  "iroh",
  "moq-audio",
+ "moq-json",
  "moq-mux",
  "moq-native",
  "moq-net",

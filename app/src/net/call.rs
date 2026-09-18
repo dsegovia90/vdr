@@ -95,6 +95,60 @@ fn camera_path(participant: &str) -> String {
     format!("{participant}/{CAMERA}")
 }
 
+/// Where a participant says what they are doing, rather than shows it.
+///
+/// **A broadcast of its own, not a track inside the camera's.** Being in a call
+/// is not the same as publishing video -- someone with the camera off is still
+/// here -- and the `.hang` suffix deliberately does not appear, because that is
+/// what catalog-format detection keys off and this is not media.
+const CONTROL: &str = "control";
+
+/// The document inside it.
+const PRESENCE: &str = "presence.json";
+
+/// How much a control message preempts media. Matches what `hang` gives its own
+/// catalog, which is the same kind of traffic: small, structural, and useless
+/// late.
+const CONTROL_PRIORITY: u8 = 100;
+
+/// What a participant says about themselves.
+///
+/// **State, not messages.** The newest value wins and older ones are dropped, so
+/// there is no ordering to get right, nothing to acknowledge and nothing to
+/// retry -- a peer that misses an intermediate value still converges on the
+/// right answer. That is what `moq-json`'s snapshot mode is for, and it is why
+/// this is the cheap shape rather than a compromise.
+///
+/// Deliberately one field. Roles, candidacy and topology opinions are tickets
+/// 22 and 23, and they extend this document rather than inventing their own.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Presence {
+    state: State,
+}
+
+/// The one thing a participant currently says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum State {
+    /// On the call.
+    #[default]
+    Here,
+    /// Going, deliberately. The whole point of having a channel: a peer that
+    /// says this is telling us apart from a peer whose network died.
+    Leaving,
+}
+
+/// Where `participant` publishes theirs.
+fn control_path(participant: &str) -> String {
+    format!("{participant}/{CONTROL}")
+}
+
+/// Whose control broadcast an announced path is.
+fn controller_of(path: &str) -> Option<&str> {
+    let id = path.strip_suffix(CONTROL)?.strip_suffix('/')?;
+    (!id.is_empty()).then_some(id)
+}
+
 /// Whose broadcast an announced path is, or `None` if it is not a camera.
 ///
 /// **Self-declared, and therefore not proof.** Between two peers who dialled
@@ -370,6 +424,27 @@ async fn run(
             moq_video::encode::Producer::with_track(track, catalog.clone(), rendition)
                 .map_err(|error| format!("could not publish video: {error:#}"))?;
 
+        // Announced beside the camera, and said before anything is shown: the
+        // peer knows we are here whether or not a frame ever arrives.
+        let mut control = outbound
+            .create_broadcast(
+                control_path(&me.to_string()),
+                moq_net::broadcast::Route::new().with_announce(true),
+            )
+            .map_err(|error| format!("could not create a control broadcast: {error:#}"))?;
+        let mut presence = control
+            .create_track(PRESENCE, None)
+            .map(|track| {
+                moq_json::snapshot::Producer::new(
+                    track,
+                    moq_json::snapshot::ProducerConfig::default(),
+                )
+            })
+            .map_err(|error| format!("could not create a presence track: {error:#}"))?;
+        if let Err(error) = presence.update(&Presence { state: State::Here }) {
+            tracing::warn!("could not publish our presence: {error:#}");
+        }
+
         let engine = audio::open_playback().await;
         match audio::publish(broadcast.clone(), catalog, engine.as_ref()) {
             Ok((publication, driver)) => {
@@ -608,15 +683,23 @@ async fn run(
             })
         });
 
-        // One loop for both media now, because both start at the same place: a
-        // participant announcing themselves. It replaces two waits on one
-        // well-known path, which is what limited a call to exactly two people.
+        // One loop for everything that arrives, because it all starts at the
+        // same place: a participant announcing themselves. It replaces two
+        // waits on one well-known path, which is what limited a call to exactly
+        // two people.
+        //
+        // `hungup` is how it says the last person left -- deliberately, which is
+        // the difference a control plane buys.
+        let (hangup, mut hungup) = futures_channel::mpsc::unbounded::<String>();
         let decode = tokio::spawn(attend(
             inbound.consume(),
             me.to_string(),
-            status.clone(),
-            participants.clone(),
-            metrics.clone(),
+            Reports {
+                status: status.clone(),
+                participants: participants.clone(),
+                hangup,
+                metrics: metrics.clone(),
+            },
             engine,
             controls.clone(),
         ));
@@ -665,6 +748,13 @@ async fn run(
                 }
                 Err(error) => Some(Err(format!("the encode thread failed: {error}"))),
             },
+            left = hungup.next() => {
+                match left {
+                    Some(who) => tracing::info!("{who} hung up"),
+                    None => tracing::warn!("the attendance loop stopped"),
+                }
+                Some(Ok(()))
+            }
             cancelled = decisions.next() => match cancelled {
                 Some(Peering::Idle) => None,
                 Some(next) => {
@@ -687,12 +777,32 @@ async fn run(
             },
         };
 
+        // **Finish the media, then say goodbye, then unannounce** -- in that
+        // order, because each step is only true once the one before it is.
+        // Writing a flushed frame into a broadcast that has already been
+        // finished re-announces it, which the peer reads as somebody leaving and
+        // immediately rejoining; observed as a `left`/`joined` pair 53
+        // microseconds apart before this was ordered properly.
         if let Ok(flushed) = encoder.flush() {
             if !flushed.is_empty() {
                 producer.publish(&flushed).ok();
             }
         }
         producer.finish().ok();
+
+        // **Said, then shown.** The document is advisory -- it is what lets the
+        // peer say "they hung up" rather than "they vanished" -- but `finish`
+        // is what ends it: a deliberate unannounce closes the broadcast on the
+        // peer immediately, where an abrupt loss lingers for the reconnect
+        // window instead. If the last word does not make it, the unannounce
+        // still does.
+        if let Err(error) = presence.update(&Presence {
+            state: State::Leaving,
+        }) {
+            tracing::warn!("could not say we are leaving: {error:#}");
+        }
+        control.finish();
+        broadcast.finish();
         decode.abort();
         if let Some(rate) = rate {
             rate.abort();
@@ -790,6 +900,19 @@ fn encode(
     }
 }
 
+/// Everywhere the attendance loop reports, gathered so its signature stays
+/// readable rather than growing a parameter per audience.
+struct Reports {
+    /// What the call is doing.
+    status: UnboundedSender<RemoteStatus>,
+    /// Who is here, and where their frames land.
+    participants: UnboundedSender<ParticipantEvent>,
+    /// Said once, when the last of them has gone deliberately.
+    hangup: UnboundedSender<String>,
+    /// Live numbers for the interface.
+    metrics: Arc<Metrics>,
+}
+
 /// Watches who is here, and gives each of them a tile and a decoder.
 ///
 /// **An announcement is the join, and its withdrawal is the leave** -- there is
@@ -804,12 +927,16 @@ fn encode(
 async fn attend(
     inbound: moq_net::origin::Consumer,
     me: String,
-    status: UnboundedSender<RemoteStatus>,
-    participants: UnboundedSender<ParticipantEvent>,
-    metrics: Arc<Metrics>,
+    reports: Reports,
     engine: Option<moq_audio::playback::Engine>,
     controls: Arc<Controls>,
 ) {
+    let Reports {
+        status,
+        participants,
+        hangup,
+        metrics,
+    } = reports;
     let mut announced = inbound.announced();
     // Dropping an entry aborts that participant's decoders, so leaving is the
     // same operation as the attempt ending.
@@ -820,9 +947,64 @@ async fn attend(
     // a mixer -- neither of which can be tested before a call can hold three
     // people. Named here rather than discovered at that call.
     let mut engine = engine;
+    // Who has a live control broadcast. Presence is this, not the camera: a
+    // participant with no video is still on the call, and this is the set whose
+    // emptying means the call is over.
+    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut listening: std::collections::HashMap<String, Abort> =
+        std::collections::HashMap::new();
+    // Where the per-participant readers report a goodbye. One arbiter, so the
+    // rule for "is the call over" is written once.
+    let (saying, mut said) = futures_channel::mpsc::unbounded::<String>();
 
-    while let Some(update) = announced.next().await {
+    loop {
+        let update = tokio::select! {
+            update = announced.next() => match update {
+                Some(update) => update,
+                None => break,
+            },
+            goodbye = said.next() => {
+                if let Some(id) = goodbye {
+                    tracing::info!("{id} is leaving");
+                    listening.remove(&id);
+                    if present.remove(&id) && present.is_empty() {
+                        let _ = hangup.unbounded_send(id);
+                    }
+                }
+                continue;
+            }
+        };
         let path = update.path.as_str().to_string();
+
+        if let Some(id) = controller_of(&path) {
+            if id == me {
+                continue;
+            }
+            match update.broadcast {
+                Some(broadcast) => {
+                    present.insert(id.to_string());
+                    listening.insert(
+                        id.to_string(),
+                        Abort(tokio::spawn(listen(
+                            broadcast,
+                            id.to_string(),
+                            saying.clone(),
+                        ))),
+                    );
+                }
+                None => {
+                    // An unannounce is the authoritative goodbye. Deliberate,
+                    // it arrives at once; abrupt, it waits out the linger, by
+                    // which time the reconnect has already given up.
+                    listening.remove(id);
+                    if present.remove(id) && present.is_empty() {
+                        let _ = hangup.unbounded_send(id.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+
         let Some(id) = participant_of(&path) else {
             tracing::debug!("ignoring an announcement at {path}");
             continue;
@@ -863,6 +1045,61 @@ async fn attend(
             tracing::warn!("[audio] {id}'s audio is not being played: the engine is taken");
         }
         attending.insert(id.to_string(), tasks);
+    }
+}
+
+/// Reads one participant's state document for as long as they publish it.
+///
+/// **A document, not a mailbox.** Every value is the whole of what they are
+/// saying, so nothing here tracks what it has seen before or asks for anything
+/// to be repeated. Saying *leaving* is the one thing that ends a call from the
+/// far side rather than from the transport.
+async fn listen(
+    broadcast: moq_net::broadcast::Consumer,
+    id: String,
+    saying: UnboundedSender<String>,
+) {
+    let track = match broadcast.track(PRESENCE) {
+        Ok(track) => track,
+        Err(error) => {
+            tracing::warn!("{id} has no presence track: {error:#}");
+            return;
+        }
+    };
+    // Preempts media, the way hang prioritises its own catalog: this is small
+    // and structural, and late it is worthless.
+    let subscription =
+        moq_net::track::Subscription::default().with_priority(CONTROL_PRIORITY);
+    let track = match track.subscribe(subscription).await {
+        Ok(track) => track,
+        Err(error) => {
+            tracing::warn!("could not subscribe to {id}'s presence: {error:#}");
+            return;
+        }
+    };
+    let mut presence = moq_json::snapshot::Consumer::<Presence>::new(
+        track,
+        moq_json::snapshot::ConsumerConfig::default(),
+    );
+
+    loop {
+        match presence.next().await {
+            Ok(Some(Presence { state })) => {
+                tracing::info!("{id} says {state:?}");
+                if state == State::Leaving {
+                    // Reported, not acted on: whether the call is over is a
+                    // question about everyone, and the loop that tracks
+                    // everyone answers it.
+                    let _ = saying.unbounded_send(id);
+                    return;
+                }
+            }
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!("could not read {id}'s presence: {error:#}");
+                return;
+            }
+        }
     }
 }
 
@@ -985,6 +1222,23 @@ mod path_tests {
     fn a_participant_is_read_off_the_path_they_publish_under() {
         let me = "3929461daf6e4354";
         assert_eq!(participant_of(&camera_path(me)), Some(me));
+    }
+
+    #[test]
+    fn a_controller_is_read_the_same_way() {
+        let me = "3929461daf6e4354";
+        assert_eq!(controller_of(&control_path(me)), Some(me));
+        // The two must not read each other's paths: a control broadcast is not
+        // media, and a camera is not a document.
+        assert_eq!(controller_of(&camera_path(me)), None);
+        assert_eq!(participant_of(&control_path(me)), None);
+    }
+
+    #[test]
+    fn control_is_deliberately_not_a_hang_broadcast() {
+        // Catalog-format detection keys off the suffix, and this carries a JSON
+        // document rather than media.
+        assert!(!control_path("anyone").ends_with(".hang"));
     }
 
     #[test]

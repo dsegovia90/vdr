@@ -55,6 +55,7 @@ pub fn ConnectRow(
 
     let waiting = status.read().is_waiting();
     let cancellable = status.read().is_cancellable();
+    let connected = status.read().is_connected();
     // Neither choosing nor able to unchoose: a call is up, or it ended. The
     // status line says the rest.
     //
@@ -89,7 +90,10 @@ pub fn ConnectRow(
                 div { class: "flex flex-row items-center gap-3",
                     Button {
                         onclick: move |_| cancel.call(()),
-                        "Cancel"
+                        // The same button either way, because it is the same
+                        // decision -- but once someone is on the other end it
+                        // tells them, which is what earns the other word.
+                        if connected { "Hang up" } else { "Cancel" }
                     }
                 }
             }

@@ -44,12 +44,12 @@ pub enum RemoteStatus {
     },
     /// Connected, and the peer's video is arriving.
     Connected {
-        /// The peer's endpoint id, when we know it.
+        /// The peer's endpoint id.
         ///
-        /// `None` on the accepting side: iroh exposes no client identity to a
-        /// server, so `--listen` genuinely does not learn who called until
-        /// something above the transport says so. Naming it anyway would be
-        /// inventing information.
+        /// Known on both sides now: iroh exposes no client identity to a
+        /// server, so a listener cannot learn it from the transport -- it reads
+        /// it off the path the peer publishes under instead. `None` only where
+        /// nothing has said yet.
         peer: Option<String>,
     },
     /// The session dropped and the stack is trying to get it back.
@@ -78,6 +78,12 @@ impl RemoteStatus {
         matches!(self, Self::Failed { .. } | Self::BadKey { .. })
     }
 
+    /// Whether a peer is on the other end, which is what makes stopping a
+    /// hang-up rather than a cancel.
+    pub fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected { .. })
+    }
+
     /// Whether the user still has a decision to make.
     ///
     /// A mistyped key leaves the endpoint bound and the choice open, so it
@@ -95,10 +101,9 @@ impl RemoteStatus {
 
     /// Whether the choice already made can still be taken back.
     ///
-    /// Only *before* a peer is on the other end. Once
-    /// [`Connected`](Self::Connected), stopping is a hang-up: the peer has to be
-    /// told, and there is no channel to tell them on — that is ticket 29, and
-    /// deliberately not this.
+    /// [`Connected`](Self::Connected) counts now: stopping then is a hang-up,
+    /// which needed a channel to tell the peer on, and there is one. The button
+    /// says so rather than saying "cancel".
     ///
     /// [`AwaitingCamera`](Self::AwaitingCamera) counts, for two reasons. It is
     /// the state between choosing and listening — a second or two of camera wait
@@ -107,9 +112,9 @@ impl RemoteStatus {
     /// cancel sent during it waits in the decision channel and is taken by the
     /// `select!` as soon as that is reached, so the button is not a decoration.
     ///
-    /// [`Reconnecting`](Self::Reconnecting) counts too, and for the reason
-    /// `Connected` does not: there is no peer on the other end to tell. Giving
-    /// up on a call that is already down costs nobody an explanation.
+    /// [`Reconnecting`](Self::Reconnecting) counts for a simpler reason than
+    /// `Connected`: there is nobody reachable to tell, so giving up on a call
+    /// that is already down costs no explanation at all.
     pub fn is_cancellable(&self) -> bool {
         matches!(
             self,
@@ -117,6 +122,7 @@ impl RemoteStatus {
                 | Self::Listening { .. }
                 | Self::Dialing { .. }
                 | Self::Reconnecting
+                | Self::Connected { .. }
         )
     }
 }
