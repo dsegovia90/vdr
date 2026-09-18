@@ -21,6 +21,7 @@
 //! vdr --loopback                          # no network; the codec round trip
 //! vdr --camera facetime                   # picks a camera by name
 //! vdr --quality high                      # 720p rung; low | mid | high, mid by default
+//! vdr --ephemeral                         # a throwaway key, not the saved one
 //! vdr --encode-width 1920                 # encode at capture size, for A/B tests
 //! ```
 //!
@@ -28,8 +29,13 @@
 //! way in, not a replacement: driving two instances from a script is how the
 //! network path gets tested, and a headless session has no other way to do it.
 //!
-//! `--secret` makes the endpoint id stable across launches, so the peer's id
-//! can be written down once instead of copied every run.
+//! **The endpoint id is stable across launches on its own now**, because the
+//! secret is kept in a file beside the settings — a key someone wrote down last
+//! week still dials. `--secret` overrides that file, and `--ephemeral` skips it
+//! for a throwaway key.
+//!
+//! Two instances on one machine therefore need one of those two, or they are
+//! literally the same endpoint. `--ephemeral` is the easy one.
 //!
 //! `--camera` is for pointing two instances on one machine at different
 //! devices, so it is obvious on screen which window is which. macOS does let
@@ -136,6 +142,12 @@ pub struct Args {
     pub camera: Option<String>,
     /// Which rung the encoder runs at. Everyone defaults to the same one.
     pub quality: Quality,
+    /// Start with a throwaway key instead of the saved one.
+    ///
+    /// The identity is normally persisted, so our key is an address that keeps
+    /// working. Two instances on one machine would then be the *same* endpoint,
+    /// which is the project's own test loop — so the second one runs with this.
+    pub ephemeral: bool,
     /// Widest the encoder may run, overriding the tier.
     ///
     /// For comparing sizes on a real link, which is the only place the
@@ -169,11 +181,13 @@ impl Args {
         let mut peering = Peering::Idle;
         let mut camera = None;
         let mut quality = Quality::default();
+        let mut ephemeral = false;
         let mut encode_width = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
                 "--loopback" => peering = Peering::Loopback,
+                "--ephemeral" => ephemeral = true,
                 "--dial" => match args.next().as_deref().map(str::parse::<EndpointId>) {
                     Some(Ok(peer)) => peering = Peering::Dial(peer),
                     Some(Err(error)) => tracing::error!("--dial is not an endpoint id: {error}"),
@@ -207,6 +221,7 @@ impl Args {
             peering,
             camera,
             quality,
+            ephemeral,
             encode_width,
         }
     }

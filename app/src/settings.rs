@@ -25,6 +25,30 @@ const APP_DIR: &str = "vdr";
 /// The settings file itself.
 const FILE: &str = "settings.json";
 
+/// Where our iroh secret key lives, next to the settings.
+const IDENTITY: &str = "identity.key";
+
+/// The file our endpoint's secret key is kept in, creating its directory if
+/// that is missing.
+///
+/// **We never read or write it** — the path is handed to `moq-native`, which
+/// generates a key into it on first use and reads it back afterwards, so there
+/// is no key handling of ours to get wrong. The directory is ours to create,
+/// because that write does not.
+///
+/// A permanent key means a permanent address: the string someone wrote down
+/// last week still dials. Deleting this file is how you stop being that person,
+/// and `--ephemeral` is how you run without one at all.
+pub fn identity_path() -> Option<std::path::PathBuf> {
+    let dirs = directories::BaseDirs::new()?;
+    let dir = dirs.data_local_dir().join(APP_DIR);
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("could not create {}: {error}", dir.display());
+        return None;
+    }
+    Some(dir.join(IDENTITY))
+}
+
 /// Everything the app remembers between launches.
 ///
 /// `#[serde(default)]` on the struct rather than `deny_unknown_fields`: a file

@@ -12,9 +12,9 @@
 //!
 //! and the right-hand branch has two implementations that differ only in the
 //! middle: [`call`] carries the packets over QUIC to another process, and
-//! [`loopback`] hands them straight back to a decoder in this one. Both end at
-//! the same [`FrameSlot`], which is why the renderer needs to know nothing
-//! about either.
+//! [`loopback`] hands them straight back to a decoder in this one. Both end in
+//! a [`FrameSlot`] -- one per participant on a call, one for the round trip in
+//! loopback -- which is why the renderer needs to know nothing about either.
 
 mod adapt;
 mod audio;
@@ -36,13 +36,51 @@ use crate::audio::Controls;
 use crate::camera::{frame_tap, FrameSlot, FrameTap};
 use crate::channel::use_channel;
 
-/// The second tile: a peer's video, or our own if there is no peer.
+/// Somebody whose video we are showing, and the name that keys their tile.
+///
+/// The id is their iroh endpoint id, read off the path they publish under. It
+/// is what `ParticipantVideo` has asked callers for since it was written: a key
+/// that survives the list reordering, so two people's video cannot swap tiles.
+#[derive(Clone)]
+pub struct Participant {
+    /// Their endpoint id.
+    pub id: String,
+    /// Their decoded frames.
+    pub slot: FrameSlot,
+}
+
+impl Participant {
+    /// Enough of the id to tell two people apart in a log or a label, without
+    /// carrying 64 hex characters around.
+    pub fn short(&self) -> String {
+        self.id.chars().take(8).collect()
+    }
+}
+
+/// What the call thread tells the interface about who is here.
+///
+/// Membership crosses as messages rather than as shared state because it is
+/// discovered on a worker thread and signals are `!Send` -- the same reason
+/// status does.
+pub(super) enum ParticipantEvent {
+    /// Somebody is publishing; here is where their frames will arrive.
+    Joined { id: String, slot: FrameSlot },
+    /// They stopped.
+    Left { id: String },
+    /// The call is over; everyone goes.
+    Cleared,
+}
+
+/// The call, as the interface sees it: who is here and what it is doing.
 #[derive(Clone)]
 pub struct Remote {
     /// Hand this to `use_camera_stream` so captured frames reach the encoder.
     pub tap: FrameTap,
-    /// Decoded frames, ready for a `ParticipantVideo`.
-    pub slot: FrameSlot,
+    /// Everyone else on the call, in the order they arrived.
+    ///
+    /// In `--loopback` this holds exactly one entry, our own round-tripped
+    /// video, so the interface has one way to render a tile rather than two.
+    pub participants: Signal<Vec<Participant>>,
     /// What the connection is doing, for the UI to show.
     pub status: Signal<RemoteStatus>,
     /// Our own endpoint id once bound, for the UI to show and copy.
@@ -83,6 +121,12 @@ pub struct Remote {
 pub fn use_remote() -> Remote {
     let mut status = use_signal(|| RemoteStatus::Binding);
     let mut me = use_signal(|| Option::<String>::None);
+    let mut participants = use_signal(Vec::<Participant>::new);
+    let joined = use_channel(move |event: ParticipantEvent| match event {
+        ParticipantEvent::Joined { id, slot } => participants.write().push(Participant { id, slot }),
+        ParticipantEvent::Left { id } => participants.write().retain(|p| p.id != id),
+        ParticipantEvent::Cleared => participants.write().clear(),
+    });
     // Status crosses from the call thread, which cannot touch a signal.
     let updates = use_channel(move |next: RemoteStatus| {
         // The key arrives inside a status rather than on its own channel: the
@@ -98,7 +142,6 @@ pub fn use_remote() -> Remote {
         let audio = Arc::new(Controls::default());
         let metrics = Arc::new(Metrics::default());
         let (tap, feed) = frame_tap();
-        let slot = FrameSlot::default();
         // The decision, not the feed, is what gets deferred. The call thread
         // takes the feed at startup and parks on this receiver after binding,
         // so there is no window where two pipelines could own one feed --
@@ -114,14 +157,21 @@ pub fn use_remote() -> Remote {
         match Args::get().peering.clone() {
             Peering::Loopback => {
                 status.set(RemoteStatus::Loopback);
+                let slot = FrameSlot::default();
                 loopback::spawn(feed, slot.clone(), audio.clone());
+                // A participant like any other, so the tile below is rendered by
+                // the same code a real peer's is.
+                participants.set(vec![Participant {
+                    id: "loopback".to_string(),
+                    slot,
+                }]);
             }
             peering => {
                 call::spawn(
                     decided,
                     feed,
-                    slot.clone(),
                     updates,
+                    joined,
                     audio.clone(),
                     metrics.clone(),
                 );
@@ -150,7 +200,7 @@ pub fn use_remote() -> Remote {
 
         Remote {
             tap,
-            slot,
+            participants,
             status,
             me,
             connect,

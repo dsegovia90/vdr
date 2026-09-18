@@ -180,13 +180,21 @@ pub fn Camera() -> Element {
             mirror: Mirror::SelfView,
             class: "w-full max-w-4xl",
         }
-        ParticipantVideo {
-            label: "remote",
-            slot: remote.slot,
-            // Not a self-view: these frames took the path a peer's would, and
-            // mirroring them would be the bug task 9 removed.
-            mirror: Mirror::None,
-            class: "w-full max-w-4xl",
+        // **Keyed, and that is the point of the id.** Without a key dioxus may
+        // reuse the wrong component instance when the list reorders, and two
+        // people's video swaps tiles. Read into a Vec first: holding the
+        // signal's guard across the nodes below would keep it borrowed while
+        // they render.
+        for participant in remote.participants.read().clone() {
+            ParticipantVideo {
+                key: "{participant.id}",
+                label: participant.short(),
+                slot: participant.slot.clone(),
+                // Not a self-view: these frames took the path a peer's would,
+                // and mirroring them would be the bug task 9 removed.
+                mirror: Mirror::None,
+                class: "w-full max-w-4xl",
+            }
         }
         p {
             class: if remote.status.read().is_error() { "text-sm text-red-400" } else { "text-sm text-neutral-400" },

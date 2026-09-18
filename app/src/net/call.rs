@@ -35,6 +35,7 @@ use super::adapt;
 use super::audio;
 use super::runtime::runtime;
 use super::status::RemoteStatus;
+use super::ParticipantEvent;
 use crate::args::Peering;
 use super::Metrics;
 use crate::audio::Controls;
@@ -76,11 +77,34 @@ struct Peer {
     stats: Option<moq_native::ConnectionStatsReader>,
 }
 
-/// The broadcast path both sides publish on.
+/// What a participant publishes their own camera and microphone under.
 ///
 /// The `.hang` suffix is load-bearing: catalog-format detection keys off it,
-/// and without it a subscriber finds nothing and says so only by timing out.
-const BROADCAST: &str = "call.hang";
+/// and without it a subscriber finds nothing and says so only by timing out. It
+/// therefore has to stay **last**, which is why the participant's id goes in
+/// front of it rather than behind.
+///
+/// One broadcast per (participant, role). A shared screen would be
+/// `<id>/screen.hang`: a second source from one person, not a second person.
+/// Audio rides here with the camera because the two together are one
+/// participant's live presence.
+const CAMERA: &str = "camera.hang";
+
+/// Where `participant` publishes.
+fn camera_path(participant: &str) -> String {
+    format!("{participant}/{CAMERA}")
+}
+
+/// Whose broadcast an announced path is, or `None` if it is not a camera.
+///
+/// **Self-declared, and therefore not proof.** Between two peers who dialled
+/// each other this is simply who they said they were, which is all it needs to
+/// be; once a relay is in the middle, token path-scoping is what makes it
+/// binding (ticket 23's job, not this one's).
+fn participant_of(path: &str) -> Option<&str> {
+    let id = path.strip_suffix(CAMERA)?.strip_suffix('/')?;
+    (!id.is_empty()).then_some(id)
+}
 
 /// The video track inside that broadcast.
 const TRACK: &str = "video.avc3";
@@ -117,6 +141,29 @@ const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How long to keep redialling a dropped peer before giving up on the call.
 const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Which secret key the endpoint comes up with, and therefore who we are.
+///
+/// Three answers, in order. `--secret` is forwarded into `IROH_SECRET` by
+/// `args`; moq-native reads its own `MOQ_IROH_SECRET`, so the two are bridged
+/// here rather than teaching `args` a second variable. `--ephemeral` is `None`,
+/// a throwaway key, which is what every launch used to be. Otherwise a **path**,
+/// which moq-native generates into on first use and reads back afterwards
+/// (hex parses as a key, anything else is treated as a file) -- so our id
+/// outlives the process and a key someone wrote down still dials.
+///
+/// The one hazard is two instances on one machine picking up the same file and
+/// being the same endpoint. That is what `--ephemeral` is for, and what the
+/// self-dial check below catches when nobody remembered.
+fn identity() -> Option<String> {
+    if let Ok(secret) = std::env::var("IROH_SECRET") {
+        return Some(secret);
+    }
+    if crate::args::Args::get().ephemeral {
+        return None;
+    }
+    crate::settings::identity_path().map(|path| path.to_string_lossy().into_owned())
+}
+
 /// Retry pacing, shared by both sides.
 ///
 /// Only the dialling side redials -- the listener has nothing to dial -- but
@@ -141,8 +188,8 @@ fn backoff() -> moq_native::Backoff {
 pub(super) fn spawn(
     decisions: futures_channel::mpsc::UnboundedReceiver<Peering>,
     feed: FrameFeed,
-    slot: FrameSlot,
     status: UnboundedSender<RemoteStatus>,
+    participants: UnboundedSender<ParticipantEvent>,
     controls: Arc<Controls>,
     metrics: Arc<Metrics>,
 ) {
@@ -156,7 +203,7 @@ pub(super) fn spawn(
                 return;
             };
             runtime.block_on(async move {
-                match run(decisions, feed, slot, &status, controls, metrics).await {
+                match run(decisions, feed, &status, participants, controls, metrics).await {
                     Ok(()) => {
                         tracing::info!("call ended");
                         let _ = status.unbounded_send(RemoteStatus::Ended);
@@ -173,7 +220,8 @@ pub(super) fn spawn(
     }
 }
 
-/// Binds, publishes, connects, and pumps the peer's video into `slot`.
+/// Binds, publishes, connects, and pumps every participant's video into a slot
+/// of its own.
 ///
 /// Errors are formatted rather than typed: they come from several crates with
 /// several error types, none of which the UI can do anything with beyond
@@ -181,8 +229,8 @@ pub(super) fn spawn(
 async fn run(
     mut decisions: futures_channel::mpsc::UnboundedReceiver<Peering>,
     feed: FrameFeed,
-    slot: FrameSlot,
     status: &UnboundedSender<RemoteStatus>,
+    participants: UnboundedSender<ParticipantEvent>,
     controls: Arc<Controls>,
     metrics: Arc<Metrics>,
 ) -> Result<(), String> {
@@ -200,10 +248,7 @@ async fn run(
     client_config.quic.idle_timeout = Some(IDLE_TIMEOUT);
     let mut iroh = moq_native::iroh::EndpointConfig::default();
     iroh.enabled = Some(true);
-    // `--secret` is forwarded into `IROH_SECRET` by `args`; moq-native reads its
-    // own `MOQ_IROH_SECRET`, so the two are bridged here rather than teaching
-    // `args` a second variable. Unset means a throwaway key, as before.
-    iroh.secret = std::env::var("IROH_SECRET").ok();
+    iroh.secret = identity();
     let endpoint = iroh
         .bind(&client_config.quic)
         .await
@@ -254,6 +299,19 @@ async fn run(
             },
         };
 
+        // Our own key dials nothing: iroh would try to reach an address that is
+        // this process. Worth a sentence rather than a hang, because pasting
+        // your own key is a thing people do -- and because two instances sharing
+        // the saved identity file land here, where the message can say so.
+        if matches!(&peering, Peering::Dial(peer) if *peer == me) {
+            tracing::warn!("refusing to dial ourselves: {me}");
+            ending = Some(RemoteStatus::BadKey {
+                reason: "that is your own key. Two windows on one machine need --ephemeral"
+                    .to_string(),
+            });
+            continue;
+        }
+
         report(RemoteStatus::AwaitingCamera);
         let Some(waiting) = parked.take() else {
             return Err("the camera feed is gone".to_string());
@@ -299,7 +357,7 @@ async fn run(
         let outbound = moq_net::Origin::random().produce();
         let mut broadcast = outbound
             .create_broadcast(
-                BROADCAST,
+                camera_path(&me.to_string()),
                 moq_net::broadcast::Route::new().with_announce(true),
             )
             .map_err(|error| format!("could not create a broadcast: {error:#}"))?;
@@ -550,29 +608,18 @@ async fn run(
             })
         });
 
-        let peer_label = match &peering {
-            Peering::Dial(peer) => Some(peer.to_string()),
-            _ => None,
-        };
-        let decode = tokio::spawn(subscribe(
+        // One loop for both media now, because both start at the same place: a
+        // participant announcing themselves. It replaces two waits on one
+        // well-known path, which is what limited a call to exactly two people.
+        let decode = tokio::spawn(attend(
             inbound.consume(),
-            slot.clone(),
+            me.to_string(),
             status.clone(),
-            peer_label,
+            participants.clone(),
             metrics.clone(),
+            engine,
+            controls.clone(),
         ));
-
-        let audio_decode = engine.map(|engine| {
-            let inbound = inbound.consume();
-            let controls = controls.clone();
-            tokio::spawn(async move {
-                let Some(broadcast) = inbound.announced_broadcast(BROADCAST).await else {
-                    tracing::warn!("[audio] the peer never announced {BROADCAST}");
-                    return;
-                };
-                audio::subscribe(broadcast, engine, controls).await;
-            })
-        });
 
         // **On a blocking thread, not in the `select!` below.** Converting a
         // frame and encoding it are synchronous and take a good fraction of the
@@ -647,9 +694,6 @@ async fn run(
         }
         producer.finish().ok();
         decode.abort();
-        if let Some(audio_decode) = audio_decode {
-            audio_decode.abort();
-        }
         if let Some(rate) = rate {
             rate.abort();
         }
@@ -658,7 +702,9 @@ async fn run(
         }
         metrics.clear();
         controls.detach();
-        slot.clear();
+        // Aborting the loop above stops the per-participant tasks with it, but
+        // the tiles are the interface's and have to be taken down by name.
+        let _ = participants.unbounded_send(ParticipantEvent::Cleared);
 
         parked = Some(feed);
 
@@ -744,25 +790,95 @@ fn encode(
     }
 }
 
-/// Waits for the peer's broadcast, opens a decoder from its catalog, and drains
-/// decoded frames into `slot`.
+/// Watches who is here, and gives each of them a tile and a decoder.
 ///
-/// **`announced_broadcast`, never `request_broadcast`.** The latter answers on
-/// the spot, so asking it first races the announcement and reports a live
-/// broadcast as unroutable -- which presents as "the peer has no video" against
-/// a peer that is publishing perfectly.
-async fn subscribe(
+/// **An announcement is the join, and its withdrawal is the leave** -- there is
+/// no separate presence mechanism to keep in step with this one. `announced()`
+/// yields `Some` for a broadcast appearing and `None` for it going away, so
+/// membership is read off the same stream the media arrives on.
+///
+/// This replaced two separate waits on one well-known path, which was the thing
+/// that made a call exactly two people. **N > 1 is structural here, not tested**:
+/// the transport still carries a single peer until the topology switch is built,
+/// so what this buys is that nothing below assumes otherwise.
+async fn attend(
     inbound: moq_net::origin::Consumer,
-    slot: FrameSlot,
+    me: String,
     status: UnboundedSender<RemoteStatus>,
-    peer: Option<String>,
+    participants: UnboundedSender<ParticipantEvent>,
+    metrics: Arc<Metrics>,
+    engine: Option<moq_audio::playback::Engine>,
+    controls: Arc<Controls>,
+) {
+    let mut announced = inbound.announced();
+    // Dropping an entry aborts that participant's decoders, so leaving is the
+    // same operation as the attempt ending.
+    let mut attending: std::collections::HashMap<String, Vec<Abort>> =
+        std::collections::HashMap::new();
+    // Taken by whoever arrives first. `audio::subscribe` owns the playback
+    // engine it is given, so a second participant would need a second engine or
+    // a mixer -- neither of which can be tested before a call can hold three
+    // people. Named here rather than discovered at that call.
+    let mut engine = engine;
+
+    while let Some(update) = announced.next().await {
+        let path = update.path.as_str().to_string();
+        let Some(id) = participant_of(&path) else {
+            tracing::debug!("ignoring an announcement at {path}");
+            continue;
+        };
+        // Cannot happen while each side keeps its own origin, and will the
+        // moment a relay puts everyone in one room.
+        if id == me {
+            continue;
+        }
+
+        let Some(broadcast) = update.broadcast else {
+            tracing::info!("{id} left");
+            attending.remove(id);
+            let _ = participants.unbounded_send(ParticipantEvent::Left { id: id.to_string() });
+            continue;
+        };
+
+        tracing::info!("{id} joined");
+        let slot = FrameSlot::default();
+        let _ = participants.unbounded_send(ParticipantEvent::Joined {
+            id: id.to_string(),
+            slot: slot.clone(),
+        });
+
+        let mut tasks = vec![Abort(tokio::spawn(watch(
+            broadcast.clone(),
+            slot,
+            id.to_string(),
+            status.clone(),
+            metrics.clone(),
+        )))];
+        if let Some(engine) = engine.take() {
+            let controls = controls.clone();
+            tasks.push(Abort(tokio::spawn(async move {
+                audio::subscribe(broadcast, engine, controls).await;
+            })));
+        } else {
+            tracing::warn!("[audio] {id}'s audio is not being played: the engine is taken");
+        }
+        attending.insert(id.to_string(), tasks);
+    }
+}
+
+/// Opens a decoder from one participant's catalog and drains frames into their
+/// slot.
+///
+/// **The catalog is theirs, never a local guess.** 20c failed here by passing a
+/// *local* config and a hardcoded track name instead, and got `Net(Remote(30))`
+/// for it.
+async fn watch(
+    broadcast: moq_net::broadcast::Consumer,
+    slot: FrameSlot,
+    peer: String,
+    status: UnboundedSender<RemoteStatus>,
     metrics: Arc<Metrics>,
 ) {
-    let Some(broadcast) = inbound.announced_broadcast(BROADCAST).await else {
-        tracing::warn!("the peer never announced {BROADCAST}");
-        return;
-    };
-
     // The catalog is the peer's description of what it is sending. 20c failed
     // here by passing a *local* config and a hardcoded track name instead, and
     // got `Net(Remote(30))` for it.
@@ -808,8 +924,11 @@ async fn subscribe(
             return;
         }
     };
-    tracing::info!("decoding the peer's video with {}", consumer.name());
-    let _ = status.unbounded_send(RemoteStatus::Connected { peer });
+    tracing::info!("decoding {peer}'s video with {}", consumer.name());
+    // **The listening side can name its caller now.** iroh exposes no client
+    // identity to a server, so the transport genuinely cannot say who this is --
+    // but the broadcast path can, and does.
+    let _ = status.unbounded_send(RemoteStatus::Connected { peer: Some(peer) });
 
     // The network half's own rate, independent of whether anything is painting.
     // `camera::paint::FrameRate` measures capture against the GPU; this measures
@@ -844,10 +963,7 @@ async fn subscribe(
         if decoded == REPORT_EVERY {
             let elapsed = since.elapsed().as_secs_f32();
             if elapsed > 0.0 {
-                tracing::debug!(
-                    "[remote] {:.1} fps decoded from the peer",
-                    decoded as f32 / elapsed
-                );
+                tracing::debug!("[remote] {:.1} fps decoded", decoded as f32 / elapsed);
             }
             decoded = 0;
             since = std::time::Instant::now();
@@ -859,4 +975,32 @@ async fn subscribe(
     // The producer is gone, so the last frame must come off the screen rather
     // than sit there looking live.
     slot.clear();
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn a_participant_is_read_off_the_path_they_publish_under() {
+        let me = "3929461daf6e4354";
+        assert_eq!(participant_of(&camera_path(me)), Some(me));
+    }
+
+    #[test]
+    fn nothing_else_is_a_participant() {
+        // The old shared path, a bare role, a foreign broadcast, and an empty
+        // id: all of them have to read as "not one of ours" rather than as
+        // somebody with a strange name.
+        for path in ["call.hang", "camera.hang", "/camera.hang", "abc/screen.hang", "abc"] {
+            assert_eq!(participant_of(path), None, "{path} should not be a participant");
+        }
+    }
+
+    #[test]
+    fn the_hang_suffix_stays_last() {
+        // Catalog-format detection keys off it, and a path that loses it fails
+        // as a timeout rather than an error -- so the id goes in front.
+        assert!(camera_path("anyone").ends_with(".hang"));
+    }
 }
