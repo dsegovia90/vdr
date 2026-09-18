@@ -20,6 +20,7 @@
 //! vdr --secret <hex> --dial <peer-id>     # dials it
 //! vdr --loopback                          # no network; the codec round trip
 //! vdr --camera facetime                   # picks a camera by name
+//! vdr --quality high                      # 720p rung; low | mid | high, mid by default
 //! vdr --encode-width 1920                 # encode at capture size, for A/B tests
 //! ```
 //!
@@ -60,6 +61,72 @@ pub enum Peering {
     Dial(EndpointId),
 }
 
+/// How big we encode, as a rung rather than a number.
+///
+/// Named by height, because that is what "360p" means and because it keeps a
+/// 4:3 camera sensible: a tier caps the lines and the width follows whatever
+/// the camera's aspect is.
+///
+/// **A ceiling, never a target.** The scaler takes integer factors only, so a
+/// capture that cannot divide onto a rung exactly lands under it rather than
+/// over. The two captures that actually happen both divide cleanly onto the
+/// lower two rungs -- 1080/3 and 720/2 are both 360 -- which is why the default
+/// is the one rung everybody can hit exactly.
+///
+/// It is also not a floor: rate control can only move the encoder *down* from
+/// the bitrate it opened at, so a poor link still spends less than its tier.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Quality {
+    /// 180 lines: 320x180 from a 16:9 camera, about 86 kbps.
+    ///
+    /// 180 rather than 270 for one reason worth writing down: 270 divides
+    /// cleanly out of 1080p but not out of 720p, so it would be the one rung
+    /// that meant something different on each platform.
+    Low,
+    /// 360 lines, the default: 640x360, about 346 kbps.
+    #[default]
+    Mid,
+    /// 720 lines: 1280x720, about 1.4 Mbps.
+    ///
+    /// **The one rung that is not the same everywhere.** 1080/720 is 1.5 and
+    /// the scaler takes integer factors, so a camera that hands us 1080p --
+    /// which is every macOS camera, whatever resolution is requested of it --
+    /// lands at 960x540 here. Fixing that means the capture honouring the size
+    /// we ask for, not a resampler.
+    High,
+}
+
+impl Quality {
+    /// The tallest frame this tier encodes.
+    pub fn height(self) -> u32 {
+        match self {
+            Self::Low => 180,
+            Self::Mid => 360,
+            Self::High => 720,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "mid" | "medium" => Some(Self::Mid),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Quality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Low => "low",
+            Self::Mid => "mid",
+            Self::High => "high",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Everything this app takes from the command line.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Args {
@@ -67,7 +134,9 @@ pub struct Args {
     pub peering: Peering,
     /// Case-insensitive substring of the camera to start on.
     pub camera: Option<String>,
-    /// Widest the encoder may run, overriding the built-in ceiling.
+    /// Which rung the encoder runs at. Everyone defaults to the same one.
+    pub quality: Quality,
+    /// Widest the encoder may run, overriding the tier.
     ///
     /// For comparing sizes on a real link, which is the only place the
     /// difference shows: locally there is nothing to run out of, so every size
@@ -99,6 +168,7 @@ impl Args {
         let mut args = std::env::args().skip(1);
         let mut peering = Peering::Idle;
         let mut camera = None;
+        let mut quality = Quality::default();
         let mut encode_width = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -119,6 +189,11 @@ impl Args {
                     Some(wanted) => camera = Some(wanted.to_lowercase()),
                     None => tracing::error!("--camera needs part of a device name"),
                 },
+                "--quality" => match args.next().as_deref().map(Quality::parse) {
+                    Some(Some(chosen)) => quality = chosen,
+                    Some(None) => tracing::error!("--quality is one of low, mid, high"),
+                    None => tracing::error!("--quality needs a level"),
+                },
                 "--encode-width" => match args.next().as_deref().map(str::parse::<u32>) {
                     Some(Ok(width)) if width >= 2 => encode_width = Some(width),
                     Some(Ok(width)) => tracing::error!("--encode-width {width} is too small"),
@@ -131,6 +206,7 @@ impl Args {
         Self {
             peering,
             camera,
+            quality,
             encode_width,
         }
     }

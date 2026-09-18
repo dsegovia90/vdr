@@ -156,19 +156,6 @@ impl Frame {
     }
 }
 
-/// Widest we are willing to encode at.
-///
-/// Not a quality preference so much as a bitrate one. `moq-video` derives its
-/// default bitrate from the frame size at ~0.07 bits per pixel per second, so
-/// resolution *is* the bitrate knob: 1080p30 asks for 4.35 Mbps, which is far
-/// more than a call between two houses can carry, and spending it is what makes
-/// a real link stutter rather than soften.
-///
-/// 1280 leaves 720p alone and halves 1080p to 960x540, which asks for about
-/// 1.1 Mbps. macOS hands us 1080p whatever we request of the camera, so this is
-/// the only place the decision can currently be made.
-const MAX_ENCODE_WIDTH: u32 = 1280;
-
 /// Bits per pixel per second we encode at.
 ///
 /// Replaces `moq-video`'s default of 0.07, which its own comment describes as
@@ -199,24 +186,49 @@ pub fn bitrate_for(width: u32, height: u32, framerate: u32) -> u64 {
 
 /// The size frames should be encoded at, and the factor that gets them there.
 ///
-/// **Integer factors only.** A 2x reduction is an exact 2x2 box average with no
+/// **The tier's height is the knob, and it is a bitrate knob more than a quality
+/// one.** Bitrate follows the frame size (see [`bitrate_for`]), so resolution
+/// *is* what a call costs: 1080p30 asks for about 2.9 Mbps, more than two houses
+/// reliably carry, and spending it is what makes a link stutter rather than
+/// soften. This used to be a width ceiling with the capture deciding the rest,
+/// which meant two people on one call encoded differently without either of them
+/// choosing — a Mac at 960x540 against a Linux box at 1280x720. See
+/// [`crate::args::Quality`] for the rungs and why they are the heights they are.
+///
+/// **Integer factors only.** A 3x reduction is an exact 3x3 box average with no
 /// resampler and no half-pixel alignment to get wrong, and it keeps the chroma
-/// plane on whole pixels. An arbitrary ratio would buy a slightly better fit to
-/// the ceiling and cost a filter, which is the wrong trade for a downscale
-/// nobody is looking at closely.
+/// plane on whole pixels. An arbitrary ratio would fit the tier exactly from any
+/// camera and cost a filter, which is the wrong trade for a downscale nobody is
+/// looking at closely — and the two captures that actually happen, 1080p and
+/// 720p, both divide onto 360 and 180 exactly.
+///
+/// The factor costs nothing extra as it grows: a box average reads every source
+/// pixel once whatever it is, so 1080p→360p at 3x touches exactly as many pixels
+/// as 1080p→540p at 2x did, and hands the encoder a quarter of the work.
 ///
 /// Returns the even dimensions the encoder should be built with, since 4:2:0
 /// has no chroma plane for an odd one.
 pub fn encode_size(width: u32, height: u32) -> (u32, u32, usize) {
-    encode_size_within(width, height, crate::args::Args::get().encode_width.unwrap_or(MAX_ENCODE_WIDTH))
+    let args = crate::args::Args::get();
+    // `--encode-width` predates the tiers and says "encode no wider than this",
+    // which is the same limit stated in the other axis. Converted rather than
+    // branched on, so there is one rule underneath instead of two.
+    let ceiling = match args.encode_width {
+        Some(wanted) if width > 0 => ((height as u64 * wanted as u64) / width as u64) as u32,
+        _ => args.quality.height(),
+    };
+    encode_size_within(width, height, ceiling)
 }
 
-/// [`encode_size`] against an explicit ceiling, which is what the tests use and
-/// what `--encode-width` overrides.
+/// [`encode_size`] against an explicit height ceiling, which is what the tests
+/// use and what a tier supplies.
 fn encode_size_within(width: u32, height: u32, ceiling: u32) -> (u32, u32, usize) {
     let mut factor = 1usize;
-    while width / factor as u32 > ceiling && (height / (factor as u32 * 2)) >= 2 {
-        factor *= 2;
+    // The smallest factor that lands at or under the ceiling. Going under
+    // rather than over is what makes a tier a bandwidth ceiling rather than a
+    // suggestion, and it is why a 1080p camera on the 720 rung sends 540p.
+    while height / factor as u32 > ceiling && (height / (factor as u32 + 1)) >= 2 {
+        factor += 1;
     }
     let w = (width / factor as u32) & !1;
     let h = (height / factor as u32) & !1;
@@ -530,6 +542,7 @@ impl Tapped {
 #[cfg(test)]
 mod encode_size_tests {
     use super::*;
+    use crate::args::Quality;
 
     #[test]
     fn the_encoded_bitrate_lands_where_the_research_says() {
@@ -543,6 +556,20 @@ mod encode_size_tests {
     }
 
     #[test]
+    fn what_each_rung_costs() {
+        // From a 1080p capture, which is what macOS gives us -- so the high
+        // rung reads 777 rather than the 1.4 Mbps a 720p capture would cost,
+        // and that is the asymmetry rather than a wrong number.
+        let cost = |tier: Quality| {
+            let (width, height, _) = encode_size_within(1920, 1080, tier.height());
+            bitrate_for(width, height, 30) / 1000
+        };
+        assert_eq!(cost(Quality::Low), 86);
+        assert_eq!(cost(Quality::Mid), 345);
+        assert_eq!(cost(Quality::High), 777);
+    }
+
+    #[test]
     fn the_bitrate_is_well_under_the_generic_default() {
         // moq-video would derive 0.07 bits per pixel for the same frame. That
         // default has to cover high-motion content; a call does not.
@@ -552,39 +579,72 @@ mod encode_size_tests {
     }
 
     #[test]
-    fn seven_twenty_p_is_left_alone() {
-        assert_eq!(encode_size_within(1280, 720, MAX_ENCODE_WIDTH), (1280, 720, 1));
+    fn the_default_rung_is_exact_from_both_captures_that_happen() {
+        // The whole point of defaulting to 360: a Mac (which is handed 1080p
+        // whatever it asks for) and a Linux box at 720p land on the same size,
+        // so two people on a call encode identically without either choosing.
+        let tier = Quality::Mid.height();
+        assert_eq!(encode_size_within(1920, 1080, tier), (640, 360, 3));
+        assert_eq!(encode_size_within(1280, 720, tier), (640, 360, 2));
     }
 
     #[test]
-    fn ten_eighty_p_is_halved() {
-        // The case that actually happens: macOS gives us 1080p whatever we ask
-        // for, and 1080p is three times the bitrate a call should be spending.
-        assert_eq!(encode_size_within(1920, 1080, MAX_ENCODE_WIDTH), (960, 540, 2));
+    fn the_low_rung_is_exact_from_both_too() {
+        let tier = Quality::Low.height();
+        assert_eq!(encode_size_within(1920, 1080, tier), (320, 180, 6));
+        assert_eq!(encode_size_within(1280, 720, tier), (320, 180, 4));
     }
 
     #[test]
-    fn four_k_halves_twice() {
-        assert_eq!(encode_size_within(3840, 2160, MAX_ENCODE_WIDTH), (960, 540, 4));
+    fn the_high_rung_cannot_be_reached_from_a_1080p_capture() {
+        // 1080/720 is 1.5 and the scaler takes integer factors, so this rung is
+        // the one that means two things. Asserted rather than left implicit,
+        // because it is the asymmetry a reader will otherwise call a bug.
+        let tier = Quality::High.height();
+        assert_eq!(encode_size_within(1920, 1080, tier), (960, 540, 2));
+        assert_eq!(encode_size_within(1280, 720, tier), (1280, 720, 1));
+    }
+
+    #[test]
+    fn a_rung_is_a_ceiling_and_is_never_exceeded() {
+        // Including the sizes that divide onto nothing in particular: going
+        // under is what keeps a tier a bandwidth promise.
+        for (width, height) in [(1920, 1080), (1280, 720), (640, 480), (3840, 2160), (800, 600)] {
+            for tier in [Quality::Low, Quality::Mid, Quality::High] {
+                let ceiling = tier.height();
+                let (_, encoded, _) = encode_size_within(width, height, ceiling);
+                assert!(
+                    encoded <= ceiling,
+                    "{width}x{height} at the {tier} rung gave {encoded} lines"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_four_three_camera_lands_under_the_rung_rather_than_over() {
+        // 480 lines will not divide onto 360, so the tier takes the next factor
+        // down rather than spending more than it promised.
+        assert_eq!(encode_size_within(640, 480, Quality::Mid.height()), (320, 240, 2));
     }
 
     #[test]
     fn small_frames_are_never_scaled_up() {
-        assert_eq!(encode_size_within(640, 480, MAX_ENCODE_WIDTH), (640, 480, 1));
+        assert_eq!(encode_size_within(640, 480, Quality::High.height()), (640, 480, 1));
     }
 
     #[test]
     fn a_raised_ceiling_stops_the_downscale() {
-        // What `--encode-width 1920` does: encode at capture size, for
-        // comparing against the default on a real link.
-        assert_eq!(encode_size_within(1920, 1080, 1920), (1920, 1080, 1));
+        // What `--encode-width 1920` does on a 1080p capture: it converts to a
+        // 1080-line ceiling, so nothing is scaled at all.
+        assert_eq!(encode_size_within(1920, 1080, 1080), (1920, 1080, 1));
     }
 
     #[test]
     fn the_result_is_always_even() {
         // 4:2:0 has no chroma plane for an odd dimension, so a size that would
         // land odd has to be rounded rather than passed on.
-        let (w, h, _) = encode_size_within(1920, 1081, MAX_ENCODE_WIDTH);
+        let (w, h, _) = encode_size_within(1920, 1081, Quality::Mid.height());
         assert_eq!(w % 2, 0);
         assert_eq!(h % 2, 0);
     }
@@ -604,7 +664,7 @@ mod encode_size_tests {
     #[test]
     fn scaling_produces_the_size_encode_size_promised() {
         let frame = grey_frame(1920, 1080);
-        let (w, h, factor) = encode_size_within(1920, 1080, MAX_ENCODE_WIDTH);
+        let (w, h, factor) = encode_size_within(1920, 1080, Quality::Mid.height());
         let surface = frame.to_i420_surface(factor).expect("converts");
         assert_eq!((surface.width(), surface.height()), (w, h));
     }

@@ -290,7 +290,11 @@ async fn run(
             .map_err(|error| format!("could not probe the encoder: {error:#}"))?;
         let mut encoder = moq_video::encode::Encoder::new(&config)
             .map_err(|error| format!("could not build an encoder: {error:#}"))?;
-        tracing::info!("encoding {width}x{height} with {}", encoder.name());
+        tracing::info!(
+            "encoding {width}x{height} at the {} rung with {}",
+            crate::args::Args::get().quality,
+            encoder.name()
+        );
 
         let outbound = moq_net::Origin::random().produce();
         let mut broadcast = outbound
