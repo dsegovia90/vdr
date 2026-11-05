@@ -11,7 +11,8 @@
 # UNVERIFIED: the package list is the set this kind of app usually needs, plus
 # what ticket 26's first Linux build (2026-09-15) recorded. This blitz version
 # (v0.3.0-beta.4) has not been built on Linux yet. If a build step fails on a
-# missing library, add its -dev package here.
+# missing library, add its -dev package here. First Fedora build (2026-11-05):
+# fontconfig was the only one missing -- blitz uses it to find system fonts.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -24,7 +25,7 @@ if [ -z "${SKIP_PACKAGES:-}" ]; then
   if command -v dnf >/dev/null; then
     sudo dnf install -y \
       gcc gcc-c++ pkgconf-pkg-config cmake clang git curl \
-      alsa-lib-devel systemd-devel libv4l-devel \
+      alsa-lib-devel systemd-devel libv4l-devel fontconfig-devel \
       libX11-devel libXcursor-devel libXrandr-devel libXi-devel libxkbcommon-devel \
       wayland-devel vulkan-loader-devel \
       openssl-devel
@@ -32,7 +33,7 @@ if [ -z "${SKIP_PACKAGES:-}" ]; then
     sudo apt-get update
     sudo apt-get install -y --no-install-recommends \
       build-essential pkg-config cmake clang curl git \
-      libasound2-dev libudev-dev libv4l-dev \
+      libasound2-dev libudev-dev libv4l-dev libfontconfig1-dev \
       libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxkbcommon-dev \
       libwayland-dev libvulkan-dev \
       libssl-dev
