@@ -266,6 +266,10 @@ const CONTROL: &str = "control";
 /// The document inside it.
 const PRESENCE: &str = "presence.json";
 
+/// How long a departed participant's reader may keep running to deliver their
+/// last word. Generous: it only ever runs out on a reader that hears nothing.
+const GOODBYE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How much a control message preempts media. Matches what `hang` gives its own
 /// catalog, which is the same kind of traffic: small, structural, and useless
 /// late.
@@ -1126,7 +1130,20 @@ async fn attend(
                     // An unannounce is the authoritative goodbye. Deliberate,
                     // it arrives at once; abrupt, it waits out the linger, by
                     // which time the reconnect has already given up.
-                    listening.remove(id);
+                    //
+                    // **The reader is let go, not killed.** Through a relay the
+                    // unannounce can overtake the last document -- the
+                    // `Leaving` said just before it -- and aborting the reader
+                    // here threw that word away: a hang-up then looked exactly
+                    // like a drop. It ends by itself once the document arrives
+                    // or the track closes; the grace only bounds a reader that
+                    // never hears either.
+                    if let Some(reader) = listening.remove(id) {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(GOODBYE_GRACE).await;
+                            drop(reader);
+                        });
+                    }
                     if present.remove(id) && present.is_empty() {
                         alone(&hangup, id.to_string(), in_room);
                     }
