@@ -88,3 +88,9 @@ moq-native = { version = "0.19", default-features = false, features = ["iroh", "
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
 url = "2"
 wgpu = "30"
+
+# A patched moq-audio: exposes the echo canceller's own statistics (sonora's
+# ERLE, delay estimate, residual echo likelihood), which 0.0.22 keeps private.
+# See vendor/moq-audio/PATCH.md. Drop this once upstream exposes them.
+[patch.crates-io]
+moq-audio = { path = "vendor/moq-audio" }
