@@ -5,7 +5,7 @@ use cameras::{CameraSource, DeviceId, PixelFormat, Resolution, StreamConfig};
 use dioxus_native::prelude::*;
 
 use super::{
-    Button, ConnectRow, Dropdown, DropdownOption, MicrophoneRow, ParticipantVideo, StatsRow, Tone,
+    Button, ConnectRow, Dropdown, DropdownOption, MicrophoneRow, ParticipantTile, StatsRow, Tone,
 };
 use crate::args::Args;
 use crate::camera::{FrameSlot, Mirror, use_camera_stream, use_shared_devices};
@@ -131,6 +131,11 @@ pub fn Camera() -> Element {
         "text-sm text-neutral-400"
     };
 
+    // Read into a Vec first: holding the signal's guard across the nodes below
+    // would keep it borrowed while they render.
+    let participants = remote.participants.read().clone();
+    let grid = grid_class(1 + participants.len());
+
     rsx! {
         div { class: "flex flex-row items-end gap-3",
             Dropdown {
@@ -172,28 +177,32 @@ pub fn Camera() -> Element {
             connect: remote.connect,
             cancel: remote.cancel,
         }
-        ParticipantVideo {
-            label: "camera",
-            slot,
-            // Mirrored, because that is what people expect of their own
-            // preview. Remote participants get `Mirror::None`.
-            mirror: Mirror::SelfView,
-            class: "w-full max-w-4xl",
-        }
-        // **Keyed, and that is the point of the id.** Without a key dioxus may
-        // reuse the wrong component instance when the list reorders, and two
-        // people's video swaps tiles. Read into a Vec first: holding the
-        // signal's guard across the nodes below would keep it borrowed while
-        // they render.
-        for participant in remote.participants.read().clone() {
-            ParticipantVideo {
-                key: "{participant.id}",
-                label: participant.short(),
-                slot: participant.slot.clone(),
-                // Not a self-view: these frames took the path a peer's would,
-                // and mirroring them would be the bug task 9 removed.
-                mirror: Mirror::None,
-                class: "w-full max-w-4xl",
+        // **Everyone in one grid, ourselves included, and it takes whatever
+        // height is left.** `flex-1 min-h-0` inside the app's full-height
+        // column is what makes it shrink to fit rather than push the page into
+        // scrolling; each video letterboxes inside its cell.
+        div { class: grid,
+            ParticipantTile {
+                label: "You",
+                slot,
+                // Mirrored, because that is what people expect of their own
+                // preview. Remote participants get `Mirror::None`.
+                mirror: Mirror::SelfView,
+                stats: None,
+            }
+            // **Keyed, and that is the point of the id.** Without a key dioxus
+            // may reuse the wrong component instance when the list reorders,
+            // and two people's video swaps tiles.
+            for participant in participants {
+                ParticipantTile {
+                    key: "{participant.id}",
+                    label: participant.short(),
+                    slot: participant.slot.clone(),
+                    // Not a self-view: these frames took the path a peer's
+                    // would, and mirroring them would be the bug task 9 removed.
+                    mirror: Mirror::None,
+                    stats: Some(participant.stats.clone()),
+                }
             }
         }
         p {
@@ -210,5 +219,43 @@ pub fn Camera() -> Element {
                 "{stream.status}"
             }
         }
+    }
+}
+
+/// The grid's classes for `tiles` tiles: as few columns as keep the tiles
+/// large, and rows to match.
+///
+/// **Every class is a whole literal**, never assembled with `format!`:
+/// Tailwind finds classes by scanning source text, so a computed
+/// `grid-cols-{n}` would never have a rule generated for it, and would look
+/// exactly like a layout this renderer does not support.
+fn grid_class(tiles: usize) -> &'static str {
+    match tiles {
+        0 | 1 => "grid grid-cols-1 grid-rows-1 gap-3 w-full flex-1 min-h-0",
+        2 => "grid grid-cols-2 grid-rows-1 gap-3 w-full flex-1 min-h-0",
+        3 | 4 => "grid grid-cols-2 grid-rows-2 gap-3 w-full flex-1 min-h-0",
+        5 | 6 => "grid grid-cols-3 grid-rows-2 gap-3 w-full flex-1 min-h-0",
+        _ => "grid grid-cols-3 grid-rows-3 gap-3 w-full flex-1 min-h-0",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grid_class;
+
+    #[test]
+    fn two_people_sit_side_by_side() {
+        assert!(grid_class(2).contains("grid-cols-2 grid-rows-1"));
+    }
+
+    #[test]
+    fn four_people_make_a_square() {
+        assert!(grid_class(3).contains("grid-cols-2 grid-rows-2"));
+        assert!(grid_class(4).contains("grid-cols-2 grid-rows-2"));
+    }
+
+    #[test]
+    fn a_fifth_person_adds_a_column() {
+        assert!(grid_class(5).contains("grid-cols-3 grid-rows-2"));
     }
 }

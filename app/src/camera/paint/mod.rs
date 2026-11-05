@@ -7,7 +7,11 @@ mod pipeline;
 mod rate;
 mod upload;
 
-use dioxus_native::{CustomPaintCtx, CustomPaintSource, DeviceHandle, TextureHandle};
+use anyrender::{PaintRef, PaintScene, RenderContext, ResourceId, Scene};
+use blitz_dom::node::ComputedStyles;
+use dioxus_native::{DeviceHandle, Widget};
+use peniko::kurbo::{Affine, Rect};
+use peniko::{Fill, ImageBrush, ImageSampler};
 use dioxus_native::prelude::*;
 
 use active::Active;
@@ -84,8 +88,14 @@ impl VideoPaintSource {
     }
 }
 
-impl CustomPaintSource for VideoPaintSource {
-    fn resume(&mut self, device_handle: &DeviceHandle) {
+impl Widget for VideoPaintSource {
+    fn can_create_surfaces(&mut self, render_ctx: &mut dyn RenderContext) {
+        let Some(any) = render_ctx.renderer_specific_context() else {
+            return;
+        };
+        let Ok(device_handle) = any.downcast::<DeviceHandle>() else {
+            return;
+        };
         let pipeline = self.cache.get_or_build(&device_handle.device);
         self.state = State::Active(Box::new(Active::new(
             device_handle.device.clone(),
@@ -95,18 +105,53 @@ impl CustomPaintSource for VideoPaintSource {
         tracing::info!("[{}] paint source resumed", self.label);
     }
 
-    fn suspend(&mut self) {
+    fn destroy_surfaces(&mut self) {
         self.state = State::Suspended;
         tracing::info!("[{}] paint source suspended", self.label);
     }
 
-    fn render(
+    /// Always `true`: video needs a repaint every vsync, and nothing else would
+    /// ask for one. Blitz polls this only after a frame is drawn, so returning
+    /// `false` while idle would stop the loop with no way for a frame arriving
+    /// on the camera or decoder thread to restart it. The old `canvas` path
+    /// behaved the same way (a document with a canvas counted as animating).
+    fn requires_redraw(&self) -> bool {
+        true
+    }
+
+    fn paint(
         &mut self,
-        mut ctx: CustomPaintCtx<'_>,
+        render_ctx: &mut dyn RenderContext,
+        _styles: &ComputedStyles,
         width: u32,
         height: u32,
         scale: f64,
-    ) -> Option<TextureHandle> {
+    ) -> Scene {
+        let mut scene = Scene::new();
+        if let Some(id) = self.render(render_ctx, width, height, scale) {
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                PaintRef::Resource(ImageBrush {
+                    image: id,
+                    sampler: ImageSampler::default(),
+                }),
+                None,
+                &Rect::from_origin_size((0.0, 0.0), (width as f64, height as f64)),
+            );
+        }
+        scene
+    }
+}
+
+impl VideoPaintSource {
+    fn render(
+        &mut self,
+        ctx: &mut dyn RenderContext,
+        width: u32,
+        height: u32,
+        scale: f64,
+    ) -> Option<ResourceId> {
         let State::Active(active) = &mut self.state else {
             return None;
         };
@@ -114,12 +159,8 @@ impl CustomPaintSource for VideoPaintSource {
             return None;
         }
 
-        // A resized canvas means a brand new, blank target, so the last frame
-        // has to be drawn into it again even if the camera has not moved on.
-        let resized = active.ensure_target(&mut ctx, width, height, scale);
+        let resized = active.ensure_target(ctx, width, height, scale);
 
-        // Releasing the camera must blank the canvas: a frozen last frame
-        // reads as still being on camera.
         let cleared = self.slot.cleared();
         let blanked = cleared != self.last_cleared;
         if blanked {
@@ -142,6 +183,6 @@ impl CustomPaintSource for VideoPaintSource {
             active.draw(width, height, self.mirror);
         }
 
-        active.target.as_ref().map(|t| t.handle.clone())
+        active.target.as_ref().map(|t| t.handle)
     }
 }

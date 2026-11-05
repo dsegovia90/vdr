@@ -56,15 +56,12 @@ pub fn Dropdown(props: DropdownProps) -> Element {
                     }
                 }
                 if open() {
-                    // In normal flow, not absolute, which pushes the content below
-                    // it down while open. That is deliberate and it is not a
-                    // style choice: in this blitz revision an absolutely
-                    // positioned menu that overflows its parent paints but never
-                    // receives clicks. Tried and rejected -- a stacking context
-                    // on the parent, dropping the menu's z-index, removing the
-                    // click-catcher, removing the video tile. Only normal flow
-                    // works.
-                    div { class: "w-full mt-1 rounded-md border border-neutral-700 bg-neutral-900 p-1",
+                    // Floats over the content below rather than pushing it down.
+                    // Needs blitz v0.3.0-beta.4 or later: older revisions painted
+                    // an absolutely positioned menu that overflows its parent but
+                    // never delivered clicks to it, which is why this was once in
+                    // normal flow.
+                    div { class: "absolute left-0 top-full z-10 w-full mt-1 rounded-md border border-neutral-700 bg-neutral-900 p-1",
                         for option in props.options.iter() {
                             div {
                                 class: if Some(&option.value) == props.selected.as_ref() {

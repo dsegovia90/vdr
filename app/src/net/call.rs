@@ -1,19 +1,21 @@
-//! First contact: one peer, both directions, over iroh and MoQ.
+//! A call: one peer directly, or a room of several on a relay.
 //!
 //! The shape is the loopback's with the pipe replaced by a real connection.
 //! `--listen` runs a `moq_native::Server` and `--dial` runs a
 //! `moq_native::Client` against it; after the handshake the two sides are
 //! identical, and so is everything below the transport.
 //!
-//! **Peer to peer, no relay.** The listening side is its own tiny server rather
-//! than a client of a third party, which keeps today's behaviour exactly: two
-//! processes, one key typed into the other. A relay only enters when the
-//! topology switch is built (ticket 22), and ticket 21 already proved a
-//! participant can host one.
+//! **Two modes, side by side.** A 1:1 call is peer to peer with no relay: the
+//! listening side is its own tiny server, two processes, one key typed into
+//! the other. `--relay` instead joins a **room** on a relay, which everyone in
+//! the room is a client of. Each participant publishes once and the relay fans
+//! out, so the uplink cost does not grow with the room. To this module a relay
+//! is just a server we dial, which is why `--dial` and `--relay` share
+//! [`connect`]. A participant hosting the relay itself is ticket 22.
 //!
-//! Both arms converge on [`Peer`], so the claim above is structural rather than
-//! a description: anything per-connection is reached the same way whichever
-//! side established it.
+//! Every arm converges on [`Peer`], so the claim above is structural rather
+//! than a description: anything per-connection is reached the same way
+//! whichever side established it.
 //!
 //! Each side keeps **two origins** -- `outbound` for what we publish, `inbound`
 //! for what arrives. They are separate `Origin`s, so both peers can publish at
@@ -38,6 +40,7 @@ use super::status::RemoteStatus;
 use super::ParticipantEvent;
 use crate::args::Peering;
 use super::Metrics;
+use super::metrics::{FpsMeter, PeerStats};
 use crate::audio::Controls;
 use crate::camera::{FrameFeed, FrameSlot, encode_size, from_decoded};
 
@@ -75,6 +78,126 @@ struct Peer {
     /// session. The listening side reports its own from inside the accept loop
     /// instead, since its session is what it has.
     stats: Option<moq_native::ConnectionStatsReader>,
+}
+
+/// Everything [`connect`] needs, named rather than positional.
+struct Connect<'a> {
+    config: &'a moq_native::ClientConfig,
+    endpoint: &'a moq_native::iroh::Endpoint,
+    outbound: &'a moq_net::origin::Producer,
+    inbound: moq_net::origin::Producer,
+    /// A peer's `iroh://<id>`, or a relay's room URL.
+    url: url::Url,
+    /// Who or what we are connected to, for the log.
+    label: String,
+    /// The room's label when this is a room on a relay, `None` for one peer.
+    room: Option<String>,
+    status: UnboundedSender<RemoteStatus>,
+    keyframe: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Dials out and keeps redialling: a peer directly, or a room on a relay.
+///
+/// **One function for both, because to the stack they are the same thing.** A
+/// relay is just a server we publish into and subscribe from, and a peer
+/// running `--listen` is too. What differs is only what "connected" means to
+/// the person watching, which `room` decides.
+fn connect(args: Connect<'_>) -> Result<Peer, String> {
+    let Connect {
+        config,
+        endpoint,
+        outbound,
+        inbound,
+        url,
+        label,
+        room,
+        status,
+        keyframe,
+    } = args;
+    let client = config
+        .clone()
+        .init()
+        .map_err(|error| format!("could not build a client: {error:#}"))?
+        .with_iroh(endpoint.clone());
+    let mut session = client
+        .with_publisher(outbound)
+        .with_subscriber(inbound)
+        .reconnect(url);
+    // Taken before the session moves into the future below. It survives a
+    // reconnect, so the estimate follows the link across one rather than being
+    // restarted. Toward a relay this is our own uplink to it, which is the
+    // right thing to adapt to: everyone downstream is the relay's problem.
+    let bandwidth = Some(session.send_bandwidth());
+    let stats = Some(session.stats());
+    Ok(Peer {
+        // **The status stream, not `closed()`.** They end at the same place --
+        // the error the retry loop gives up with -- but this one also says when
+        // the link went away and when it came back. Without it a drop is
+        // invisible: the loop underneath has always redialled, it just did it
+        // silently, and the interface went on claiming a connection that was
+        // not there.
+        closed: Box::pin(async move {
+            // With one peer, the first connect is the subscriber's to report:
+            // it arrives when the peer's video does, which is what "connected"
+            // means to a person watching a tile. In a room the session itself
+            // is the news, since nobody else may be there yet.
+            let mut connected = false;
+            loop {
+                match session.status().await {
+                    Ok(moq_native::Status::Connected) => {
+                        if connected {
+                            tracing::info!("reconnected to {label}");
+                            keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
+                        } else if room.is_some() {
+                            tracing::info!("joined {label}");
+                        }
+                        let next = match &room {
+                            Some(room) => Some(RemoteStatus::InRoom { room: room.clone() }),
+                            None if connected => Some(RemoteStatus::Connected {
+                                peer: Some(label.clone()),
+                            }),
+                            None => None,
+                        };
+                        if let Some(next) = next {
+                            let _ = status.unbounded_send(next);
+                        }
+                        connected = true;
+                    }
+                    Ok(moq_native::Status::Disconnected) => {
+                        tracing::warn!("the session dropped; redialling {label}");
+                        let _ = status.unbounded_send(RemoteStatus::Reconnecting);
+                    }
+                    // `Status` is non-exhaustive: a variant added upstream is
+                    // not news we can act on.
+                    Ok(_) => {}
+                    Err(error) => return format!("{error:#}"),
+                }
+            }
+        }),
+        bandwidth,
+        stats,
+    })
+}
+
+/// How a room reads in the status line: its path, and the relay it is on.
+///
+/// The path *is* the room -- the relay roots each session at the path it
+/// connected with -- so two URLs differing only in host are two rooms.
+fn room_label(url: &url::Url) -> String {
+    let path = url.path().trim_matches('/');
+    let host = url.host_str().unwrap_or("the relay");
+    // An iroh relay's host is a 64-character key; the front is enough to tell
+    // two apart on screen, and the log has the whole URL.
+    let host = if url.scheme() == "iroh" && host.len() > 12 {
+        &host[..12]
+    } else {
+        host
+    };
+    if path.is_empty() {
+        format!("the relay at {host}")
+    } else {
+        format!("room {path} on {host}")
+    }
 }
 
 /// What a participant publishes their own camera and microphone under.
@@ -170,11 +293,6 @@ const FRAMERATE: u32 = 30;
 /// path's cadence so the two logs are comparable.
 const REPORT_EVERY: u32 = 120;
 
-/// How often the incoming frame rate is published to the interface.
-///
-/// Faster than the log on purpose: the log is for comparing runs afterwards,
-/// this is for watching a link misbehave while it happens.
-const FPS_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long the transport may go unheard before the session is declared dead.
 ///
@@ -466,6 +584,8 @@ async fn run(
             .with_linger(linger)
             .produce();
 
+        // Read before the match below takes `peering` apart.
+        let in_room = matches!(peering, Peering::Join(_));
         let peer_transport: Peer = match peering {
             Peering::Dial(peer) => {
                 report(RemoteStatus::Dialing {
@@ -477,63 +597,33 @@ async fn run(
                 let url: url::Url = format!("iroh://{peer}")
                     .parse()
                     .map_err(|error| format!("could not build a dial url: {error}"))?;
-                let client = client_config
-                    .clone()
-                    .init()
-                    .map_err(|error| format!("could not build a client: {error:#}"))?
-                    .with_iroh(endpoint.clone());
-                let mut session = client
-                    .with_publisher(&outbound)
-                    .with_subscriber(inbound.clone())
-                    .reconnect(url);
-                // Taken before the session moves into the future below. It
-                // survives a reconnect, so the estimate follows the link across
-                // one rather than being restarted.
-                let bandwidth = Some(session.send_bandwidth());
-                let stats = Some(session.stats());
-                let status = status.clone();
-                let keyframe = keyframe.clone();
-                let label = peer.to_string();
-                Peer {
-                    // **The status stream, not `closed()`.** They end at the
-                    // same place -- the error the retry loop gives up with --
-                    // but this one also says when the link went away and when it
-                    // came back. Without it a drop is invisible: the loop
-                    // underneath has always redialled, it just did it silently,
-                    // and the interface went on claiming a connection that was
-                    // not there.
-                    closed: Box::pin(async move {
-                        // The first connect is the subscriber's to report: it
-                        // arrives when the peer's video does, which is what
-                        // "connected" means to a person watching a tile.
-                        let mut connected = false;
-                        loop {
-                            match session.status().await {
-                                Ok(moq_native::Status::Connected) => {
-                                    if connected {
-                                        tracing::info!("reconnected to {label}");
-                                        keyframe
-                                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                                        let _ = status.unbounded_send(RemoteStatus::Connected {
-                                            peer: Some(label.clone()),
-                                        });
-                                    }
-                                    connected = true;
-                                }
-                                Ok(moq_native::Status::Disconnected) => {
-                                    tracing::warn!("the session dropped; redialling {label}");
-                                    let _ = status.unbounded_send(RemoteStatus::Reconnecting);
-                                }
-                                // `Status` is non-exhaustive: a variant added
-                                // upstream is not news we can act on.
-                                Ok(_) => {}
-                                Err(error) => return format!("{error:#}"),
-                            }
-                        }
-                    }),
-                    bandwidth,
-                    stats,
-                }
+                connect(Connect {
+                    config: &client_config,
+                    endpoint: &endpoint,
+                    outbound: &outbound,
+                    inbound: inbound.clone(),
+                    url,
+                    label: peer.to_string(),
+                    room: None,
+                    status: status.clone(),
+                    keyframe: keyframe.clone(),
+                })?
+            }
+            Peering::Join(ref url) => {
+                let room = room_label(url);
+                report(RemoteStatus::Joining { room: room.clone() });
+                tracing::info!("joining {room} at {url}");
+                connect(Connect {
+                    config: &client_config,
+                    endpoint: &endpoint,
+                    outbound: &outbound,
+                    inbound: inbound.clone(),
+                    url: url.clone(),
+                    label: url.to_string(),
+                    room: Some(room),
+                    status: status.clone(),
+                    keyframe: keyframe.clone(),
+                })?
             }
             Peering::Listen => {
                 report(RemoteStatus::Listening { me: me.to_string() });
@@ -698,7 +788,7 @@ async fn run(
                 status: status.clone(),
                 participants: participants.clone(),
                 hangup,
-                metrics: metrics.clone(),
+                in_room,
             },
             engine,
             controls.clone(),
@@ -909,8 +999,12 @@ struct Reports {
     participants: UnboundedSender<ParticipantEvent>,
     /// Said once, when the last of them has gone deliberately.
     hangup: UnboundedSender<String>,
-    /// Live numbers for the interface.
-    metrics: Arc<Metrics>,
+    /// Whether this is a room on a relay rather than one peer.
+    ///
+    /// Changes two rules. Everyone leaving does not end it -- a room stays open
+    /// for whoever comes next, and only Hang up leaves. And no single peer is
+    /// "who we are connected to", so the status line stays on the room.
+    in_room: bool,
 }
 
 /// Watches who is here, and gives each of them a tile and a decoder.
@@ -921,9 +1015,9 @@ struct Reports {
 /// membership is read off the same stream the media arrives on.
 ///
 /// This replaced two separate waits on one well-known path, which was the thing
-/// that made a call exactly two people. **N > 1 is structural here, not tested**:
-/// the transport still carries a single peer until the topology switch is built,
-/// so what this buys is that nothing below assumes otherwise.
+/// that made a call exactly two people. Through a relay this is the whole room:
+/// the relay roots our subscription at the room's path, so every participant in
+/// it is announced here relative to that path, as `<id>/camera.hang`.
 async fn attend(
     inbound: moq_net::origin::Consumer,
     me: String,
@@ -935,18 +1029,17 @@ async fn attend(
         status,
         participants,
         hangup,
-        metrics,
+        in_room,
     } = reports;
     let mut announced = inbound.announced();
     // Dropping an entry aborts that participant's decoders, so leaving is the
     // same operation as the attempt ending.
     let mut attending: std::collections::HashMap<String, Vec<Abort>> =
         std::collections::HashMap::new();
-    // Taken by whoever arrives first. `audio::subscribe` owns the playback
-    // engine it is given, so a second participant would need a second engine or
-    // a mixer -- neither of which can be tested before a call can hold three
-    // people. Named here rather than discovered at that call.
-    let mut engine = engine;
+    // **Cloned per participant, never taken.** Clones of an engine share its
+    // device and its mix, so each peer becomes one more sink in the same output
+    // -- and the echo canceller, built from this engine, subtracts that whole
+    // mix. `None` only when there is no output device at all.
     // Who has a live control broadcast. Presence is this, not the camera: a
     // participant with no video is still on the call, and this is the set whose
     // emptying means the call is over.
@@ -968,7 +1061,7 @@ async fn attend(
                     tracing::info!("{id} is leaving");
                     listening.remove(&id);
                     if present.remove(&id) && present.is_empty() {
-                        let _ = hangup.unbounded_send(id);
+                        alone(&hangup, id, in_room);
                     }
                 }
                 continue;
@@ -998,7 +1091,7 @@ async fn attend(
                     // which time the reconnect has already given up.
                     listening.remove(id);
                     if present.remove(id) && present.is_empty() {
-                        let _ = hangup.unbounded_send(id.to_string());
+                        alone(&hangup, id.to_string(), in_room);
                     }
                 }
             }
@@ -1009,8 +1102,10 @@ async fn attend(
             tracing::debug!("ignoring an announcement at {path}");
             continue;
         };
-        // Cannot happen while each side keeps its own origin, and will the
-        // moment a relay puts everyone in one room.
+        // Cannot happen while each side keeps its own origin. Through a relay
+        // it should not either -- the relay does not announce a session's own
+        // broadcasts back to it -- but that is the relay's rule, not ours, so
+        // the check stays.
         if id == me {
             continue;
         }
@@ -1024,27 +1119,44 @@ async fn attend(
 
         tracing::info!("{id} joined");
         let slot = FrameSlot::default();
+        let stats = Arc::new(PeerStats::default());
         let _ = participants.unbounded_send(ParticipantEvent::Joined {
             id: id.to_string(),
             slot: slot.clone(),
+            stats: stats.clone(),
         });
 
         let mut tasks = vec![Abort(tokio::spawn(watch(
             broadcast.clone(),
             slot,
             id.to_string(),
-            status.clone(),
-            metrics.clone(),
+            (!in_room).then(|| status.clone()),
+            stats.clone(),
         )))];
-        if let Some(engine) = engine.take() {
+        if let Some(engine) = engine.clone() {
             let controls = controls.clone();
+            let peer = id.to_string();
+            let talking = stats.talking_flag();
             tasks.push(Abort(tokio::spawn(async move {
-                audio::subscribe(broadcast, engine, controls).await;
+                audio::subscribe(broadcast, peer, engine, controls, talking).await;
             })));
         } else {
-            tracing::warn!("[audio] {id}'s audio is not being played: the engine is taken");
+            tracing::warn!("[audio] {id} cannot be heard: there is no output device");
         }
         attending.insert(id.to_string(), tasks);
+    }
+}
+
+/// The last other person has gone, deliberately.
+///
+/// With one peer that ends the call: there is nobody left to talk to. In a room
+/// it does not -- the room is still there for whoever comes next, and leaving
+/// it is the user's decision, made with Hang up.
+fn alone(hangup: &UnboundedSender<String>, last: String, in_room: bool) {
+    if in_room {
+        tracing::info!("{last} left; alone in the room, staying");
+    } else {
+        let _ = hangup.unbounded_send(last);
     }
 }
 
@@ -1113,8 +1225,10 @@ async fn watch(
     broadcast: moq_net::broadcast::Consumer,
     slot: FrameSlot,
     peer: String,
-    status: UnboundedSender<RemoteStatus>,
-    metrics: Arc<Metrics>,
+    // `None` in a room, where one peer's video arriving is not the call's
+    // status -- see `Reports::in_room`.
+    status: Option<UnboundedSender<RemoteStatus>>,
+    stats: Arc<PeerStats>,
 ) {
     // The catalog is the peer's description of what it is sending. 20c failed
     // here by passing a *local* config and a hardcoded track name instead, and
@@ -1165,7 +1279,11 @@ async fn watch(
     // **The listening side can name its caller now.** iroh exposes no client
     // identity to a server, so the transport genuinely cannot say who this is --
     // but the broadcast path can, and does.
-    let _ = status.unbounded_send(RemoteStatus::Connected { peer: Some(peer) });
+    if let Some(status) = &status {
+        let _ = status.unbounded_send(RemoteStatus::Connected {
+            peer: Some(peer.clone()),
+        });
+    }
 
     // The network half's own rate, independent of whether anything is painting.
     // `camera::paint::FrameRate` measures capture against the GPU; this measures
@@ -1174,33 +1292,19 @@ async fn watch(
     let mut decoded = 0u32;
     let mut since = std::time::Instant::now();
 
-    // **Counted here, timed elsewhere.** Publishing the rate from inside this
-    // loop would mean it only updates when a frame arrives, so a stalled stream
-    // would leave the last healthy number on screen for as long as it was
-    // stalled -- showing 30 fps through the freeze it is meant to reveal. A
-    // ticker reading a counter reports the truth, which during a stall is zero.
-    let counted = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let _ticker = Abort(tokio::spawn({
-        let counted = counted.clone();
-        let metrics = metrics.clone();
-        async move {
-            let mut ticker = tokio::time::interval(FPS_WINDOW);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                ticker.tick().await;
-                let frames = counted.swap(0, std::sync::atomic::Ordering::Relaxed);
-                metrics.set_video_fps(frames as f32 / FPS_WINDOW.as_secs_f32());
-            }
-        }
-    }));
+    // Per tile, so a stalled peer shows as one tile at zero rather than hiding
+    // behind whichever healthy peer wrote the shared number last.
+    let meter = FpsMeter::new(stats);
 
     while let Ok(Some(frame)) = consumer.read().await {
-        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        meter.frame();
         decoded += 1;
         if decoded == REPORT_EVERY {
             let elapsed = since.elapsed().as_secs_f32();
             if elapsed > 0.0 {
-                tracing::debug!("[remote] {:.1} fps decoded", decoded as f32 / elapsed);
+                // Named, because in a room there are several of these lines
+                // and an unnamed rate cannot be told apart from the others.
+                tracing::debug!("[remote] {peer}: {:.1} fps decoded", decoded as f32 / elapsed);
             }
             decoded = 0;
             since = std::time::Instant::now();
@@ -1256,5 +1360,31 @@ mod path_tests {
         // Catalog-format detection keys off it, and a path that loses it fails
         // as a timeout rather than an error -- so the id goes in front.
         assert!(camera_path("anyone").ends_with(".hang"));
+    }
+}
+
+#[cfg(test)]
+mod room_tests {
+    use super::room_label;
+
+    fn label(url: &str) -> String {
+        room_label(&url.parse().unwrap())
+    }
+
+    #[test]
+    fn a_room_is_its_path_on_its_host() {
+        assert_eq!(label("http://localhost:4443/test"), "room test on localhost");
+        assert_eq!(label("https://relay.example.com/a/b/"), "room a/b on relay.example.com");
+    }
+
+    #[test]
+    fn no_path_is_the_relay_itself() {
+        assert_eq!(label("http://localhost:4443"), "the relay at localhost");
+    }
+
+    #[test]
+    fn an_iroh_relay_is_shortened() {
+        let key = "a".repeat(64);
+        assert_eq!(label(&format!("iroh://{key}/test")), "room test on aaaaaaaaaaaa");
     }
 }

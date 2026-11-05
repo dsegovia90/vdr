@@ -44,12 +44,13 @@ Frames never touch a DOM. The chain is:
 ```
 cameras::pump (worker thread)
   -> FrameSlot            src/camera/frames.rs   newest-frame-wins handoff
-  -> VideoPaintSource     src/camera/paint/      CustomPaintSource, uploads to wgpu
-  -> vello                                       composites the texture
+  -> VideoPaintSource     src/camera/paint/      a blitz Widget, uploads to wgpu
+  -> vello (hybrid)                              composites the texture
 ```
 
-`use_wgpu` registers the paint source and returns a `u64`, which RSX references as
-`canvas { "src": paint_source_id }`.
+`CustomWidgetAttr::new(VideoPaintSource::new(..))` wraps the widget, and RSX
+mounts it as `object { "data": widget }` (blitz `v0.3.0-beta.4`; the old pin
+used `use_wgpu` and `canvas { "src": id }`).
 
 ## Notes for future work
 
@@ -58,13 +59,18 @@ cameras::pump (worker thread)
   cannot work here. Its `Registry` also exposes no public frame *reader* — only
   `publish_frame` — so its frames are unreachable except over that HTTP server.
   We depend on the underlying `cameras` crate directly instead.
-- **`wgpu` is 27**, fixed by the pinned blitz revision -> anyrender_vello 0.7.
-  Textures are handed to vello, so both must be the same wgpu version.
+- **`wgpu` is 30**, fixed by the pinned blitz tag (`v0.3.0-beta.4`) ->
+  anyrender_vello_hybrid 0.11. Textures are handed to the renderer, so both must
+  be the same wgpu version. On wide-gamut screens colours are oversaturated
+  until an upstream fix ships (ticket 0).
 - **No `<select>`.** Blitz ships no interactive select widget, hence
   `components/dropdown.rs`.
-- **A canvas has zero intrinsic size** in blitz and its parent height reads as
-  indefinite, so percentage heights collapse it to 0px and it is never painted.
-  Size it with flex stretch (see `.preview` in `assets/styling/main.css`).
+- **The video element is positioned absolutely inside its tile.** It has no
+  useful intrinsic size, and as an ordinary flex/grid child its own pixel size
+  fed back into the grid, resizing every frame. Out of layout, it can only take
+  the size its tile is given. The app root is `h-screen` rather than `h-full`,
+  because a percentage height read as indefinite on the old pin and collapsed
+  the tiles to a few pixels.
 - **Tailwind v4 renders correctly**, including `@layer`, `@property`,
   `color-mix()` and `oklch()` colours — Blitz styles through Stylo, which is
   Firefox's engine, so the modern CSS surface is well covered.
@@ -72,13 +78,12 @@ cameras::pump (worker thread)
   usual rules (opacity, position with a z-index, transforms), painting hoists
   negative and positive z-index children around the regular ones, and
   hit-testing consults the same hoisted set — so ordering and clicks agree. An
-  earlier revision sorted `z-index` among direct siblings only, and that is what
-  the z-index classes in `components/camera.rs` were written for.
-- **An absolutely positioned overlay paints but never receives clicks** when it
-  overflows its parent's box — `Node::hit` will not descend into it. This is why
-  the dropdown menu renders in normal flow and pushes the content below it down
-  while open, which looks like a bug and is not. Five alternatives were tried.
-- **`border-radius` does not clip the canvas.** `rounded-lg` on the video
+  earlier revision sorted `z-index` among direct siblings only.
+- **Overlays take clicks** since `v0.3.0-beta.4`. The old pin's `Node::hit`
+  would not descend into an absolutely positioned child that overflowed its
+  parent, so the dropdown menu used to render in normal flow and push content
+  down. It floats again (`absolute left-0 top-full z-10`).
+- **`border-radius` does not clip the video** (checked on the old pin). `rounded-lg` on the video
   container leaves the frame's own corners square.
 - **BGRA frames skip the CPU entirely** — they upload straight into a
   `Bgra8Unorm` texture and the shader samples them as RGBA. Other formats

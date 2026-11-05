@@ -42,6 +42,16 @@ pub fn ConnectRow(
         if typed.is_empty() {
             return;
         }
+        // A URL is a room on a relay; anything else has to be someone's key.
+        // Told apart by `://`, which no endpoint id contains, so a mistyped
+        // URL gets the URL's complaint rather than the key's.
+        if typed.contains("://") {
+            match crate::args::relay_url(&typed) {
+                Ok(url) => connect.call(Peering::Join(url)),
+                Err(reason) => status.set(RemoteStatus::BadKey { reason }),
+            }
+            return;
+        }
         match typed.parse::<EndpointId>() {
             Ok(peer) => connect.call(Peering::Dial(peer)),
             // Reported in place rather than refused silently: a key that does
@@ -102,7 +112,7 @@ pub fn ConnectRow(
                 input {
                     class: "w-96 rounded-md bg-neutral-900 px-3 py-2 text-sm text-neutral-100",
                     r#type: "text",
-                    placeholder: "Paste the other person's key",
+                    placeholder: "Paste the other person's key, or a relay room URL",
                     value: "{draft}",
                     oninput: move |evt| {
                         // Clears a previous complaint as soon as the text

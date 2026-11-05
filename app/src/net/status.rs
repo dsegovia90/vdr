@@ -42,6 +42,20 @@ pub enum RemoteStatus {
         /// The peer's endpoint id.
         peer: String,
     },
+    /// Connecting to a relay to join a room.
+    Joining {
+        /// Which room, and on which relay.
+        room: String,
+    },
+    /// In a room on a relay, whoever else is or is not there.
+    ///
+    /// Its own state rather than [`Connected`](Self::Connected), because a room
+    /// is not one peer: being in it is true before anyone else arrives and
+    /// stays true after they all leave, and the tiles say who is there.
+    InRoom {
+        /// Which room, and on which relay.
+        room: String,
+    },
     /// Connected, and the peer's video is arriving.
     Connected {
         /// The peer's endpoint id.
@@ -80,8 +94,11 @@ impl RemoteStatus {
 
     /// Whether a peer is on the other end, which is what makes stopping a
     /// hang-up rather than a cancel.
+    ///
+    /// A room counts even when empty: leaving it is still said on the control
+    /// channel, and someone may arrive between the label and the click.
     pub fn is_connected(&self) -> bool {
-        matches!(self, Self::Connected { .. })
+        matches!(self, Self::Connected { .. } | Self::InRoom { .. })
     }
 
     /// Whether the user still has a decision to make.
@@ -121,6 +138,8 @@ impl RemoteStatus {
             Self::AwaitingCamera
                 | Self::Listening { .. }
                 | Self::Dialing { .. }
+                | Self::Joining { .. }
+                | Self::InRoom { .. }
                 | Self::Reconnecting
                 | Self::Connected { .. }
         )
@@ -133,10 +152,12 @@ impl fmt::Display for RemoteStatus {
             Self::Loopback => write!(f, "Loopback: your own camera, encoded and decoded"),
             Self::Binding => write!(f, "Starting the endpoint..."),
             Self::Idle { me } => write!(f, "Ready. Your key: {me}"),
-            Self::BadKey { reason } => write!(f, "That is not a key: {reason}"),
+            Self::BadKey { reason } => write!(f, "That is not a key or a room URL: {reason}"),
             Self::AwaitingCamera => write!(f, "Waiting for the camera..."),
             Self::Listening { me } => write!(f, "Waiting for a call. Your key: {me}"),
             Self::Dialing { peer } => write!(f, "Dialing {peer}..."),
+            Self::Joining { room } => write!(f, "Joining {room}..."),
+            Self::InRoom { room } => write!(f, "In {room}"),
             Self::Connected { peer: Some(peer) } => write!(f, "Connected to {peer}"),
             Self::Connected { peer: None } => write!(f, "Connected"),
             Self::Reconnecting => write!(f, "Connection lost. Reconnecting..."),

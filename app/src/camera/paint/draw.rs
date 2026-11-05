@@ -1,6 +1,6 @@
 //! Second half of a frame's journey: source texture -> target texture.
 
-use dioxus_native::{CustomPaintCtx, TextureHandle};
+use anyrender::{RenderContext, ResourceId};
 
 use super::active::Active;
 use super::fit::{contain, uniform_bytes, Mirror};
@@ -9,14 +9,14 @@ pub(super) struct Target {
     width: u32,
     height: u32,
     view: wgpu::TextureView,
-    pub(super) handle: TextureHandle,
+    pub(super) handle: ResourceId,
 }
 
 impl Active {
     /// Returns whether the target was (re)created.
     pub(super) fn ensure_target(
         &mut self,
-        ctx: &mut CustomPaintCtx<'_>,
+        ctx: &mut dyn RenderContext,
         width: u32,
         height: u32,
         scale: f64,
@@ -26,7 +26,7 @@ impl Active {
         }
 
         if let Some(old) = self.target.take() {
-            ctx.unregister_texture(old.handle);
+            ctx.unregister_resource(old.handle);
         }
 
         // Vello copies out of this into its Rgba8Unorm atlas, so it needs
@@ -42,11 +42,15 @@ impl Active {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let handle = ctx.register_texture(texture);
+        let Ok(handle) = ctx.try_register_custom_resource(Box::new(texture)) else {
+            return false;
+        };
         tracing::debug!("camera target resized to {width}x{height} at scale {scale}");
 
         self.target = Some(Target {
@@ -101,6 +105,7 @@ impl Active {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             if let Some(source) = source {
                 pass.set_pipeline(&self.pipeline.pipeline);

@@ -10,15 +10,26 @@ cameras = "0.3.2"
 # umbrella's `native` feature did not exist at 0.7.0, and this revision is
 # 0.7.0. `prelude` brings dioxus-core/hooks/signals/manganis with it.
 #
-# Pinned to a revision because blitz 0.2.x ships stylo 0.8, which fails to
+# Pinned to a git tag because blitz 0.2.x ships stylo 0.8, which fails to
 # compile once `derive_more`'s debug/eq features are unified into the graph.
-# This revision carries stylo 0.14.
+# `v0.3.0-beta.4` carries stylo 0.22 and wgpu 30 (ticket 0, moved from rev
+# `f83b2bc`). It is a tag, not crates.io, because no `dioxus-native` 0.7.x
+# release carries a new blitz; 0.8.0-alpha.3 does, but needs Dioxus 0.8.
+#
+# Known cost of beta.4: colours are oversaturated on wide-gamut (P3) screens.
+# wgpu 30's Metal backend tells the layer to do no colour matching. The fix is
+# merged upstream (wgpu #10286, anyrender #138) but unreleased; see ticket 0.
 #
 # The unification used to come from `iroh-live`; ticket 20e removed it and the
 # pin is still load-bearing, because `hang 0.20` (via moq-mux/moq-video) and
 # `iroh 1.1` both pull `derive_more` in on their own. Verify with
 # `cargo tree -i derive_more` before concluding this pin is stale.
-dioxus-native = { git = "https://github.com/DioxusLabs/blitz", rev = "f83b2bc", features = ["prelude", "tracing"] }
+dioxus-native = { git = "https://github.com/DioxusLabs/blitz", tag = "v0.3.0-beta.4", features = ["prelude", "tracing"] }
+# Needed to name the `Widget` API types the video tiles implement (it replaced
+# `CustomPaintSource` in beta.4). Same tag as dioxus-native, or the two disagree.
+blitz-dom = { git = "https://github.com/DioxusLabs/blitz", tag = "v0.3.0-beta.4", default-features = false }
+anyrender = "0.14"
+peniko = "0.6"
 anyhow = "1"
 bytes = "1"
 futures-channel = "0.3"
@@ -56,9 +67,12 @@ tracing-subscriber = "0.3"
 # `iroh-live`/`moq-media`. `hang` is deliberately NOT a direct dependency -- the
 # catalog types we touch reach us through `moq-mux`.
 #
-# NEVER enable moq-video's `render` feature: it pulls wgpu 30 and vello owns our
-# device at 27. Guard: `cargo tree --target <host> | grep "wgpu v30"` must be
-# empty. A Cargo.lock grep false-positives on anyrender_vello_cpu's wgpu 0.19.
+# Keep moq-video's `render` feature OFF. It used to be forbidden because it
+# pulls wgpu 30 while vello owned our device at 27. Since beta.4 we are on 30
+# too, so that reason is gone, but nobody has checked whether its renderer and
+# vello can share a device. Until someone does, it stays off. The Cargo.lock
+# also carries wgpu 29 via anyrender_vello_cpu -> pixels, which is target-gated
+# and never on the host (`cargo tree -i wgpu@29.0.4` prints nothing).
 moq-net   = { version = "0.2",  default-features = false }
 moq-mux   = { version = "0.9",  default-features = false }
 # The control plane, and it costs nothing: `moq-mux` already pulls this in to
@@ -71,4 +85,4 @@ moq-audio = { version = "0.0.22", default-features = false, features = ["capture
 moq-native = { version = "0.19", default-features = false, features = ["iroh", "quinn", "aws-lc-rs"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
 url = "2"
-wgpu = "27"
+wgpu = "30"

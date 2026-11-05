@@ -12,5 +12,5 @@ mod control;
 mod devices;
 
 pub use control::{Controls, MicStatus};
-pub(crate) use control::{loudness, Talking};
+pub(crate) use control::{loudness, Speaking, Talking};
 pub use devices::{use_microphones_provider, use_shared_microphones};

@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use super::audio;
+use super::metrics::{FpsMeter, PeerStats};
 use super::runtime::runtime;
 use crate::audio::Controls;
 use crate::camera::{FrameFeed, FrameSlot, encode_size, from_decoded};
@@ -27,16 +28,21 @@ use crate::camera::{FrameFeed, FrameSlot, encode_size, from_decoded};
 /// [`FrameTap`](crate::camera::FrameTap) drops, `FrameFeed::take` starts
 /// erroring, the encode loop ends, the producer finishes, and the decode task
 /// sees the track close and returns.
-pub(super) fn spawn(feed: FrameFeed, slot: FrameSlot, controls: Arc<Controls>) {
+pub(super) fn spawn(
+    feed: FrameFeed,
+    slot: FrameSlot,
+    stats: Arc<PeerStats>,
+    controls: Arc<Controls>,
+) {
     let spawned = std::thread::Builder::new()
         .name("loopback".into())
-        .spawn(move || run(feed, slot, controls));
+        .spawn(move || run(feed, slot, stats, controls));
     if let Err(error) = spawned {
         tracing::warn!("could not spawn the loopback thread: {error}");
     }
 }
 
-fn run(mut feed: FrameFeed, slot: FrameSlot, controls: Arc<Controls>) {
+fn run(mut feed: FrameFeed, slot: FrameSlot, stats: Arc<PeerStats>, controls: Arc<Controls>) {
     let Some(runtime) = runtime() else {
         return;
     };
@@ -52,7 +58,7 @@ fn run(mut feed: FrameFeed, slot: FrameSlot, controls: Arc<Controls>) {
     let (width, height) = (first.width, first.height);
 
     runtime.block_on(async move {
-        if let Err(error) = pump(feed, slot, width, height, controls).await {
+        if let Err(error) = pump(feed, slot, stats, width, height, controls).await {
             tracing::error!("loopback: {error:#}");
         }
         tracing::info!("loopback: stopped");
@@ -63,6 +69,7 @@ fn run(mut feed: FrameFeed, slot: FrameSlot, controls: Arc<Controls>) {
 async fn pump(
     mut feed: FrameFeed,
     slot: FrameSlot,
+    stats: Arc<PeerStats>,
     width: u32,
     height: u32,
     controls: Arc<Controls>,
@@ -103,13 +110,22 @@ async fn pump(
     }
     let audio_decode = engine.map(|engine| {
         let broadcast = broadcast.consume();
-        tokio::spawn(audio::subscribe(broadcast, engine, controls.clone()))
+        tokio::spawn(audio::subscribe(
+            broadcast,
+            "loopback".to_string(),
+            engine,
+            controls.clone(),
+            stats.talking_flag(),
+        ))
     });
 
     // In-process, so the producer's own consumer is the whole "network". A call
     // resolves the rendition from the catalog it receives instead.
     let consumer_broadcast = broadcast.consume();
     let decode = tokio::spawn(async move {
+        // The same per-tile rate a peer's tile shows, so loopback can be read
+        // the same way.
+        let meter = FpsMeter::new(stats);
         let mut consumer = match moq_video::decode::Consumer::new(
             &consumer_broadcast,
             &rendition,
@@ -127,6 +143,7 @@ async fn pump(
         tracing::info!("loopback: decoding with {}", consumer.name());
 
         while let Ok(Some(frame)) = consumer.read().await {
+            meter.frame();
             if let Some(frame) = from_decoded(frame) {
                 slot.publish(frame);
             }

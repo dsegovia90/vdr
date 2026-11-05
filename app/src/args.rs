@@ -18,7 +18,8 @@
 //! vdr                                     # idle: shows your key, waits for you
 //! vdr --secret <hex> --listen             # prints its endpoint id and waits
 //! vdr --secret <hex> --dial <peer-id>     # dials it
-//! vdr --loopback                          # no network; the codec round trip
+//! vdr --relay http://localhost:4443/room  # joins a room on a relay
+//! vdr --loopback                         # no network; the codec round trip
 //! vdr --camera facetime                   # picks a camera by name
 //! vdr --quality high                      # 720p rung; low | mid | high, mid by default
 //! vdr --ephemeral                         # a throwaway key, not the saved one
@@ -43,6 +44,18 @@
 //! necessity. It matches on the device's name rather than its position, for
 //! the reason task 17 gives -- enumeration order is not stable across launches,
 //! so an index would select a different camera on different runs.
+//!
+//! `--relay` joins a **room**: every participant connects to the same relay
+//! and the URL's path names the room, because the relay roots each session at
+//! the path it connected with. Three schemes, all handled by moq-native's
+//! client:
+//!
+//! - `http://host:port/room` -- a local dev relay. The client fetches and pins
+//!   the relay's `/certificate.sha256`, so a self-signed certificate needs no
+//!   flags. For testing only: that fetch is itself unauthenticated.
+//! - `https://host/room` -- a relay with a real certificate.
+//! - `iroh://<relay-endpoint-id>/room` -- a relay with iroh enabled, dialled by
+//!   key the same way a peer is.
 
 use std::sync::OnceLock;
 
@@ -65,6 +78,24 @@ pub enum Peering {
     Listen,
     /// Dial this peer by public key.
     Dial(EndpointId),
+    /// Join the room this relay URL names, alongside everyone else in it.
+    ///
+    /// A second mode beside `Listen`/`Dial`, not a replacement: a 1:1 call
+    /// still goes direct, which needs nothing running anywhere. Merging the two
+    /// is the topology switch's job (ticket 22).
+    Join(url::Url),
+}
+
+/// Reads a relay URL, or says why it is not one.
+///
+/// Shared by `--relay` and the connect field so the two cannot disagree about
+/// what counts.
+pub fn relay_url(text: &str) -> Result<url::Url, String> {
+    let url: url::Url = text.parse().map_err(|error| format!("{error}"))?;
+    match url.scheme() {
+        "http" | "https" | "iroh" => Ok(url),
+        other => Err(format!("a relay url is http, https or iroh, not {other}")),
+    }
 }
 
 /// How big we encode, as a rung rather than a number.
@@ -193,6 +224,11 @@ impl Args {
                     Some(Err(error)) => tracing::error!("--dial is not an endpoint id: {error}"),
                     None => tracing::error!("--dial needs an endpoint id"),
                 },
+                "--relay" => match args.next().as_deref().map(relay_url) {
+                    Some(Ok(url)) => peering = Peering::Join(url),
+                    Some(Err(error)) => tracing::error!("--relay is not a relay url: {error}"),
+                    None => tracing::error!("--relay needs a url"),
+                },
                 "--secret" => match args.next() {
                     // Read back by `net::call` on the call thread, which has
                     // not started yet -- this runs before the first render.
@@ -223,6 +259,25 @@ impl Args {
             quality,
             ephemeral,
             encode_width,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relay_url_is_one_of_three_schemes() {
+        for ok in [
+            "http://localhost:4443/room",
+            "https://relay.example.com/room",
+            "iroh://abc/room",
+        ] {
+            assert!(relay_url(ok).is_ok(), "{ok} should be a relay url");
+        }
+        for bad in ["ftp://host/room", "not a url", "localhost:4443/room"] {
+            assert!(relay_url(bad).is_err(), "{bad} should not be a relay url");
         }
     }
 }

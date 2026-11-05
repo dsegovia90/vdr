@@ -14,8 +14,31 @@ const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
 fn main() {
     tracing_subscriber::fmt::init();
+    install_crypto_provider();
     warn_if_unbundled();
     dioxus_native::launch(App);
+}
+
+/// Picks rustls's crypto backend for the whole process, once, before anything
+/// builds a TLS client.
+///
+/// **Without it, joining a room at an `http://` relay panics.** That form fetches
+/// the relay's certificate hash over plain HTTP with `reqwest`, which builds
+/// its client on rustls's *process* default -- and there is none, because both
+/// `aws-lc-rs` and `ring` are compiled into the tree, so rustls refuses to
+/// guess. The panic is inside moq-native's reconnect task, so all that reached
+/// the call was "reconnect stopped". moq-native's own TLS passes a provider
+/// explicitly, which is why direct calls never hit this.
+///
+/// aws-lc-rs, to match the backend moq-native is built with.
+fn install_crypto_provider() {
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        // Only possible if something installed one first, which is fine.
+        tracing::debug!("a rustls crypto provider was already installed");
+    }
 }
 
 /// Complains if the app was built without dx, which leaves it unstyled.
@@ -41,7 +64,7 @@ fn App() -> Element {
     rsx! {
         document::Title { "Vdr "}
         document::Stylesheet { href: TAILWIND_CSS }
-        div { class: "flex h-full flex-col gap-4 p-6",
+        div { class: "flex h-screen flex-col gap-4 overflow-hidden p-6",
             components::Camera {}
         }
     }

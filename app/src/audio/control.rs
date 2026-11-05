@@ -1,5 +1,5 @@
 //! The microphone as the interface sees it: mute, a chosen input, a level, and
-//! whether the other person is talking.
+//! whether anyone else is talking.
 //!
 //! Shared directly rather than through a channel. `moq_audio`'s publication
 //! handle is `Send + Sync` and its controls only flip a flag that the capture
@@ -8,7 +8,8 @@
 //! direction -- a level worth drawing changes faster than anything wants to be
 //! pushed a message about -- so that half is polled.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use moq_audio::{capture, encode};
@@ -100,7 +101,10 @@ impl Default for Mic {
 #[derive(Default)]
 pub struct Controls {
     mic: Mutex<Mic>,
-    peer_talking: AtomicBool,
+    /// How many peers are talking right now. A count, not a flag: with several
+    /// peers, one of them going quiet must not switch the indicator off while
+    /// another is still mid-sentence. Held up by [`Speaking`] guards.
+    peers_talking: AtomicUsize,
 }
 
 impl PartialEq for Controls {
@@ -188,9 +192,9 @@ impl Controls {
         }
     }
 
-    /// Whether the peer is talking.
+    /// Whether anyone else on the call is talking.
     pub fn peer_talking(&self) -> bool {
-        self.peer_talking.load(Ordering::Relaxed)
+        self.peers_talking.load(Ordering::Relaxed) > 0
     }
 
     /// Hand over the publication a new call just created, and apply the intent
@@ -213,12 +217,63 @@ impl Controls {
         if let Ok(mut mic) = self.mic.lock() {
             mic.publication = None;
         }
-        self.peer_talking.store(false, Ordering::Relaxed);
+        self.peers_talking.store(0, Ordering::Relaxed);
     }
 
-    /// Record what the talking window concluded.
-    pub(crate) fn set_peer_talking(&self, talking: bool) {
-        self.peer_talking.store(talking, Ordering::Relaxed);
+    /// Takes one away, never below zero.
+    ///
+    /// Saturating because [`detach`](Self::detach) zeroes the count while the
+    /// guards that raised it may still be alive; their later drop must not wrap
+    /// the count round to "everyone is talking".
+    fn quieter(&self) {
+        let _ = self
+            .peers_talking
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
+}
+
+/// One peer's contribution to "someone is talking".
+///
+/// **A guard, because a peer's audio task does not get to finish.** A peer
+/// leaving aborts the task reading their audio, so nothing written after its
+/// loop ever runs -- a single flag cleared on the way out stayed on whenever
+/// someone left mid-word. Dropping this takes their share back whichever way
+/// the task ends.
+pub(crate) struct Speaking {
+    controls: Arc<Controls>,
+    /// This peer's own flag, for their tile. The count in `controls` answers
+    /// "is anyone talking"; this answers "is *this* one".
+    own: Arc<AtomicBool>,
+    on: bool,
+}
+
+impl Speaking {
+    pub(crate) fn new(controls: Arc<Controls>, own: Arc<AtomicBool>) -> Self {
+        Self {
+            controls,
+            own,
+            on: false,
+        }
+    }
+
+    /// Records what this peer's talking window concluded.
+    pub(crate) fn set(&mut self, talking: bool) {
+        if talking == self.on {
+            return;
+        }
+        self.on = talking;
+        self.own.store(talking, Ordering::Relaxed);
+        if talking {
+            self.controls.peers_talking.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.controls.quieter();
+        }
+    }
+}
+
+impl Drop for Speaking {
+    fn drop(&mut self) {
+        self.set(false);
     }
 }
 
@@ -291,6 +346,42 @@ mod tests {
 
     fn pcm(samples: &[f32]) -> Vec<u8> {
         samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn one_peer_stopping_does_not_silence_another() {
+        let controls = Arc::new(Controls::default());
+        let mut alice = Speaking::new(controls.clone(), Arc::default());
+        let mut bob = Speaking::new(controls.clone(), Arc::default());
+        alice.set(true);
+        bob.set(true);
+        alice.set(false);
+        assert!(controls.peer_talking(), "bob is still talking");
+        bob.set(false);
+        assert!(!controls.peer_talking());
+    }
+
+    #[test]
+    fn a_peer_leaving_mid_word_takes_their_share_back() {
+        let controls = Arc::new(Controls::default());
+        let own = Arc::new(AtomicBool::new(false));
+        let mut alice = Speaking::new(controls.clone(), own.clone());
+        alice.set(true);
+        assert!(own.load(Ordering::Relaxed), "their own tile shows them talking");
+        // What aborting their audio task does: the guard drops while on.
+        drop(alice);
+        assert!(!controls.peer_talking());
+        assert!(!own.load(Ordering::Relaxed), "and their tile's dot goes out too");
+    }
+
+    #[test]
+    fn a_call_ending_under_a_live_guard_does_not_wrap() {
+        let controls = Arc::new(Controls::default());
+        let mut alice = Speaking::new(controls.clone(), Arc::default());
+        alice.set(true);
+        controls.detach();
+        drop(alice);
+        assert!(!controls.peer_talking(), "the count must not wrap below zero");
     }
 
     #[test]

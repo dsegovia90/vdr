@@ -1,4 +1,8 @@
-//! The audio half of a call: a microphone out, the peer's voice in.
+//! The audio half of a call: a microphone out, every other participant's voice in.
+//!
+//! Each peer gets a sink of their own on one shared playback engine, which mixes
+//! them into a single device stream. That single mix is also what the echo
+//! canceller subtracts, so one canceller covers everyone in the room.
 //!
 //! Deliberately **not** a parallel of the video path, and the difference is the
 //! whole design. Video is newest-wins from end to end: the capture tap keeps one
@@ -23,7 +27,7 @@ use std::time::Duration;
 use moq_audio::{capture, decode, encode, playback};
 use moq_mux::catalog::Stream as _;
 
-use crate::audio::{Controls, Talking, loudness};
+use crate::audio::{Controls, Speaking, Talking, loudness};
 
 /// How far ahead newer audio has to be before a stalled group is abandoned.
 ///
@@ -164,14 +168,21 @@ pub(super) fn drive(driver: encode::Driver) {
     }
 }
 
-/// Waits for the peer's audio rendition, decodes it, and plays it.
+/// Waits for one peer's audio rendition, decodes it, and plays it.
 ///
-/// Runs until the track closes. Every failure is terminal *for audio only* and
-/// says so in the log rather than propagating: the call keeps its video.
+/// Runs until the track closes or the peer leaves, which aborts it. Every
+/// failure is terminal *for this peer's audio only* and says so in the log
+/// rather than propagating: the call keeps its video.
+///
+/// `engine` is a clone of the call's one engine -- clones share the device and
+/// its mix -- so several of these run at once, one per peer.
 pub(super) async fn subscribe(
     broadcast: moq_net::broadcast::Consumer,
+    peer: String,
     engine: playback::Engine,
     controls: Arc<Controls>,
+    // Their tile's own talking dot, beside the call-wide one in `controls`.
+    talking_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut catalog = match moq_mux::catalog::Consumer::<()>::new(
         &broadcast,
@@ -181,7 +192,7 @@ pub(super) async fn subscribe(
     {
         Ok(catalog) => catalog,
         Err(error) => {
-            tracing::error!("[audio] no catalog from the peer: {error:#}");
+            tracing::error!("[audio] no catalog from {peer}: {error:#}");
             return;
         }
     };
@@ -192,14 +203,14 @@ pub(super) async fn subscribe(
                 if let Some((name, config)) = snapshot.audio.renditions.iter().next() {
                     break (name.clone(), config.clone());
                 }
-                tracing::debug!("[audio] the peer has no audio rendition yet; waiting");
+                tracing::debug!("[audio] {peer} has no audio rendition yet; waiting");
             }
             Ok(None) => {
-                tracing::warn!("[audio] the peer's catalog closed before it offered audio");
+                tracing::warn!("[audio] {peer}'s catalog closed before it offered audio");
                 return;
             }
             Err(error) => {
-                tracing::error!("[audio] could not read the peer's catalog: {error:#}");
+                tracing::error!("[audio] could not read {peer}'s catalog: {error:#}");
                 return;
             }
         }
@@ -209,7 +220,7 @@ pub(super) async fn subscribe(
         match decode::Consumer::new(&broadcast, &config, &name, decode_config()).await {
             Ok(consumer) => consumer,
             Err(error) => {
-                tracing::error!("[audio] no decoder for the peer's audio: {error:#}");
+                tracing::error!("[audio] no decoder for {peer}'s audio: {error:#}");
                 return;
             }
         };
@@ -221,12 +232,12 @@ pub(super) async fn subscribe(
     }) {
         Ok(sink) => sink,
         Err(error) => {
-            tracing::error!("[audio] could not add the peer to the mix: {error:#}");
+            tracing::error!("[audio] could not add {peer} to the mix: {error:#}");
             return;
         }
     };
     tracing::info!(
-        "[audio] playing the peer at {} Hz, {} channel(s)",
+        "[audio] playing {peer} at {} Hz, {} channel(s)",
         consumer.sample_rate(),
         consumer.channels()
     );
@@ -235,20 +246,18 @@ pub(super) async fn subscribe(
     let mut decoded = 0u32;
     let mut since = std::time::Instant::now();
     let mut talking = Talking::default();
-    let mut was_talking = false;
+    // Released when this task ends *or is aborted*, which is how a peer leaving
+    // mid-word stops counting as someone talking.
+    let mut speaking = Speaking::new(controls, talking_flag);
 
     while let Ok(Some(frame)) = consumer.read().await {
-        let now_talking = talking.push(loudness(&frame.data));
-        if now_talking != was_talking {
-            controls.set_peer_talking(now_talking);
-            was_talking = now_talking;
-        }
+        speaking.set(talking.push(loudness(&frame.data)));
         decoded += 1;
         if decoded == REPORT_EVERY {
             let elapsed = since.elapsed().as_secs_f32();
             if elapsed > 0.0 {
                 tracing::debug!(
-                    "[audio] {:.1} frames/s decoded from the peer",
+                    "[audio] {:.1} frames/s decoded from {peer}",
                     decoded as f32 / elapsed
                 );
             }
@@ -262,8 +271,7 @@ pub(super) async fn subscribe(
             }
         }
     }
-    controls.set_peer_talking(false);
-    tracing::info!("[audio] the peer's audio track ended");
+    tracing::info!("[audio] {peer}'s audio track ended");
 }
 
 /// The decoder settings, which differ from the defaults in exactly one place.

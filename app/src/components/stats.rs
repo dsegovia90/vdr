@@ -1,5 +1,9 @@
 //! One line of numbers about the connection.
 //!
+//! About the link as a whole -- what we send, round trip, loss. What arrives
+//! from each person is on their own tile instead, because in a room one
+//! call-wide "fps in" could only ever be one of them.
+//!
 //! The app has always measured these and always thrown them at the log, which
 //! is fine while the only person running it has a terminal open. It stops being
 //! fine the moment someone else has a bad call: "it lagged" is all they can
@@ -30,7 +34,6 @@ struct Sample {
     loss: Option<f32>,
     send_kbps: Option<u32>,
     estimate_kbps: Option<u32>,
-    video_fps: Option<f32>,
     encode_size: Option<(u32, u32)>,
 }
 
@@ -56,7 +59,6 @@ pub fn StatsRow(props: StatsProps) -> Element {
                             loss: metrics.loss(),
                             send_kbps: metrics.send_kbps(),
                             estimate_kbps: metrics.estimate_kbps(),
-                            video_fps: metrics.video_fps(),
                             encode_size: metrics.encode_size(),
                         };
                         if tx.unbounded_send(next).is_err() {
@@ -84,9 +86,6 @@ pub fn StatsRow(props: StatsProps) -> Element {
             Some(estimate) => parts.push(format!("{kbps} kbps up (link {estimate})")),
             None => parts.push(format!("{kbps} kbps up")),
         }
-    }
-    if let Some(fps) = reading.video_fps {
-        parts.push(format!("{fps:.0} fps in"));
     }
     if let Some(rtt) = reading.rtt {
         parts.push(format!("{rtt} ms"));

@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use dioxus_native::prelude::*;
 
-pub use metrics::Metrics;
+pub use metrics::{Metrics, PeerStats};
 pub use status::RemoteStatus;
 
 use crate::args::{Args, Peering};
@@ -47,6 +47,8 @@ pub struct Participant {
     pub id: String,
     /// Their decoded frames.
     pub slot: FrameSlot,
+    /// What their tile says about them: frame rate, and whether they talk.
+    pub stats: Arc<PeerStats>,
 }
 
 impl Participant {
@@ -64,7 +66,11 @@ impl Participant {
 /// status does.
 pub(super) enum ParticipantEvent {
     /// Somebody is publishing; here is where their frames will arrive.
-    Joined { id: String, slot: FrameSlot },
+    Joined {
+        id: String,
+        slot: FrameSlot,
+        stats: Arc<PeerStats>,
+    },
     /// They stopped.
     Left { id: String },
     /// The call is over; everyone goes.
@@ -123,7 +129,9 @@ pub fn use_remote() -> Remote {
     let mut me = use_signal(|| Option::<String>::None);
     let mut participants = use_signal(Vec::<Participant>::new);
     let joined = use_channel(move |event: ParticipantEvent| match event {
-        ParticipantEvent::Joined { id, slot } => participants.write().push(Participant { id, slot }),
+        ParticipantEvent::Joined { id, slot, stats } => {
+            participants.write().push(Participant { id, slot, stats })
+        }
         ParticipantEvent::Left { id } => participants.write().retain(|p| p.id != id),
         ParticipantEvent::Cleared => participants.write().clear(),
     });
@@ -158,12 +166,14 @@ pub fn use_remote() -> Remote {
             Peering::Loopback => {
                 status.set(RemoteStatus::Loopback);
                 let slot = FrameSlot::default();
-                loopback::spawn(feed, slot.clone(), audio.clone());
+                let stats = Arc::new(PeerStats::default());
+                loopback::spawn(feed, slot.clone(), stats.clone(), audio.clone());
                 // A participant like any other, so the tile below is rendered by
                 // the same code a real peer's is.
                 participants.set(vec![Participant {
                     id: "loopback".to_string(),
                     slot,
+                    stats,
                 }]);
             }
             peering => {
