@@ -25,7 +25,11 @@ fn main() {
 /// **Not silence.** The old default logged nothing at all, so a call that went
 /// wrong on someone else's machine left no evidence to send back -- which is
 /// exactly where echo turned up.
-const DEFAULT_LOG: &str = "warn,vdr=info,moq_audio=info";
+///
+/// `vello_common` only at `error`: it warns "A path contains NaN" about 1,300
+/// times a second on every build so far, which would bury everything else in
+/// the file. Present on master too; quietened here rather than fixed.
+const DEFAULT_LOG: &str = "warn,vdr=info,moq_audio=info,vello_common=error";
 
 /// Logs to stderr and to `vdr.log` in the app's data folder.
 ///

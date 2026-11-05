@@ -36,6 +36,10 @@ use fixed_resample::{ResamplingChannelConfig, ResamplingCons, ResamplingProd, re
 use sonora::config::{EchoCanceller, GainController2, NoiseSuppression, NoiseSuppressionLevel};
 use sonora::{AudioProcessing, StreamConfig};
 
+/// vid patch: the type [`Canceller::statistics`] returns, so callers need no
+/// direct (and version-matched) dependency on sonora.
+pub use sonora::AudioProcessingStats;
+
 use crate::Error;
 use crate::playback::{self, BUS_CHANNELS};
 
@@ -256,7 +260,7 @@ impl Canceller {
 	///
 	/// `None` until a microphone has opened and the first second has passed.
 	/// vid patch, not in moq-audio 0.0.22.
-	pub fn statistics(&self) -> Option<sonora::AudioProcessingStats> {
+	pub fn statistics(&self) -> Option<AudioProcessingStats> {
 		self.inner.stats.lock().ok().and_then(|stats| stats.clone())
 	}
 

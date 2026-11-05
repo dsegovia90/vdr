@@ -87,9 +87,12 @@ pub(super) fn publish(
     broadcast: moq_net::broadcast::Producer,
     catalog: moq_mux::catalog::Producer,
     engine: Option<&playback::Engine>,
-) -> Result<(encode::Publication, encode::Driver), String> {
+) -> Result<(encode::Publication, encode::Driver, Option<moq_audio::aec::Canceller>), String> {
     // Opus at 20 ms, the system default input.
     let mut options = encode::PublicationOptions::default();
+    // A clone handed back for `report_aec`: clones share one adaptive filter,
+    // so this one sees what the microphone's does.
+    let mut canceller = None;
     // **Discontinuous transmission stays off, and that is a decision.** Turning
     // it on is tempting: it saves bandwidth through silence, and it marks that
     // silence on the wire so a listener can tell a quiet microphone from a
@@ -106,7 +109,8 @@ pub(super) fn publish(
         // Defaults are noise suppression and auto gain both on, which is what a
         // browser gives a call. Costs up to 10 ms of capture latency.
         Some(engine) => {
-            options.capture.aec = Some(engine.canceller(moq_audio::aec::Config::default()));
+            canceller = Some(engine.canceller(moq_audio::aec::Config::default()));
+            options.capture.aec = canceller.clone();
         }
         None => tracing::warn!(
             "[audio] no output device, so nothing to cancel and nothing to cancel it against"
@@ -116,8 +120,37 @@ pub(super) fn publish(
     // sound identical from the inside.
     tracing::info!("[audio] publishing {}", describe(&options.capture.source));
     encode::Publication::new(broadcast, catalog, options)
+        .map(|(publication, driver)| (publication, driver, canceller))
         .map_err(|error| format!("could not publish the microphone: {error:#}"))
 }
+
+/// Logs how well our echo canceller is doing, every few seconds, and keeps the
+/// latest numbers in `metrics` for the stats file.
+///
+/// **The canceller grades itself** (sonora's statistics): how much echo it
+/// removes (ERLE), how loud the echo was to begin with (ERL), where it thinks
+/// the echo sits in time, and how likely some got through. A call with echo
+/// then says whose machine fails to cancel and why, rather than leaving it to
+/// guesswork. Runs until the call aborts it.
+pub(super) async fn report_aec(
+    canceller: moq_audio::aec::Canceller,
+    metrics: Option<Arc<super::Metrics>>,
+) {
+    let mut ticker = tokio::time::interval(AEC_REPORT_EVERY);
+    loop {
+        ticker.tick().await;
+        let Some(stats) = canceller.statistics() else { continue };
+        let snapshot = super::metrics::AecStats::from(&stats);
+        tracing::info!("[aec] {snapshot}");
+        if let Some(metrics) = &metrics {
+            metrics.set_aec(snapshot);
+        }
+    }
+}
+
+/// How often the echo canceller's numbers are logged. Often enough to see it
+/// settle after a join, rare enough not to drown the log.
+const AEC_REPORT_EVERY: Duration = Duration::from_secs(5);
 
 /// Runs the capture driver on a thread of its own, until the publication drops.
 ///

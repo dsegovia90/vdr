@@ -100,9 +100,14 @@ async fn pump(
 
     let engine = audio::open_playback().await;
     match audio::publish(broadcast.clone(), catalog, engine.as_ref()) {
-        Ok((publication, driver)) => {
+        Ok((publication, driver, canceller)) => {
             controls.attach(publication);
             audio::drive(driver);
+            // Loopback plays our own voice back, which the canceller's
+            // reference holds: the easy case, useful for seeing it settle.
+            if let Some(canceller) = canceller {
+                tokio::spawn(audio::report_aec(canceller, None));
+            }
         }
         Err(error) => {
             tracing::warn!("loopback: [audio] the microphone is not being published: {error}")

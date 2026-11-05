@@ -659,10 +659,13 @@ async fn run(
         let announcing = Abort(tokio::spawn(announce(presence.clone(), local.clone())));
 
         let engine = audio::open_playback().await;
+        let mut aec_report = None;
         match audio::publish(broadcast.clone(), catalog, engine.as_ref()) {
-            Ok((publication, driver)) => {
+            Ok((publication, driver, canceller)) => {
                 controls.attach(publication);
                 audio::drive(driver);
+                aec_report = canceller
+                    .map(|canceller| Abort(tokio::spawn(audio::report_aec(canceller, Some(metrics.clone())))));
             }
             Err(error) => tracing::warn!("[audio] the microphone is not being published: {error}"),
         }
@@ -1026,6 +1029,7 @@ async fn run(
             reporting.abort();
         }
         metrics.clear();
+        drop(aec_report);
         controls.detach();
         // Aborting the loop above stops the per-participant tasks with it, but
         // the tiles are the interface's and have to be taken down by name.
@@ -1420,9 +1424,13 @@ fn write_stats(
         lines.push_str(&line.to_string());
         lines.push('\n');
     }
+    let aec = metrics.aec().unwrap_or_default();
     let link = serde_json::json!({
         "t": t, "me": me, "link": true,
         "rtt_ms": metrics.rtt(), "loss_pct": metrics.loss(), "up_kbps": metrics.send_kbps(),
+        "aec_erle_db": aec.erle_db, "aec_erl_db": aec.erl_db,
+        "aec_delay_ms": aec.delay_ms, "aec_delay_sd_ms": aec.delay_sd_ms,
+        "aec_residual_max": aec.residual_max, "aec_divergent": aec.divergent,
     });
     lines.push_str(&link.to_string());
     lines.push('\n');

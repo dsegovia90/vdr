@@ -40,8 +40,15 @@ const FPS_SHARE: f64 = 0.95;
 const MAX_DELAY_MS: f64 = 300.0;
 const MUTE_MARGIN_S: f64 = 2.0;
 
-/// One second of one participant's link: round trip, and loss.
-type LinkSample = (Option<f64>, Option<f64>);
+/// One second of one participant's link and echo canceller.
+struct LinkSample {
+    rtt: Option<f64>,
+    loss: Option<f64>,
+    erle: Option<f64>,
+    delay: Option<f64>,
+    delay_sd: Option<f64>,
+    residual_max: Option<f64>,
+}
 
 /// One second of one received stream.
 struct Second {
@@ -79,10 +86,14 @@ fn main() {
             };
             let me = short(value["me"].as_str().unwrap_or("?"));
             if value["link"].as_bool() == Some(true) {
-                links
-                    .entry(me)
-                    .or_default()
-                    .push((value["rtt_ms"].as_f64(), value["loss_pct"].as_f64()));
+                links.entry(me).or_default().push(LinkSample {
+                    rtt: value["rtt_ms"].as_f64(),
+                    loss: value["loss_pct"].as_f64(),
+                    erle: value["aec_erle_db"].as_f64(),
+                    delay: value["aec_delay_ms"].as_f64(),
+                    delay_sd: value["aec_delay_sd_ms"].as_f64(),
+                    residual_max: value["aec_residual_max"].as_f64(),
+                });
                 continue;
             }
             let Some(peer) = value["peer"].as_str() else { continue };
@@ -123,11 +134,23 @@ fn main() {
 
     println!();
     for (me, samples) in &links {
-        let rtts: Vec<f64> = samples.iter().filter_map(|(rtt, _)| *rtt).collect();
-        let loss = samples.iter().filter_map(|(_, loss)| *loss).fold(0.0_f64, f64::max);
+        let column = |pick: fn(&LinkSample) -> Option<f64>| samples.iter().filter_map(pick).collect::<Vec<_>>();
+        let loss = column(|s| s.loss).into_iter().fold(0.0_f64, f64::max);
         println!(
             "link {me:<9} rtt p50 {} ms, loss up to {loss:.2}%",
-            fmt(percentile(rtts, 0.5), 0)
+            fmt(percentile(column(|s| s.rtt), 0.5), 0)
+        );
+        // The echo canceller's own grade, for *this* participant's microphone:
+        // low ERLE or a wandering delay here is whose machine sends echo back.
+        // Shown, not judged, until a real call shows what good looks like.
+        println!(
+            "     {:<9} echo canceller: erle p50 {} dB (worst {} dB), delay p50 {} ms (sd p50 {} ms), residual echo worst {}",
+            "",
+            fmt(percentile(column(|s| s.erle), 0.5), 1),
+            fmt(percentile(column(|s| s.erle), 0.0), 1),
+            fmt(percentile(column(|s| s.delay), 0.5), 0),
+            fmt(percentile(column(|s| s.delay_sd), 0.5), 0),
+            fmt(percentile(column(|s| s.residual_max), 1.0), 2),
         );
     }
 

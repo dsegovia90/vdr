@@ -4,10 +4,11 @@ The crate as published on crates.io (MIT OR Apache-2.0, see `Cargo.toml`),
 vendored unchanged in its own commit. **One change**, in `src/aec.rs`, so that
 diff is the whole patch:
 
-**`Canceller::statistics() -> Option<sonora::AudioProcessingStats>`**, the echo
-canceller's own measurements (echo-return-loss enhancement, echo return loss,
-delay estimate, residual echo likelihood, divergent filter fraction), refreshed
-about once a second.
+**`Canceller::statistics() -> Option<AudioProcessingStats>`** returns the
+echo canceller's own measurements (echo-return-loss enhancement, echo return
+loss, delay estimate, residual echo likelihood, divergent filter fraction),
+refreshed about once a second. `aec::AudioProcessingStats` is re-exported from
+sonora, so callers need no direct, version-matched dependency on it.
 
 ## Why
 

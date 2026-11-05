@@ -21,9 +21,65 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+/// The echo canceller's grade of itself, from sonora's statistics, in the
+/// units a person reads: dB and ms.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AecStats {
+    /// Echo-return-loss enhancement: how much the canceller removes, in dB.
+    /// Under ~10 dB, a far end hears itself.
+    pub erle_db: Option<f64>,
+    /// Echo return loss: how much quieter the echo already was than what
+    /// played, in dB. Low means loud speakers close to the mic.
+    pub erl_db: Option<f64>,
+    /// Where it thinks the echo sits, and how much that estimate wanders. A
+    /// wandering delay is the sign of a mic and speaker on different clocks.
+    pub delay_ms: Option<i32>,
+    pub delay_sd_ms: Option<i32>,
+    /// How likely some echo got through, now and its recent worst, 0 to 1.
+    pub residual: Option<f64>,
+    pub residual_max: Option<f64>,
+    /// Share of the last second its filter spent diverged, 0 to 1.
+    pub divergent: Option<f64>,
+}
+
+impl From<&moq_audio::aec::AudioProcessingStats> for AecStats {
+    fn from(stats: &moq_audio::aec::AudioProcessingStats) -> Self {
+        Self {
+            erle_db: stats.echo_return_loss_enhancement,
+            erl_db: stats.echo_return_loss,
+            delay_ms: stats.delay_median_ms,
+            delay_sd_ms: stats.delay_standard_deviation_ms,
+            residual: stats.residual_echo_likelihood,
+            residual_max: stats.residual_echo_likelihood_recent_max,
+            divergent: stats.divergent_filter_fraction,
+        }
+    }
+}
+
+impl std::fmt::Display for AecStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let db = |v: Option<f64>| v.map_or("?".to_string(), |v| format!("{v:.1} dB"));
+        let ms = |v: Option<i32>| v.map_or("?".to_string(), |v| v.to_string());
+        let p = |v: Option<f64>| v.map_or("?".to_string(), |v| format!("{v:.2}"));
+        write!(
+            f,
+            "erle {}, erl {}, delay {}±{} ms, residual echo {} (recent max {}), divergent {}",
+            db(self.erle_db),
+            db(self.erl_db),
+            ms(self.delay_ms),
+            ms(self.delay_sd_ms),
+            p(self.residual),
+            p(self.residual_max),
+            p(self.divergent),
+        )
+    }
+}
+
 /// Live numbers for the current call.
 #[derive(Default)]
 pub struct Metrics {
+    /// The echo canceller's latest grade of itself, if it has given one.
+    aec: std::sync::Mutex<Option<AecStats>>,
     rtt_ms: AtomicU32,
     /// Loss in hundredths of a percent, so a tenth of a percent survives.
     loss_bp: AtomicU32,
@@ -91,8 +147,22 @@ impl Metrics {
         }
     }
 
+    /// The echo canceller's latest numbers.
+    pub fn aec(&self) -> Option<AecStats> {
+        self.aec.lock().ok().and_then(|aec| *aec)
+    }
+
+    pub(super) fn set_aec(&self, stats: AecStats) {
+        if let Ok(mut aec) = self.aec.lock() {
+            *aec = Some(stats);
+        }
+    }
+
     /// Forgets everything, for when a call ends.
     pub(super) fn clear(&self) {
+        if let Ok(mut aec) = self.aec.lock() {
+            *aec = None;
+        }
         for field in [
             &self.rtt_ms,
             &self.loss_bp,

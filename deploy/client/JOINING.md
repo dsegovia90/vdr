@@ -32,6 +32,18 @@ Keep it to yourself: anyone holding it can join that room until it expires.
 
 Headphones avoid echo if you are in the same room as another participant.
 
+## After a call: send the log
+
+The app writes a log every time it runs, which says which microphone and
+speakers it used and how well its echo canceller is doing. If a call had echo
+or anything else odd, send the file from that run:
+
+- macOS: `~/Library/Application Support/vdr/vdr.log`
+- Linux: `~/.local/share/vdr/vdr.log`
+
+`vdr.prev.log` beside it is the run before, in case you have started the app
+again since.
+
 ## For the test call (if you were asked to measure)
 
 Start it from a terminal instead, so it writes measurements to a file:
