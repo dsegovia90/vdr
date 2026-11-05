@@ -17,13 +17,16 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 
 # System packages need root; set SKIP_PACKAGES=1 once they are installed.
+# Build headers only: Vulkan *drivers* are a runtime need, and asking for
+# Fedora's mesa-vulkan-drivers conflicts with RPM Fusion's freeworld build, which
+# provides the same thing.
 if [ -z "${SKIP_PACKAGES:-}" ]; then
   if command -v dnf >/dev/null; then
     sudo dnf install -y \
       gcc gcc-c++ pkgconf-pkg-config cmake clang git curl \
       alsa-lib-devel systemd-devel libv4l-devel \
       libX11-devel libXcursor-devel libXrandr-devel libXi-devel libxkbcommon-devel \
-      wayland-devel vulkan-loader-devel mesa-vulkan-drivers \
+      wayland-devel vulkan-loader-devel \
       openssl-devel
   elif command -v apt-get >/dev/null; then
     sudo apt-get update
@@ -31,7 +34,7 @@ if [ -z "${SKIP_PACKAGES:-}" ]; then
       build-essential pkg-config cmake clang curl git \
       libasound2-dev libudev-dev libv4l-dev \
       libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxkbcommon-dev \
-      libwayland-dev libvulkan-dev mesa-vulkan-drivers \
+      libwayland-dev libvulkan-dev \
       libssl-dev
   fi
 fi
