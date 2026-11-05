@@ -40,7 +40,7 @@ use super::status::RemoteStatus;
 use super::ParticipantEvent;
 use crate::args::Peering;
 use super::Metrics;
-use super::metrics::{FpsMeter, PeerStats};
+use super::metrics::{Clock, FpsMeter, PeerStats};
 use crate::audio::Controls;
 use crate::camera::{FrameFeed, FrameSlot, encode_size, from_decoded};
 
@@ -304,6 +304,10 @@ struct Presence {
     camera: bool,
     #[serde(default = "on")]
     mic: bool,
+    /// How our camera clock maps to the wall clock, refreshed every couple of
+    /// seconds; what lets a peer measure each frame's delay. See `Clock`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clock: Option<Clock>,
 }
 
 impl Default for Presence {
@@ -312,6 +316,7 @@ impl Default for Presence {
             state: State::Here,
             camera: true,
             mic: true,
+            clock: None,
         }
     }
 }
@@ -323,6 +328,7 @@ impl Presence {
             state: State::Here,
             camera: local.camera_on(),
             mic: local.mic_on(),
+            clock: local.clock(),
         }
     }
 }
@@ -877,6 +883,7 @@ async fn run(
                 status: status.clone(),
                 participants: participants.clone(),
                 hangup,
+                metrics: metrics.clone(),
                 in_room,
             },
             engine,
@@ -898,15 +905,19 @@ async fn run(
             let stop = stop.clone();
             let target = target.clone();
             let keyframe = keyframe.clone();
+            let local = local.clone();
             move || {
                 let outcome = encode(
                     &mut feed,
                     &mut encoder,
                     &mut producer,
-                    scale,
-                    &target,
-                    &keyframe,
-                    &stop,
+                    Steering {
+                        scale,
+                        target: &target,
+                        keyframe: &keyframe,
+                        stop: &stop,
+                        local: &local,
+                    },
                 );
                 (feed, encoder, producer, outcome)
             }
@@ -1045,15 +1056,33 @@ async fn run(
 /// Pulls camera frames off the tap, encodes them, and publishes them.
 ///
 /// The loopback's loop verbatim -- which is the point of having had one.
+/// What the call thread steers the encode loop with, from outside it.
+struct Steering<'a> {
+    /// Integer downscale from capture to encode size.
+    scale: usize,
+    /// A new bitrate, set by the rate loop.
+    target: &'a adapt::Target,
+    /// Set when a peer rejoins and needs a keyframe.
+    keyframe: &'a std::sync::atomic::AtomicBool,
+    /// Set when the attempt is over.
+    stop: &'a std::sync::atomic::AtomicBool,
+    /// Ourselves: the encode loop records our camera-to-wall-clock pairing.
+    local: &'a PeerStats,
+}
+
 fn encode(
     feed: &mut FrameFeed,
     encoder: &mut moq_video::encode::Encoder,
     producer: &mut moq_video::encode::Producer,
-    scale: usize,
-    target: &adapt::Target,
-    keyframe: &std::sync::atomic::AtomicBool,
-    stop: &std::sync::atomic::AtomicBool,
+    steering: Steering<'_>,
 ) -> Result<(), String> {
+    let Steering {
+        scale,
+        target,
+        keyframe,
+        stop,
+        local,
+    } = steering;
     loop {
         // The only way out other than the camera going away. Checked per frame
         // rather than per sleep, so a busy encoder still notices promptly.
@@ -1095,6 +1124,11 @@ fn encode(
             tracing::warn!("frame timestamp out of range; skipping");
             continue;
         };
+        // Pairs this frame's camera time with the wall clock, for the presence
+        // document to carry. Taken as the frame is encoded, a few ms after
+        // capture, so measured delays read that much short -- small next to
+        // what is being measured, and stated where the numbers are reported.
+        local.set_clock(Clock::now(frame.timestamp.as_micros() as u64));
         let encoded = encoder
             .encode(&moq_video::Frame::new(surface, timestamp))
             .map_err(|error| format!("encode failed: {error:#}"))?;
@@ -1115,6 +1149,8 @@ struct Reports {
     participants: UnboundedSender<ParticipantEvent>,
     /// Said once, when the last of them has gone deliberately.
     hangup: UnboundedSender<String>,
+    /// Link numbers, for the stats file's link line.
+    metrics: Arc<Metrics>,
     /// Whether this is a room on a relay rather than one peer.
     ///
     /// Changes two rules. Everyone leaving does not end it -- a room stays open
@@ -1144,8 +1180,20 @@ async fn attend(
         status,
         participants,
         hangup,
+        metrics,
         in_room,
     } = reports;
+    // The stats file, if asked for (`--stats`). A file that cannot be opened is
+    // a line in the log, not a failed call.
+    let mut stats_file = crate::args::Args::get().stats.as_ref().and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| tracing::warn!("cannot write stats to {}: {error}", path.display()))
+            .ok()
+    });
+    let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut announced = inbound.announced();
     // Dropping an entry aborts that participant's decoders, so leaving is the
     // same operation as the attempt ending.
@@ -1176,6 +1224,12 @@ async fn attend(
                 Some(update) => update,
                 None => break,
             },
+            _ = stats_tick.tick(), if stats_file.is_some() => {
+                if let Some(file) = stats_file.as_mut() {
+                    write_stats(file, &me, &people, &metrics);
+                }
+                continue;
+            }
             goodbye = said.next() => {
                 if let Some(id) = goodbye {
                     tracing::info!("{id} is leaving");
@@ -1277,9 +1331,9 @@ async fn attend(
         )))];
         if let Some(engine) = engine.clone() {
             let peer = id.to_string();
-            let talking = stats.talking_flag();
+            let stats = stats.clone();
             tasks.push(Abort(tokio::spawn(async move {
-                audio::subscribe(broadcast, peer, engine, talking).await;
+                audio::subscribe(broadcast, peer, engine, stats).await;
             })));
         } else {
             tracing::warn!("[audio] {id} cannot be heard: there is no output device");
@@ -1299,7 +1353,8 @@ fn say(presence: &std::sync::Mutex<moq_json::snapshot::Producer<Presence>>, now:
     }
 }
 
-/// Re-announces our presence whenever our camera or microphone changes.
+/// Re-announces our presence whenever our camera or microphone changes, and
+/// every [`CLOCK_EVERY`] regardless, so the clock pairing it carries stays fresh.
 ///
 /// **Polled, four times a second.** Two booleans flipped by a click do not earn
 /// a notification channel, and a quarter-second lag on "camera off" is not
@@ -1309,20 +1364,71 @@ async fn announce(
     local: Arc<PeerStats>,
 ) {
     let mut said = Presence::here(&local);
+    let mut said_at = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
     loop {
         ticker.tick().await;
         let now = Presence::here(&local);
-        if now != said {
+        let changed = (now.camera, now.mic) != (said.camera, said.mic);
+        if changed {
             tracing::info!("now camera {}, mic {}", on_off(now.camera), on_off(now.mic));
+        }
+        if changed || said_at.elapsed() >= CLOCK_EVERY {
             say(&presence, now);
             said = now;
+            said_at = tokio::time::Instant::now();
         }
     }
 }
 
+/// How often our clock pairing is re-said. Clocks drift slowly; this is about
+/// a peer that joins late having one soon, not about precision.
+const CLOCK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
+}
+
+/// Appends one second's measurements: a line per person we receive, and one
+/// for our link. Read by `s7-report`.
+///
+/// Delays are only as good as the two machines' clocks agree (NTP keeps that to
+/// a few ms), and run from encode, a few ms after capture, to decode -- the
+/// camera sensor and the display are not in them.
+fn write_stats(
+    file: &mut std::fs::File,
+    me: &str,
+    people: &std::collections::HashMap<String, Arc<PeerStats>>,
+    metrics: &Metrics,
+) {
+    use std::io::Write as _;
+    let t = super::metrics::wall_us() as f64 / 1e6;
+    let mut lines = String::new();
+    for (peer, stats) in people {
+        let mut delays = stats.take_delays();
+        delays.sort_unstable();
+        let pick = |q: f64| (!delays.is_empty()).then(|| delays[((delays.len() - 1) as f64 * q).round() as usize]);
+        let (gaps, dry) = stats.audio_trouble();
+        let line = serde_json::json!({
+            "t": t, "me": me, "peer": peer,
+            "camera": stats.camera_on(), "mic": stats.mic_on(),
+            "fps": stats.video_fps(),
+            "delay_p50_ms": pick(0.5), "delay_p95_ms": pick(0.95),
+            "audio_fps": stats.take_audio_frames(),
+            "audio_gaps": gaps, "audio_dry": dry,
+        });
+        lines.push_str(&line.to_string());
+        lines.push('\n');
+    }
+    let link = serde_json::json!({
+        "t": t, "me": me, "link": true,
+        "rtt_ms": metrics.rtt(), "loss_pct": metrics.loss(), "up_kbps": metrics.send_kbps(),
+    });
+    lines.push_str(&link.to_string());
+    lines.push('\n');
+    if let Err(error) = file.write_all(lines.as_bytes()) {
+        tracing::warn!("could not write stats: {error}");
+    }
 }
 
 /// The last other person has gone, deliberately.
@@ -1375,8 +1481,16 @@ async fn listen(
 
     loop {
         match presence.next().await {
-            Ok(Some(Presence { state, camera, mic })) => {
-                tracing::info!("{id} says {state:?}, camera {}, mic {}", on_off(camera), on_off(mic));
+            Ok(Some(Presence {
+                state,
+                camera,
+                mic,
+                clock,
+            })) => {
+                if let Some(clock) = clock {
+                    stats.set_clock(clock);
+                }
+                tracing::debug!("{id} says {state:?}, camera {}, mic {}", on_off(camera), on_off(mic));
                 // Their choice, for their tile: a card instead of a frozen
                 // frame, a badge instead of silence nobody can explain.
                 stats.set_camera(camera);
@@ -1477,10 +1591,11 @@ async fn watch(
 
     // Per tile, so a stalled peer shows as one tile at zero rather than hiding
     // behind whichever healthy peer wrote the shared number last.
-    let meter = FpsMeter::new(stats);
+    let meter = FpsMeter::new(stats.clone());
 
     while let Ok(Some(frame)) = consumer.read().await {
         meter.frame();
+        stats.frame_arrived(frame.timestamp.as_micros() as u64);
         decoded += 1;
         if decoded == REPORT_EVERY {
             let elapsed = since.elapsed().as_secs_f32();
@@ -1549,6 +1664,7 @@ mod path_tests {
 #[cfg(test)]
 mod presence_tests {
     use super::{Presence, State};
+    use crate::net::metrics::Clock;
 
     #[test]
     fn an_older_peer_without_the_flags_reads_as_on() {
@@ -1563,6 +1679,10 @@ mod presence_tests {
             state: State::Here,
             camera: false,
             mic: true,
+            clock: Some(Clock {
+                wall_us: 1_700_000_000_000_000,
+                media_us: 42,
+            }),
         };
         let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
         assert_eq!(heard, said);

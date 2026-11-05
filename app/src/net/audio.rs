@@ -180,8 +180,8 @@ pub(super) async fn subscribe(
     broadcast: moq_net::broadcast::Consumer,
     peer: String,
     engine: playback::Engine,
-    // Their tile's talking dot.
-    talking_flag: Arc<std::sync::atomic::AtomicBool>,
+    // Their tile's talking dot, and the audio counters for the stats file.
+    stats: Arc<super::PeerStats>,
 ) {
     let mut catalog = match moq_mux::catalog::Consumer::<()>::new(
         &broadcast,
@@ -247,9 +247,23 @@ pub(super) async fn subscribe(
     let mut talking = Talking::default();
     // Released when this task ends *or is aborted*, which is how a peer leaving
     // mid-word stops counting as someone talking.
-    let mut speaking = Speaking::new(talking_flag);
+    let mut speaking = Speaking::new(stats.talking_flag());
+    // When the last frame came, to spot a gap a listener would hear.
+    let mut last_frame: Option<std::time::Instant> = None;
 
     while let Ok(Some(frame)) = consumer.read().await {
+        stats.audio_frame();
+        let now = std::time::Instant::now();
+        if last_frame.is_some_and(|last| now - last > super::metrics::AUDIO_GAP) {
+            stats.audio_gap();
+        }
+        last_frame = Some(now);
+        // Checked before this frame refills it: an empty buffer with frames
+        // still arriving is playback that went silent while it should not have.
+        // moq-audio counts no underruns itself, so this is the closest there is.
+        if sink.buffered().is_zero() {
+            stats.audio_ran_dry();
+        }
         speaking.set(talking.push(loudness(&frame.data)));
         decoded += 1;
         if decoded == REPORT_EVERY {

@@ -141,7 +141,63 @@ pub struct PeerStats {
     camera_on: AtomicBool,
     /// Whether their microphone is on, the same way.
     mic_on: AtomicBool,
+    /// How their camera clock maps to wall-clock time, as they last said.
+    /// For our own entry, the mapping we say. See [`Clock`].
+    clock: std::sync::Mutex<Option<Clock>>,
+    /// Delays of their frames this second, in ms, for the stats file.
+    delays: std::sync::Mutex<Vec<u32>>,
+    /// Audio frames decoded this second.
+    audio_frames: AtomicU32,
+    /// Gaps of more than [`AUDIO_GAP`] between their decoded audio frames, ever.
+    audio_gaps: AtomicU32,
+    /// Times their playback buffer was found empty while frames still came.
+    audio_dry: AtomicU32,
 }
+
+/// "Camera time `media_us` was wall-clock time `wall_us`" -- what lets another
+/// machine read a frame's timestamp, whose epoch is the sender's camera's.
+///
+/// Frame timestamps are the capturing camera's own clock, meaningless on any
+/// other machine. A sender says this pairing in its presence document; a
+/// receiver then turns each frame's timestamp into the wall-clock moment it was
+/// captured, and the difference from its own clock is the delay. That only
+/// holds while both machines' clocks agree, which NTP keeps to within a few ms
+/// -- the measurement is only as good as that, and says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Clock {
+    pub wall_us: u64,
+    pub media_us: u64,
+}
+
+impl Clock {
+    /// Pairs a camera timestamp with the wall clock now.
+    pub fn now(media_us: u64) -> Self {
+        Self {
+            wall_us: wall_us(),
+            media_us,
+        }
+    }
+
+    /// How long ago, by our own wall clock, a frame stamped `media_us` was
+    /// captured. `None` when the answer is negative beyond clock noise -- the
+    /// clocks disagree, and a delay of less than nothing is not a number.
+    pub fn delay_ms(&self, media_us: u64, now_wall_us: u64) -> Option<u32> {
+        let captured = self.wall_us as i128 + media_us as i128 - self.media_us as i128;
+        let delay = (now_wall_us as i128 - captured) / 1000;
+        u32::try_from(delay).ok()
+    }
+}
+
+/// Microseconds since the Unix epoch, by this machine's wall clock.
+pub fn wall_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros() as u64)
+}
+
+/// A pause between audio frames that a listener would hear: three missing 20 ms
+/// frames, minus some scheduling slack.
+pub const AUDIO_GAP: Duration = Duration::from_millis(60);
 
 /// No measurement yet.
 const UNKNOWN: u32 = u32::MAX;
@@ -160,6 +216,11 @@ impl Default for PeerStats {
             talking: Arc::default(),
             camera_on: AtomicBool::new(true),
             mic_on: AtomicBool::new(true),
+            clock: std::sync::Mutex::new(None),
+            delays: std::sync::Mutex::new(Vec::new()),
+            audio_frames: AtomicU32::new(0),
+            audio_gaps: AtomicU32::new(0),
+            audio_dry: AtomicU32::new(0),
         }
     }
 }
@@ -197,6 +258,62 @@ impl PeerStats {
     /// Records whether their microphone is on.
     pub fn set_mic(&self, on: bool) {
         self.mic_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Their latest camera-to-wall-clock mapping, if they have said one.
+    pub fn clock(&self) -> Option<Clock> {
+        self.clock.lock().ok().and_then(|clock| *clock)
+    }
+
+    /// Records a camera-to-wall-clock mapping.
+    pub fn set_clock(&self, clock: Clock) {
+        if let Ok(mut slot) = self.clock.lock() {
+            *slot = Some(clock);
+        }
+    }
+
+    /// Notes a frame of theirs stamped `media_us` arriving now. Without a clock
+    /// from them yet, there is nothing to measure against, and nothing is noted.
+    pub(super) fn frame_arrived(&self, media_us: u64) {
+        let Some(delay) = self.clock().and_then(|clock| clock.delay_ms(media_us, wall_us())) else {
+            return;
+        };
+        if let Ok(mut delays) = self.delays.lock() {
+            delays.push(delay);
+        }
+    }
+
+    /// This second's delays, emptied for the next.
+    pub(super) fn take_delays(&self) -> Vec<u32> {
+        self.delays.lock().map(|mut d| std::mem::take(&mut *d)).unwrap_or_default()
+    }
+
+    /// One of their audio frames was decoded.
+    pub(super) fn audio_frame(&self) {
+        self.audio_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Audio frames decoded since the last call.
+    pub(super) fn take_audio_frames(&self) -> u32 {
+        self.audio_frames.swap(0, Ordering::Relaxed)
+    }
+
+    /// A hearable gap opened in their audio.
+    pub(super) fn audio_gap(&self) {
+        self.audio_gaps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Their playback ran dry.
+    pub(super) fn audio_ran_dry(&self) {
+        self.audio_dry.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Audio gaps and dry spells so far.
+    pub(super) fn audio_trouble(&self) -> (u32, u32) {
+        (
+            self.audio_gaps.load(Ordering::Relaxed),
+            self.audio_dry.load(Ordering::Relaxed),
+        )
     }
 
     /// The flag the audio side raises while they talk.
@@ -262,6 +379,33 @@ impl Drop for FpsMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_maps_through_the_senders_clock() {
+        // Camera time 5 s was wall time 1000 s; a frame stamped 5.1 s,
+        // arriving at wall 1000.25 s, took 150 ms.
+        let clock = Clock {
+            wall_us: 1_000_000_000,
+            media_us: 5_000_000,
+        };
+        assert_eq!(clock.delay_ms(5_100_000, 1_000_250_000), Some(150));
+    }
+
+    #[test]
+    fn disagreeing_clocks_give_no_number_rather_than_a_wrong_one() {
+        let clock = Clock {
+            wall_us: 1_000_000_000,
+            media_us: 0,
+        };
+        assert_eq!(clock.delay_ms(2_000_000, 1_000_000_000), None);
+    }
+
+    #[test]
+    fn no_clock_no_delays() {
+        let stats = PeerStats::default();
+        stats.frame_arrived(123);
+        assert!(stats.take_delays().is_empty());
+    }
 
     #[test]
     fn camera_and_mic_are_on_until_told_otherwise() {

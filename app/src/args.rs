@@ -24,6 +24,7 @@
 //! vdr --quality high                      # 720p rung; low | mid | high, mid by default
 //! vdr --ephemeral                         # a throwaway key, not the saved one
 //! vdr --encode-width 1920                 # encode at capture size, for A/B tests
+//! vdr --stats s7-alice.jsonl              # one line of measurements a second
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry (19c) is a second
@@ -185,6 +186,9 @@ pub struct Args {
     /// difference shows: locally there is nothing to run out of, so every size
     /// looks fine. The bitrate follows the size, so this moves both.
     pub encode_width: Option<u32>,
+    /// Where to append the once-a-second measurements (JSON lines), for the
+    /// `s7-report` tool. Off unless asked for.
+    pub stats: Option<std::path::PathBuf>,
 }
 
 impl Args {
@@ -214,6 +218,7 @@ impl Args {
         let mut quality = Quality::default();
         let mut ephemeral = false;
         let mut encode_width = None;
+        let mut stats = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -250,6 +255,10 @@ impl Args {
                     Some(Err(error)) => tracing::error!("--encode-width is not a number: {error}"),
                     None => tracing::error!("--encode-width needs a pixel count"),
                 },
+                "--stats" => match args.next() {
+                    Some(path) => stats = Some(std::path::PathBuf::from(path)),
+                    None => tracing::error!("--stats needs a file path"),
+                },
                 other => tracing::warn!("ignoring unknown argument {other}"),
             }
         }
@@ -259,6 +268,7 @@ impl Args {
             quality,
             ephemeral,
             encode_width,
+            stats,
         }
     }
 }

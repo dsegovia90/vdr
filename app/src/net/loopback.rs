@@ -114,7 +114,7 @@ async fn pump(
             broadcast,
             "loopback".to_string(),
             engine,
-            stats.talking_flag(),
+            stats.clone(),
         ))
     });
 
