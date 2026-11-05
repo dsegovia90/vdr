@@ -19,5 +19,6 @@ podman run --rm \
   -v vid-linux-cargo:/root/.cargo \
   -w /src \
   -e PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  -e VID_COMMIT="${VID_COMMIT:-}" \
   docker.io/library/ubuntu:22.04 \
   bash -c 'apt-get update -qq && apt-get install -y -qq git curl ca-certificates >/dev/null && git config --global --add safe.directory /src && deploy/client/build-linux.sh'

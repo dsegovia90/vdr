@@ -21,7 +21,8 @@ for key in NSCameraUsageDescription NSMicrophoneUsageDescription; do
 done
 
 arch="$(lipo -archs "$app/Contents/MacOS/vdr" | tr ' ' '+')"
-commit="$(git -C "$root" rev-parse --short HEAD)"
+# The commit names the package; VID_COMMIT wins when set (see build-linux.sh).
+commit="${VID_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 out="$root/dist/vid-macos-$arch-$commit.zip"
 mkdir -p "$root/dist"
 rm -f "$out"

@@ -62,7 +62,10 @@ bin="$(find target/dx/vdr/release/linux -type f -name vdr -perm -u+x | head -1)"
 dir="$(dirname "$bin")"
 
 arch="$(uname -m)"
-commit="$(git -C "$root" rev-parse --short HEAD)"
+# The commit names the package. VID_COMMIT wins when set: a worktree copied to
+# another machine has a .git file pointing at a path that does not exist there,
+# so rev-parse would fail and stop the build.
+commit="${VID_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 out="$root/dist/vid-linux-$arch-$commit.tar.gz"
 mkdir -p "$root/dist"
 cp "$root/deploy/client/JOINING.md" "$dir/JOINING.md"
