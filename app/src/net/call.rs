@@ -270,6 +270,14 @@ const PRESENCE: &str = "presence.json";
 /// last word. Generous: it only ever runs out on a reader that hears nothing.
 const GOODBYE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long `Leaving` is given to reach the relay before the broadcast it is
+/// carried on is finished.
+const GOODBYE_SAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long the connection is kept after we finish our broadcasts, so the
+/// finishes reach the relay before the line closes behind them.
+const GOODBYE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// How much a control message preempts media. Matches what `hang` gives its own
 /// catalog, which is the same kind of traffic: small, structural, and useless
 /// late.
@@ -868,8 +876,15 @@ async fn run(
         // below knows not to await a handle that has already resolved.
         let mut encoded = None;
 
+        // **Raced by reference, so the connection outlives the race.** Moving
+        // it in dropped it the moment anything else won -- a click on Leave,
+        // say -- and everything below then said goodbye down a line already
+        // hung up. A relay reads a publisher that vanishes like that as a crash
+        // and keeps its broadcasts up for its linger (5 s by default), so a
+        // deliberate leave reached the room five seconds late.
+        let mut transport = transport;
         let outcome = tokio::select! {
-            error = transport => Some(Err(error)),
+            error = &mut transport => Some(Err(error)),
             joined = &mut encoding => match joined {
                 Ok(parts) => {
                     let outcome = parts.3.clone();
@@ -931,8 +946,23 @@ async fn run(
         }) {
             tracing::warn!("could not say we are leaving: {error:#}");
         }
+        // A beat between saying it and ending the broadcast it is said on. A
+        // relay tears a cleanly finished broadcast down at once, and a
+        // document written in the same instant goes down with it -- observed:
+        // with the line kept open the leave arrived instantly but `Leaving`
+        // never did. (Before that, an abrupt close made the relay keep the
+        // broadcast up for its linger, which delivered the word by accident.)
+        // Finishing the presence track first, with no pause, was tried and
+        // lost the word just the same: nothing reports that the relay has
+        // forwarded it, so a short bound is what there is.
+        tokio::time::sleep(GOODBYE_SAY).await;
         control.finish();
         broadcast.finish();
+        // Long enough for the finishes above to leave, then the line goes. No
+        // handle says when they have, so this is a bound rather than a wait
+        // for something; short, because a leave should feel instant.
+        tokio::time::sleep(GOODBYE_FLUSH).await;
+        drop(transport);
         decode.abort();
         if let Some(rate) = rate {
             rate.abort();
