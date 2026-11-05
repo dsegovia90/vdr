@@ -17,21 +17,25 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 
+# Root already (as in a container) needs no sudo, and may not have it.
+sudo=""
+[ "$(id -u)" -eq 0 ] || sudo="sudo"
+
 # System packages need root; set SKIP_PACKAGES=1 once they are installed.
 # Build headers only: Vulkan *drivers* are a runtime need, and asking for
 # Fedora's mesa-vulkan-drivers conflicts with RPM Fusion's freeworld build, which
 # provides the same thing.
 if [ -z "${SKIP_PACKAGES:-}" ]; then
   if command -v dnf >/dev/null; then
-    sudo dnf install -y \
+    $sudo dnf install -y \
       gcc gcc-c++ pkgconf-pkg-config cmake clang git curl \
       alsa-lib-devel systemd-devel libv4l-devel fontconfig-devel \
       libX11-devel libXcursor-devel libXrandr-devel libXi-devel libxkbcommon-devel \
       wayland-devel vulkan-loader-devel \
       openssl-devel
   elif command -v apt-get >/dev/null; then
-    sudo apt-get update
-    sudo apt-get install -y --no-install-recommends \
+    $sudo apt-get update
+    DEBIAN_FRONTEND=noninteractive $sudo apt-get install -y --no-install-recommends \
       build-essential pkg-config cmake clang curl git \
       libasound2-dev libudev-dev libv4l-dev libfontconfig1-dev \
       libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxkbcommon-dev \
