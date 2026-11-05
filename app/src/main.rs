@@ -70,7 +70,7 @@ fn App() -> Element {
         // so the bar floats mid-window. `overflow-hidden` because nothing here
         // should ever scroll, and it stopped a one-pixel scrollbar flicker.
         div { class: "flex h-screen flex-col gap-4 overflow-hidden p-6",
-            components::Camera {}
+            components::CallScreen {}
         }
     }
 }

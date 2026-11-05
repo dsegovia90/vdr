@@ -96,4 +96,4 @@ used `use_wgpu` and `canvas { "src": id }`).
   visible stream in full, so capturing far above the size of the tile it fills is
   the cost that matters. Frames reaching the encoder are downscaled by an integer
   factor first (`camera/frames.rs`, `encode_size`); capture itself is still
-  negotiated against a fixed request in `components/camera.rs`.
+  negotiated against a fixed request in `camera/hooks/choice.rs`.

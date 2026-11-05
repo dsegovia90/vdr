@@ -6,12 +6,14 @@
 //!
 //! [`FrameSlot`]: super::FrameSlot
 
+mod choice;
 mod devices;
 mod status;
 mod stream;
 
 // Globs because this is a binary crate: naming a type nothing mentions warns
 // as an unused import. Same reason `camera/mod.rs` globs this module.
+pub use choice::*;
 pub use devices::*;
 pub use status::*;
 pub use stream::*;
