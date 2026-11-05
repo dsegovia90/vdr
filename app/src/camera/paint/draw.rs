@@ -3,7 +3,7 @@
 use anyrender::{RenderContext, ResourceId};
 
 use super::active::Active;
-use super::fit::{contain, uniform_bytes, Mirror};
+use super::fit::{uniform_bytes, Card, Mirror};
 
 pub(super) struct Target {
     width: u32,
@@ -62,23 +62,26 @@ impl Active {
         true
     }
 
-    /// Draws the current frame into the target, or clears the target to black
-    /// when there is no frame -- the camera has been released.
-    pub(super) fn draw(&mut self, width: u32, height: u32, mirror: Mirror) {
+    /// Draws the current frame into the card-sized target, or clears it to
+    /// black when there is no frame -- the camera has been released.
+    ///
+    /// The target is the card, not the canvas, so there are no bars to draw:
+    /// the only fitting left is the side crop, which the shader reads as an x
+    /// uv scale below 1.
+    pub(super) fn draw(&mut self, card: Card, mirror: Mirror) {
         let Some(target) = self.target.as_ref() else {
             return;
         };
         let source = self.source.as_ref();
 
         if let Some(source) = source {
-            let fit = contain(source.width, source.height, width, height);
             self.queue.write_buffer(
                 &self.uniforms,
                 0,
                 // fit.w selects the shader branch: 1.0 = I420, 0.0 = packed.
                 &uniform_bytes([
-                    fit[0],
-                    fit[1],
+                    card.crop_x,
+                    1.0,
                     mirror.as_uniform(),
                     if source.planar { 1.0 } else { 0.0 },
                 ]),

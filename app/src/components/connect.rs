@@ -29,8 +29,6 @@ pub fn ConnectRow(
     status: Signal<RemoteStatus>,
     /// Chooses who to talk to.
     connect: Callback<Peering>,
-    /// Takes a choice back while it is still only a choice.
-    cancel: Callback<()>,
 ) -> Element {
     let mut draft = use_signal(String::new);
     let mut status = status;
@@ -66,14 +64,12 @@ pub fn ConnectRow(
     let waiting = status.read().is_waiting();
     let cancellable = status.read().is_cancellable();
     let connected = status.read().is_connected();
-    // Neither choosing nor able to unchoose: a call is up, or it ended. The
-    // status line says the rest.
-    //
-    // The two together span every state from binding to connected, so the key
-    // and its Copy button stay mounted the whole way. They used to drop out
-    // during `AwaitingCamera` -- the second or so between pressing a button and
-    // the encoder being ready -- which read as a flash.
-    if !waiting && !cancellable {
+    // Gone once a call or room is actually up: from then on the screen is the
+    // grid and the bottom bar, which carries Leave. Until then -- including
+    // while waiting for a call, which is exactly when the key has to be handed
+    // over -- it stays, so the key never flashes out of view between pressing
+    // a button and the encoder being ready.
+    if connected || (!waiting && !cancellable) {
         return rsx! {};
     }
 
@@ -93,17 +89,6 @@ pub fn ConnectRow(
                             copy_to_clipboard(&key);
                         },
                         "Copy"
-                    }
-                }
-            }
-            if cancellable {
-                div { class: "flex flex-row items-center gap-3",
-                    Button {
-                        onclick: move |_| cancel.call(()),
-                        // The same button either way, because it is the same
-                        // decision -- but once someone is on the other end it
-                        // tells them, which is what earns the other word.
-                        if connected { "Hang up" } else { "Cancel" }
                     }
                 }
             }

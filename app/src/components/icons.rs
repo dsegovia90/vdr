@@ -1,0 +1,86 @@
+//! Small line icons for the control bar, drawn inline as SVG.
+//!
+//! Inline rather than as image files so they take `currentColor`: a button
+//! recolours its icon by setting its own text colour, the same way it
+//! recolours a label. 24-unit grid, 2-unit strokes, drawn at 18px.
+//!
+//! **Give the button a plain colour, not a Tailwind palette shade.** Blitz
+//! swaps `currentColor` for the computed colour and hands the SVG to usvg,
+//! and Tailwind v4's palette is `oklch()`, which that path drops: a button
+//! with `text-neutral-100` showed no icon at all, while `text-white` did.
+
+use dioxus_native::prelude::*;
+
+/// A microphone; struck through while muted.
+#[component]
+pub fn MicIcon(off: bool) -> Element {
+    rsx! {
+        svg {
+            // Needed: blitz hands the serialized subtree to usvg, which only
+            // accepts a root in the SVG namespace.
+            xmlns: "http://www.w3.org/2000/svg",
+            width: "18",
+            height: "18",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            rect { x: "9", y: "2", width: "6", height: "12", rx: "3" }
+            path { d: "M5 10v1a7 7 0 0 0 14 0v-1" }
+            path { d: "M12 18v4" }
+            if off {
+                path { d: "M3 3l18 18" }
+            }
+        }
+    }
+}
+
+/// A video camera; struck through while off.
+#[component]
+pub fn CameraIcon(off: bool) -> Element {
+    rsx! {
+        svg {
+            // Needed: blitz hands the serialized subtree to usvg, which only
+            // accepts a root in the SVG namespace.
+            xmlns: "http://www.w3.org/2000/svg",
+            width: "18",
+            height: "18",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            rect { x: "2", y: "6", width: "14", height: "12", rx: "2" }
+            path { d: "M16 10l6-3v10l-6-3" }
+            if off {
+                path { d: "M3 3l18 18" }
+            }
+        }
+    }
+}
+
+/// A door with an arrow leaving it.
+#[component]
+pub fn LeaveIcon() -> Element {
+    rsx! {
+        svg {
+            // Needed: blitz hands the serialized subtree to usvg, which only
+            // accepts a root in the SVG namespace.
+            xmlns: "http://www.w3.org/2000/svg",
+            width: "18",
+            height: "18",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" }
+            path { d: "M16 17l5-5-5-5" }
+            path { d: "M21 12H9" }
+        }
+    }
+}

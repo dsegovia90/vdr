@@ -54,8 +54,12 @@ pub fn ParticipantVideo(props: ParticipantVideoProps) -> Element {
         // An `object` carrying a widget, which is what replaced `canvas` +
         // `CustomPaintSource` in blitz beta.4. Found on the old pin; kept on the
         // new one until it is shown to be unnecessary there.
-        div { class: "relative rounded-lg bg-black {props.class}",
-            object { class: "absolute inset-0 rounded-lg", "data": widget.clone() }
+        // Positioned by the caller (`absolute inset-0` inside a tile), which also
+        // makes it the containing block for the video below. Not `relative`
+        // here: two `position` classes on one element, and Tailwind's order
+        // would quietly pick `relative`.
+        div { class: "{props.class}",
+            object { class: "absolute inset-0", "data": widget.clone() }
         }
     }
 }

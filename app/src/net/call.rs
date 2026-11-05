@@ -791,7 +791,6 @@ async fn run(
                 in_room,
             },
             engine,
-            controls.clone(),
         ));
 
         // **On a blocking thread, not in the `select!` below.** Converting a
@@ -1023,7 +1022,6 @@ async fn attend(
     me: String,
     reports: Reports,
     engine: Option<moq_audio::playback::Engine>,
-    controls: Arc<Controls>,
 ) {
     let Reports {
         status,
@@ -1134,11 +1132,10 @@ async fn attend(
             stats.clone(),
         )))];
         if let Some(engine) = engine.clone() {
-            let controls = controls.clone();
             let peer = id.to_string();
             let talking = stats.talking_flag();
             tasks.push(Abort(tokio::spawn(async move {
-                audio::subscribe(broadcast, peer, engine, controls, talking).await;
+                audio::subscribe(broadcast, peer, engine, talking).await;
             })));
         } else {
             tracing::warn!("[audio] {id} cannot be heard: there is no output device");

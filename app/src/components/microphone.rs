@@ -1,6 +1,8 @@
-//! Picking an input, muting it, and seeing that it is working.
+//! Picking an input, muting it, and seeing that it is working -- as one small
+//! control in the bottom bar: an icon toggle, a level along its bottom edge,
+//! and a ▾ for the device list.
 //!
-//! The camera row's shape, with one thing it does not have: a level. A camera
+//! The camera control's shape, with one thing it does not have: a level. A camera
 //! that is on shows a picture, so "is this working" answers itself. A
 //! microphone that is on looks exactly like a microphone that is muted, broken,
 //! or pointed at the wrong device -- so a meter is not decoration here, it is
@@ -11,7 +13,7 @@ use std::time::Duration;
 
 use dioxus_native::prelude::*;
 
-use super::{Button, Dropdown, DropdownOption, Tone};
+use super::{DeviceMenu, DropdownOption, MicIcon};
 use crate::audio::{Controls, MicStatus, use_shared_microphones};
 use crate::channel::use_channel;
 use crate::settings::{self, Settings};
@@ -33,7 +35,6 @@ const POLL: Duration = Duration::from_millis(66);
 struct Meter {
     level: f32,
     status: MicStatus,
-    peer_talking: bool,
 }
 
 #[derive(Clone, PartialEq, Props)]
@@ -43,7 +44,7 @@ pub struct MicrophoneProps {
 }
 
 #[component]
-pub fn MicrophoneRow(props: MicrophoneProps) -> Element {
+pub fn MicControl(props: MicrophoneProps) -> Element {
     let devices = use_shared_microphones();
     let mut meter = use_signal(Meter::default);
 
@@ -83,7 +84,6 @@ pub fn MicrophoneRow(props: MicrophoneProps) -> Element {
                         let next = Meter {
                             level: audio.level(),
                             status: audio.status(),
-                            peer_talking: audio.peer_talking(),
                         };
                         if tx.unbounded_send(next).is_err() {
                             return;
@@ -112,76 +112,59 @@ pub fn MicrophoneRow(props: MicrophoneProps) -> Element {
         })
         .collect();
     let has_devices = !options.is_empty();
-    let placeholder = if *devices.ready.read() {
-        if has_devices {
-            "System default"
-        } else {
-            "No microphones found"
-        }
-    } else {
-        "Scanning..."
-    };
 
     let reading = meter();
-    let status_class = if reading.status.is_error() {
-        "text-sm text-red-400"
-    } else {
-        "text-sm text-neutral-400"
-    };
     let width = (reading.level.clamp(0.0, 1.0).sqrt() * 100.0).round() as u32;
-    let bar_class = if muted() {
-        "h-full rounded bg-neutral-600"
-    } else {
-        "h-full rounded bg-emerald-500"
-    };
+    let off = muted();
+    // A problem with the device reads differently from choosing to mute: red
+    // text beside the button, because the icon alone looks the same either way.
+    let problem = (!off && reading.status.is_error()).then(|| reading.status.to_string());
 
     rsx! {
-        div { class: "flex flex-row items-end gap-3",
-            Dropdown {
-                label: "Microphone",
+        div { class: "flex flex-row items-center gap-0.5",
+            button {
+                class: if off {
+                    "relative flex h-10 w-10 items-center justify-center overflow-hidden rounded-full bg-red-600 text-white hover:bg-red-500"
+                } else {
+                    "relative flex h-10 w-10 items-center justify-center overflow-hidden rounded-full bg-neutral-800 text-white hover:bg-neutral-700"
+                },
+                onclick: {
+                    let audio = props.audio.clone();
+                    move |_| {
+                        if !has_devices {
+                            return;
+                        }
+                        let next = !*muted.peek();
+                        muted.set(next);
+                        audio.set_enabled(!next);
+                    }
+                },
+                MicIcon { off }
+                // The level, as a thin line along the bottom: the only sign the
+                // microphone is actually hearing anything.
+                if !off {
+                    div { class: "absolute bottom-0 left-0 h-1 bg-emerald-500", style: "width: {width}%" }
+                }
+            }
+            DeviceMenu {
+                title: "Microphone",
                 options,
                 selected: selected.read().clone(),
-                placeholder: placeholder.to_string(),
                 onchange: {
                     let audio = props.audio.clone();
                     move |value: String| {
+                        // Saved here rather than in an effect: this is the one
+                        // place a *person* changes the input.
                         let chosen = value.clone();
                         Settings::update(move |settings| settings.microphone = Some(chosen));
                         audio.set_device(Some(value.clone()));
                         selected.set(Some(value));
                     }
                 },
+                onrescan: move |_| devices.refresh.call(()),
             }
-            Button {
-                onclick: move |_| devices.refresh.call(()),
-                "Rescan"
-            }
-            if has_devices {
-                Button {
-                    tone: Tone::Primary,
-                    onclick: {
-                        let audio = props.audio.clone();
-                        move |_| {
-                            let next = !*muted.peek();
-                            muted.set(next);
-                            audio.set_enabled(!next);
-                        }
-                    },
-                    if muted() { "Unmute" } else { "Mute" }
-                }
-            }
-        }
-        div { class: "h-2 w-full max-w-4xl rounded bg-neutral-800",
-            div { class: bar_class, style: "width: {width}%" }
-        }
-        p { class: status_class,
-            if muted() {
-                "Muted"
-            } else {
-                "{reading.status}"
-            }
-            if reading.peer_talking {
-                " \u{00b7} they are talking"
+            if let Some(problem) = problem {
+                span { class: "ml-1 text-xs text-red-400 whitespace-nowrap", "{problem}" }
             }
         }
     }

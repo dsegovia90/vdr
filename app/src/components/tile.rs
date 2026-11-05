@@ -36,6 +36,8 @@ pub struct ParticipantTileProps {
     /// Their numbers, or `None` for our own preview, which has none worth a
     /// label -- the camera's own rate is on the status line below the grid.
     pub stats: Option<Arc<PeerStats>>,
+    /// Size and placement, from `layout::tile_class`: the box *is* the card.
+    pub class: &'static str,
 }
 
 #[component]
@@ -81,26 +83,29 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     // coloured rather than merely printed.
     let stalled = now.fps.is_some_and(|fps| fps < 1.0);
     let text = if stalled {
-        "text-xs text-amber-400"
+        "whitespace-nowrap text-xs text-amber-400"
     } else {
-        "text-xs text-neutral-400"
+        "whitespace-nowrap text-xs text-neutral-200"
     };
 
     rsx! {
-        // `min-h-0 min-w-0` let a grid cell shrink below the canvas's own size;
-        // without them a cell refuses to get smaller and the page scrolls.
-        div { class: "flex flex-col gap-1 min-h-0 min-w-0",
+        // **The box is the card.** It is sized by the layout to the video's
+        // shape, so the label can sit on the picture itself and moves with it,
+        // rather than under a cell the card may not fill.
+        div { class: props.class,
             ParticipantVideo {
                 label: props.label.clone(),
                 slot: props.slot.clone(),
                 mirror: props.mirror,
-                class: "flex-1 min-h-0 min-w-0",
+                class: "absolute inset-0",
             }
-            div { class: "flex flex-row items-center gap-2 shrink-0",
+            // Over the video's bottom-left corner. It needs no clicks, so being
+            // laid over the video costs nothing even where overlays misbehave.
+            div { class: "absolute bottom-2 left-2 flex flex-row items-center gap-2 rounded-md bg-black/50 px-2 py-1",
                 // Always rendered, so the label does not shift sideways when
                 // someone starts talking.
                 div {
-                    class: if now.talking { "h-2 w-2 shrink-0 rounded-full bg-emerald-400" } else { "h-2 w-2 shrink-0 rounded-full bg-neutral-700" },
+                    class: if now.talking { "h-2 w-2 shrink-0 rounded-full bg-emerald-400" } else { "h-2 w-2 shrink-0 rounded-full bg-neutral-500" },
                 }
                 span { class: text, "{props.label}{fps}" }
             }

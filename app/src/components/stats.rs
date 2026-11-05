@@ -105,12 +105,14 @@ pub fn StatsRow(props: StatsProps) -> Element {
     // and video start to show it rather than anywhere principled.
     let unhealthy = reading.loss.is_some_and(|loss| loss >= 2.0);
     let class = if unhealthy {
-        "font-mono text-xs text-amber-400"
+        "shrink-0 whitespace-nowrap font-mono text-xs text-amber-400"
     } else {
-        "font-mono text-xs text-neutral-500"
+        "shrink-0 whitespace-nowrap font-mono text-xs text-neutral-500"
     };
 
+    // Inline, so it can sit on the control bar's status line after the call's
+    // own status.
     rsx! {
-        p { class, "{parts.join(\"  \u{b7}  \")}" }
+        span { class, "\u{b7}  {parts.join(\"  \u{b7}  \")}" }
     }
 }

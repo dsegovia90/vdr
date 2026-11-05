@@ -64,6 +64,11 @@ fn App() -> Element {
     rsx! {
         document::Title { "Vdr "}
         document::Stylesheet { href: TAILWIND_CSS }
+        // `h-screen`, not `h-full`: a percentage height on the root never
+        // resolves in blitz -- checked on both the old pin and beta.4 -- and
+        // without a definite height the video area cannot take what is left,
+        // so the bar floats mid-window. `overflow-hidden` because nothing here
+        // should ever scroll, and it stopped a one-pixel scrollbar flicker.
         div { class: "flex h-screen flex-col gap-4 overflow-hidden p-6",
             components::Camera {}
         }

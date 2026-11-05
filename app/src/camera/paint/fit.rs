@@ -4,18 +4,71 @@
 //! paint path that can be tested directly. These are also the calculations that
 //! produced the crop bug.
 
-/// uv scale that fits `src` inside `dst` while preserving aspect ratio.
+/// Where the video sits in its canvas, and how much of its width shows.
 ///
-/// One axis comes out at 1.0 and the other above it, which the shader reads as
-/// "sample beyond the edge here", producing letterbox bars.
-pub(super) fn contain(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> [f32; 2] {
-    let (src_w, src_h) = (src_w as f32, src_h as f32);
-    let (dst_w, dst_h) = (dst_w as f32, dst_h as f32);
-    if src_w <= 0.0 || src_h <= 0.0 || dst_w <= 0.0 || dst_h <= 0.0 {
-        return [1.0, 1.0];
+/// **The card is the video's own shape, so there are no bars inside it.** Its
+/// height fills the canvas, and its width follows the video:
+///
+/// - canvas wider than the video: the card is narrower than the canvas and
+///   centred, with nothing cropped;
+/// - canvas narrower: the card fills the width and the video's **sides are
+///   cropped** to fit;
+/// - canvas narrower than square: cropping stops at square, and the card is
+///   `width × width`, centred vertically. Past that point, cropping further
+///   would leave a sliver of face.
+///
+/// Everything outside the card is left unpainted, so the page shows through.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Card {
+    /// Offset of the card's top-left corner inside the canvas, in pixels.
+    pub x: u32,
+    pub y: u32,
+    /// The card's size, in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// The fraction of the video's width that shows, at most 1. The shader
+    /// reads it as a uv scale below 1, which crops evenly from both sides.
+    pub crop_x: f32,
+}
+
+/// Lays out the card for `src` video in a `dst` canvas. See [`Card`].
+pub(super) fn card(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Card {
+    let whole = Card {
+        x: 0,
+        y: 0,
+        width: dst_w,
+        height: dst_h,
+        crop_x: 1.0,
+    };
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return whole;
     }
-    let scale = (dst_w / src_w).min(dst_h / src_h);
-    [dst_w / (src_w * scale), dst_h / (src_h * scale)]
+    let video = src_w as f64 / src_h as f64;
+    let canvas = dst_w as f64 / dst_h as f64;
+
+    if canvas >= video {
+        // Wider than the video: narrow the card, crop nothing.
+        let width = ((dst_h as f64 * video).round() as u32).clamp(1, dst_w);
+        Card {
+            x: (dst_w - width) / 2,
+            width,
+            ..whole
+        }
+    } else if canvas >= 1.0 {
+        // Narrower than the video but not than square: crop the sides.
+        Card {
+            crop_x: (canvas / video) as f32,
+            ..whole
+        }
+    } else {
+        // Narrower than square: a square card, centred vertically.
+        Card {
+            y: (dst_h - dst_w) / 2,
+            height: dst_w,
+            crop_x: (1.0 / video) as f32,
+            ..whole
+        }
+    }
 }
 
 /// Bytes per row of a tightly packed RGBA buffer, tolerating the row padding
@@ -78,59 +131,50 @@ mod tests {
     /// Tolerance for one f32 divide-then-multiply round trip.
     const EPS: f32 = 1e-6;
 
-    fn assert_close(actual: [f32; 2], expected: [f32; 2]) {
-        assert!(
-            (actual[0] - expected[0]).abs() < EPS && (actual[1] - expected[1]).abs() < EPS,
-            "expected {expected:?}, got {actual:?}"
-        );
+    #[test]
+    fn card_in_a_wide_cell_is_narrower_and_centred() {
+        // 16:9 video in a 1000x360 cell: 640 wide, centred, nothing cropped.
+        let c = card(1280, 720, 1000, 360);
+        assert_eq!((c.x, c.y, c.width, c.height), (180, 0, 640, 360));
+        assert_eq!(c.crop_x, 1.0);
     }
 
     #[test]
-    fn contain_matching_aspect_has_no_bars() {
-        // Exact, not approximate: the round trip does land on 1.0 for these,
-        // and a change that only *nearly* does is worth failing on.
-        for (dw, dh) in [(736, 414), (1280, 720), (160, 90), (1920, 1080)] {
-            assert_eq!(contain(1920, 1080, dw, dh), [1.0, 1.0], "{dw}x{dh}");
-        }
+    fn card_matching_the_video_fills_the_cell() {
+        let c = card(1280, 720, 640, 360);
+        assert_eq!((c.x, c.y, c.width, c.height), (0, 0, 640, 360));
+        assert_eq!(c.crop_x, 1.0);
     }
 
     #[test]
-    fn contain_wide_canvas_pillarboxes() {
-        // 2.00:1 canvas against 1.78:1 video, so x samples 12.5% past.
-        assert_close(contain(1920, 1080, 800, 400), [1.125, 1.0]);
+    fn card_in_a_narrow_cell_crops_the_sides() {
+        // 4:3 cell, 16:9 video: show 3/4 of the width.
+        let c = card(1280, 720, 480, 360);
+        assert_eq!((c.x, c.y, c.width, c.height), (0, 0, 480, 360));
+        assert!((c.crop_x - 0.75).abs() < EPS);
     }
 
     #[test]
-    fn contain_tall_canvas_letterboxes() {
-        // The mirror image: a square canvas overshoots on y instead.
-        assert_close(contain(1920, 1080, 400, 400), [1.0, 1920.0 / 1080.0]);
+    fn card_at_exactly_square_crops_to_square() {
+        let c = card(1280, 720, 360, 360);
+        assert_eq!((c.x, c.y, c.width, c.height), (0, 0, 360, 360));
+        assert!((c.crop_x - 0.5625).abs() < EPS);
     }
 
     #[test]
-    fn contain_pins_exactly_one_axis_to_one() {
-        // Both axes above 1.0 means sampling past the edge on all four
-        // sides -- the crop bug's signature.
-        for (sw, sh) in [(1920, 1080), (640, 480), (1080, 1920), (1, 1000)] {
-            for (dw, dh) in [(736, 414), (800, 400), (400, 400), (200, 113), (1, 1)] {
-                let [x, y] = contain(sw, sh, dw, dh);
-                assert!(x >= 1.0 - EPS && y >= 1.0 - EPS, "{sw}x{sh} -> {dw}x{dh}");
-                assert!(
-                    (x - 1.0).abs() < EPS || (y - 1.0).abs() < EPS,
-                    "neither axis pinned to 1.0 for {sw}x{sh} -> {dw}x{dh}: [{x}, {y}]"
-                );
-            }
-        }
+    fn card_never_goes_narrower_than_square() {
+        // A tall cell: the card stays square and sits in the middle.
+        let c = card(1280, 720, 300, 500);
+        assert_eq!((c.x, c.y, c.width, c.height), (0, 100, 300, 300));
+        assert!((c.crop_x - 0.5625).abs() < EPS, "cropped to square, no further");
     }
 
     #[test]
-    fn contain_survives_zero_dimensions() {
-        // A canvas is zero-sized before first layout and `render` still runs.
-        // Dividing through gives a NaN uv scale: paints nothing, explains
-        // nothing.
-        for args in [(0, 1080, 736, 414), (1920, 0, 736, 414), (1920, 1080, 0, 414), (1920, 1080, 736, 0)] {
-            let (sw, sh, dw, dh) = args;
-            assert_eq!(contain(sw, sh, dw, dh), [1.0, 1.0], "{args:?}");
-        }
+    fn card_survives_zero_dimensions() {
+        let c = card(0, 720, 640, 360);
+        assert_eq!((c.width, c.height, c.crop_x), (640, 360, 1.0));
+        let c = card(1280, 720, 0, 360);
+        assert_eq!(c.crop_x, 1.0);
     }
 
     #[test]

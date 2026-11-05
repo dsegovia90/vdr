@@ -27,7 +27,7 @@ use std::time::Duration;
 use moq_audio::{capture, decode, encode, playback};
 use moq_mux::catalog::Stream as _;
 
-use crate::audio::{Controls, Speaking, Talking, loudness};
+use crate::audio::{Speaking, Talking, loudness};
 
 /// How far ahead newer audio has to be before a stalled group is abandoned.
 ///
@@ -180,8 +180,7 @@ pub(super) async fn subscribe(
     broadcast: moq_net::broadcast::Consumer,
     peer: String,
     engine: playback::Engine,
-    controls: Arc<Controls>,
-    // Their tile's own talking dot, beside the call-wide one in `controls`.
+    // Their tile's talking dot.
     talking_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut catalog = match moq_mux::catalog::Consumer::<()>::new(
@@ -248,7 +247,7 @@ pub(super) async fn subscribe(
     let mut talking = Talking::default();
     // Released when this task ends *or is aborted*, which is how a peer leaving
     // mid-word stops counting as someone talking.
-    let mut speaking = Speaking::new(controls, talking_flag);
+    let mut speaking = Speaking::new(talking_flag);
 
     while let Ok(Some(frame)) = consumer.read().await {
         speaking.set(talking.push(loudness(&frame.data)));

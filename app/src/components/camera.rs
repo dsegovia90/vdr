@@ -4,9 +4,7 @@ use std::rc::Rc;
 use cameras::{CameraSource, DeviceId, PixelFormat, Resolution, StreamConfig};
 use dioxus_native::prelude::*;
 
-use super::{
-    Button, ConnectRow, Dropdown, DropdownOption, MicrophoneRow, ParticipantTile, StatsRow, Tone,
-};
+use super::{ConnectRow, ControlBar, DropdownOption, ParticipantTile, layout, use_open_menu_provider};
 use crate::args::Args;
 use crate::camera::{FrameSlot, Mirror, use_camera_stream, use_shared_devices};
 use crate::net::use_remote;
@@ -36,6 +34,8 @@ const CONFIG: StreamConfig = StreamConfig {
 
 #[component]
 pub fn Camera() -> Element {
+    // One open menu at a time across the bar; see `device_menu::OpenMenu`.
+    use_open_menu_provider();
     let devices = use_shared_devices();
     // Never a position: enumeration order is not stable across launches, and a
     // device disappearing shifts every later index down by one.
@@ -113,75 +113,37 @@ pub fn Camera() -> Element {
         .read()
         .as_ref()
         .is_some_and(|id| !devices.devices.read().iter().any(|device| &device.id == id));
-    let placeholder = if missing {
-        "Camera disconnected"
-    } else if *devices.ready.read() {
-        "No cameras found"
+    // "Camera off" is the user's own doing and the icon already says it; a
+    // vanished device or a dead capture thread is not, and gets words.
+    let camera_problem = if !camera_enabled() {
+        None
+    } else if missing {
+        Some("Camera disconnected".to_string())
+    } else if stream.status.read().is_error() {
+        Some(stream.status.read().to_string())
     } else {
-        "Scanning..."
-    };
-    let can_stream = !options.is_empty();
-    // "Camera off" is the user's own doing; a vanished device or a dead
-    // capture thread is not.
-    let status_class = if !camera_enabled() {
-        "text-sm text-neutral-400"
-    } else if missing || stream.status.read().is_error() {
-        "text-sm text-red-400"
-    } else {
-        "text-sm text-neutral-400"
+        None
     };
 
     // Read into a Vec first: holding the signal's guard across the nodes below
     // would keep it borrowed while they render.
     let participants = remote.participants.read().clone();
-    let grid = grid_class(1 + participants.len());
+    let tiles = 1 + participants.len();
+    let tile = layout::tile_class(tiles);
 
     rsx! {
-        div { class: "flex flex-row items-end gap-3",
-            Dropdown {
-                label: "Camera",
-                options,
-                selected: selected.read().as_ref().map(|id| id.0.clone()),
-                placeholder: placeholder.to_string(),
-                onchange: move |value: String| {
-                    // Saved here rather than in an effect watching `selected`:
-                    // this is the one place a *person* changes the camera, and
-                    // signals notify on redundant writes.
-                    let chosen = value.clone();
-                    Settings::update(move |settings| settings.camera = Some(chosen));
-                    selected.set(Some(DeviceId(value)));
-                },
-            }
-            Button {
-                onclick: move |_| devices.refresh.call(()),
-                "Rescan"
-            }
-            if can_stream {
-                Button {
-                    tone: Tone::Primary,
-                    onclick: move |_| {
-                        let next = !*camera_enabled.peek();
-                        camera_enabled.set(next);
-                    },
-                    if camera_enabled() { "Turn camera off" } else { "Turn camera on" }
-                }
-            }
-        }
-        // Above the tiles and in normal flow: an overlay would paint but never
-        // receive clicks in this blitz revision (ticket 0). Disappears once a
-        // peer is chosen.
-        MicrophoneRow { audio: remote.audio.clone() }
+        // Only while there is no call: your key and who to call. A call is the
+        // grid and the bar below, nothing else.
         ConnectRow {
             me: remote.me,
             status: remote.status,
             connect: remote.connect,
-            cancel: remote.cancel,
         }
-        // **Everyone in one grid, ourselves included, and it takes whatever
+        // **Everyone in one area, ourselves included, and it takes whatever
         // height is left.** `flex-1 min-h-0` inside the app's full-height
         // column is what makes it shrink to fit rather than push the page into
-        // scrolling; each video letterboxes inside its cell.
-        div { class: grid,
+        // scrolling. The rows hug the middle; see `layout`.
+        div { class: layout::CONTAINER,
             ParticipantTile {
                 label: "You",
                 slot,
@@ -189,73 +151,54 @@ pub fn Camera() -> Element {
                 // preview. Remote participants get `Mirror::None`.
                 mirror: Mirror::SelfView,
                 stats: None,
+                class: tile,
+            }
+            if let Some(class) = layout::break_after(tiles, 1) {
+                div { class }
             }
             // **Keyed, and that is the point of the id.** Without a key dioxus
             // may reuse the wrong component instance when the list reorders,
-            // and two people's video swaps tiles.
-            for participant in participants {
-                ParticipantTile {
-                    key: "{participant.id}",
-                    label: participant.short(),
-                    slot: participant.slot.clone(),
-                    // Not a self-view: these frames took the path a peer's
-                    // would, and mirroring them would be the bug task 9 removed.
-                    mirror: Mirror::None,
-                    stats: Some(participant.stats.clone()),
+            // and two people's video swaps tiles. Each card's line break shares
+            // its key's fragment, so the two move together.
+            for (index, participant) in participants.into_iter().enumerate() {
+                Fragment { key: "{participant.id}",
+                    ParticipantTile {
+                        label: participant.short(),
+                        slot: participant.slot.clone(),
+                        // Not a self-view: these frames took the path a peer's
+                        // would, and mirroring them would be the bug task 9 removed.
+                        mirror: Mirror::None,
+                        stats: Some(participant.stats.clone()),
+                        class: tile,
+                    }
+                    if let Some(class) = layout::break_after(tiles, index + 2) {
+                        div { class }
+                    }
                 }
             }
         }
-        p {
-            class: if remote.status.read().is_error() { "text-sm text-red-400" } else { "text-sm text-neutral-400" },
-            "{remote.status}"
+        ControlBar {
+            audio: remote.audio.clone(),
+            camera_on: camera_enabled(),
+            cameras: options,
+            camera: selected.read().as_ref().map(|id| id.0.clone()),
+            on_camera_toggle: move |_| {
+                let next = !*camera_enabled.peek();
+                camera_enabled.set(next);
+            },
+            on_camera_select: move |value: String| {
+                // Saved here rather than in an effect watching `selected`:
+                // this is the one place a *person* changes the camera, and
+                // signals notify on redundant writes.
+                let chosen = value.clone();
+                Settings::update(move |settings| settings.camera = Some(chosen));
+                selected.set(Some(DeviceId(value)));
+            },
+            on_camera_rescan: move |_| devices.refresh.call(()),
+            camera_problem,
+            status: remote.status,
+            metrics: remote.metrics.clone(),
+            leave: remote.cancel,
         }
-        StatsRow { metrics: remote.metrics.clone() }
-        p { class: status_class,
-            if !camera_enabled() {
-                "Camera off"
-            } else if missing {
-                "Camera disconnected"
-            } else {
-                "{stream.status}"
-            }
-        }
-    }
-}
-
-/// The grid's classes for `tiles` tiles: as few columns as keep the tiles
-/// large, and rows to match.
-///
-/// **Every class is a whole literal**, never assembled with `format!`:
-/// Tailwind finds classes by scanning source text, so a computed
-/// `grid-cols-{n}` would never have a rule generated for it, and would look
-/// exactly like a layout this renderer does not support.
-fn grid_class(tiles: usize) -> &'static str {
-    match tiles {
-        0 | 1 => "grid grid-cols-1 grid-rows-1 gap-3 w-full flex-1 min-h-0",
-        2 => "grid grid-cols-2 grid-rows-1 gap-3 w-full flex-1 min-h-0",
-        3 | 4 => "grid grid-cols-2 grid-rows-2 gap-3 w-full flex-1 min-h-0",
-        5 | 6 => "grid grid-cols-3 grid-rows-2 gap-3 w-full flex-1 min-h-0",
-        _ => "grid grid-cols-3 grid-rows-3 gap-3 w-full flex-1 min-h-0",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::grid_class;
-
-    #[test]
-    fn two_people_sit_side_by_side() {
-        assert!(grid_class(2).contains("grid-cols-2 grid-rows-1"));
-    }
-
-    #[test]
-    fn four_people_make_a_square() {
-        assert!(grid_class(3).contains("grid-cols-2 grid-rows-2"));
-        assert!(grid_class(4).contains("grid-cols-2 grid-rows-2"));
-    }
-
-    #[test]
-    fn a_fifth_person_adds_a_column() {
-        assert!(grid_class(5).contains("grid-cols-3 grid-rows-2"));
     }
 }

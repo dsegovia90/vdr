@@ -10,7 +10,7 @@ mod upload;
 use anyrender::{PaintRef, PaintScene, RenderContext, ResourceId, Scene};
 use blitz_dom::node::ComputedStyles;
 use dioxus_native::{DeviceHandle, Widget};
-use peniko::kurbo::{Affine, Rect};
+use peniko::kurbo::{Affine, RoundedRect};
 use peniko::{Fill, ImageBrush, ImageSampler};
 use dioxus_native::prelude::*;
 
@@ -18,6 +18,11 @@ use active::Active;
 use rate::FrameRate;
 
 pub use fit::Mirror;
+use fit::Card;
+
+/// How round a video card's corners are, in CSS pixels; scaled by the window's
+/// pixel density when painted, so it looks the same on a Retina screen.
+const CORNER_RADIUS: f64 = 12.0;
 pub use pipeline::PipelineCache;
 
 /// The pipeline cache every stream in this app shares.
@@ -128,7 +133,20 @@ impl Widget for VideoPaintSource {
         scale: f64,
     ) -> Scene {
         let mut scene = Scene::new();
-        if let Some(id) = self.render(render_ctx, width, height, scale) {
+        if let Some((id, card)) = self.render(render_ctx, width, height, scale) {
+            // **The renderer draws the card's shape, not us.** The texture is
+            // exactly the card, so filling a rounded rectangle with it gives
+            // anti-aliased corners without the shader knowing about them, and
+            // everything outside the card is simply never painted -- no alpha
+            // for the renderer to interpret.
+            let (x, y) = (card.x as f64, card.y as f64);
+            let shape = RoundedRect::new(
+                x,
+                y,
+                x + card.width as f64,
+                y + card.height as f64,
+                CORNER_RADIUS * scale,
+            );
             scene.fill(
                 Fill::NonZero,
                 Affine::IDENTITY,
@@ -136,8 +154,10 @@ impl Widget for VideoPaintSource {
                     image: id,
                     sampler: ImageSampler::default(),
                 }),
-                None,
-                &Rect::from_origin_size((0.0, 0.0), (width as f64, height as f64)),
+                // The image is placed at the brush's origin, so move it to the
+                // card's corner.
+                Some(Affine::translate((x, y))),
+                &shape,
             );
         }
         scene
@@ -151,15 +171,13 @@ impl VideoPaintSource {
         width: u32,
         height: u32,
         scale: f64,
-    ) -> Option<ResourceId> {
+    ) -> Option<(ResourceId, Card)> {
         let State::Active(active) = &mut self.state else {
             return None;
         };
         if width == 0 || height == 0 {
             return None;
         }
-
-        let resized = active.ensure_target(ctx, width, height, scale);
 
         let cleared = self.slot.cleared();
         let blanked = cleared != self.last_cleared;
@@ -179,10 +197,20 @@ impl VideoPaintSource {
             None => false,
         };
 
+        // Laid out after the upload, because the card's shape is the video's.
+        // With no video yet -- or a camera that was turned off -- a 16:9 card
+        // stands in, so the tile keeps its place rather than vanishing.
+        let (video_w, video_h) = active
+            .source
+            .as_ref()
+            .map_or((16, 9), |source| (source.width, source.height));
+        let card = fit::card(video_w, video_h, width, height);
+        let resized = active.ensure_target(ctx, card.width, card.height, scale);
+
         if uploaded || resized || blanked {
-            active.draw(width, height, self.mirror);
+            active.draw(card, self.mirror);
         }
 
-        active.target.as_ref().map(|t| t.handle)
+        active.target.as_ref().map(|t| (t.handle, card))
     }
 }
