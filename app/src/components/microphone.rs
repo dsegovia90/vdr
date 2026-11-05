@@ -16,6 +16,7 @@ use dioxus_native::prelude::*;
 use super::{DeviceMenu, DropdownOption, MicIcon};
 use crate::audio::{Controls, MicStatus, use_shared_microphones};
 use crate::channel::use_channel;
+use crate::net::PeerStats;
 use crate::settings::{self, Settings};
 
 /// How often the meter is sampled.
@@ -41,6 +42,8 @@ struct Meter {
 pub struct MicrophoneProps {
     /// The microphone and what the peer is doing with theirs.
     pub audio: Arc<Controls>,
+    /// Ourselves: muting is recorded here, for our tile and for the room.
+    pub local: Arc<PeerStats>,
 }
 
 #[component]
@@ -130,6 +133,7 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
                 },
                 onclick: {
                     let audio = props.audio.clone();
+                    let local = props.local.clone();
                     move |_| {
                         if !has_devices {
                             return;
@@ -137,6 +141,7 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
                         let next = !*muted.peek();
                         muted.set(next);
                         audio.set_enabled(!next);
+                        local.set_mic(!next);
                     }
                 },
                 MicIcon { off }

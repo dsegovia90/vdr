@@ -136,6 +136,11 @@ pub struct PeerStats {
     /// Whether they are talking. Shared with the audio task's `Speaking` guard,
     /// which owns turning it off however that task ends.
     talking: Arc<AtomicBool>,
+    /// Whether their camera is on, as they say in their presence document --
+    /// or, for our own tile, as we set it. On until told otherwise.
+    camera_on: AtomicBool,
+    /// Whether their microphone is on, the same way.
+    mic_on: AtomicBool,
 }
 
 /// No measurement yet.
@@ -153,6 +158,8 @@ impl Default for PeerStats {
         Self {
             fps_tenths: AtomicU32::new(UNKNOWN),
             talking: Arc::default(),
+            camera_on: AtomicBool::new(true),
+            mic_on: AtomicBool::new(true),
         }
     }
 }
@@ -170,6 +177,26 @@ impl PeerStats {
     /// Whether they are talking right now.
     pub fn talking(&self) -> bool {
         self.talking.load(Ordering::Relaxed)
+    }
+
+    /// Whether their camera is on.
+    pub fn camera_on(&self) -> bool {
+        self.camera_on.load(Ordering::Relaxed)
+    }
+
+    /// Whether their microphone is on.
+    pub fn mic_on(&self) -> bool {
+        self.mic_on.load(Ordering::Relaxed)
+    }
+
+    /// Records whether their camera is on.
+    pub fn set_camera(&self, on: bool) {
+        self.camera_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Records whether their microphone is on.
+    pub fn set_mic(&self, on: bool) {
+        self.mic_on.store(on, Ordering::Relaxed);
     }
 
     /// The flag the audio side raises while they talk.
@@ -235,6 +262,14 @@ impl Drop for FpsMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_and_mic_are_on_until_told_otherwise() {
+        let stats = PeerStats::default();
+        assert!(stats.camera_on() && stats.mic_on());
+        stats.set_camera(false);
+        assert!(!stats.camera_on() && stats.mic_on());
+    }
 
     #[test]
     fn a_new_peer_has_no_rate_yet() {

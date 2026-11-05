@@ -15,7 +15,7 @@ mod tile;
 pub use bar::ControlBar;
 pub use button::{Button, Size, Tone};
 pub use device_menu::{DeviceMenu, DropdownOption, use_open_menu_provider};
-pub use icons::{CameraIcon, LeaveIcon, MicIcon};
+pub use icons::{CameraIcon, LeaveIcon, MicIcon, PersonIcon};
 pub use call_screen::CallScreen;
 pub use connect::ConnectRow;
 pub use microphone::MicControl;

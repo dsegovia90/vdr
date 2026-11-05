@@ -112,6 +112,10 @@ pub struct Remote {
     /// call them directly. It outlives any one call -- muting while idle stays
     /// true when the next call starts.
     pub audio: Arc<Controls>,
+    /// Ourselves, as our own tile shows us and as the room is told: whether
+    /// our camera and microphone are on. The controls write it; the call
+    /// announces it in our presence document.
+    pub local: Arc<PeerStats>,
 }
 
 /// Starts whichever remote path the command line asked for.
@@ -149,6 +153,7 @@ pub fn use_remote() -> Remote {
     use_hook(|| {
         let audio = Arc::new(Controls::default());
         let metrics = Arc::new(Metrics::default());
+        let local = Arc::new(PeerStats::default());
         let (tap, feed) = frame_tap();
         // The decision, not the feed, is what gets deferred. The call thread
         // takes the feed at startup and parks on this receiver after binding,
@@ -184,6 +189,7 @@ pub fn use_remote() -> Remote {
                     joined,
                     audio.clone(),
                     metrics.clone(),
+                    local.clone(),
                 );
                 // `--listen` / `--dial` decide immediately; `Idle` waits for the
                 // UI. The CLI path is deliberately unchanged: it is how two
@@ -217,6 +223,7 @@ pub fn use_remote() -> Remote {
             cancel,
             audio,
             metrics,
+            local,
         }
     })
 }

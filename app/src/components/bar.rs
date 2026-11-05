@@ -11,12 +11,14 @@ use dioxus_native::prelude::*;
 
 use super::{CameraIcon, DeviceMenu, DropdownOption, LeaveIcon, MicControl, StatsRow};
 use crate::audio::Controls;
-use crate::net::{Metrics, RemoteStatus};
+use crate::net::{Metrics, PeerStats, RemoteStatus};
 
 #[derive(Clone, PartialEq, Props)]
 pub struct ControlBarProps {
     /// The microphone, which manages its own device choice.
     pub audio: Arc<Controls>,
+    /// Ourselves: the mic toggle records itself here for the room to hear of.
+    pub local: Arc<PeerStats>,
     /// Whether the camera is on, by the user's choice.
     pub camera_on: bool,
     /// Cameras to choose from, and the chosen one's `value`.
@@ -55,7 +57,7 @@ pub fn ControlBar(props: ControlBarProps) -> Element {
     rsx! {
         div { class: "flex shrink-0 flex-row items-center gap-4 border-t border-neutral-800 pt-3",
             div { class: "flex shrink-0 flex-row items-center gap-3",
-                MicControl { audio: props.audio.clone() }
+                MicControl { audio: props.audio.clone(), local: props.local.clone() }
                 div { class: "flex flex-row items-center gap-0.5",
                     button {
                         class: if off {

@@ -291,11 +291,45 @@ const CONTROL_PRIORITY: u8 = 100;
 /// right answer. That is what `moq-json`'s snapshot mode is for, and it is why
 /// this is the cheap shape rather than a compromise.
 ///
-/// Deliberately one field. Roles, candidacy and topology opinions are tickets
-/// 22 and 23, and they extend this document rather than inventing their own.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+/// Everything here is about the person, not the media: whether they are on the
+/// call, and whether their camera and microphone are on *by their choice*. A
+/// camera that is off is not a stalled stream, and only the sender can say
+/// which it is. Roles, candidacy and topology opinions extend this same
+/// document when they come, rather than inventing their own.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Presence {
     state: State,
+    /// Absent reads as on: a peer that predates the field never turned it off.
+    #[serde(default = "on")]
+    camera: bool,
+    #[serde(default = "on")]
+    mic: bool,
+}
+
+impl Default for Presence {
+    fn default() -> Self {
+        Self {
+            state: State::Here,
+            camera: true,
+            mic: true,
+        }
+    }
+}
+
+impl Presence {
+    /// Here, with our camera and microphone as `local` says.
+    fn here(local: &PeerStats) -> Self {
+        Self {
+            state: State::Here,
+            camera: local.camera_on(),
+            mic: local.mic_on(),
+        }
+    }
+}
+
+/// The serde default for the media flags.
+fn on() -> bool {
+    true
 }
 
 /// The one thing a participant currently says.
@@ -413,6 +447,7 @@ pub(super) fn spawn(
     participants: UnboundedSender<ParticipantEvent>,
     controls: Arc<Controls>,
     metrics: Arc<Metrics>,
+    local: Arc<PeerStats>,
 ) {
     let spawned = std::thread::Builder::new()
         .name("call".into())
@@ -424,7 +459,7 @@ pub(super) fn spawn(
                 return;
             };
             runtime.block_on(async move {
-                match run(decisions, feed, &status, participants, controls, metrics).await {
+                match run(decisions, feed, &status, participants, controls, metrics, local).await {
                     Ok(()) => {
                         tracing::info!("call ended");
                         let _ = status.unbounded_send(RemoteStatus::Ended);
@@ -454,6 +489,7 @@ async fn run(
     participants: UnboundedSender<ParticipantEvent>,
     controls: Arc<Controls>,
     metrics: Arc<Metrics>,
+    local: Arc<PeerStats>,
 ) -> Result<(), String> {
     let report = |next: RemoteStatus| {
         let _ = status.unbounded_send(next);
@@ -599,7 +635,7 @@ async fn run(
                 moq_net::broadcast::Route::new().with_announce(true),
             )
             .map_err(|error| format!("could not create a control broadcast: {error:#}"))?;
-        let mut presence = control
+        let presence = control
             .create_track(PRESENCE, None)
             .map(|track| {
                 moq_json::snapshot::Producer::new(
@@ -608,9 +644,13 @@ async fn run(
                 )
             })
             .map_err(|error| format!("could not create a presence track: {error:#}"))?;
-        if let Err(error) = presence.update(&Presence { state: State::Here }) {
-            tracing::warn!("could not publish our presence: {error:#}");
-        }
+        // Shared with the announcer below and with the leave sequence. A plain
+        // mutex: every use is a quick update, never held across an await.
+        let presence = Arc::new(std::sync::Mutex::new(presence));
+        // The first word already carries the camera and microphone as they
+        // are, so joining muted is announced from the start.
+        say(&presence, Presence::here(&local));
+        let announcing = Abort(tokio::spawn(announce(presence.clone(), local.clone())));
 
         let engine = audio::open_playback().await;
         match audio::publish(broadcast.clone(), catalog, engine.as_ref()) {
@@ -941,11 +981,15 @@ async fn run(
         // peer immediately, where an abrupt loss lingers for the reconnect
         // window instead. If the last word does not make it, the unannounce
         // still does.
-        if let Err(error) = presence.update(&Presence {
-            state: State::Leaving,
-        }) {
-            tracing::warn!("could not say we are leaving: {error:#}");
-        }
+        // The announcer goes first, so nothing it says can follow `Leaving`.
+        drop(announcing);
+        say(
+            &presence,
+            Presence {
+                state: State::Leaving,
+                ..Presence::here(&local)
+            },
+        );
         // A beat between saying it and ending the broadcast it is said on. A
         // relay tears a cleanly finished broadcast down at once, and a
         // document written in the same instant goes down with it -- observed:
@@ -1117,6 +1161,11 @@ async fn attend(
     let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut listening: std::collections::HashMap<String, Abort> =
         std::collections::HashMap::new();
+    // One per person, shared by their presence reader and their tile, so what
+    // they say about their camera reaches the tile showing it. Either
+    // broadcast may be announced first, hence get-or-insert at both.
+    let mut people: std::collections::HashMap<String, Arc<PeerStats>> =
+        std::collections::HashMap::new();
     // Where the per-participant readers report a goodbye. One arbiter, so the
     // rule for "is the call over" is written once.
     let (saying, mut said) = futures_channel::mpsc::unbounded::<String>();
@@ -1153,6 +1202,7 @@ async fn attend(
                             broadcast,
                             id.to_string(),
                             saying.clone(),
+                            people.entry(id.to_string()).or_default().clone(),
                         ))),
                     );
                 }
@@ -1177,6 +1227,9 @@ async fn attend(
                     if present.remove(id) && present.is_empty() {
                         alone(&hangup, id.to_string(), in_room);
                     }
+                    if !attending.contains_key(id) {
+                        people.remove(id);
+                    }
                 }
             }
             continue;
@@ -1197,13 +1250,18 @@ async fn attend(
         let Some(broadcast) = update.broadcast else {
             tracing::info!("{id} left");
             attending.remove(id);
+            // Forgotten once both of their broadcasts are gone, so a rejoin
+            // with the same key starts from "on" rather than their last word.
+            if !present.contains(id) {
+                people.remove(id);
+            }
             let _ = participants.unbounded_send(ParticipantEvent::Left { id: id.to_string() });
             continue;
         };
 
         tracing::info!("{id} joined");
         let slot = FrameSlot::default();
-        let stats = Arc::new(PeerStats::default());
+        let stats = people.entry(id.to_string()).or_default().clone();
         let _ = participants.unbounded_send(ParticipantEvent::Joined {
             id: id.to_string(),
             slot: slot.clone(),
@@ -1230,6 +1288,43 @@ async fn attend(
     }
 }
 
+/// Publishes one presence document, logging rather than failing: a word that
+/// does not get out is a degraded call, not a broken one.
+fn say(presence: &std::sync::Mutex<moq_json::snapshot::Producer<Presence>>, now: Presence) {
+    let Ok(mut presence) = presence.lock() else {
+        return;
+    };
+    if let Err(error) = presence.update(&now) {
+        tracing::warn!("could not publish our presence: {error:#}");
+    }
+}
+
+/// Re-announces our presence whenever our camera or microphone changes.
+///
+/// **Polled, four times a second.** Two booleans flipped by a click do not earn
+/// a notification channel, and a quarter-second lag on "camera off" is not
+/// something anyone can see. Runs until the call aborts it.
+async fn announce(
+    presence: Arc<std::sync::Mutex<moq_json::snapshot::Producer<Presence>>>,
+    local: Arc<PeerStats>,
+) {
+    let mut said = Presence::here(&local);
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        ticker.tick().await;
+        let now = Presence::here(&local);
+        if now != said {
+            tracing::info!("now camera {}, mic {}", on_off(now.camera), on_off(now.mic));
+            say(&presence, now);
+            said = now;
+        }
+    }
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
 /// The last other person has gone, deliberately.
 ///
 /// With one peer that ends the call: there is nobody left to talk to. In a room
@@ -1253,6 +1348,7 @@ async fn listen(
     broadcast: moq_net::broadcast::Consumer,
     id: String,
     saying: UnboundedSender<String>,
+    stats: Arc<PeerStats>,
 ) {
     let track = match broadcast.track(PRESENCE) {
         Ok(track) => track,
@@ -1279,8 +1375,12 @@ async fn listen(
 
     loop {
         match presence.next().await {
-            Ok(Some(Presence { state })) => {
-                tracing::info!("{id} says {state:?}");
+            Ok(Some(Presence { state, camera, mic })) => {
+                tracing::info!("{id} says {state:?}, camera {}, mic {}", on_off(camera), on_off(mic));
+                // Their choice, for their tile: a card instead of a frozen
+                // frame, a badge instead of silence nobody can explain.
+                stats.set_camera(camera);
+                stats.set_mic(mic);
                 if state == State::Leaving {
                     // Reported, not acted on: whether the call is over is a
                     // question about everyone, and the loop that tracks
@@ -1443,6 +1543,29 @@ mod path_tests {
         // Catalog-format detection keys off it, and a path that loses it fails
         // as a timeout rather than an error -- so the id goes in front.
         assert!(camera_path("anyone").ends_with(".hang"));
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::{Presence, State};
+
+    #[test]
+    fn an_older_peer_without_the_flags_reads_as_on() {
+        let old: Presence = serde_json::from_str(r#"{"state":"here"}"#).unwrap();
+        assert_eq!(old, Presence::default());
+        assert!(old.camera && old.mic);
+    }
+
+    #[test]
+    fn the_flags_survive_the_round_trip() {
+        let said = Presence {
+            state: State::Here,
+            camera: false,
+            mic: true,
+        };
+        let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
+        assert_eq!(heard, said);
     }
 }
 

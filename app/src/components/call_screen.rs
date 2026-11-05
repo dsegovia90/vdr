@@ -59,7 +59,11 @@ pub fn CallScreen() -> Element {
                 // Mirrored, because that is what people expect of their own
                 // preview. Remote participants get `Mirror::None`.
                 mirror: Mirror::SelfView,
-                stats: None,
+                // Our own state, so we see the card and badge others see.
+                stats: Some(remote.local.clone()),
+                // Our endpoint id once bound, so our avatar matches what
+                // others see; loopback has none, and any constant will do.
+                who: remote.me.read().clone().unwrap_or_default(),
                 class: tile,
             }
             if let Some(class) = layout::break_after(tiles, 1) {
@@ -78,6 +82,7 @@ pub fn CallScreen() -> Element {
                         // would, and mirroring them would be the bug task 9 removed.
                         mirror: Mirror::None,
                         stats: Some(participant.stats.clone()),
+                        who: participant.id.clone(),
                         class: tile,
                     }
                     if let Some(class) = layout::break_after(tiles, index + 2) {
@@ -88,10 +93,19 @@ pub fn CallScreen() -> Element {
         }
         ControlBar {
             audio: remote.audio.clone(),
+            local: remote.local.clone(),
             camera_on: (camera.enabled)(),
             cameras: camera_options,
             camera: camera.selected.read().as_ref().map(|id| id.0.clone()),
-            on_camera_toggle: move |_| camera.toggle(),
+            on_camera_toggle: {
+                let local = remote.local.clone();
+                move |_| {
+                    camera.toggle();
+                    // Told to the room by the call's announcer, and shown on
+                    // our own tile the same way others will see it.
+                    local.set_camera(*camera.enabled.peek());
+                }
+            },
             on_camera_select: move |value: String| camera.choose(DeviceId(value)),
             on_camera_rescan: move |_| camera.devices.refresh.call(()),
             camera_problem: camera.problem(),

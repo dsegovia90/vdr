@@ -84,3 +84,25 @@ pub fn LeaveIcon() -> Element {
         }
     }
 }
+
+/// A head and shoulders: someone whose camera is off.
+#[component]
+pub fn PersonIcon() -> Element {
+    rsx! {
+        svg {
+            // Needed: blitz hands the serialized subtree to usvg, which only
+            // accepts a root in the SVG namespace.
+            xmlns: "http://www.w3.org/2000/svg",
+            width: "32",
+            height: "32",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.75",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            circle { cx: "12", cy: "8", r: "4" }
+            path { d: "M4 21a8 8 0 0 1 16 0" }
+        }
+    }
+}
