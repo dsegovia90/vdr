@@ -15,3 +15,6 @@
 CLAUDE.md
 
 .DS_Store
+
+# Packaged builds for sending (deploy/client/)
+/dist/

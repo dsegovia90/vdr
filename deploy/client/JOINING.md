@@ -1,0 +1,48 @@
+# Joining a vid call
+
+You were sent an **invite link** that looks like:
+
+```
+https://relay.example.com:4443/<room>?jwt=<a long code>
+```
+
+Keep it to yourself: anyone holding it can join that room until it expires.
+
+## macOS (Apple Silicon)
+
+1. Unzip `vid-macos-…zip` and move **Vdr.app** to Applications.
+2. The app is not signed by Apple yet, so the first time, **right-click Vdr.app
+   and choose Open**, then Open again. (If macOS says it is "damaged", run
+   `xattr -dr com.apple.quarantine /Applications/Vdr.app` in Terminal once.)
+3. Allow camera and microphone when asked.
+
+## Linux
+
+1. Unpack `vid-linux-…tar.gz` and run `./vdr` from the unpacked folder.
+2. It needs `libasound2`, `libvulkan1` with a Vulkan driver (`mesa-vulkan-drivers`
+   on most machines), and an X11 or Wayland desktop.
+
+## Join
+
+**Paste the invite link into the field at the top and press Connect.**
+
+- The buttons at the bottom left turn your microphone and camera on and off;
+  the small ▾ beside each picks a different device.
+- **Leave** is at the bottom right.
+
+Headphones avoid echo if you are in the same room as another participant.
+
+## For the test call (if you were asked to measure)
+
+Start it from a terminal instead, so it writes measurements to a file:
+
+```sh
+# macOS
+/Applications/Vdr.app/Contents/MacOS/vdr --relay "<invite link>" --stats ~/s7-<your-name>.jsonl
+# Linux
+./vdr --relay "<invite link>" --stats ~/s7-<your-name>.jsonl
+```
+
+Check your clock is in sync first (macOS: `sntp -t 1 time.apple.com`; Linux:
+`chronyc tracking` or `timedatectl`), and send the `.jsonl` file back after
+the call.
