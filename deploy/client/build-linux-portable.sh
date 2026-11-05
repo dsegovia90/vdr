@@ -8,6 +8,9 @@
 # Ubuntu 24.04 (2.39), Debian 12 (2.36) or older. Ubuntu 22.04's 2.35 is old
 # enough for nearly every current desktop, and glibc runs older builds fine.
 #
+# `git config` runs from `/`: git reads the current directory's repo first even
+# for `--global`, and a worktree copied off the Mac has a dangling `.git` file.
+#
 # Rootless podman, no sudo. The container's build output and cargo cache live
 # in named volumes, apart from any build on the host.
 set -euo pipefail
@@ -21,4 +24,4 @@ podman run --rm \
   -e PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   -e VID_COMMIT="${VID_COMMIT:-}" \
   docker.io/library/ubuntu:22.04 \
-  bash -c 'apt-get update -qq && apt-get install -y -qq git curl ca-certificates >/dev/null && git config --global --add safe.directory /src && deploy/client/build-linux.sh'
+  bash -c 'apt-get update -qq && apt-get install -y -qq git curl ca-certificates >/dev/null && (cd / && git config --global --add safe.directory /src) && deploy/client/build-linux.sh'
