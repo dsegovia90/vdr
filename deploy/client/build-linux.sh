@@ -44,10 +44,16 @@ if [ -z "${SKIP_PACKAGES:-}" ]; then
   fi
 fi
 
-if ! command -v cargo >/dev/null; then
-  curl https://sh.rustup.rs -sSf | sh -s -- -y
-  # shellcheck disable=SC1091
-  . "$HOME/.cargo/env"
+# Whether cargo *runs*, not whether it exists: rustup's launcher can be present
+# with no toolchain behind it (a cache that kept ~/.cargo but not ~/.rustup).
+if ! cargo --version >/dev/null 2>&1; then
+  if command -v rustup >/dev/null; then
+    rustup default stable
+  else
+    curl https://sh.rustup.rs -sSf | sh -s -- -y
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+  fi
 fi
 # The dx version this repo is built with (CLAUDE.md).
 command -v dx >/dev/null || cargo install dioxus-cli --version 0.7.10 --locked

@@ -20,6 +20,7 @@ podman run --rm \
   -v "$root:/src:Z" \
   -v vid-linux-target:/src/app/target \
   -v vid-linux-cargo:/root/.cargo \
+  -v vid-linux-rustup:/root/.rustup \
   -w /src \
   -e PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   -e VID_COMMIT="${VID_COMMIT:-}" \
