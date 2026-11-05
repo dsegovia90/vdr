@@ -179,6 +179,43 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
     })
 }
 
+/// The URL with any token's value blanked, for logs and labels.
+///
+/// **A room URL can carry its invitation** (`?jwt=…`, the relay's token), and
+/// anyone holding it can join that room until it expires, so it must never be
+/// written anywhere a log or a screenshot might travel. Only our own lines are
+/// covered: moq-native logs the full URL at `info` itself, which the default
+/// `RUST_LOG=vdr=…` filter happens to hide.
+fn redacted(url: &url::Url) -> String {
+    let mut clean = url.clone();
+    if url.query_pairs().any(|(key, _)| key == "jwt") {
+        let kept: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(key, value)| {
+                // Plain ASCII: a URL would percent-encode an ellipsis.
+                let value = if key == "jwt" { "redacted".to_string() } else { value.into_owned() };
+                (key.into_owned(), value)
+            })
+            .collect();
+        clean.query_pairs_mut().clear().extend_pairs(kept);
+    }
+    clean.to_string()
+}
+
+/// A call's final error, in words where we know what it means.
+///
+/// The relay refusing a token arrives as a closed session (`code=6
+/// reason=unauthorized`), which moq-native retries like any drop until its
+/// budget runs out -- it does not tell a refusal from a flaky link until then.
+/// What reaches us at the end is transport text; this says what to do.
+fn explain(error: String) -> String {
+    if error.contains("reason=unauthorized") {
+        "the relay refused this room's token (missing, expired, or for another room)".to_string()
+    } else {
+        error
+    }
+}
+
 /// How a room reads in the status line: its path, and the relay it is on.
 ///
 /// The path *is* the room -- the relay roots each session at the path it
@@ -612,14 +649,14 @@ async fn run(
             Peering::Join(ref url) => {
                 let room = room_label(url);
                 report(RemoteStatus::Joining { room: room.clone() });
-                tracing::info!("joining {room} at {url}");
+                tracing::info!("joining {room} at {}", redacted(url));
                 connect(Connect {
                     config: &client_config,
                     endpoint: &endpoint,
                     outbound: &outbound,
                     inbound: inbound.clone(),
                     url: url.clone(),
-                    label: url.to_string(),
+                    label: redacted(url),
                     room: Some(room),
                     status: status.clone(),
                     keyframe: keyframe.clone(),
@@ -918,7 +955,9 @@ async fn run(
             }
             Some(Err(error)) => {
                 tracing::error!("call failed: {error}");
-                ending = Some(RemoteStatus::Failed { error });
+                ending = Some(RemoteStatus::Failed {
+                    error: explain(error),
+                });
             }
             None => tracing::info!("call cancelled; back to idle"),
         }
@@ -1362,7 +1401,28 @@ mod path_tests {
 
 #[cfg(test)]
 mod room_tests {
-    use super::room_label;
+    use super::{explain, redacted, room_label};
+
+    #[test]
+    fn a_token_never_reaches_the_log() {
+        let url: url::Url = "https://relay.example.com:4443/test?jwt=secret.token.value".parse().unwrap();
+        let shown = redacted(&url);
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("relay.example.com:4443/test"), "{shown}");
+    }
+
+    #[test]
+    fn a_url_without_a_token_is_left_alone() {
+        let url: url::Url = "http://localhost:4443/test".parse().unwrap();
+        assert_eq!(redacted(&url), "http://localhost:4443/test");
+    }
+
+    #[test]
+    fn a_refused_token_is_said_in_words() {
+        let raw = "reconnect timed out after 30s: transport: webtransport error: closed: code=6 reason=unauthorized";
+        assert!(explain(raw.to_string()).starts_with("the relay refused this room's token"));
+        assert_eq!(explain("something else".to_string()), "something else");
+    }
 
     fn label(url: &str) -> String {
         room_label(&url.parse().unwrap())
