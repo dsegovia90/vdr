@@ -61,7 +61,9 @@ serde_json = "1"
 # context even for the in-process loopback -- there is no non-async way in.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+# `env-filter` named here rather than relied on through another crate: the
+# default log filter in `main.rs` builds one.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # The moq stack: the whole network path, since ticket 20e retired the last of
 # `iroh-live`/`moq-media`. `hang` is deliberately NOT a direct dependency -- the

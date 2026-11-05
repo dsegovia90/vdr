@@ -13,10 +13,50 @@ use dioxus_native::prelude::*;
 const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    init_logging();
     install_crypto_provider();
     warn_if_unbundled();
     dioxus_native::launch(App);
+}
+
+/// What is logged when `RUST_LOG` says nothing: our own progress and the audio
+/// library's device and echo-canceller lines, warnings from everything else.
+///
+/// **Not silence.** The old default logged nothing at all, so a call that went
+/// wrong on someone else's machine left no evidence to send back -- which is
+/// exactly where echo turned up.
+const DEFAULT_LOG: &str = "warn,vdr=info,moq_audio=info";
+
+/// Logs to stderr and to `vdr.log` in the app's data folder.
+///
+/// The file is truncated at each launch, with the previous run kept beside it
+/// as `vdr.prev.log`: someone reporting a call that went wrong usually starts
+/// the app again before they get round to sending anything. An explicit
+/// `RUST_LOG` still decides what is written to both.
+fn init_logging() {
+    use tracing_subscriber::prelude::*;
+
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG))
+    };
+    let file = settings::log_path().and_then(|path| {
+        let _ = std::fs::rename(&path, path.with_file_name("vdr.prev.log"));
+        std::fs::File::create(&path).ok()
+    });
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(filter()))
+        .with(file.map(|file| {
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_filter(filter())
+        }))
+        .init();
+    if let Some(path) = settings::log_path() {
+        tracing::info!("logging to {}", path.display());
+    }
 }
 
 /// Picks rustls's crypto backend for the whole process, once, before anything

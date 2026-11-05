@@ -49,6 +49,19 @@ pub fn identity_path() -> Option<std::path::PathBuf> {
     Some(dir.join(IDENTITY))
 }
 
+/// The log file, creating its directory if that is missing.
+///
+/// Next to the identity, in the app's own data folder, so someone who was on a
+/// call can find it and send it: a double-clicked app has no terminal to read
+/// from. `None` where the platform has no such folder, and then the log goes to
+/// stderr only.
+pub fn log_path() -> Option<std::path::PathBuf> {
+    let dirs = directories::BaseDirs::new()?;
+    let dir = dirs.data_local_dir().join(APP_DIR);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("vdr.log"))
+}
+
 /// Everything the app remembers between launches.
 ///
 /// `#[serde(default)]` on the struct rather than `deny_unknown_fields`: a file
