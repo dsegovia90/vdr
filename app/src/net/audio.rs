@@ -257,13 +257,15 @@ pub(super) async fn subscribe(
         if last_frame.is_some_and(|last| now - last > super::metrics::AUDIO_GAP) {
             stats.audio_gap();
         }
-        last_frame = Some(now);
         // Checked before this frame refills it: an empty buffer with frames
         // still arriving is playback that went silent while it should not have.
         // moq-audio counts no underruns itself, so this is the closest there is.
-        if sink.buffered().is_zero() {
+        // Not on the first frame, whose buffer is empty because nothing has
+        // played yet -- counted, that read as one dropout per stream.
+        if last_frame.is_some() && sink.buffered().is_zero() {
             stats.audio_ran_dry();
         }
+        last_frame = Some(now);
         speaking.set(talking.push(loudness(&frame.data)));
         decoded += 1;
         if decoded == REPORT_EVERY {

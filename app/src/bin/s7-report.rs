@@ -11,8 +11,11 @@
 //! - **frame rate:** at least 24 fps (a rolling 5 s mean, less half a frame of
 //!   counting slack) in 95% of the seconds the sender's camera was on;
 //! - **delay:** the 95th percentile of the per-second p95 under 300 ms;
-//! - **audio:** no gaps a listener would hear (more than 60 ms between frames)
-//!   while the sender's mic was on.
+//! - **audio:** playback never ran dry while the sender's mic was on -- what a
+//!   listener actually hears. Late arrivals (more than 60 ms between frames)
+//!   are shown too, as jitter, but do not fail: the first runs found every one
+//!   absorbed by the playback buffer, with all 50 frames of the second still
+//!   arriving.
 //!
 //! The first 5 s of each stream are skipped (a joiner catches up on a burst of
 //! cached frames), and gaps within 2 s of a muted second are skipped too
@@ -49,6 +52,7 @@ struct Second {
     delay_p50: Option<f64>,
     delay_p95: Option<f64>,
     audio_gaps: u64,
+    audio_dry: u64,
 }
 
 fn main() {
@@ -90,13 +94,14 @@ fn main() {
                 delay_p50: value["delay_p50_ms"].as_f64(),
                 delay_p95: value["delay_p95_ms"].as_f64(),
                 audio_gaps: value["audio_gaps"].as_u64().unwrap_or(0),
+                audio_dry: value["audio_dry"].as_u64().unwrap_or(0),
             });
         }
     }
 
     println!(
         "{:<9} {:<9} {:>5} {:>7} {:>7} {:>8} {:>8} {:>6}  verdict",
-        "receiver", "sender", "secs", "fps p50", "fps≥24", "delay50", "delay95", "gaps"
+        "receiver", "sender", "secs", "fps p50", "fps≥24", "delay50", "delay95", "late"
     );
     let mut all_pass = true;
     for ((me, peer), seconds) in &streams {
@@ -170,12 +175,13 @@ fn judge(seconds: &[Second]) -> Verdict {
     // New gaps per second, except near a muted second.
     let muted: Vec<f64> = seconds.iter().filter(|s| !s.mic).map(|s| s.t).collect();
     let near_mute = |t: f64| muted.iter().any(|&m| (t - m).abs() <= MUTE_MARGIN_S);
-    let mut gaps = 0;
+    let (mut gaps, mut dry) = (0, 0);
     for pair in measured.windows(2) {
-        let fresh = pair[1].audio_gaps.saturating_sub(pair[0].audio_gaps);
-        if fresh > 0 && !near_mute(pair[1].t) {
-            gaps += fresh;
+        if near_mute(pair[1].t) {
+            continue;
         }
+        gaps += pair[1].audio_gaps.saturating_sub(pair[0].audio_gaps);
+        dry += pair[1].audio_dry.saturating_sub(pair[0].audio_dry);
     }
 
     let mut problems = Vec::new();
@@ -189,8 +195,8 @@ fn judge(seconds: &[Second]) -> Verdict {
         Some(p95) if p95 >= MAX_DELAY_MS => problems.push(format!("delay p95 {p95:.0} ms")),
         Some(_) => {}
     }
-    if gaps > 0 {
-        problems.push(format!("{gaps} audio gaps"));
+    if dry > 0 {
+        problems.push(format!("audio ran dry {dry}×"));
     }
 
     Verdict {
@@ -235,6 +241,7 @@ mod tests {
             delay_p50: Some(p95 / 2.0),
             delay_p95: Some(p95),
             audio_gaps: gaps,
+            audio_dry: gaps,
         }
     }
 
@@ -284,10 +291,20 @@ mod tests {
     }
 
     #[test]
-    fn a_gap_while_talking_fails() {
+    fn late_audio_that_never_ran_dry_passes() {
         let mut seconds: Vec<_> = (0..60).map(|t| second(t as f64, 30.0, 120.0, 0, true)).collect();
         for s in seconds.iter_mut().skip(30) {
-            s.audio_gaps = 1;
+            s.audio_gaps = 2;
+            s.audio_dry = 0;
+        }
+        assert!(judge(&seconds).pass);
+    }
+
+    #[test]
+    fn playback_running_dry_while_talking_fails() {
+        let mut seconds: Vec<_> = (0..60).map(|t| second(t as f64, 30.0, 120.0, 0, true)).collect();
+        for s in seconds.iter_mut().skip(30) {
+            s.audio_dry = 1;
         }
         assert!(!judge(&seconds).pass);
     }
