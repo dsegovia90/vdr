@@ -79,7 +79,7 @@ package:
     linux=$!
     just package-mac; mac=$?
     wait $linux; linux=$?
-    [ $linux -eq 0 ] || { echo "linux failed:"; tail -5 dist/linux-build.log; }
+    if [ $linux -eq 0 ]; then rm -f dist/linux-build.log; else echo "linux failed, see dist/linux-build.log:"; tail -5 dist/linux-build.log; fi
     echo; ls -1 dist/vid-* 2>/dev/null
     exit $(( mac || linux ))
 
