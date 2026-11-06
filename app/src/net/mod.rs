@@ -19,6 +19,7 @@
 mod adapt;
 mod audio;
 mod call;
+mod codec_check;
 mod metrics;
 mod loopback;
 pub(crate) mod runtime;
