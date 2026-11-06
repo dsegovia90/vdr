@@ -87,6 +87,10 @@ pub struct Metrics {
     estimate_kbps: AtomicU32,
     width: AtomicU32,
     height: AtomicU32,
+    /// Our video encoder and the last peer's video decoder, by backend name
+    /// ("videotoolbox", "vaapi", "openh264"...), so a tester can say which
+    /// they got without opening a log.
+    codecs: std::sync::Mutex<(Option<String>, Option<String>)>,
 }
 
 impl Metrics {
@@ -113,6 +117,23 @@ impl Metrics {
     /// The size we encode at, which is not the size the camera captures.
     pub fn encode_size(&self) -> Option<(u32, u32)> {
         Some((nonzero(&self.width)?, nonzero(&self.height)?))
+    }
+
+    /// The encoder and decoder backends in use, as `(encoder, decoder)`.
+    pub fn codecs(&self) -> (Option<String>, Option<String>) {
+        self.codecs.lock().map(|codecs| codecs.clone()).unwrap_or_default()
+    }
+
+    pub(super) fn set_encoder(&self, name: &str) {
+        if let Ok(mut codecs) = self.codecs.lock() {
+            codecs.0 = Some(name.to_string());
+        }
+    }
+
+    pub(super) fn set_decoder(&self, name: &str) {
+        if let Ok(mut codecs) = self.codecs.lock() {
+            codecs.1 = Some(name.to_string());
+        }
     }
 
     pub(super) fn set_encode_size(&self, width: u32, height: u32) {
@@ -162,6 +183,9 @@ impl Metrics {
     pub(super) fn clear(&self) {
         if let Ok(mut aec) = self.aec.lock() {
             *aec = None;
+        }
+        if let Ok(mut codecs) = self.codecs.lock() {
+            *codecs = (None, None);
         }
         for field in [
             &self.rtt_ms,

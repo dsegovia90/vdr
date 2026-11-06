@@ -28,13 +28,14 @@ use crate::net::Metrics;
 const POLL: Duration = Duration::from_millis(500);
 
 /// A sampled snapshot, so rendering never touches the atomics.
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, PartialEq, Default)]
 struct Sample {
     rtt: Option<u32>,
     loss: Option<f32>,
     send_kbps: Option<u32>,
     estimate_kbps: Option<u32>,
     encode_size: Option<(u32, u32)>,
+    codecs: (Option<String>, Option<String>),
 }
 
 #[derive(Clone, PartialEq, Props)]
@@ -60,6 +61,7 @@ pub fn StatsRow(props: StatsProps) -> Element {
                             send_kbps: metrics.send_kbps(),
                             estimate_kbps: metrics.estimate_kbps(),
                             encode_size: metrics.encode_size(),
+                            codecs: metrics.codecs(),
                         };
                         if tx.unbounded_send(next).is_err() {
                             return;
@@ -77,6 +79,13 @@ pub fn StatsRow(props: StatsProps) -> Element {
     let mut parts: Vec<String> = Vec::new();
     if let Some((width, height)) = reading.encode_size {
         parts.push(format!("{width}\u{d7}{height}"));
+    }
+    // Which codec backends are working: hardware or the CPU, each way.
+    match &reading.codecs {
+        (Some(encoder), Some(decoder)) => parts.push(format!("enc {encoder}, dec {decoder}")),
+        (Some(encoder), None) => parts.push(format!("enc {encoder}")),
+        (None, Some(decoder)) => parts.push(format!("dec {decoder}")),
+        (None, None) => {}
     }
     if let Some(kbps) = reading.send_kbps {
         // The estimate alongside the rate, because the interesting thing is the

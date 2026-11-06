@@ -378,6 +378,28 @@ const TRACK: &str = "video.avc3";
 /// The encoder's pacing hint, not a promise. Matches the loopback.
 const FRAMERATE: u32 = 30;
 
+/// Set once a hardware encoder has failed mid-call, so every later attempt in
+/// this process uses software. One failure is enough to stop trusting a driver:
+/// a flaky one would otherwise fail every redial the same way.
+static HARDWARE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The software encoder's backend name, as moq-video reports it.
+const SOFTWARE_ENCODER: &str = "openh264";
+
+/// Which encoder to ask moq-video for: `--encoder`, unless hardware has
+/// already failed in this process.
+fn encoder_kind() -> moq_video::encode::Kind {
+    use crate::args::EncoderChoice;
+    if HARDWARE_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return moq_video::encode::Kind::Software;
+    }
+    match crate::args::Args::get().encoder {
+        EncoderChoice::Auto => moq_video::encode::Kind::Auto,
+        EncoderChoice::Hardware => moq_video::encode::Kind::Hardware,
+        EncoderChoice::Software => moq_video::encode::Kind::Software,
+    }
+}
+
 /// [`FRAMERATE`] as the encoder takes it: an exact fraction.
 fn framerate() -> moq_video::Rate {
     moq_video::Rate::new(FRAMERATE, 1).expect("a positive whole frame rate")
@@ -615,10 +637,23 @@ async fn run(
     // already inserts one every two seconds -- so this only buys back that wait,
     // but the wait is a frozen tile and worth buying.
     let keyframe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let rendition = config
-            .probe()
-            .await
-            .map_err(|error| format!("could not probe the encoder: {error:#}"))?;
+        // The probe encodes one real frame through the chosen backend, so a
+        // hardware encoder that opens but cannot encode fails here, before
+        // anything is advertised -- and then software gets a turn. Asking for
+        // hardware only (`--encoder hardware`) means no second turn.
+        config.kind = encoder_kind();
+        let rendition = match config.probe().await {
+            Ok(rendition) => rendition,
+            Err(error) if config.kind == moq_video::encode::Kind::Auto => {
+                tracing::warn!("[video] the hardware encoder failed its probe, using software: {error:#}");
+                config.kind = moq_video::encode::Kind::Software;
+                config
+                    .probe()
+                    .await
+                    .map_err(|error| format!("could not probe the encoder: {error:#}"))?
+            }
+            Err(error) => return Err(format!("could not probe the encoder: {error:#}")),
+        };
 
         let outbound = moq_tokio::origin::spawn();
         let mut broadcast = outbound
@@ -912,6 +947,7 @@ async fn run(
         // the feed and this one still has to flush.
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut encoding = tokio::task::spawn_blocking({
+            let metrics = metrics.clone();
             let stop = stop.clone();
             let target = target.clone();
             let keyframe = keyframe.clone();
@@ -935,6 +971,7 @@ async fn run(
                     crate::args::Args::get().quality,
                     encoder.name()
                 );
+                metrics.set_encoder(encoder.name());
                 let outcome = encode(
                     &mut feed,
                     &mut encoder,
@@ -947,6 +984,12 @@ async fn run(
                         local: &local,
                     },
                 );
+                // A hardware encoder failing mid-call demotes the rest of this
+                // run to software; the call's own retry then reopens on it.
+                if outcome.is_err() && encoder.name() != SOFTWARE_ENCODER {
+                    tracing::warn!("[video] {} failed mid-call; software from now on", encoder.name());
+                    HARDWARE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 if let Ok(flushed) = encoder.flush() {
                     if !flushed.is_empty() {
                         producer.publish(&flushed).ok();
@@ -1374,6 +1417,7 @@ async fn attend(
             id.to_string(),
             (!in_room).then(|| status.clone()),
             stats.clone(),
+            metrics.clone(),
         )))];
         if let Some(engine) = engine.clone() {
             let peer = id.to_string();
@@ -1576,6 +1620,7 @@ async fn watch(
     // status -- see `Reports::in_room`.
     status: Option<UnboundedSender<RemoteStatus>>,
     stats: Arc<PeerStats>,
+    metrics: Arc<Metrics>,
 ) {
     // The catalog is the peer's description of what it is sending. 20c failed
     // here by passing a *local* config and a hardcoded track name instead, and
@@ -1625,6 +1670,7 @@ async fn watch(
         }
     };
     tracing::info!("decoding {peer}'s video with {}", consumer.name());
+    metrics.set_decoder(consumer.name());
     // **The listening side can name its caller now.** iroh exposes no client
     // identity to a server, so the transport genuinely cannot say who this is --
     // but the broadcast path can, and does.

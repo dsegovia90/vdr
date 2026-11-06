@@ -22,6 +22,7 @@
 //! vdr --loopback                         # no network; the codec round trip
 //! vdr --camera facetime                   # picks a camera by name
 //! vdr --quality high                      # 720p rung; low | mid | high, mid by default
+//! vdr --encoder software                  # auto | hardware | software, auto by default
 //! vdr --ephemeral                         # a throwaway key, not the saved one
 //! vdr --encode-width 1920                 # encode at capture size, for A/B tests
 //! vdr --stats s7-alice.jsonl              # one line of measurements a second
@@ -165,6 +166,31 @@ impl std::fmt::Display for Quality {
     }
 }
 
+/// Which video encoder to use. `auto` is right for nearly everyone; the other
+/// two exist to compare CPU on one machine, and to rule a driver out.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum EncoderChoice {
+    /// Hardware where the machine has it (VideoToolbox, VA-API, NVENC),
+    /// otherwise software.
+    #[default]
+    Auto,
+    /// Hardware or nothing: a call fails rather than quietly using the CPU.
+    Hardware,
+    /// openh264 on the CPU, even where hardware exists.
+    Software,
+}
+
+impl EncoderChoice {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "hardware" | "hw" => Some(Self::Hardware),
+            "software" | "sw" => Some(Self::Software),
+            _ => None,
+        }
+    }
+}
+
 /// Everything this app takes from the command line.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Args {
@@ -174,6 +200,8 @@ pub struct Args {
     pub camera: Option<String>,
     /// Which rung the encoder runs at. Everyone defaults to the same one.
     pub quality: Quality,
+    /// Hardware, software, or whichever this machine has (`--encoder`).
+    pub encoder: EncoderChoice,
     /// Start with a throwaway key instead of the saved one.
     ///
     /// The identity is normally persisted, so our key is an address that keeps
@@ -216,6 +244,7 @@ impl Args {
         let mut peering = Peering::Idle;
         let mut camera = None;
         let mut quality = Quality::default();
+        let mut encoder = EncoderChoice::default();
         let mut ephemeral = false;
         let mut encode_width = None;
         let mut stats = None;
@@ -249,6 +278,11 @@ impl Args {
                     Some(None) => tracing::error!("--quality is one of low, mid, high"),
                     None => tracing::error!("--quality needs a level"),
                 },
+                "--encoder" => match args.next().as_deref().map(EncoderChoice::parse) {
+                    Some(Some(chosen)) => encoder = chosen,
+                    Some(None) => tracing::error!("--encoder is one of auto, hardware, software"),
+                    None => tracing::error!("--encoder needs a choice"),
+                },
                 "--encode-width" => match args.next().as_deref().map(str::parse::<u32>) {
                     Some(Ok(width)) if width >= 2 => encode_width = Some(width),
                     Some(Ok(width)) => tracing::error!("--encode-width {width} is too small"),
@@ -266,6 +300,7 @@ impl Args {
             peering,
             camera,
             quality,
+            encoder,
             ephemeral,
             encode_width,
             stats,
