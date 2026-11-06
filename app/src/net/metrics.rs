@@ -135,7 +135,7 @@ impl Metrics {
     /// not "is it dropping them now" -- a call that struggled for ten seconds
     /// and recovered keeps a non-zero figure, which is the honest reading of a
     /// total.
-    pub(super) fn set_connection(&self, stats: &moq_net::ConnectionStats) {
+    pub(super) fn set_connection(&self, stats: &moq_net::session::Stats) {
         if let Some(rtt) = stats.rtt {
             self.rtt_ms.store(rtt.as_millis() as u32, Ordering::Relaxed);
         }

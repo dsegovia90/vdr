@@ -76,8 +76,9 @@ async fn pump(
 ) -> anyhow::Result<()> {
     // Framerate is the encoder's pacing hint, not a promise.
     let (width, height, scale) = encode_size(width, height);
-    let mut config = moq_video::encode::Config::new(width, height, 30);
-    config.bitrate = Some(crate::camera::bitrate_for(width, height, 30));
+    let framerate = moq_video::Rate::new(30, 1).expect("a positive whole frame rate");
+    let mut config = moq_video::encode::Config::new(width, height, framerate);
+    config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(crate::camera::bitrate_for(width, height, 30)));
     // `probe` asks the encoder what it will emit, so the catalog is published
     // before anything is encoded -- which is what lets the decoder below open
     // against a track nothing has written to yet.
@@ -88,13 +89,12 @@ async fn pump(
         encoder.name()
     );
 
-    let origin = moq_net::Origin::random().produce();
-    let mut broadcast = origin.create_broadcast(
-        "loopback.hang",
-        moq_net::broadcast::Route::new().with_announce(true),
-    )?;
-    let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
-    let track = broadcast.create_track("video.avc3", catalog.track_info())?;
+    // Kept for the whole run: dropping the origin would end the broadcast.
+    let origin = moq_tokio::origin::spawn();
+    let mut broadcast = origin.create_broadcast("loopback.hang")?;
+    let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default())?;
+    // Video's priority, as hang's catalog ranks it (audio is 80).
+    let track = broadcast.create_track("video.avc3", catalog.track_info(60))?;
     let mut producer =
         moq_video::encode::Producer::with_track(track, catalog.clone(), rendition.clone())?;
 
@@ -113,6 +113,7 @@ async fn pump(
             tracing::warn!("loopback: [audio] the microphone is not being published: {error}")
         }
     }
+    broadcast.announce(moq_net::origin::Route::default())?;
     let audio_decode = engine.map(|engine| {
         let broadcast = broadcast.consume();
         tokio::spawn(audio::subscribe(
@@ -134,7 +135,7 @@ async fn pump(
             &consumer_broadcast,
             &rendition,
             "video.avc3",
-            moq_video::decode::Config::default(),
+            moq_video::decode::Options::default(),
         )
         .await
         {

@@ -77,12 +77,12 @@ struct Peer {
     /// Connection figures, when this side has a handle that outlives a single
     /// session. The listening side reports its own from inside the accept loop
     /// instead, since its session is what it has.
-    stats: Option<moq_tokio::ConnectionStatsReader>,
+    stats: Option<moq_tokio::connection::Monitor>,
 }
 
 /// Everything [`connect`] needs, named rather than positional.
 struct Connect<'a> {
-    config: &'a moq_tokio::ClientConfig,
+    config: &'a moq_tokio::client::Config,
     endpoint: &'a moq_tokio::iroh::Endpoint,
     outbound: &'a moq_net::origin::Producer,
     inbound: moq_net::origin::Producer,
@@ -122,13 +122,13 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
     let mut session = client
         .with_publisher(outbound)
         .with_subscriber(inbound)
-        .reconnect(url);
+        .connect(url);
     // Taken before the session moves into the future below. It survives a
     // reconnect, so the estimate follows the link across one rather than being
     // restarted. Toward a relay this is our own uplink to it, which is the
     // right thing to adapt to: everyone downstream is the relay's problem.
     let bandwidth = Some(session.send_bandwidth());
-    let stats = Some(session.stats());
+    let stats = Some(session.monitor());
     Ok(Peer {
         // **The status stream, not `closed()`.** They end at the same place --
         // the error the retry loop gives up with -- but this one also says when
@@ -378,6 +378,15 @@ const TRACK: &str = "video.avc3";
 /// The encoder's pacing hint, not a promise. Matches the loopback.
 const FRAMERATE: u32 = 30;
 
+/// [`FRAMERATE`] as the encoder takes it: an exact fraction.
+fn framerate() -> moq_video::Rate {
+    moq_video::Rate::new(FRAMERATE, 1).expect("a positive whole frame rate")
+}
+
+/// Video's delivery priority: below audio (80) and the control documents
+/// ([`CONTROL_PRIORITY`]), as hang's own catalog ranks them.
+const VIDEO_PRIORITY: u8 = 60;
+
 /// How many decoded frames between rate reports in the log. Matches the paint
 /// path's cadence so the two logs are comparable.
 const REPORT_EVERY: u32 = 120;
@@ -425,13 +434,14 @@ fn identity() -> Option<String> {
     crate::settings::identity_path().map(|path| path.to_string_lossy().into_owned())
 }
 
-/// Retry pacing, shared by both sides.
+/// Retry pacing for the dialling side.
 ///
 /// Only the dialling side redials -- the listener has nothing to dial -- but
-/// both sides read [`moq_tokio::Backoff::linger`] from the same value, because
-/// what it decides is how long each side holds the *other's* broadcast open
-/// waiting for it to come back. The two have to agree or one side tears down a
-/// call the other is still repairing.
+/// both sides derive their linger from [`RETRY_BUDGET`] (it plus a second, the
+/// rule moq-native's `Backoff::linger` used to apply), because what it decides
+/// is how long each side holds the *other's* broadcast open waiting for it to
+/// come back. The two have to agree or one side tears down a call the other is
+/// still repairing.
 ///
 /// The escalation itself is left alone: 1 s, doubling to 5 s, is a sensible
 /// climb, and the jitter matters even between two peers.
@@ -503,13 +513,13 @@ async fn run(
 
     report(RemoteStatus::Binding);
 
-    let mut client_config = moq_tokio::ClientConfig::default();
-    client_config.backoff = backoff();
+    let mut client_config = moq_tokio::client::Config::default();
+    client_config.connect.backoff = backoff();
     // Read by `bind` below and applied to the endpoint's transport config, which
     // is what makes it symmetric: the listener shares this endpoint and so
     // inherits the same timeout without a config of its own.
-    client_config.quic.idle_timeout = Some(IDLE_TIMEOUT);
-    let mut iroh = moq_tokio::iroh::EndpointConfig::default();
+    client_config.quic.idle_timeout = IDLE_TIMEOUT;
+    let mut iroh = moq_tokio::iroh::Config::default();
     iroh.enabled = Some(true);
     iroh.secret = identity();
     let endpoint = iroh
@@ -539,7 +549,7 @@ async fn run(
     let mut ending: Option<RemoteStatus> = None;
     // How long a broadcast outlives losing its session, on both sides. See
     // `backoff`: it is the retry budget plus a second.
-    let linger = backoff().linger();
+    let linger = RETRY_BUDGET + std::time::Duration::from_secs(1);
 
     loop {
         // The decision may already be made (`--listen` / `--dial`) or may be the
@@ -594,9 +604,9 @@ async fn run(
     // gets decided.
     let (width, height, scale) = encode_size(width, height);
     metrics.set_encode_size(width, height);
-    let mut config = moq_video::encode::Config::new(width, height, FRAMERATE);
+    let mut config = moq_video::encode::Config::new(width, height, framerate());
     let opening_bitrate = crate::camera::bitrate_for(width, height, FRAMERATE);
-    config.bitrate = Some(opening_bitrate);
+    config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(opening_bitrate));
     // Filled in by the rate loop below, read by the encode loop. Stays empty
     // unless this attempt turns out to be one that can measure the link.
     let target: adapt::Target = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -609,25 +619,15 @@ async fn run(
             .probe()
             .await
             .map_err(|error| format!("could not probe the encoder: {error:#}"))?;
-        let mut encoder = moq_video::encode::Encoder::new(&config)
-            .map_err(|error| format!("could not build an encoder: {error:#}"))?;
-        tracing::info!(
-            "encoding {width}x{height} at the {} rung with {}",
-            crate::args::Args::get().quality,
-            encoder.name()
-        );
 
-        let outbound = moq_net::Origin::random().produce();
+        let outbound = moq_tokio::origin::spawn();
         let mut broadcast = outbound
-            .create_broadcast(
-                camera_path(&me.to_string()),
-                moq_net::broadcast::Route::new().with_announce(true),
-            )
+            .create_broadcast(camera_path(&me.to_string()))
             .map_err(|error| format!("could not create a broadcast: {error:#}"))?;
-        let catalog = moq_mux::catalog::Producer::new(&mut broadcast)
+        let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default())
             .map_err(|error| format!("could not create a catalog: {error:#}"))?;
         let track = broadcast
-            .create_track(TRACK, catalog.track_info())
+            .create_track(TRACK, catalog.track_info(VIDEO_PRIORITY))
             .map_err(|error| format!("could not create a track: {error:#}"))?;
         let mut producer =
             moq_video::encode::Producer::with_track(track, catalog.clone(), rendition)
@@ -635,18 +635,15 @@ async fn run(
 
         // Announced beside the camera, and said before anything is shown: the
         // peer knows we are here whether or not a frame ever arrives.
-        let mut control = outbound
-            .create_broadcast(
-                control_path(&me.to_string()),
-                moq_net::broadcast::Route::new().with_announce(true),
-            )
+        let control = outbound
+            .create_broadcast(control_path(&me.to_string()))
             .map_err(|error| format!("could not create a control broadcast: {error:#}"))?;
         let presence = control
             .create_track(PRESENCE, None)
             .map(|track| {
                 moq_json::snapshot::Producer::new(
                     track,
-                    moq_json::snapshot::ProducerConfig::default(),
+                    moq_json::snapshot::Config::default(),
                 )
             })
             .map_err(|error| format!("could not create a presence track: {error:#}"))?;
@@ -656,6 +653,11 @@ async fn run(
         // The first word already carries the camera and microphone as they
         // are, so joining muted is announced from the start.
         say(&presence, Presence::here(&local));
+        // Advertised only now that the presence track exists: an announce is
+        // acted on at once, so a peer must find the document waiting.
+        control
+            .announce(moq_net::origin::Route::default())
+            .map_err(|error| format!("could not announce our presence: {error:#}"))?;
         let announcing = Abort(tokio::spawn(announce(presence.clone(), local.clone())));
 
         let engine = audio::open_playback(&controls).await;
@@ -669,6 +671,10 @@ async fn run(
             }
             Err(error) => tracing::warn!("[audio] the microphone is not being published: {error}"),
         }
+        // The camera broadcast likewise, once its catalog and tracks exist.
+        broadcast
+            .announce(moq_net::origin::Route::default())
+            .map_err(|error| format!("could not announce our camera: {error:#}"))?;
 
         // **Lingers rather than tearing down.** A session dying abruptly detaches
         // the peer's broadcast from this origin, and with the default zero
@@ -678,9 +684,7 @@ async fn run(
         // keeps the path announced instead, and a session re-attaching within
         // the window splices into the same broadcast, so the gap is never
         // observed above this line.
-        let inbound = moq_net::origin::Info::new(moq_net::Origin::random())
-            .with_linger(linger)
-            .produce();
+        let inbound = moq_tokio::origin::spawn();
 
         // Read before the match below takes `peering` apart.
         let in_room = matches!(peering, Peering::Join(_));
@@ -725,16 +729,23 @@ async fn run(
             }
             Peering::Listen => {
                 report(RemoteStatus::Listening { me: me.to_string() });
-                let mut server_config = moq_tokio::ServerConfig::default();
-
-                server_config.bind = Some("[::]:0".to_string());
-                server_config.tls.generate = vec!["localhost".to_string()];
-                let server = server_config
+                let mut server_config = moq_tokio::server::Config::default();
+                server_config.listen.bind = Some(moq_tokio::listen::Bind::Addr(
+                    std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+                ));
+                server_config.listen.tls.generate = vec!["localhost".to_string()];
+                server_config.quic = client_config.quic.clone();
+                server_config.iroh = Some(endpoint.clone());
+                // The origins stay on the server rather than moving to each
+                // request: `accept` attaches them.
+                server_config.publisher = Some(outbound.consume());
+                server_config.subscriber = Some(inbound.clone());
+                let mut server = server_config
                     .init()
                     .map_err(|error| format!("could not build a server: {error:#}"))?
-                    .with_iroh(endpoint.clone());
-                let publish = outbound.consume();
-                let subscribe = inbound.clone();
+                    .bind()
+                    .await
+                    .map_err(|error| format!("could not listen: {error:#}"))?;
                 // **Our own accept loop, rather than `serve_both`.** That
                 // convenience method is exactly this loop, plus a private
                 // helper that does `request.ok()` and waits -- but it never
@@ -742,10 +753,6 @@ async fn run(
                 // estimate lives. Without one, a callee sends at its opening
                 // rate for the whole call however bad the link gets.
                 //
-                // The origins stay on the server rather than moving to each
-                // request: `accept` attaches them, which is why the upstream
-                // helper can get away with a bare `ok()`.
-                let mut server = server.with_publisher(publish).with_subscriber(subscribe);
                 // Persistent, and fed from whichever session is live. The
                 // dialling side gets this shape for free from `Reconnect`;
                 // here it is ours to keep, because an estimate has to exist
@@ -909,7 +916,25 @@ async fn run(
             let target = target.clone();
             let keyframe = keyframe.clone();
             let local = local.clone();
+            // **The encoder is built here, on the thread that uses it.** It
+            // is not `Send` (a hardware session belongs to the thread that
+            // opened it), so it can neither be handed in nor handed back. For
+            // the same reason it is flushed here, before the feed and the
+            // producer go back: the leave sequence below needs the media
+            // finished before it says goodbye.
             move || {
+                let mut encoder = match moq_video::encode::Encoder::new(&config) {
+                    Ok(encoder) => encoder,
+                    Err(error) => {
+                        let outcome = Err(format!("could not build an encoder: {error:#}"));
+                        return (feed, producer, outcome);
+                    }
+                };
+                tracing::info!(
+                    "encoding {width}x{height} at the {} rung with {}",
+                    crate::args::Args::get().quality,
+                    encoder.name()
+                );
                 let outcome = encode(
                     &mut feed,
                     &mut encoder,
@@ -922,7 +947,12 @@ async fn run(
                         local: &local,
                     },
                 );
-                (feed, encoder, producer, outcome)
+                if let Ok(flushed) = encoder.flush() {
+                    if !flushed.is_empty() {
+                        producer.publish(&flushed).ok();
+                    }
+                }
+                (feed, producer, outcome)
             }
         });
 
@@ -941,7 +971,7 @@ async fn run(
             error = &mut transport => Some(Err(error)),
             joined = &mut encoding => match joined {
                 Ok(parts) => {
-                    let outcome = parts.3.clone();
+                    let outcome = parts.2.clone();
                     encoded = Some(parts);
                     Some(outcome)
                 }
@@ -966,12 +996,13 @@ async fn run(
 
         // Whatever won the race, the encode thread has to be told to stop and
         // then waited for: a blocking task cannot be cancelled out from under
-        // itself, and its three values are needed here.
+        // itself, and the feed and producer are needed here. The thread has
+        // flushed the encoder by the time it returns.
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (feed, mut encoder, mut producer) = match encoded {
-            Some((feed, encoder, producer, _)) => (feed, encoder, producer),
+        let (feed, mut producer) = match encoded {
+            Some((feed, producer, _)) => (feed, producer),
             None => match encoding.await {
-                Ok((feed, encoder, producer, _)) => (feed, encoder, producer),
+                Ok((feed, producer, _)) => (feed, producer),
                 Err(error) => return Err(format!("the encode thread failed: {error}")),
             },
         };
@@ -982,11 +1013,6 @@ async fn run(
         // finished re-announces it, which the peer reads as somebody leaving and
         // immediately rejoining; observed as a `left`/`joined` pair 53
         // microseconds apart before this was ordered properly.
-        if let Ok(flushed) = encoder.flush() {
-            if !flushed.is_empty() {
-                producer.publish(&flushed).ok();
-            }
-        }
         producer.finish().ok();
 
         // **Said, then shown.** The document is advisory -- it is what lets the
@@ -1014,8 +1040,8 @@ async fn run(
         // lost the word just the same: nothing reports that the relay has
         // forwarded it, so a short bound is what there is.
         tokio::time::sleep(GOODBYE_SAY).await;
-        control.finish();
-        broadcast.finish();
+        control.close();
+        broadcast.close();
         // Long enough for the finishes above to leave, then the line goes. No
         // handle says when they have, so this is a bound rather than a wait
         // for something; short, because a leave should feel instant.
@@ -1097,7 +1123,7 @@ fn encode(
         // mid-frame waits for the next one, which is well inside what the
         // control loop ramps over.
         if let Some(bitrate) = adapt::take(target) {
-            if let Err(error) = encoder.set_bitrate(bitrate) {
+            if let Err(error) = encoder.set_bitrate(moq_net::bandwidth::Rate::from_bps(bitrate)) {
                 tracing::warn!("could not move the encoder to {bitrate} bps: {error:#}");
             }
         }
@@ -1106,7 +1132,9 @@ fn encode(
         // which is the same rule the bitrate above follows and for the same
         // reason: this thread owns the encoder.
         if keyframe.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            encoder.keyframe();
+            if let Err(error) = encoder.cut() {
+                tracing::warn!("could not ask the encoder for a keyframe: {error:#}");
+            }
         }
         // `take` errors only when every tap has dropped: the camera going away
         // for good, rather than a gap between frames.
@@ -1245,13 +1273,27 @@ async fn attend(
                 continue;
             }
         };
-        let path = update.path.as_str().to_string();
+        let path = update.prefix.as_str().to_string();
+        // An announcement names a path; the broadcast is asked for by that path.
+        // A re-priced route changes nothing we act on, and a retraction is the
+        // goodbye, carried as `None` the way the old cursor carried it.
+        let broadcast = match update.kind {
+            moq_net::announce::Kind::Updated => continue,
+            moq_net::announce::Kind::Retracted => None,
+            moq_net::announce::Kind::Announced => match inbound.request_broadcast(path.as_str()).await {
+                Ok(broadcast) => Some(broadcast),
+                Err(error) => {
+                    tracing::warn!("could not open the broadcast at {path}: {error:#}");
+                    continue;
+                }
+            },
+        };
 
         if let Some(id) = controller_of(&path) {
             if id == me {
                 continue;
             }
-            match update.broadcast {
+            match broadcast {
                 Some(broadcast) => {
                     present.insert(id.to_string());
                     listening.insert(
@@ -1305,7 +1347,7 @@ async fn attend(
             continue;
         }
 
-        let Some(broadcast) = update.broadcast else {
+        let Some(broadcast) = broadcast else {
             tracing::info!("{id} left");
             attending.remove(id);
             // Forgotten once both of their broadcasts are gone, so a rejoin
@@ -1484,7 +1526,7 @@ async fn listen(
     };
     let mut presence = moq_json::snapshot::Consumer::<Presence>::new(
         track,
-        moq_json::snapshot::ConsumerConfig::default(),
+        moq_json::snapshot::consumer::Config::default(),
     );
 
     loop {
@@ -1570,7 +1612,9 @@ async fn watch(
         &broadcast,
         config,
         name,
-        moq_video::decode::Config::default(),
+        // Default options: a zero `max_age`, so a stalled group is skipped as
+        // soon as a newer one exists -- video's newest-wins posture.
+        moq_video::decode::Options::default(),
     )
     .await
     {

@@ -156,21 +156,26 @@ async fn run(
     );
 
     // ---- encoder + publisher ----------------------------------------------
-    let enc_config = moq_video::encode::Config::new(real_w, real_h, framerate);
+    let rate = moq_video::Rate::new(framerate, 1).context("a positive frame rate")?;
+    let enc_config = moq_video::encode::Config::new(real_w, real_h, rate);
     let rendition = enc_config.probe().await.context("probing encoder")?;
     let mut encoder = moq_video::encode::Encoder::new(&enc_config).context("building encoder")?;
     println!("encoder: {} ({:?})", encoder.name(), encoder.codec());
 
-    let origin = moq_net::Origin::random().produce();
+    let origin = moq_tokio::origin::spawn();
     let mut broadcast = origin
-        .create_broadcast("cam.hang", moq_net::broadcast::Route::new().with_announce(true))
+        .create_broadcast("cam.hang")
         .context("creating broadcast")?;
-    let catalog = moq_mux::catalog::Producer::new(&mut broadcast).context("creating catalog")?;
+    let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default())
+        .context("creating catalog")?;
     let track = broadcast
-        .create_track("video.avc3", catalog.track_info())
+        .create_track("video.avc3", catalog.track_info(60))
         .context("creating video track")?;
     let mut producer = moq_video::encode::Producer::with_track(track, catalog, rendition.clone())
         .context("creating video producer")?;
+    broadcast
+        .announce(moq_net::origin::Route::default())
+        .context("announcing broadcast")?;
 
     // ---- subscriber --------------------------------------------------------
     // In-process consumes the producer's own broadcast; with a relay the same
@@ -184,8 +189,8 @@ async fn run(
             println!("via relay {url}");
             let url: url::Url = url.parse().context("--relay must be a URL")?;
 
-            let client_config = moq_tokio::ClientConfig::default();
-            let mut iroh = moq_tokio::iroh::EndpointConfig::default();
+            let client_config = moq_tokio::client::Config::default();
+            let mut iroh = moq_tokio::iroh::Config::default();
             iroh.enabled = Some(true);
             let endpoint = iroh
                 .bind(&client_config.quic)
@@ -196,11 +201,11 @@ async fn run(
 
             // Separate origins so the returning broadcast is unambiguously the
             // relay's copy rather than our own.
-            let inbound = moq_net::Origin::random().produce();
+            let inbound = moq_tokio::origin::spawn();
             let session = client
                 .with_publisher(&origin)
                 .with_subscriber(inbound.clone())
-                .reconnect(url);
+                .connect(url);
 
             // Wait for the relay to announce our broadcast back to us.
             let mut announced = inbound.consume().announced();
@@ -210,18 +215,21 @@ async fn run(
                 match next {
                     Err(_) => anyhow::bail!("relay never announced our broadcast back"),
                     Ok(None) => anyhow::bail!("announce stream ended"),
-                    Ok(Some(moq_net::announce::Update { path, broadcast })) => {
+                    Ok(Some(update)) => {
                         // Ours, not merely the first announced: a relay host
                         // publishes its own broadcasts too, and pointing the
                         // decoder at one of those reports a missing track.
-                        let is_ours = path.to_string().rsplit('/').next() == Some("cam.hang");
-                        match broadcast {
-                            Some(b) if is_ours => {
-                                println!("relay announced our broadcast back: {path}");
-                                break b;
-                            }
-                            _ => tracing::debug!(%path, "ignoring announce (not ours)"),
+                        let path = update.prefix.to_string();
+                        let is_ours = path.rsplit('/').next() == Some("cam.hang");
+                        if is_ours && update.kind == moq_net::announce::Kind::Announced {
+                            println!("relay announced our broadcast back: {path}");
+                            break inbound
+                                .consume()
+                                .request_broadcast(path.as_str())
+                                .await
+                                .context("opening our broadcast from the relay")?;
                         }
+                        tracing::debug!(%path, "ignoring announce (not ours)");
                     }
                 }
             };
@@ -234,7 +242,7 @@ async fn run(
             &consumer_broadcast,
             &rendition,
             "video.avc3",
-            moq_video::decode::Config::default(),
+            moq_video::decode::Options::default(),
         )
         .await
         {
@@ -399,7 +407,7 @@ fn to_i420(frame: &cameras::Frame) -> anyhow::Result<moq_video::Surface> {
     let mut data = y_plane;
     data.extend_from_slice(&u_plane);
     data.extend_from_slice(&v_plane);
-    let i420 = moq_video::I420::new(frame.width, frame.height, data)
+    let i420 = moq_video::I420::new(moq_video::Size::new(frame.width, frame.height), data)
         .map_err(|e| anyhow::anyhow!("I420::new: {e}"))?;
     Ok(moq_video::Surface::I420(i420))
 }

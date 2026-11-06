@@ -146,7 +146,7 @@ impl Frame {
             }
         };
 
-        match moq_video::I420::new(w as u32, h as u32, data) {
+        match moq_video::I420::new(moq_video::Size::new(w as u32, h as u32), data) {
             Ok(i420) => Some(moq_video::Surface::I420(i420)),
             Err(error) => {
                 tracing::warn!("I420 conversion failed: {error}");
@@ -378,11 +378,11 @@ pub fn from_decoded(frame: moq_video::Frame) -> Option<Frame> {
     let height = frame.surface.height();
     let timestamp = Duration::from_micros(frame.timestamp.as_micros() as u64);
     match frame.surface.into_i420() {
-        Ok(data) => Some(Frame {
+        Ok(i420) => Some(Frame {
             width,
             height,
             timestamp,
-            pixels: Pixels::I420(data),
+            pixels: Pixels::I420(Bytes::from(i420.into_data())),
         }),
         Err(error) => {
             tracing::warn!("decoded frame conversion failed: {error}");
@@ -679,6 +679,7 @@ mod encode_size_tests {
             unscaled.into_i420().expect("planar"),
             scaled.into_i420().expect("planar"),
         );
+        let (a, b) = (a.data(), b.data());
         assert_eq!(a[0], b[0], "luma level must not move");
         // Chroma sits after the luma plane in each buffer.
         assert_eq!(a[64 * 64], b[32 * 32], "chroma level must not move");

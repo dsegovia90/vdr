@@ -53,8 +53,8 @@ pub(super) fn spawn(
     metrics: Arc<super::Metrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let policy = moq_video::encode::rate::Policy::new(ceiling);
-        let mut control = moq_video::encode::rate::Control::new(policy);
+        let policy = moq_mux::rate::Policy::new(moq_net::bandwidth::Rate::from_bps(ceiling));
+        let mut control = moq_mux::rate::Control::new(policy);
         let mut ticker = tokio::time::interval(SAMPLE);
         // A missed tick should not be made up for by a burst of catch-up polls:
         // only the newest estimate means anything.
@@ -68,21 +68,24 @@ pub(super) fn spawn(
         loop {
             ticker.tick().await;
             let estimate = bandwidth.peek();
-            metrics.set_estimate_kbps(estimate.map(|bps| (bps / 1000) as u32));
+            // Plain bits per second from here on: the encoder and the stats take
+            // numbers, and only the policy speaks `Rate`.
+            let estimate_bps = estimate.map(|rate| rate.as_bps());
+            metrics.set_estimate_kbps(estimate_bps.map(|bps| (bps / 1000) as u32));
             if reported.elapsed() >= Duration::from_secs(5) {
-                match estimate {
+                match estimate_bps {
                     Some(bps) => tracing::debug!("[rate] estimate {} kbps", bps / 1000),
                     None => tracing::debug!("[rate] no estimate from the transport"),
                 }
                 reported = Instant::now();
             }
-            let Some(next) = control.update(estimate, Instant::now()) else {
+            let Some(next) = control.update(estimate, Instant::now()).map(|rate| rate.as_bps()) else {
                 continue;
             };
             tracing::debug!(
                 "[rate] target {} kbps (estimate {} kbps)",
                 next / 1000,
-                estimate.unwrap_or(0) / 1000
+                estimate_bps.unwrap_or(0) / 1000
             );
             metrics.set_send_kbps((next / 1000) as u32);
             target.store(next, Ordering::Relaxed);
