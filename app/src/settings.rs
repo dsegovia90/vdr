@@ -46,7 +46,31 @@ pub fn identity_path() -> Option<std::path::PathBuf> {
         tracing::warn!("could not create {}: {error}", dir.display());
         return None;
     }
-    Some(dir.join(IDENTITY))
+    let path = dir.join(IDENTITY);
+    private(&path);
+    Some(path)
+}
+
+/// Makes an existing key file readable by its owner only.
+///
+/// **moq-tokio refuses a key others can read** ("use chmod 600"), and every key
+/// written before it started checking was created 644. Tightened here rather
+/// than left to each tester to fix by hand; a missing file is the first launch
+/// and is created private by moq-tokio itself.
+fn private(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = std::fs::metadata(path) else { return };
+        if metadata.permissions().mode() & 0o077 != 0 {
+            match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => tracing::info!("made {} private to this user", path.display()),
+                Err(error) => tracing::warn!("could not make {} private: {error}", path.display()),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// The log file, creating its directory if that is missing.
@@ -372,6 +396,19 @@ mod tests {
     #[test]
     fn no_devices_means_no_choice() {
         assert_eq!(choose(&[], Some(&id("c922-uid")), Some("c922")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_readable_key_file_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("vdr-key-test-{}", std::process::id()));
+        std::fs::write(&path, "key").expect("test fixture writable");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        private(&path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
