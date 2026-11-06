@@ -259,17 +259,35 @@ impl Drop for Speaking {
 /// connected, and there was nothing a receiver could do about it. Loudness has
 /// no such asymmetry: it is a property of the audio rather than of how the
 /// other end was configured.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Talking {
     /// Frames left before the indicator goes out.
     hold: u32,
+    /// What a frame above threshold resets `hold` to.
+    full: u32,
+}
+
+impl Default for Talking {
+    /// For decoded audio, one push per 20 ms frame: [`HOLD`] frames is 300 ms.
+    fn default() -> Self {
+        Self { hold: 0, full: HOLD }
+    }
 }
 
 impl Talking {
+    /// For a caller that pushes once every `every`, holding the same 300 ms
+    /// as decoded audio does -- the microphone meter samples at its own pace,
+    /// and 15 of *its* samples would hold the dot for a second.
+    pub(crate) fn every(every: std::time::Duration) -> Self {
+        let hold_ms = u128::from(HOLD) * 20;
+        let full = (hold_ms / every.as_millis().max(1)).max(1) as u32;
+        Self { hold: 0, full }
+    }
+
     /// Adds a frame's loudness and returns whether this reads as talking.
     pub(crate) fn push(&mut self, rms: f32) -> bool {
         if rms >= TALKING {
-            self.hold = HOLD;
+            self.hold = self.full;
         } else {
             self.hold = self.hold.saturating_sub(1);
         }
@@ -335,6 +353,18 @@ mod tests {
         // What aborting their audio task does: the guard drops while on.
         drop(alice);
         assert!(!own.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_slower_sampler_holds_the_same_time() {
+        // At 66 ms a sample, 300 ms is about 4 samples, not 15.
+        let mut talking = Talking::every(std::time::Duration::from_millis(66));
+        talking.push(0.1);
+        let mut on_for = 0;
+        while talking.push(0.0) {
+            on_for += 1;
+        }
+        assert!((3..=5).contains(&on_for), "held for {on_for} samples");
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::time::Duration;
 use dioxus_native::prelude::*;
 
 use super::{DeviceMenu, DropdownOption, MicIcon};
-use crate::audio::{Controls, MicStatus, use_shared_microphones};
+use crate::audio::{Controls, MicStatus, Talking, use_shared_microphones};
 use crate::channel::use_channel;
 use crate::net::PeerStats;
 use crate::settings::{self, Settings};
@@ -79,15 +79,20 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
     let tx = use_channel(move |next: Meter| meter.set(next));
     use_hook({
         let audio = props.audio.clone();
+        let local = props.local.clone();
         move || {
             let spawned = std::thread::Builder::new()
                 .name("mic-meter".into())
                 .spawn(move || {
+                    // Our own tile's talking dot, by the same rule as everyone
+                    // else's, from the level we send (zero while muted).
+                    let mut talking = Talking::every(POLL);
                     loop {
                         let next = Meter {
                             level: audio.level(),
                             status: audio.status(),
                         };
+                        local.set_talking(talking.push(next.level));
                         if tx.unbounded_send(next).is_err() {
                             return;
                         }

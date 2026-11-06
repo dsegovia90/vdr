@@ -386,6 +386,12 @@ impl PeerStats {
         )
     }
 
+    /// Records whether they are talking. For our own tile, from the
+    /// microphone meter; a remote peer's comes from their decoded audio.
+    pub fn set_talking(&self, on: bool) {
+        self.talking.store(on, Ordering::Relaxed);
+    }
+
     /// The flag the audio side raises while they talk.
     pub(super) fn talking_flag(&self) -> Arc<AtomicBool> {
         self.talking.clone()
