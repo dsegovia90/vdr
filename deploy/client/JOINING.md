@@ -8,7 +8,7 @@ https://relay.example.com:4443/<room>?jwt=<a long code>
 
 Keep it to yourself: anyone holding it can join that room until it expires.
 
-## macOS (Apple Silicon)
+## macOS (Apple Silicon or Intel)
 
 1. Unzip `vid-macos-…zip` and move **Vdr.app** to Applications.
 2. The app is not signed by Apple yet, so the first time, **right-click Vdr.app
