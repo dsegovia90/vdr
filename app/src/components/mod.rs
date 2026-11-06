@@ -22,5 +22,5 @@ pub use connect::ConnectRow;
 pub use microphone::MicControl;
 pub use participant::ParticipantVideo;
 pub use stats::StatsRow;
-pub use subroom::{Rooms, SubroomMenu, use_rooms_provider};
+pub use subroom::{CrosstalkLevel, Rooms, SubroomMenu, use_crosstalk_provider, use_rooms_provider};
 pub use tile::ParticipantTile;

@@ -13,6 +13,7 @@ use std::time::Duration;
 use dioxus_native::prelude::*;
 
 use super::{MicIcon, ParticipantVideo, PersonIcon, Rooms};
+use crate::audio::Crosstalk;
 use crate::camera::{FrameSlot, Mirror};
 use crate::channel::use_channel;
 use crate::net::PeerStats;
@@ -54,8 +55,11 @@ pub struct ParticipantTileProps {
     /// Their numbers, or `None` for our own preview, which has none worth a
     /// label -- the camera's own rate is on the status line below the grid.
     pub stats: Option<Arc<PeerStats>>,
-    /// Size and placement, from `layout::tile_class`: the box *is* the card.
+    /// Size and placement, `layout::TILE`: the box *is* the card.
     pub class: &'static str,
+    /// The dark layer over someone outside our subroom, from [`dim_class`];
+    /// [`UNDIMMED`] for everyone in it.
+    pub dim: &'static str,
     /// Who this is, by endpoint id: picks their avatar's colour, so everyone
     /// -- them included -- sees the same colour for the same person. Not the
     /// label, which reads "You" on your own tile.
@@ -183,7 +187,33 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                     }
                 }
             }
+            // **Last, so it covers everything above, the talking dot
+            // included**: these are positioned siblings without a z-index, so
+            // they paint in order. Mounted always and hidden by class, so a
+            // change of room never adds or removes a node. Clicks fall through
+            // it to the card.
+            div { class: props.dim }
         }
+    }
+}
+
+/// The dim layer, hidden: our own subroom, or crosstalk at full volume, where
+/// a subroom is only a label.
+pub(super) const UNDIMMED: &str = "hidden absolute inset-0 rounded-[12px]";
+
+/// The dim layer over a tile outside our subroom, darker the quieter they are
+/// to us, so what you see agrees with what you hear. Five steps rather than a
+/// continuous alpha, because every class must be a literal.
+///
+/// The thresholds and alphas are first guesses, to be tuned by eye.
+pub(super) fn dim_class(level: Crosstalk) -> &'static str {
+    match level.volume {
+        _ if level.muted => "absolute inset-0 rounded-[12px] bg-black/80",
+        v if v >= 0.95 => UNDIMMED,
+        v if v >= 0.6 => "absolute inset-0 rounded-[12px] bg-black/30",
+        v if v >= 0.3 => "absolute inset-0 rounded-[12px] bg-black/50",
+        v if v > 0.0 => "absolute inset-0 rounded-[12px] bg-black/65",
+        _ => "absolute inset-0 rounded-[12px] bg-black/80",
     }
 }
 
@@ -212,7 +242,47 @@ fn avatar_class(who: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::avatar_class;
+    use super::*;
+
+    /// How dark a dim class is, as its alpha in percent; hidden is zero.
+    fn darkness(class: &str) -> u32 {
+        if class.starts_with("hidden") {
+            return 0;
+        }
+        class.rsplit("bg-black/").next().unwrap().parse().unwrap()
+    }
+
+    fn level(volume: f32, muted: bool) -> Crosstalk {
+        Crosstalk { volume, muted }
+    }
+
+    #[test]
+    fn quieter_is_never_lighter() {
+        let mut last = 0;
+        for step in (0..=100).rev() {
+            let now = darkness(dim_class(level(step as f32 / 100.0, false)));
+            assert!(now >= last, "{step}% is lighter than the step above it");
+            last = now;
+        }
+    }
+
+    #[test]
+    fn muted_is_the_darkest_whatever_the_volume() {
+        for step in 0..=100 {
+            assert_eq!(dim_class(level(step as f32 / 100.0, true)), dim_class(level(0.0, false)));
+        }
+        assert_eq!(darkness(dim_class(level(1.0, true))), 80);
+    }
+
+    #[test]
+    fn full_volume_is_not_dimmed() {
+        assert_eq!(dim_class(level(1.0, false)), UNDIMMED);
+    }
+
+    #[test]
+    fn the_default_volume_is_dimmed() {
+        assert_eq!(darkness(dim_class(Crosstalk::default())), 65);
+    }
 
     #[test]
     fn a_person_keeps_their_colour() {

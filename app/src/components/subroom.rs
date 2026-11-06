@@ -17,7 +17,7 @@ use dioxus_native::prelude::*;
 
 use super::SpeakerIcon;
 use super::device_menu::OpenMenu;
-use crate::audio::Controls;
+use crate::audio::{Controls, Crosstalk};
 use crate::net::PeerStats;
 use crate::settings::Settings;
 
@@ -42,6 +42,18 @@ pub struct Rooms(pub Signal<BTreeMap<String, Option<String>>>);
 /// Makes the shared [`Rooms`] available to the tiles and the menu below.
 pub fn use_rooms_provider() {
     use_context_provider(|| Rooms(Signal::new(BTreeMap::new())));
+}
+
+/// The out-of-room volume and mute as last set, for the page: the menu writes
+/// it, and the tiles outside our subroom dim to match it.
+#[derive(Clone, Copy)]
+pub struct CrosstalkLevel(pub Signal<Crosstalk>);
+
+/// Makes the shared [`CrosstalkLevel`] available to the menu and the tiles,
+/// starting from what the audio holds (the saved setting, by then).
+pub fn use_crosstalk_provider(audio: &Controls) {
+    let initial = audio.crosstalk();
+    use_context_provider(|| CrosstalkLevel(Signal::new(initial)));
 }
 
 #[derive(Clone, PartialEq, Props)]
@@ -70,10 +82,7 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
             current.set(None);
         }
     }));
-    let mut crosstalk = use_signal({
-        let audio = props.audio.clone();
-        move || audio.crosstalk()
-    });
+    let CrosstalkLevel(mut crosstalk) = use_context::<CrosstalkLevel>();
     let mut dragging = use_signal(|| false);
 
     let map = rooms.read().clone();
@@ -280,6 +289,12 @@ fn number(name: &str) -> Option<u32> {
     name.strip_prefix("Room ")?.parse().ok()
 }
 
+/// Where a subroom sorts: by number, so "Room 10" follows "Room 9"; any other
+/// name after, alphabetically. Shared by this menu and the tile groups.
+pub(super) fn room_order(name: &str) -> (u32, &str) {
+    (number(name).unwrap_or(u32::MAX), name)
+}
+
 /// The name a new subroom takes: the smallest "Room n" no open subroom uses.
 /// Names that are not of that form take nothing.
 pub(crate) fn next_free_name(open: &[&str]) -> String {
@@ -301,9 +316,7 @@ pub(crate) fn open_subrooms(rooms: &BTreeMap<String, Option<String>>) -> Vec<(St
         }
     }
     let mut open: Vec<_> = by_name.into_iter().collect();
-    open.sort_by(|(a, _), (b, _)| {
-        (number(a).unwrap_or(u32::MAX), a).cmp(&(number(b).unwrap_or(u32::MAX), b))
-    });
+    open.sort_by(|(a, _), (b, _)| room_order(a).cmp(&room_order(b)));
     open
 }
 
