@@ -653,7 +653,6 @@ dependencies = [
 [[package]]
 name = "blitz-dom"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/DioxusLabs/blitz?tag=v0.3.0-beta.4#92b11f1bd8ab7975411328b0406a95a09445b4e7"
 dependencies = [
  "accesskit",
  "anyrender",
