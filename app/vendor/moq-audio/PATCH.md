@@ -1,33 +1,59 @@
 # vid's patch to moq-audio 0.0.22
 
 The crate as published on crates.io (MIT OR Apache-2.0, see `Cargo.toml`),
-vendored unchanged in its own commit. **One change**, in `src/aec.rs`, so that
-diff is the whole patch:
+vendored unchanged in its own commit. Every change is in `src/aec.rs` and
+marked `vid patch`, so the diff against that commit is the whole patch.
 
-**`Canceller::statistics() -> Option<AudioProcessingStats>`** returns the
-echo canceller's own measurements (echo-return-loss enhancement, echo return
-loss, delay estimate, residual echo likelihood, divergent filter fraction),
-refreshed about once a second. `aec::AudioProcessingStats` is re-exported from
-sonora, so callers need no direct, version-matched dependency on it.
+## 1. The echo fix: the canceller never received what the speakers played
 
-## Why
+**The bug.** The mixer pushes everything it plays into the canceller's
+reference channel (`playback/mixer.rs`). That channel is a `fixed-resample`
+`resampling_channel`, which **discards every push until its consumer has read
+once** (`fixed-resample` 0.12 `channel.rs`: `push_interleaved` returns
+`OutputNotReady` until `output_stream_ready`, which only
+`read`/`read_interleaved` set). But the capture side only reads once a whole
+10 ms frame is waiting (`aec.rs`, `while reference.available_frames() >=
+REFERENCE_FRAME`), and `available_frames` does not set the flag.
 
-vid's first real call had echo: one participant heard their own voice through
-the others' microphones. sonora measures exactly what would say whose canceller
-is failing and why, but 0.0.22 keeps the processor private, and the canceller
-offers only on/off.
+So neither side ever moves. The canceller runs, but against silence, and
+**passes the microphone through with the room's echo in it**, on every machine.
+The playback test in `mixer.rs` (`discards_writes_until_the_device_reads`)
+documents the same rule for the device side, where the device's callback does
+read once; the reference side has no such first read.
 
-## How, and the one subtlety
+**Measured in vid** (loopback, speakers on, someone talking), with the counter
+from §2:
 
-The microphone callback (`Canceller::process`) holds the processor lock and
-uses `try_lock`. On contention it passes its buffer through **uncancelled**. So
-reading statistics from another thread would take that lock and leak about
-10 ms of echo each time. Instead the callback copies the statistics into a
-separate small slot once a second, while it already holds the lock, again with
-`try_lock`, so it never waits. `AudioProcessingStats` is all `Option<f64>`/
-`Option<i32>`, so nothing allocates on the audio thread.
+| | Reference frames reaching the canceller | Canceller state |
+|---|---|---|
+| before | **0 frames/s**, rms 0 | ERL −30 dB, ERLE 0.2 dB: AEC3's starting values, never updated in minutes |
+| after | **100–102 frames/s** | delay estimate found (12 ms), ERL adapting (−30 → −23.6 dB) within a minute of speech |
+
+**The fix.** Mark the consumer ready when the tap is (re)built
+(`Reference::rebuild`), and again on every capture callback before checking
+for frames, since a channel reset clears the flag.
+
+## 2. Diagnostics
+
+- **`Canceller::statistics() -> Option<AudioProcessingStats>`**: sonora's own
+  measurements (ERLE, ERL, its delay, and more), refreshed about once a second.
+  `aec::AudioProcessingStats` is re-exported, so callers need no direct
+  dependency on sonora. In this configuration sonora fills ERLE, ERL and
+  `delay_ms`. Its median/sd delay, residual-echo and divergence fields stay
+  empty (no echo detector).
+- **`Canceller::reference_activity() -> Option<(u32, f32)>`**: reference
+  frames received over the last second, and their RMS. This is what found §1.
+
+**The one subtlety.** The microphone callback holds the processor lock and uses
+`try_lock`, and on contention it passes its buffer through **uncancelled**. So
+reading these from another thread would leak about 10 ms of echo each time.
+Instead the callback copies them into separate small slots once a second,
+while it already holds the lock, again with `try_lock`. Everything copied is
+plain numbers, so nothing allocates on the audio thread.
 
 ## Leaving
 
-Propose this upstream (moq-dev/moq, `rs/moq-audio`), then drop the vendored copy
-and the `[patch.crates-io]` entry in `app/Cargo.toml` once a release carries it.
+Report §1 upstream first (moq-dev/moq, `rs/moq-audio`): it breaks echo
+cancellation for every user, and the fix is two lines. Then propose §2. Drop the
+vendored copy and the `[patch.crates-io]` entry in `app/Cargo.toml` once a
+release carries both.

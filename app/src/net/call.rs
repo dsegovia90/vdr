@@ -1429,8 +1429,8 @@ fn write_stats(
         "t": t, "me": me, "link": true,
         "rtt_ms": metrics.rtt(), "loss_pct": metrics.loss(), "up_kbps": metrics.send_kbps(),
         "aec_erle_db": aec.erle_db, "aec_erl_db": aec.erl_db,
-        "aec_delay_ms": aec.delay_ms, "aec_delay_sd_ms": aec.delay_sd_ms,
-        "aec_residual_max": aec.residual_max, "aec_divergent": aec.divergent,
+        "aec_delay_ms": aec.delay_ms,
+        "aec_reference_frames": aec.reference_frames, "aec_reference_rms": aec.reference_rms,
     });
     lines.push_str(&link.to_string());
     lines.push('\n');

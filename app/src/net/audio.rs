@@ -140,7 +140,7 @@ pub(super) async fn report_aec(
     loop {
         ticker.tick().await;
         let Some(stats) = canceller.statistics() else { continue };
-        let snapshot = super::metrics::AecStats::from(&stats);
+        let snapshot = super::metrics::AecStats::new(&stats, canceller.reference_activity());
         tracing::info!("[aec] {snapshot}");
         if let Some(metrics) = &metrics {
             metrics.set_aec(snapshot);

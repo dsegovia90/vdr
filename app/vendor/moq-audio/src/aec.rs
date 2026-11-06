@@ -146,6 +146,7 @@ impl Canceller {
 			state: Arc::new(Mutex::new(State::default())),
 			shared: shared.clone(),
 			stats: Mutex::new(None),
+			reference: Mutex::new(None),
 		});
 
 		shared.set_reference(Reference {
@@ -251,6 +252,19 @@ impl Canceller {
 					*slot = Some(processor.statistics().clone());
 				}
 			}
+			// What the canceller was told was played over that second: whether
+			// a speaker signal reaches it at all, and how loud.
+			let rms = if state.reference_samples == 0 {
+				0.0
+			} else {
+				(state.reference_energy / state.reference_samples as f64).sqrt() as f32
+			};
+			if let Ok(mut slot) = self.inner.reference.try_lock() {
+				*slot = Some((state.reference_frames, rms));
+			}
+			state.reference_frames = 0;
+			state.reference_energy = 0.0;
+			state.reference_samples = 0;
 		}
 	}
 
@@ -262,6 +276,13 @@ impl Canceller {
 	/// vid patch, not in moq-audio 0.0.22.
 	pub fn statistics(&self) -> Option<AudioProcessingStats> {
 		self.inner.stats.lock().ok().and_then(|stats| stats.clone())
+	}
+
+	/// How many 10 ms reference frames (what the speakers played) the canceller
+	/// received over the last second, and their RMS level. Zero frames means it
+	/// is cancelling against nothing. vid patch, not in moq-audio 0.0.22.
+	pub fn reference_activity(&self) -> Option<(u32, f32)> {
+		self.inner.reference.lock().ok().and_then(|reference| *reference)
 	}
 
 	/// Discard partial frames before processing the next capture buffer.
@@ -302,6 +323,8 @@ struct Inner {
 	shared: Arc<playback::Shared>,
 	/// vid patch: the latest statistics, written by the microphone callback.
 	stats: Mutex<Option<sonora::AudioProcessingStats>>,
+	/// vid patch: reference frames read over the last second, and their RMS.
+	reference: Mutex<Option<(u32, f32)>>,
 }
 
 /// vid patch: how often the microphone callback copies the statistics out.
@@ -322,6 +345,10 @@ struct State {
 	processor: Option<AudioProcessing>,
 	/// vid patch: when the statistics were last copied out.
 	stats_at: Option<std::time::Instant>,
+	/// vid patch: reference frames read, and their energy, since the last copy.
+	reference_frames: u32,
+	reference_energy: f64,
+	reference_samples: u64,
 	capture: StreamConfig,
 	/// Reference from the output mixer, replaced whenever the output stream is
 	/// rebuilt and `None` while none is running.
@@ -351,6 +378,9 @@ impl Default for State {
 		Self {
 			processor: None,
 			stats_at: None,
+			reference_frames: 0,
+			reference_energy: 0.0,
+			reference_samples: 0,
 			// Replaced by `Canceller::open`; nothing is processed before then.
 			capture: reference_config(),
 			reference: None,
@@ -407,6 +437,9 @@ impl State {
 			capture_out,
 			// vid patch: read by `Canceller::process`, not here.
 			stats_at: _,
+			reference_frames,
+			reference_energy,
+			reference_samples,
 		} = self;
 
 		// No microphone has been opened against this canceller, so there is
@@ -448,8 +481,15 @@ impl State {
 		// than the last output callback, so it leads the echo by however much
 		// the output device buffers, however little that is.
 		if let Some(reference) = reference {
+			// vid patch: kept ready on every callback too, since a channel reset
+			// clears it, and a cleared flag is the same deadlock as above.
+			reference.set_output_stream_ready(true);
 			while reference.available_frames() >= REFERENCE_FRAME {
 				reference.read_interleaved(reference_frame, false);
+				// vid patch: what the canceller is actually told was played.
+				*reference_frames += 1;
+				*reference_energy += reference_frame.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>();
+				*reference_samples += reference_frame.len() as u64;
 				deinterleave(reference_frame, render_in, BUS_CHANNELS);
 				let _ = process_render(processor, render_in, render_out);
 			}
@@ -588,7 +628,13 @@ impl Reference {
 			return false;
 		}
 
-		let (prod, cons) = channel(rate);
+		let (prod, mut cons) = channel(rate);
+		// vid patch, the echo fix: mark this end ready now. fixed-resample
+		// discards every push until the consumer has *read* once, and the
+		// capture side only reads once a whole frame is waiting -- so neither
+		// side ever moved, the canceller never saw a sample of what played, and
+		// echo went straight through (measured: 0 reference frames a second).
+		cons.set_output_stream_ready(true);
 		self.state.lock().unwrap().reference = Some(cons);
 		self.pending = Some(prod);
 		true

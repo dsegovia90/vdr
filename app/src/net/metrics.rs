@@ -31,27 +31,31 @@ pub struct AecStats {
     /// Echo return loss: how much quieter the echo already was than what
     /// played, in dB. Low means loud speakers close to the mic.
     pub erl_db: Option<f64>,
-    /// Where it thinks the echo sits, and how much that estimate wanders. A
-    /// wandering delay is the sign of a mic and speaker on different clocks.
+    /// Where it has aligned the speaker signal against the microphone, in ms.
+    /// A value that keeps moving is the sign of a mic and speaker on
+    /// different clocks.
     pub delay_ms: Option<i32>,
-    pub delay_sd_ms: Option<i32>,
-    /// How likely some echo got through, now and its recent worst, 0 to 1.
-    pub residual: Option<f64>,
-    pub residual_max: Option<f64>,
-    /// Share of the last second its filter spent diverged, 0 to 1.
-    pub divergent: Option<f64>,
+    /// What it was told the speakers played over the last second: frames
+    /// (about 100 when playback runs) and their RMS level. Zero frames means
+    /// it is cancelling against nothing.
+    pub reference_frames: Option<u32>,
+    pub reference_rms: Option<f32>,
 }
 
-impl From<&moq_audio::aec::AudioProcessingStats> for AecStats {
-    fn from(stats: &moq_audio::aec::AudioProcessingStats) -> Self {
+impl AecStats {
+    /// From sonora's statistics and the patch's reference counter.
+    ///
+    /// The delay is sonora's `delay_ms`, the one it fills; its median and
+    /// standard-deviation fields, and the residual-echo and divergence ones,
+    /// stay empty in this configuration (no echo detector), so they are left
+    /// out rather than printed as "?".
+    pub fn new(stats: &moq_audio::aec::AudioProcessingStats, reference: Option<(u32, f32)>) -> Self {
         Self {
             erle_db: stats.echo_return_loss_enhancement,
             erl_db: stats.echo_return_loss,
-            delay_ms: stats.delay_median_ms,
-            delay_sd_ms: stats.delay_standard_deviation_ms,
-            residual: stats.residual_echo_likelihood,
-            residual_max: stats.residual_echo_likelihood_recent_max,
-            divergent: stats.divergent_filter_fraction,
+            delay_ms: stats.delay_ms,
+            reference_frames: reference.map(|(frames, _)| frames),
+            reference_rms: reference.map(|(_, rms)| rms),
         }
     }
 }
@@ -59,18 +63,14 @@ impl From<&moq_audio::aec::AudioProcessingStats> for AecStats {
 impl std::fmt::Display for AecStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let db = |v: Option<f64>| v.map_or("?".to_string(), |v| format!("{v:.1} dB"));
-        let ms = |v: Option<i32>| v.map_or("?".to_string(), |v| v.to_string());
-        let p = |v: Option<f64>| v.map_or("?".to_string(), |v| format!("{v:.2}"));
         write!(
             f,
-            "erle {}, erl {}, delay {}±{} ms, residual echo {} (recent max {}), divergent {}",
+            "erle {}, erl {}, delay {} ms, speaker reference {} frames/s at rms {}",
             db(self.erle_db),
             db(self.erl_db),
-            ms(self.delay_ms),
-            ms(self.delay_sd_ms),
-            p(self.residual),
-            p(self.residual_max),
-            p(self.divergent),
+            self.delay_ms.map_or("?".to_string(), |v| v.to_string()),
+            self.reference_frames.map_or("?".to_string(), |v| v.to_string()),
+            self.reference_rms.map_or("?".to_string(), |v| format!("{v:.4}")),
         )
     }
 }

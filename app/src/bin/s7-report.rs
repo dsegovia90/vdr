@@ -46,8 +46,7 @@ struct LinkSample {
     loss: Option<f64>,
     erle: Option<f64>,
     delay: Option<f64>,
-    delay_sd: Option<f64>,
-    residual_max: Option<f64>,
+    reference_frames: Option<f64>,
 }
 
 /// One second of one received stream.
@@ -91,8 +90,7 @@ fn main() {
                     loss: value["loss_pct"].as_f64(),
                     erle: value["aec_erle_db"].as_f64(),
                     delay: value["aec_delay_ms"].as_f64(),
-                    delay_sd: value["aec_delay_sd_ms"].as_f64(),
-                    residual_max: value["aec_residual_max"].as_f64(),
+                    reference_frames: value["aec_reference_frames"].as_f64(),
                 });
                 continue;
             }
@@ -144,13 +142,12 @@ fn main() {
         // low ERLE or a wandering delay here is whose machine sends echo back.
         // Shown, not judged, until a real call shows what good looks like.
         println!(
-            "     {:<9} echo canceller: erle p50 {} dB (worst {} dB), delay p50 {} ms (sd p50 {} ms), residual echo worst {}",
+            "     {:<9} echo canceller: erle p50 {} dB (worst {} dB), delay p50 {} ms, speaker reference p50 {} frames/s",
             "",
             fmt(percentile(column(|s| s.erle), 0.5), 1),
             fmt(percentile(column(|s| s.erle), 0.0), 1),
             fmt(percentile(column(|s| s.delay), 0.5), 0),
-            fmt(percentile(column(|s| s.delay_sd), 0.5), 0),
-            fmt(percentile(column(|s| s.residual_max), 1.0), 2),
+            fmt(percentile(column(|s| s.reference_frames), 0.5), 0),
         );
     }
 
