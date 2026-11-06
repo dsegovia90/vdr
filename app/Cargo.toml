@@ -104,6 +104,10 @@ moq-video = { version = "0.1.21", default-features = false, features = ["openh26
 # See vendor/moq-audio/PATCH.md. Drop this once upstream exposes them.
 [patch.crates-io]
 moq-audio = { path = "vendor/moq-audio" }
+# A patched moq-vaapi: its H.264 encoder left the macroblock padding below a
+# frame (8 rows of 640x360) uninitialised, which showed as a green band along
+# the bottom on Intel. See vendor/moq-vaapi/PATCH.md.
+moq-vaapi = { path = "vendor/moq-vaapi" }
 
 # A patched blitz-dom: its hit test unwraps child ids that a DOM change has
 # already removed, and panics if the pointer moves before the next layout.
