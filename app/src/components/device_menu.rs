@@ -83,7 +83,7 @@ pub fn DeviceMenu(props: DeviceMenuProps) -> Element {
             // layer and the panel have positive z-index, so blitz caches them
             // in a stacking context; removing them left that cache naming a
             // node that was gone, and a hit-test before the next layout
-            // panicked on it (blitz-dom `hit_inner`, finding F9). Hiding
+            // panicked on it (blitz-dom `hit_inner`). Hiding
             // changes a style, not the tree.
             Fragment {
                 // **Closes on any click outside the menu.** An invisible layer
