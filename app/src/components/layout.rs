@@ -29,7 +29,7 @@
 //!
 //! **Grouped by subroom, the table holds per arrangement, not per count.** Each
 //! subroom is its own run of rows under a label, so a group's last row can end
-//! early: two in Room 1 and one in main is two rows at `xl`, where three
+//! early: two in a subroom and one in main is two rows at `xl`, where three
 //! ungrouped tiles are one. The columns still come from the total, so every
 //! card has the same size; the rows and labels are counted from the groups.
 //! With one group and no labels this is exactly the table above.
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn main_comes_first_then_subrooms_by_number() {
+    fn main_comes_first_then_subrooms_in_room_order() {
         let rooms = map(&[
             ("a", Some("Room 10")),
             ("b", Some("Kitchen")),
@@ -264,7 +264,7 @@ mod tests {
             ("d", None),
         ]);
         let groups = groups(&["a", "b", "c", "d"], &rooms);
-        assert_eq!(rooms_of(&groups), [None, Some("Room 2"), Some("Room 10"), Some("Kitchen")]);
+        assert_eq!(rooms_of(&groups), [None, Some("Kitchen"), Some("Room 2"), Some("Room 10")]);
     }
 
     #[test]

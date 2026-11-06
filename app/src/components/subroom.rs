@@ -3,15 +3,20 @@
 //!
 //! **A subroom is a name and nothing more.** It is open while someone's
 //! presence names it; nobody creates or closes it, so it stops existing when
-//! the last person leaves and its name is free again. Two people opening one at
-//! the same instant pick the same free name and end up together, which is
-//! harmless and visible.
+//! the last person leaves and its name is free again.
+//!
+//! **New subrooms are rooms of a house, picked at random** from those not in
+//! use, so two people pressing New subroom before either has heard of the
+//! other's usually get different rooms. When they do pick the same one they
+//! end up together, which is harmless and visible. Only once every room of
+//! the house is taken does a new one fall back to "Room n".
 //!
 //! The volume itself is applied in `net::audio`, on every frame, from the same
 //! state this menu writes; nothing here tells the audio anything.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use dioxus_native::prelude::*;
 
@@ -284,30 +289,63 @@ fn who(members: &[String], me: &str) -> String {
         .join(", ")
 }
 
-/// The number in a generated name, "Room 3" -> 3.
+/// The names a new subroom draws from. Kept large so that two picks made at
+/// once rarely meet, and short enough for the menu row and the tile label.
+const HOUSE: [&str; 20] = [
+    "Attic", "Balcony", "Boathouse", "Cellar", "Garage", "Greenhouse", "Hallway", "Kitchen", "Library", "Loft",
+    "Lounge", "Nursery", "Pantry", "Porch", "Shed", "Study", "Sunroom", "Treehouse", "Veranda", "Workshop",
+];
+
+/// The number in a fallback name, "Room 3" -> 3.
 fn number(name: &str) -> Option<u32> {
     name.strip_prefix("Room ")?.parse().ok()
 }
 
-/// Where a subroom sorts: by number, so "Room 10" follows "Room 9"; any other
-/// name after, alphabetically. Shared by this menu and the tile groups.
-pub(super) fn room_order(name: &str) -> (u32, &str) {
-    (number(name).unwrap_or(u32::MAX), name)
+/// Where a subroom sorts: rooms of the house alphabetically, then "Room n" by
+/// number, so "Room 10" follows "Room 9", then any other name alphabetically.
+/// Shared by this menu and the tile groups.
+pub(super) fn room_order(name: &str) -> (u8, u32, &str) {
+    if HOUSE.contains(&name) {
+        (0, 0, name)
+    } else if let Some(n) = number(name) {
+        (1, n, name)
+    } else {
+        (2, 0, name)
+    }
 }
 
-/// The name a new subroom takes: the smallest "Room n" no open subroom uses.
-/// Names that are not of that form take nothing.
+/// The name a new subroom takes: a room of the house no open subroom uses,
+/// picked at random; with all of them in use, the smallest free "Room n".
 pub(crate) fn next_free_name(open: &[&str]) -> String {
+    free_name(open, roll())
+}
+
+/// [`next_free_name`] with the random number supplied, so tests can choose it.
+fn free_name(open: &[&str], roll: u64) -> String {
+    let free: Vec<&str> = HOUSE.iter().copied().filter(|name| !open.contains(name)).collect();
+    if !free.is_empty() {
+        return free[(roll % free.len() as u64) as usize].to_string();
+    }
     let taken: BTreeSet<u32> = open.iter().filter_map(|name| number(name)).collect();
-    let free = (1..).find(|n| !taken.contains(n)).unwrap_or(1);
-    format!("Room {free}")
+    let n = (1..).find(|n| !taken.contains(n)).unwrap_or(1);
+    format!("Room {n}")
+}
+
+/// A random number from the clock, scrambled (splitmix64). Two people pressing
+/// at once are on different machines with different clocks, which is all the
+/// randomness this needs; no crate in the tree is worth adding for it.
+fn roll() -> u64 {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let mut z = nanos.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// The open subrooms and who is in each, from everyone's room.
 ///
 /// A subroom exists only by someone naming it, so an empty one cannot appear,
-/// and the main room is not one. Sorted by number, so "Room 10" follows
-/// "Room 9"; any other name comes after, alphabetically.
+/// and the main room is not one. Sorted by [`room_order`].
 pub(crate) fn open_subrooms(rooms: &BTreeMap<String, Option<String>>) -> Vec<(String, Vec<String>)> {
     let mut by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (id, room) in rooms {
@@ -333,19 +371,40 @@ mod tests {
     }
 
     #[test]
-    fn the_first_subroom_is_room_1() {
-        assert_eq!(next_free_name(&[]), "Room 1");
+    fn a_new_subroom_is_a_free_room_of_the_house() {
+        let open = ["Kitchen", "Attic", "Room 1", "Workshop"];
+        for roll in 0..100 {
+            let name = free_name(&open, roll);
+            assert!(HOUSE.contains(&name.as_str()), "{name} is not in the house");
+            assert!(!open.contains(&name.as_str()), "{name} is already open");
+        }
+        for _ in 0..100 {
+            let name = next_free_name(&open);
+            assert!(HOUSE.contains(&name.as_str()) && !open.contains(&name.as_str()));
+        }
     }
 
     #[test]
-    fn a_gap_is_filled_first() {
-        assert_eq!(next_free_name(&["Room 1", "Room 3"]), "Room 2");
-        assert_eq!(next_free_name(&["Room 1", "Room 2"]), "Room 3");
+    fn every_free_room_can_be_picked() {
+        let picked: BTreeSet<String> = (0..HOUSE.len() as u64).map(|roll| free_name(&[], roll)).collect();
+        assert_eq!(picked.len(), HOUSE.len());
     }
 
     #[test]
-    fn other_names_take_no_number() {
-        assert_eq!(next_free_name(&["Kitchen", "Room x", "Room 2"]), "Room 1");
+    fn a_full_house_falls_back_to_numbers() {
+        let mut open = HOUSE.to_vec();
+        assert_eq!(next_free_name(&open), "Room 1");
+        open.push("Room 1");
+        assert_eq!(next_free_name(&open), "Room 2");
+        open.extend(["Room 3", "Room x"]);
+        assert_eq!(next_free_name(&open), "Room 2", "a gap is filled first");
+    }
+
+    #[test]
+    fn rooms_sort_house_then_numbers_then_the_rest() {
+        let mut names = ["Zebra", "Room 10", "Lounge", "Room 2", "Attic", "Basement"];
+        names.sort_by_key(|name| room_order(name));
+        assert_eq!(names, ["Attic", "Lounge", "Room 2", "Room 10", "Basement", "Zebra"]);
     }
 
     fn map(entries: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
@@ -361,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn subrooms_list_their_members_in_number_order() {
+    fn subrooms_list_their_members_in_order() {
         let open = open_subrooms(&map(&[
             ("a", Some("Room 10")),
             ("b", Some("Room 2")),
@@ -370,16 +429,18 @@ mod tests {
             ("e", Some("Kitchen")),
         ]));
         let names: Vec<_> = open.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, ["Room 2", "Room 10", "Kitchen"]);
-        assert_eq!(open[0].1, ["b", "d"]);
+        assert_eq!(names, ["Kitchen", "Room 2", "Room 10"]);
+        assert_eq!(open[1].1, ["b", "d"]);
     }
 
     #[test]
     fn a_subroom_everyone_left_is_gone() {
-        let open = open_subrooms(&map(&[("a", Some("Room 1")), ("b", Some("Room 2"))]));
+        let open = open_subrooms(&map(&[("a", Some("Attic")), ("b", Some("Loft"))]));
         assert_eq!(open.len(), 2);
-        let open = open_subrooms(&map(&[("a", Some("Room 1")), ("b", None)]));
-        assert_eq!(open.len(), 1, "Room 2 closed when b left it");
-        assert_eq!(next_free_name(&open.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()), "Room 2");
+        let open = open_subrooms(&map(&[("a", Some("Attic")), ("b", None)]));
+        assert_eq!(open.len(), 1, "Loft closed when b left it");
+        let mut taken: Vec<&str> = HOUSE.iter().copied().filter(|name| *name != "Loft").collect();
+        taken.extend(open.iter().map(|(n, _)| n.as_str()));
+        assert_eq!(next_free_name(&taken), "Loft", "and its name is free again");
     }
 }
