@@ -131,6 +131,11 @@ pub struct Encoder {
 	// Source surface (reused; NV12 re-uploaded per frame) and a 2-deep
 	// reconstructed surface ring (current + previous reference for IPPP).
 	input: Option<Surface<()>>,
+	/// vid patch: the surface CPU frames are uploaded into, rounded up to whole
+	/// macroblocks so the padding the encoder reads can be filled. `input`
+	/// stays at the picture size for the DMA-BUF path, whose video processor
+	/// scales into whatever surface it is given.
+	padded: Option<Surface<()>>,
 	recon: Vec<Surface<()>>,
 	/// Reference from the previous encoded frame: (recon index, metadata).
 	reference: Option<(usize, FrameMeta)>,
@@ -200,7 +205,15 @@ impl Encoder {
 			.map_err(|e| anyhow::anyhow!("create VA config: {e:?}"))?;
 
 		let context = display
-			.create_context::<()>(&va_config, config.width, config.height, None, true)
+			// vid patch: at the coded (macroblock-aligned) size, matching the
+			// surfaces below, as ffmpeg does.
+			.create_context::<()>(
+				&va_config,
+				config.width.next_multiple_of(16),
+				config.height.next_multiple_of(16),
+				None,
+				true,
+			)
 			.map_err(|e| anyhow::anyhow!("create VA context: {e:?}"))?;
 
 		let coded_size = coded_size(config.bitrate);
@@ -209,7 +222,9 @@ impl Encoder {
 			.map_err(|e| anyhow::anyhow!("create coded buffer: {e:?}"))?;
 
 		let input = make_surface(&display, &config)?;
-		let recon = vec![make_surface(&display, &config)?, make_surface(&display, &config)?];
+		let padded = make_padded_surface(&display, &config)?;
+		// vid patch: reconstructed pictures are whole macroblocks too.
+		let recon = vec![make_padded_surface(&display, &config)?, make_padded_surface(&display, &config)?];
 
 		let (sps, pps) = build_sps_pps(&config);
 		let width_mbs = sps.pic_width_in_mbs_minus1 + 1;
@@ -232,6 +247,7 @@ impl Encoder {
 			width_mbs,
 			height_mbs,
 			input: Some(input),
+			padded: Some(padded),
 			recon,
 			reference: None,
 			counter: 0,
@@ -258,10 +274,10 @@ impl Encoder {
 		if nv12.len() < expected {
 			anyhow::bail!("NV12 frame is {} bytes, {width}x{height} needs {expected}", nv12.len());
 		}
-		let input = self.input.take().expect("input surface present");
+		let input = self.padded.take().expect("padded input surface present");
 		let result = upload_nv12(&self.display, &input, self.config.width, self.config.height, nv12)
 			.and_then(|()| self.encode_surface(&input, keyframe));
-		self.input = Some(input);
+		self.padded = Some(input);
 		result
 	}
 
@@ -605,6 +621,24 @@ fn make_surface(display: &Arc<Display>, config: &Config) -> anyhow::Result<Surfa
 	surfaces.pop().ok_or_else(|| anyhow::anyhow!("no surface created"))
 }
 
+/// vid patch: one NV12 encode surface rounded up to whole macroblocks.
+///
+/// The encoder reads whole 16x16 macroblocks, so a 640x360 picture is coded as
+/// 640x368 and cropped back by the SPS. A surface allocated at 640x360 leaves
+/// the driver's extra rows unwritten: zeros, which are green in YUV. They are
+/// cropped from view, but prediction and deblocking across the last macroblock
+/// row pulled them into the visible picture, as a green band along the bottom
+/// (seen on Intel iHD, Panther Lake). ffmpeg allocates aligned surfaces for
+/// the same reason.
+fn make_padded_surface(display: &Arc<Display>, config: &Config) -> anyhow::Result<Surface<()>> {
+	let padded = Config {
+		width: config.width.next_multiple_of(16),
+		height: config.height.next_multiple_of(16),
+		..config.clone()
+	};
+	make_surface(display, &padded)
+}
+
 /// Upload tightly-packed NV12 into a surface. Ported from cros-codecs
 /// `upload_nv12_img` (honors the image's per-plane offsets + pitches).
 fn upload_nv12(
@@ -627,22 +661,38 @@ fn upload_nv12(
 	let va_image = *image.image();
 	let dest: &mut [u8] = image.as_mut();
 	let (w, h) = (width as usize, height as usize);
-
+	// vid patch: the image may be larger than the picture (a padded surface).
+	// Everything past the picture is filled by repeating its last column and
+	// last row, so the encoder's padding macroblocks carry picture, not zeros.
+	let (sw, sh) = ((va_image.width as usize).max(w), (va_image.height as usize).max(h));
+	let (luma, luma_pitch) = (va_image.offsets[0] as usize, va_image.pitches[0] as usize);
+	let (chroma, chroma_pitch) = (va_image.offsets[1] as usize, va_image.pitches[1] as usize);
 	// Luma plane.
-	let mut src = data;
-	let mut dst = &mut dest[va_image.offsets[0] as usize..];
-	for _ in 0..h {
-		dst[..w].copy_from_slice(&src[..w]);
-		dst = &mut dst[va_image.pitches[0] as usize..];
-		src = &src[w..];
+	for row in 0..h {
+		let src = &data[row * w..(row + 1) * w];
+		let dst = &mut dest[luma + row * luma_pitch..][..sw];
+		dst[..w].copy_from_slice(src);
+		dst[w..].fill(src[w - 1]);
 	}
-	// Interleaved chroma plane (h/2 rows of w bytes).
-	let mut src = &data[w * h..];
-	let mut dst = &mut dest[va_image.offsets[1] as usize..];
-	for _ in 0..h / 2 {
-		dst[..w].copy_from_slice(&src[..w]);
-		dst = &mut dst[va_image.pitches[1] as usize..];
-		src = &src[w..];
+	for row in h..sh {
+		let (above, below) = dest.split_at_mut(luma + row * luma_pitch);
+		below[..sw].copy_from_slice(&above[luma + (h - 1) * luma_pitch..][..sw]);
+	}
+	// Interleaved chroma plane (h/2 rows of w bytes, UV pairs).
+	let (ch, csh) = (h / 2, sh / 2);
+	for row in 0..ch {
+		let src = &data[w * h + row * w..w * h + (row + 1) * w];
+		let dst = &mut dest[chroma + row * chroma_pitch..][..sw];
+		dst[..w].copy_from_slice(src);
+		let (u, v) = (src[w - 2], src[w - 1]);
+		for pair in dst[w..].chunks_exact_mut(2) {
+			pair[0] = u;
+			pair[1] = v;
+		}
+	}
+	for row in ch..csh {
+		let (above, below) = dest.split_at_mut(chroma + row * chroma_pitch);
+		below[..sw].copy_from_slice(&above[chroma + (ch - 1) * chroma_pitch..][..sw]);
 	}
 
 	drop(image);
