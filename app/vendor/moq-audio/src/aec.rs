@@ -674,9 +674,8 @@ impl Reference {
 		// vid patch, the echo fix: mark this end ready now. fixed-resample
 		// discards every push until the consumer has *read* once, and the
 		// capture side only reads once a whole frame is waiting, so neither
-		// side ever moved in 0.0.22, and echo went straight through (measured in
-		// vid: 0 reference frames a second). Whether 0.1.21 still needs this is
-		// open; see PATCH.md.
+		// side ever moved, and echo went straight through (measured in vid, on
+		// 0.0.22 and again on 0.1.21: 0 reference frames a second).
 		cons.set_output_stream_ready(true);
 		self.state.lock().unwrap().reference = Some(cons);
 		self.pending = Some(prod);

@@ -37,14 +37,14 @@ from §2:
 (`Reference::rebuild`), and again on every capture callback before checking
 for frames, since a channel reset clears the flag.
 
-**Is §1 still needed on 0.1.21? Open.** fixed-resample is now 0.13, and a unit
-test that builds the tap first, attaches a microphone and then pushes saw the
-tap unlock *without* the fix: its startup padding survived and the first read
-went through. That contradicts what was measured on 0.0.22 in the app, and
-the source of `discard_frames` is unchanged, so it is not explained. Settle it
-in the app, not here: a loopback with §1 removed, reading the `[aec]` reference
-counter. The fix only marks the channel ready, which one read would do anyway,
-so keeping it costs nothing meanwhile.
+**Still needed on 0.1.21: measured 2026-11-06.** A loopback built with §1
+removed reported **0 speaker reference frames/s, rms 0** in every `[aec]` line,
+and ERL frozen at −30 dB: the same deadlock as on 0.0.22. With §1 the same
+loopback reads 100–101 frames/s and ERL adapts (−30 → −16 dB in 20 s). A unit
+test that builds the tap, attaches a microphone, then pushes did *not* show the
+bug (the channel's startup padding survived and unlocked it), so upstream's
+tests can pass while the app is deaf. Report it with the app's numbers, not a
+unit test.
 
 ## 2. Diagnostics
 
