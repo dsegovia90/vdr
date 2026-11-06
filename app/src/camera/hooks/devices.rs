@@ -54,7 +54,7 @@ fn use_devices() -> UseDevices {
         // milliseconds, so it runs on a worker thread and reports back.
         let spawned = std::thread::Builder::new()
             .name("camera-enumerate".into())
-            .spawn(move || match cameras::devices() {
+            .spawn(move || match cameras::devices().map(capture_only) {
                 Ok(list) => {
                     // Ids as well as names: enumeration *order* is not stable
                     // across launches (task 17), so a log that only says "2
@@ -84,4 +84,31 @@ fn use_devices() -> UseDevices {
         ready,
         refresh,
     }
+}
+
+/// Drops devices that cannot capture video.
+///
+/// **Linux lists every `/dev/video*` node**, and a USB webcam has more than
+/// one: a capture node and a metadata node, under the same name. `cameras`
+/// returns them all, so each camera appeared two or more times in the menu
+/// (seen on a Panther Lake laptop with a Logitech). A metadata node offers no
+/// video formats, which is the test applied here: probe each, keep those with
+/// at least one. Elsewhere the platform lists cameras only, so nothing changes.
+fn capture_only(list: Vec<Device>) -> Vec<Device> {
+    if !cfg!(target_os = "linux") {
+        return list;
+    }
+    list.into_iter()
+        .filter(|device| match cameras::probe(device) {
+            Ok(capabilities) if !capabilities.formats.is_empty() => true,
+            Ok(_) => {
+                tracing::debug!("skipping {} ({}): no video formats", device.name, device.id.0);
+                false
+            }
+            Err(error) => {
+                tracing::debug!("skipping {} ({}): {error}", device.name, device.id.0);
+                false
+            }
+        })
+        .collect()
 }
