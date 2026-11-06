@@ -39,6 +39,10 @@ use fixed_resample::{ResamplingChannelConfig, ResamplingCons, ResamplingProd, re
 use sonora::config::{EchoCanceller, GainController2, NoiseSuppression, NoiseSuppressionLevel};
 use sonora::{AudioProcessing, StreamConfig};
 
+/// vid patch: the type [`Control::statistics`] returns, so callers need no
+/// direct (and version-matched) dependency on sonora.
+pub use sonora::AudioProcessingStats;
+
 use crate::Error;
 use crate::playback::{self, REFERENCE_CHANNELS};
 
@@ -146,6 +150,8 @@ impl Control {
 			config,
 			state: Arc::new(Mutex::new(State::default())),
 			shared: shared.clone(),
+			stats: Mutex::new(None),
+			reference: Mutex::new(None),
 		});
 
 		shared.set_reference(Reference {
@@ -233,6 +239,23 @@ impl Control {
 		})
 	}
 
+	/// The canceller's own measure of how it is doing: echo-return-loss
+	/// enhancement, its delay estimate and more (sonora's
+	/// `AudioProcessingStats`), refreshed about once a second.
+	///
+	/// `None` until a microphone has attached and the first second has passed.
+	/// vid patch, not in moq-audio 0.1.21.
+	pub fn statistics(&self) -> Option<AudioProcessingStats> {
+		self.inner.stats.lock().ok().and_then(|stats| stats.clone())
+	}
+
+	/// How many 10 ms reference frames (what the speakers played) the canceller
+	/// received over the last second, and their RMS level. Zero frames means it
+	/// is cancelling against nothing. vid patch, not in moq-audio 0.1.21.
+	pub fn reference_activity(&self) -> Option<(u32, f32)> {
+		self.inner.reference.lock().ok().and_then(|reference| *reference)
+	}
+
 	/// Number of microphone samples waiting for a complete AEC frame.
 	#[cfg(test)]
 	pub(crate) fn pending_samples(&self) -> usize {
@@ -275,6 +298,33 @@ impl Attachment {
 			state.reset();
 		}
 		state.process(buf, enabled);
+
+		// vid patch: the statistics, copied out once a second while the lock is
+		// already held. Read from another thread they would take this lock, and
+		// a contended callback passes its buffer through *uncancelled* -- a
+		// stats reader would leak echo. `try_lock` so this never waits either.
+		let now = std::time::Instant::now();
+		if state.stats_at.is_none_or(|at| now.duration_since(at) >= STATS_EVERY) {
+			state.stats_at = Some(now);
+			if let Some(processor) = &state.processor
+				&& let Ok(mut slot) = self.inner.stats.try_lock()
+			{
+				*slot = Some(processor.statistics().clone());
+			}
+			// What the canceller was told was played over that second: whether
+			// a speaker signal reaches it at all, and how loud.
+			let rms = if state.reference_samples == 0 {
+				0.0
+			} else {
+				(state.reference_energy / state.reference_samples as f64).sqrt() as f32
+			};
+			if let Ok(mut slot) = self.inner.reference.try_lock() {
+				*slot = Some((state.reference_frames, rms));
+			}
+			state.reference_frames = 0;
+			state.reference_energy = 0.0;
+			state.reference_samples = 0;
+		}
 	}
 
 	/// Discard partial frames before processing the next capture buffer.
@@ -313,7 +363,14 @@ struct Inner {
 	state: Arc<Mutex<State>>,
 	/// The engine's registry, so dropping the last clone removes the tap.
 	shared: Arc<playback::Shared>,
+	/// vid patch: the latest statistics, written by the microphone callback.
+	stats: Mutex<Option<sonora::AudioProcessingStats>>,
+	/// vid patch: reference frames read over the last second, and their RMS.
+	reference: Mutex<Option<(u32, f32)>>,
 }
+
+/// vid patch: how often the microphone callback copies the statistics out.
+const STATS_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Drop for Inner {
 	fn drop(&mut self) {
@@ -328,6 +385,12 @@ impl Drop for Inner {
 struct State {
 	/// `None` until a microphone opens and reports its format.
 	processor: Option<AudioProcessing>,
+	/// vid patch: when the statistics were last copied out.
+	stats_at: Option<std::time::Instant>,
+	/// vid patch: reference frames read, and their energy, since the last copy.
+	reference_frames: u32,
+	reference_energy: f64,
+	reference_samples: u64,
 	capture: StreamConfig,
 	/// Reference from the output mixer, replaced whenever the output stream is
 	/// rebuilt and `None` while none is running.
@@ -356,6 +419,10 @@ impl Default for State {
 	fn default() -> Self {
 		Self {
 			processor: None,
+			stats_at: None,
+			reference_frames: 0,
+			reference_energy: 0.0,
+			reference_samples: 0,
 			// Replaced by `Control::attach`; nothing is processed before then.
 			capture: reference_config(),
 			reference: None,
@@ -410,6 +477,11 @@ impl State {
 			render_out,
 			capture_in,
 			capture_out,
+			// vid patch: read by `Attachment::process`, not here.
+			stats_at: _,
+			reference_frames,
+			reference_energy,
+			reference_samples,
 		} = self;
 
 		// No microphone has been opened against this canceller, so there is
@@ -451,8 +523,15 @@ impl State {
 		// than the last output callback, so it leads the echo by however much
 		// the output device buffers, however little that is.
 		if let Some(reference) = reference {
+			// vid patch: kept ready on every callback too, since a channel reset
+			// clears it, and a cleared flag is the same deadlock as in `rebuild`.
+			reference.set_output_stream_ready(true);
 			while reference.available_frames() >= REFERENCE_FRAME {
 				reference.read_interleaved(reference_frame, false);
+				// vid patch: what the canceller is actually told was played.
+				*reference_frames += 1;
+				*reference_energy += reference_frame.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>();
+				*reference_samples += reference_frame.len() as u64;
 				deinterleave(reference_frame, render_in, REFERENCE_CHANNELS);
 				let _ = process_render(processor, render_in, render_out);
 			}
@@ -591,7 +670,14 @@ impl Reference {
 			return false;
 		}
 
-		let (prod, cons) = channel(rate);
+		let (prod, mut cons) = channel(rate);
+		// vid patch, the echo fix: mark this end ready now. fixed-resample
+		// discards every push until the consumer has *read* once, and the
+		// capture side only reads once a whole frame is waiting, so neither
+		// side ever moved in 0.0.22, and echo went straight through (measured in
+		// vid: 0 reference frames a second). Whether 0.1.21 still needs this is
+		// open; see PATCH.md.
+		cons.set_output_stream_ready(true);
 		self.state.lock().unwrap().reference = Some(cons);
 		self.pending = Some(prod);
 		true
@@ -1150,3 +1236,4 @@ mod tests {
 		assert_eq!(round, interleaved);
 	}
 }
+
