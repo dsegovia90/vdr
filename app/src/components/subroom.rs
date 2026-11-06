@@ -44,9 +44,26 @@ const TRACK: f64 = 160.0;
 #[derive(Clone, Copy)]
 pub struct Rooms(pub Signal<BTreeMap<String, Option<String>>>);
 
-/// Makes the shared [`Rooms`] available to the tiles and the menu below.
+/// Who invites us, to which room (`None` is main), keyed by inviter. Written
+/// by our own tile, which already samples our entry, and read here; the same
+/// half-second lag as [`Rooms`].
+#[derive(Clone, Copy)]
+pub struct Invites(pub Signal<BTreeMap<String, Option<String>>>);
+
+/// Makes the shared [`Rooms`] and [`Invites`] available to the tiles and the
+/// menu below.
 pub fn use_rooms_provider() {
     use_context_provider(|| Rooms(Signal::new(BTreeMap::new())));
+    use_context_provider(|| Invites(Signal::new(BTreeMap::new())));
+}
+
+/// Moves us to `room` (`None` is main). Ours is written straight into the map
+/// as well as told to the room, so the bar's button changes on the click
+/// rather than at our tile's next sample. Shared by this menu and the tile
+/// menus' "Join".
+pub(super) fn join(local: &PeerStats, mut rooms: Signal<BTreeMap<String, Option<String>>>, me: &str, room: Option<String>) {
+    local.set_room(room.clone());
+    rooms.write().insert(me.to_string(), room);
 }
 
 /// The out-of-room volume and mute as last set, for the page: the menu writes
@@ -78,20 +95,29 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
     let OpenMenu(mut current) = use_context::<OpenMenu>();
     let Rooms(rooms) = use_context::<Rooms>();
     let shown = props.shown;
-    let open = move || shown && current() == Some(NAME);
+    let open = move || shown && current.read().as_deref() == Some(NAME);
     // **Closed when the call goes.** The open flag is the page's, so left set
     // through a reconnect it would bring the panel and its click-away layer
     // back open the moment the call returned.
     use_effect(use_reactive!(|shown| {
-        if !shown && *current.peek() == Some(NAME) {
+        if !shown && current.peek().as_deref() == Some(NAME) {
             current.set(None);
         }
     }));
     let CrosstalkLevel(mut crosstalk) = use_context::<CrosstalkLevel>();
     let mut dragging = use_signal(|| false);
 
+    let Invites(invites) = use_context::<Invites>();
     let map = rooms.read().clone();
     let mine = map.get(&props.me).cloned().flatten();
+    // An invite to where we already are is hidden at once, ahead of the
+    // inviter's next document withdrawing it.
+    let invited: Vec<(String, Option<String>)> = invites
+        .read()
+        .iter()
+        .filter(|(_, room)| **room != mine)
+        .map(|(from, room)| (from.clone(), room.clone()))
+        .collect();
     let subrooms = open_subrooms(&map);
     let label = mine.clone().unwrap_or_else(|| "Main room".to_string());
 
@@ -101,9 +127,7 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
         let local = props.local.clone();
         let me = props.me.clone();
         move |room: Option<String>| {
-            let mut rooms = rooms;
-            local.set_room(room.clone());
-            rooms.write().insert(me.clone(), room);
+            join(&local, rooms, &me, room);
             current.set(None);
         }
     };
@@ -142,10 +166,15 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
                     "relative z-[6] flex h-10 max-w-48 flex-row items-center gap-1.5 rounded-full bg-neutral-800 px-4 text-sm text-white hover:bg-neutral-700"
                 },
                 onclick: move |_| {
-                    let next = if open() { None } else { Some(NAME) };
+                    let next = if open() { None } else { Some(NAME.to_string()) };
                     current.set(next);
                 },
                 span { class: "truncate", "{label}" }
+                // Someone invites us. Without it an invite is invisible until
+                // the menu is opened.
+                if !invited.is_empty() {
+                    span { class: "h-2 w-2 shrink-0 rounded-full bg-emerald-400" }
+                }
                 span { class: "shrink-0 text-xs text-neutral-400", "\u{25BE}" }
             }
             // **Mounted always, hidden while closed -- never removed**, as in
@@ -164,6 +193,18 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
                     } else {
                         "hidden absolute bottom-full right-0 z-10 mb-2 w-72 rounded-lg border border-neutral-700 bg-neutral-900 p-1"
                     },
+                    for (from, room) in invited.iter() {
+                        div {
+                            key: "invite:{from}",
+                            class: "mb-1 rounded px-2.5 py-2 text-sm bg-emerald-600 text-white",
+                            onclick: {
+                                let mut join = join.clone();
+                                let room = room.clone();
+                                move |_| join(room.clone())
+                            },
+                            {invite_text(room, from)}
+                        }
+                    }
                     div { class: "px-2.5 pb-1 pt-1.5 text-xs text-neutral-500", "Subrooms" }
                     if subrooms.is_empty() {
                         div { class: "px-2.5 py-2 text-sm text-neutral-500", "None open" }
@@ -280,6 +321,13 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
     }
 }
 
+/// An invite's row: where to, and from whom by short id.
+fn invite_text(room: &Option<String>, from: &str) -> String {
+    let to = room.as_deref().unwrap_or("main room");
+    let by: String = from.chars().take(8).collect();
+    format!("Join {to} \u{b7} invited by {by}")
+}
+
 /// Who is in a subroom, for its row: short ids, and "you" for us.
 fn who(members: &[String], me: &str) -> String {
     members
@@ -367,7 +415,8 @@ mod tests {
         // `w-72` (288) less `p-1` and the row's `px-2.5` each side is 260;
         // the row is the track, `gap-3`, `w-10`, `gap-3`, the `w-8` button,
         // all `shrink-0`, so an overflow pushes the button outside the border.
-        assert!(TRACK + 12.0 + 40.0 + 12.0 + 32.0 <= 260.0);
+        const ROW: f64 = TRACK + 12.0 + 40.0 + 12.0 + 32.0;
+        const { assert!(ROW <= 260.0) };
     }
 
     #[test]

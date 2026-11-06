@@ -36,6 +36,9 @@ const POLL: Duration = Duration::from_millis(66);
 struct Meter {
     level: f32,
     status: MicStatus,
+    /// Whether the mic is on, which a peer's mute request can change from
+    /// outside this control; the button follows it.
+    enabled: bool,
 }
 
 #[derive(Clone, PartialEq, Props)]
@@ -96,7 +99,14 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
         }
     });
 
-    let tx = use_channel(move |next: Meter| meter.set(next));
+    let tx = use_channel(move |next: Meter| {
+        // A peer muting us turns the mic off behind the button's back; this
+        // is how the button finds out, within one sample.
+        if *muted.peek() == next.enabled {
+            muted.set(!next.enabled);
+        }
+        meter.set(next);
+    });
     use_hook({
         let audio = props.audio.clone();
         let local = props.local.clone();
@@ -111,6 +121,7 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
                         let next = Meter {
                             level: audio.level(),
                             status: audio.status(),
+                            enabled: audio.enabled(),
                         };
                         local.set_talking(talking.push(next.level));
                         if tx.unbounded_send(next).is_err() {
@@ -165,6 +176,10 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
                         muted.set(next);
                         audio.set_enabled(!next);
                         local.set_mic(!next);
+                        // Only our own unmute clears who muted us.
+                        if !next {
+                            local.set_muted_by(None);
+                        }
                     }
                 },
                 MicIcon { off }

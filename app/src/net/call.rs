@@ -40,7 +40,7 @@ use super::status::RemoteStatus;
 use super::ParticipantEvent;
 use crate::args::Peering;
 use super::Metrics;
-use super::metrics::{Clock, FpsMeter, PeerStats};
+use super::metrics::{Ask, Clock, FpsMeter, PeerStats, Request};
 use crate::audio::Controls;
 use crate::camera::{FrameFeed, FrameSlot, encode_size, from_decoded};
 
@@ -313,6 +313,11 @@ struct Presence {
     /// build without subrooms sends, and such a build reads as the main room.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     room: Option<String>,
+    /// What we are asking of single peers: an invite to our room, a mute.
+    /// Absent when empty, so a document with no requests is what a build
+    /// without them sends, and such a build ignores the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requests: Vec<Request>,
 }
 
 impl Default for Presence {
@@ -323,6 +328,7 @@ impl Default for Presence {
             mic: true,
             clock: None,
             room: None,
+            requests: Vec::new(),
         }
     }
 }
@@ -336,6 +342,7 @@ impl Presence {
             mic: local.mic_on(),
             clock: local.clock(),
             room: local.room(),
+            requests: local.requests(),
         }
     }
 }
@@ -1118,6 +1125,10 @@ async fn run(
         metrics.clear();
         drop(aec_report);
         controls.detach();
+        // Requests went to a room that is gone, and "muted by" was about it.
+        // The mic button stays red if the mic is still off, which is honest
+        // on its own.
+        local.clear_asks();
         // The subroom was in a room that is gone now: the next call starts in
         // its main room, not in a name nobody else is using.
         local.set_room(None);
@@ -1317,6 +1328,12 @@ async fn attend(
     // Where the per-participant readers report a goodbye. One arbiter, so the
     // rule for "is the call over" is written once.
     let (saying, mut said) = futures_channel::mpsc::unbounded::<String>();
+    // What peers ask of us, shared by every presence reader in this call.
+    let asked = Asked {
+        me: me.clone(),
+        rooms: rooms.clone(),
+        seen: Arc::default(),
+    };
 
     loop {
         let update = tokio::select! {
@@ -1371,6 +1388,7 @@ async fn attend(
                             id.to_string(),
                             saying.clone(),
                             people.entry(id.to_string()).or_default().clone(),
+                            asked.clone(),
                         ))),
                     );
                 }
@@ -1484,11 +1502,17 @@ async fn announce(
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
     loop {
         ticker.tick().await;
+        local.expire_asks(ASK_FOR);
         let now = Presence::here(&local);
-        let changed = (now.camera, now.mic, &now.room) != (said.camera, said.mic, &said.room);
+        let changed = (now.camera, now.mic, &now.room, &now.requests)
+            != (said.camera, said.mic, &said.room, &said.requests);
         if changed {
+            let asking = match now.requests.len() {
+                0 => String::new(),
+                n => format!(", asking {n}"),
+            };
             tracing::info!(
-                "now camera {}, mic {}, room {}",
+                "now camera {}, mic {}, room {}{asking}",
                 on_off(now.camera),
                 on_off(now.mic),
                 room_name(&now.room)
@@ -1505,6 +1529,10 @@ async fn announce(
 /// How often our clock pairing is re-said. Clocks drift slowly; this is about
 /// a peer that joins late having one soon, not about precision.
 const CLOCK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a request is said before we give up on it. An invite nobody
+/// accepts simply goes away; there is no decline.
+const ASK_FOR: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
@@ -1585,7 +1613,14 @@ async fn listen(
     id: String,
     saying: UnboundedSender<String>,
     stats: Arc<PeerStats>,
+    asked: Asked,
 ) {
+    // Their invite lasts exactly as long as this reader: the leave aborts it
+    // rather than letting it return, so a guard is what drops it.
+    let _invited = Invited {
+        local: asked.rooms.local.clone(),
+        from: id.clone(),
+    };
     let track = match broadcast.track(PRESENCE) {
         Ok(track) => track,
         Err(error) => {
@@ -1617,6 +1652,7 @@ async fn listen(
                 mic,
                 clock,
                 room,
+                requests,
             })) => {
                 let room = subroom(room);
                 if let Some(clock) = clock {
@@ -1634,7 +1670,8 @@ async fn listen(
                 stats.set_mic(mic);
                 // Read by their audio task on every frame, which is what sets
                 // how loud they are to us.
-                stats.set_room(room);
+                stats.set_room(room.clone());
+                asked.act(&id, &room, mic, &requests);
                 if state == State::Leaving {
                     // Reported, not acted on: whether the call is over is a
                     // question about everyone, and the loop that tracks
@@ -1649,6 +1686,88 @@ async fn listen(
                 return;
             }
         }
+    }
+}
+
+/// What a presence reader needs to act on requests addressed to us: who we
+/// are, our own entry and mic, and what this call has already honoured.
+#[derive(Clone)]
+struct Asked {
+    me: String,
+    /// `audio::Rooms` is exactly our entry and our controls, reused as is.
+    rooms: audio::Rooms,
+    /// `(from, nonce)` of every mute honoured in this call. Per call, not per
+    /// reader: a peer whose control broadcast drops and returns gets a fresh
+    /// reader, which would otherwise honour a standing mute a second time
+    /// after we had unmuted.
+    seen: Arc<std::sync::Mutex<std::collections::HashSet<(String, u64)>>>,
+}
+
+impl Asked {
+    /// Acts on one document from `from`, whose room is `room` and whose mic
+    /// is `mic`.
+    fn act(&self, from: &str, room: &Option<String>, mic: bool, requests: &[Request]) {
+        let local = &self.rooms.local;
+        // As the asker: drop what they have already done.
+        local.settle(from, room, mic);
+        // As the addressee.
+        let (mute, invited) = asked_of(&self.me, requests);
+        if let Some(nonce) = mute {
+            // Marked seen even when the mic is already off, so a later unmute
+            // is not undone by the same request.
+            if honour(&self.seen, from, nonce) && local.mic_on() {
+                // The mic button's own path. `set_enabled` only flips a flag
+                // on the publication, so it is fine from this task.
+                self.rooms.controls.set_enabled(false);
+                local.set_mic(false);
+                local.set_muted_by(Some(from.to_string()));
+                tracing::info!("muted by {from}");
+            }
+        }
+        // Mirrored, not once per nonce: the invite stands exactly while their
+        // document carries it and we are not already in their room.
+        if invited && *room != local.room() {
+            local.set_invite(from, room.clone());
+        } else {
+            local.drop_invite(from);
+        }
+    }
+}
+
+/// What `from`'s requests ask of us: a mute to honour (its nonce), and
+/// whether we are invited. Requests to anyone else, and kinds from a later
+/// build, are ignored.
+fn asked_of(me: &str, requests: &[Request]) -> (Option<u64>, bool) {
+    let mut mute = None;
+    let mut invited = false;
+    for request in requests.iter().filter(|request| request.to == me) {
+        match request.kind {
+            Ask::Mute => mute = Some(request.nonce),
+            Ask::Invite => invited = true,
+            Ask::Unknown => {}
+        }
+    }
+    (mute, invited)
+}
+
+/// Whether `(from, nonce)` is new, marking it seen: a request is acted on
+/// once however many times the document carrying it is read.
+fn honour(seen: &std::sync::Mutex<std::collections::HashSet<(String, u64)>>, from: &str, nonce: u64) -> bool {
+    seen.lock()
+        .map(|mut seen| seen.insert((from.to_string(), nonce)))
+        .unwrap_or(false)
+}
+
+/// Drops one inviter's invite however their reader ends -- it is aborted
+/// when they leave, so nothing after its loop runs.
+struct Invited {
+    local: Arc<PeerStats>,
+    from: String,
+}
+
+impl Drop for Invited {
+    fn drop(&mut self) {
+        self.local.drop_invite(&self.from);
     }
 }
 
@@ -1807,13 +1926,74 @@ mod path_tests {
 
 #[cfg(test)]
 mod presence_tests {
-    use super::{Presence, State, subroom};
-    use crate::net::metrics::Clock;
+    use super::{Presence, State, asked_of, honour, subroom};
+    use crate::net::metrics::{Ask, Clock, Request};
+
+    fn request(to: &str, kind: Ask, nonce: u64) -> Request {
+        Request {
+            to: to.to_string(),
+            kind,
+            nonce,
+        }
+    }
+
+    #[test]
+    fn requests_survive_the_round_trip() {
+        let said = Presence {
+            requests: vec![request("a", Ask::Invite, 1), request("b", Ask::Mute, 2)],
+            ..Presence::default()
+        };
+        let json = serde_json::to_string(&said).unwrap();
+        assert!(json.contains(r#""kind":"invite""#), "{json}");
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard, said);
+    }
+
+    #[test]
+    fn no_requests_are_said_without_a_requests_key() {
+        let json = serde_json::to_string(&Presence::default()).unwrap();
+        assert!(!json.contains("requests"), "{json}");
+    }
+
+    #[test]
+    fn an_unknown_kind_does_not_lose_the_document() {
+        let json = r#"{"state":"here","mic":false,"room":"Kitchen",
+            "requests":[{"to":"x","kind":"wave","nonce":1},{"to":"y","kind":"mute","nonce":2}]}"#;
+        let heard: Presence = serde_json::from_str(json).unwrap();
+        assert_eq!(heard.requests[0].kind, Ask::Unknown);
+        assert_eq!(heard.requests[1], request("y", Ask::Mute, 2));
+        assert!(!heard.mic);
+        assert_eq!(heard.room.as_deref(), Some("Kitchen"));
+    }
+
+    #[test]
+    fn only_requests_to_us_are_ours() {
+        assert_eq!(asked_of("me", &[request("you", Ask::Mute, 1), request("you", Ask::Invite, 2)]), (None, false));
+        assert_eq!(asked_of("me", &[request("me", Ask::Mute, 7)]), (Some(7), false));
+        assert_eq!(asked_of("me", &[request("me", Ask::Invite, 8)]), (None, true));
+        assert_eq!(asked_of("me", &[request("me", Ask::Unknown, 9)]), (None, false));
+    }
+
+    #[test]
+    fn a_mute_is_honoured_once_per_nonce() {
+        let seen = std::sync::Mutex::default();
+        let document = [request("me", Ask::Mute, 5)];
+        let mut mutes = 0;
+        for _ in 0..2 {
+            if let (Some(nonce), _) = asked_of("me", &document) {
+                mutes += honour(&seen, "them", nonce) as u32;
+            }
+        }
+        assert_eq!(mutes, 1, "the same document read twice mutes once");
+        assert!(honour(&seen, "them", 6), "a new nonce mutes again");
+        assert!(honour(&seen, "other", 5), "the nonce is per asker");
+    }
 
     #[test]
     fn an_older_peer_without_the_flags_reads_as_on() {
         let old: Presence = serde_json::from_str(r#"{"state":"here"}"#).unwrap();
         assert_eq!(old, Presence::default());
+        assert!(old.requests.is_empty());
         assert!(old.camera && old.mic);
         assert_eq!(old.room, None, "an older peer is in the main room");
     }
@@ -1856,6 +2036,7 @@ mod presence_tests {
                 media_us: 42,
             }),
             room: None,
+            requests: Vec::new(),
         };
         let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
         assert_eq!(heard, said);

@@ -149,6 +149,8 @@ pub fn CallScreen() -> Element {
                                 who: participant.id.clone(),
                                 class: layout::TILE,
                                 dim: item.dim,
+                                local: remote.local.clone(),
+                                me: me.clone(),
                             }
                         } else {
                             ParticipantTile {
@@ -166,6 +168,8 @@ pub fn CallScreen() -> Element {
                                 who: me.clone(),
                                 class: layout::TILE,
                                 dim: item.dim,
+                                local: remote.local.clone(),
+                                me: me.clone(),
                             }
                         }
                         if let Some(class) = item.line_break {

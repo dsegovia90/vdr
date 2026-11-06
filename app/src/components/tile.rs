@@ -6,13 +6,16 @@
 //! cover the picture, and is one less thing that depends on the renderer.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use dioxus_native::prelude::*;
 
-use super::{MicIcon, ParticipantVideo, PersonIcon, Rooms};
+use super::device_menu::OpenMenu;
+use super::tile_menu::{TileMenu, menu_name};
+use super::{Invites, MicIcon, ParticipantVideo, PersonIcon, Rooms};
 use crate::audio::Crosstalk;
 use crate::camera::{FrameSlot, Mirror};
 use crate::channel::use_channel;
@@ -30,6 +33,11 @@ struct Reading {
     mic_on: bool,
     /// Their subroom. Not shown on the tile; passed on to the page's [`Rooms`].
     room: Option<String>,
+    /// Who muted us. Our own tile only; empty on a peer's.
+    muted_by: Option<String>,
+    /// Who invites us, to which room. Our own tile only; passed on to the
+    /// page's [`Invites`].
+    invites: BTreeMap<String, Option<String>>,
 }
 
 impl Default for Reading {
@@ -40,6 +48,8 @@ impl Default for Reading {
             camera_on: true,
             mic_on: true,
             room: None,
+            muted_by: None,
+            invites: BTreeMap::new(),
         }
     }
 }
@@ -64,12 +74,21 @@ pub struct ParticipantTileProps {
     /// -- them included -- sees the same colour for the same person. Not the
     /// label, which reads "You" on your own tile.
     pub who: String,
+    /// Ourselves: what a peer's tile menu asks through, and moves.
+    pub local: Arc<PeerStats>,
+    /// Our key in [`Rooms`]. The tile whose `who` is this is ours, and has no
+    /// menu.
+    pub me: String,
 }
 
 #[component]
 pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     let mut reading = use_signal(Reading::default);
     let Rooms(mut rooms) = use_context::<Rooms>();
+    let Invites(mut invites) = use_context::<Invites>();
+    let OpenMenu(mut current) = use_context::<OpenMenu>();
+    // Both are "" before the endpoint binds, and a peer's id is never ours.
+    let mine = props.who == props.me;
     // **Who, as of this render.** Our own tile's `who` changes once, when the
     // endpoint binds, and the callback below outlives that render; it reads
     // this rather than the props it was created with.
@@ -95,6 +114,9 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                 rooms.write().insert(key.clone(), next.room.clone());
             }
             written.replace(Some(key));
+            if mine && *invites.peek() != next.invites {
+                invites.set(next.invites.clone());
+            }
             if *reading.peek() != next {
                 reading.set(next);
             }
@@ -121,6 +143,8 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                         camera_on: stats.camera_on(),
                         mic_on: stats.mic_on(),
                         room: stats.room(),
+                        muted_by: stats.muted_by(),
+                        invites: stats.invites(),
                     };
                     if tx.unbounded_send(next).is_err() {
                         return;
@@ -151,6 +175,24 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     } else {
         "whitespace-nowrap text-xs text-neutral-200"
     };
+    // On our own tile only: a mic that went off by itself reads as a fault
+    // unless it says who did it.
+    let muted_by = now
+        .muted_by
+        .as_ref()
+        .map(|by| format!("muted by {}", by.chars().take(8).collect::<String>()));
+    let name = menu_name(&props.who);
+    let open = !mine && current.read().as_deref() == Some(name.as_str());
+    let our_room = rooms.read().get(&props.me).cloned().flatten();
+    // **No z-index while closed**, so the dim layer still covers it; lifted
+    // above its own click-away layer while open, so a second click closes it.
+    let label = if mine {
+        "absolute bottom-2 left-2 flex flex-row items-center gap-2 rounded-md bg-black/50 px-2 py-1"
+    } else if open {
+        "absolute bottom-2 left-2 z-[6] flex flex-row items-center gap-2 rounded-md bg-black/80 px-2 py-1"
+    } else {
+        "absolute bottom-2 left-2 flex flex-row items-center gap-2 rounded-md bg-black/50 px-2 py-1 hover:bg-black/70"
+    };
 
     rsx! {
         // **The box is the card.** It is sized by the layout to the video's
@@ -170,15 +212,26 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                     div { class: avatar, PersonIcon {} }
                 }
             }
-            // Over the video's bottom-left corner. It needs no clicks, so being
-            // laid over the video costs nothing even where overlays misbehave.
-            div { class: "absolute bottom-2 left-2 flex flex-row items-center gap-2 rounded-md bg-black/50 px-2 py-1",
+            // Over the video's bottom-left corner. On a peer's tile it opens
+            // their menu.
+            div {
+                class: label,
+                onclick: move |_| {
+                    if mine {
+                        return;
+                    }
+                    let next = if open { None } else { Some(name.clone()) };
+                    current.set(next);
+                },
                 // Always rendered, so the label does not shift sideways when
                 // someone starts talking.
                 div {
                     class: if now.talking { "h-2 w-2 shrink-0 rounded-full bg-emerald-400" } else { "h-2 w-2 shrink-0 rounded-full bg-neutral-500" },
                 }
                 span { class: text, "{props.label}{fps}" }
+                if let Some(muted_by) = muted_by {
+                    span { class: "whitespace-nowrap text-xs text-red-300", "\u{b7} {muted_by}" }
+                }
                 if !now.mic_on {
                     // Red and white, plain colours: an `oklch()` palette shade
                     // would leave the icon invisible (see `icons`).
@@ -186,12 +239,28 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                         MicIcon { off: true }
                     }
                 }
+                if !mine {
+                    span { class: "text-xs text-neutral-400", "\u{25BE}" }
+                }
+            }
+            // Beside the label, not inside it: a click on an item would
+            // otherwise bubble to the label and reopen the menu.
+            if !mine {
+                TileMenu {
+                    who: props.who.clone(),
+                    their_room: now.room.clone(),
+                    their_mic: now.mic_on,
+                    our_room,
+                    local: props.local.clone(),
+                    me: props.me.clone(),
+                }
             }
             // **Last, so it covers everything above, the talking dot
             // included**: these are positioned siblings without a z-index, so
             // they paint in order. Mounted always and hidden by class, so a
-            // change of room never adds or removes a node. Clicks fall through
-            // it to the card.
+            // change of room never adds or removes a node. `pointer-events-none`
+            // on every dim class lets clicks through it, so the label it covers
+            // still opens the menu.
             div { class: props.dim }
         }
     }
@@ -199,7 +268,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
 
 /// The dim layer, hidden: our own subroom, or crosstalk at full volume, where
 /// a subroom is only a label.
-pub(super) const UNDIMMED: &str = "hidden absolute inset-0 rounded-[12px]";
+pub(super) const UNDIMMED: &str = "hidden pointer-events-none absolute inset-0 rounded-[12px]";
 
 /// The dim layer over a tile outside our subroom, darker the quieter they are
 /// to us, so what you see agrees with what you hear. Five steps rather than a
@@ -208,12 +277,12 @@ pub(super) const UNDIMMED: &str = "hidden absolute inset-0 rounded-[12px]";
 /// The thresholds and alphas are first guesses, to be tuned by eye.
 pub(super) fn dim_class(level: Crosstalk) -> &'static str {
     match level.volume {
-        _ if level.muted => "absolute inset-0 rounded-[12px] bg-black/80",
+        _ if level.muted => "pointer-events-none absolute inset-0 rounded-[12px] bg-black/80",
         v if v >= 0.95 => UNDIMMED,
-        v if v >= 0.6 => "absolute inset-0 rounded-[12px] bg-black/30",
-        v if v >= 0.3 => "absolute inset-0 rounded-[12px] bg-black/50",
-        v if v > 0.0 => "absolute inset-0 rounded-[12px] bg-black/65",
-        _ => "absolute inset-0 rounded-[12px] bg-black/80",
+        v if v >= 0.6 => "pointer-events-none absolute inset-0 rounded-[12px] bg-black/30",
+        v if v >= 0.3 => "pointer-events-none absolute inset-0 rounded-[12px] bg-black/50",
+        v if v > 0.0 => "pointer-events-none absolute inset-0 rounded-[12px] bg-black/65",
+        _ => "pointer-events-none absolute inset-0 rounded-[12px] bg-black/80",
     }
 }
 

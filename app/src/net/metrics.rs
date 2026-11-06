@@ -19,7 +19,8 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 /// The echo canceller's grade of itself, from sonora's statistics, in the
 /// units a person reads: dB and ms.
@@ -241,6 +242,15 @@ pub struct PeerStats {
     /// The subroom they are in, as they say in their presence document, or
     /// `None` for the main room. For our own entry, the one we chose.
     room: std::sync::Mutex<Option<String>>,
+    /// What we are asking of other peers, each with when we asked. Our own
+    /// entry only; a peer's requests are acted on as they arrive, not kept.
+    asks: std::sync::Mutex<Vec<(Request, Instant)>>,
+    /// Who invites us, to which room (`None` is main). Our own entry only.
+    /// Keyed by inviter so each inviter's task writes only its own invite.
+    invites: std::sync::Mutex<BTreeMap<String, Option<String>>>,
+    /// The peer whose request turned our microphone off. Our own entry only;
+    /// cleared by our own unmute, nobody else's.
+    muted_by: std::sync::Mutex<Option<String>>,
     /// Delays of their frames this second, in ms, for the stats file.
     delays: std::sync::Mutex<Vec<u32>>,
     /// Audio frames decoded this second.
@@ -285,6 +295,35 @@ impl Clock {
     }
 }
 
+/// One peer asking one peer to do something, said in the asker's presence
+/// document. Every peer reads it; only `to` acts on it, once per nonce.
+///
+/// An invite carries no room: it means "join the room I am in", which the
+/// asker's own presence already says, so the two can never disagree.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Request {
+    pub to: String,
+    pub kind: Ask,
+    /// The asker's wall clock in µs when it asked: unique per asker without a
+    /// counter, and distinct across its restarts.
+    pub nonce: u64,
+}
+
+/// What a [`Request`] asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ask {
+    /// Join the asker's room.
+    Invite,
+    /// Turn your microphone off.
+    Mute,
+    /// A kind from a later build. Without this, an unknown kind would fail
+    /// the whole presence document, and a failed parse ends listening to
+    /// that peer.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Microseconds since the Unix epoch, by this machine's wall clock.
 pub fn wall_us() -> u64 {
     std::time::SystemTime::now()
@@ -315,6 +354,9 @@ impl Default for PeerStats {
             mic_on: AtomicBool::new(true),
             clock: std::sync::Mutex::new(None),
             room: std::sync::Mutex::new(None),
+            asks: std::sync::Mutex::new(Vec::new()),
+            invites: std::sync::Mutex::new(BTreeMap::new()),
+            muted_by: std::sync::Mutex::new(None),
             delays: std::sync::Mutex::new(Vec::new()),
             audio_frames: AtomicU32::new(0),
             audio_gaps: AtomicU32::new(0),
@@ -364,10 +406,119 @@ impl PeerStats {
     }
 
     /// Records which subroom they are in; `None` is the main room.
+    ///
+    /// On our own entry, a change of room also withdraws our invites: an
+    /// invite means "join the room I am in", and that room is no longer it.
+    /// Mutes stand. A peer's entry has no asks, so this costs it nothing.
     pub fn set_room(&self, room: Option<String>) {
-        if let Ok(mut slot) = self.room.lock() {
-            *slot = room;
+        let changed = match self.room.lock() {
+            Ok(mut slot) => {
+                let changed = *slot != room;
+                *slot = room;
+                changed
+            }
+            Err(_) => false,
+        };
+        if changed {
+            self.retain_asks(|request| request.kind != Ask::Invite);
         }
+    }
+
+    /// Asks `to` for something. Replaces a standing request of the same kind
+    /// to the same peer with a fresh nonce and time, so asking again both
+    /// refreshes the timeout and counts as a new request (a second mute after
+    /// they unmuted works).
+    pub fn ask(&self, to: &str, kind: Ask) {
+        if let Ok(mut asks) = self.asks.lock() {
+            asks.retain(|(request, _)| !(request.to == to && request.kind == kind));
+            let request = Request {
+                to: to.to_string(),
+                kind,
+                nonce: wall_us(),
+            };
+            asks.push((request, Instant::now()));
+        }
+    }
+
+    /// What we are asking, as our presence document says it.
+    pub fn requests(&self) -> Vec<Request> {
+        self.asks
+            .lock()
+            .map(|asks| asks.iter().map(|(request, _)| request.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Drops requests older than `ttl`.
+    pub fn expire_asks(&self, ttl: Duration) {
+        if let Ok(mut asks) = self.asks.lock() {
+            asks.retain(|(_, asked)| asked.elapsed() < ttl);
+        }
+    }
+
+    /// Drops what `to` has already done: our invite once they are in our
+    /// room, our mute once their mic is off. A satisfied request stops being
+    /// said within one document.
+    pub fn settle(&self, to: &str, their_room: &Option<String>, their_mic: bool) {
+        let ours = self.room();
+        self.retain_asks(|request| {
+            request.to != to
+                || match request.kind {
+                    Ask::Invite => *their_room != ours,
+                    Ask::Mute => their_mic,
+                    Ask::Unknown => true,
+                }
+        });
+    }
+
+    fn retain_asks(&self, keep: impl Fn(&Request) -> bool) {
+        if let Ok(mut asks) = self.asks.lock() {
+            asks.retain(|(request, _)| keep(request));
+        }
+    }
+
+    /// Who invites us, to which room (`None` is main).
+    pub fn invites(&self) -> BTreeMap<String, Option<String>> {
+        self.invites.lock().map(|invites| invites.clone()).unwrap_or_default()
+    }
+
+    /// Records that `from` invites us to `room`.
+    pub fn set_invite(&self, from: &str, room: Option<String>) {
+        if let Ok(mut invites) = self.invites.lock() {
+            if invites.get(from) != Some(&room) {
+                invites.insert(from.to_string(), room);
+            }
+        }
+    }
+
+    /// Forgets `from`'s invite, if any.
+    pub fn drop_invite(&self, from: &str) {
+        if let Ok(mut invites) = self.invites.lock() {
+            invites.remove(from);
+        }
+    }
+
+    /// The peer whose request muted us, until we unmute.
+    pub fn muted_by(&self) -> Option<String> {
+        self.muted_by.lock().ok().and_then(|by| by.clone())
+    }
+
+    /// Records who muted us; `None` once we unmute ourselves.
+    pub fn set_muted_by(&self, by: Option<String>) {
+        if let Ok(mut slot) = self.muted_by.lock() {
+            *slot = by;
+        }
+    }
+
+    /// Forgets our asks, our invites and who muted us, for when a call ends:
+    /// none of them means anything in the next one.
+    pub fn clear_asks(&self) {
+        if let Ok(mut asks) = self.asks.lock() {
+            asks.clear();
+        }
+        if let Ok(mut invites) = self.invites.lock() {
+            invites.clear();
+        }
+        self.set_muted_by(None);
     }
 
     /// Their latest camera-to-wall-clock mapping, if they have said one.
@@ -541,6 +692,80 @@ mod tests {
         let stats = PeerStats::default();
         stats.set_video_fps(0.0);
         assert_eq!(stats.video_fps(), Some(0.0));
+    }
+
+    fn kinds(stats: &PeerStats) -> Vec<(String, Ask)> {
+        stats.requests().into_iter().map(|r| (r.to, r.kind)).collect()
+    }
+
+    #[test]
+    fn asking_again_replaces_the_same_request_with_a_new_nonce() {
+        let stats = PeerStats::default();
+        stats.ask("a", Ask::Mute);
+        stats.ask("a", Ask::Invite);
+        let first = stats.requests()[0].nonce;
+        std::thread::sleep(Duration::from_millis(2));
+        stats.ask("a", Ask::Mute);
+        let requests = stats.requests();
+        assert_eq!(requests.len(), 2);
+        let mute = requests.iter().find(|r| r.kind == Ask::Mute).unwrap();
+        assert_ne!(mute.nonce, first);
+    }
+
+    #[test]
+    fn settling_drops_only_what_was_done() {
+        let stats = PeerStats::default();
+        stats.set_room(Some("Kitchen".into()));
+        for to in ["a", "b"] {
+            stats.ask(to, Ask::Invite);
+            stats.ask(to, Ask::Mute);
+        }
+        // `a` is still elsewhere with the mic on: nothing settles.
+        stats.settle("a", &None, true);
+        assert_eq!(stats.requests().len(), 4);
+        // `a` joins us: the invite goes, the mute stays.
+        stats.settle("a", &Some("Kitchen".into()), true);
+        // `b` turns the mic off: the mute goes, the invite stays.
+        stats.settle("b", &None, false);
+        assert_eq!(
+            kinds(&stats),
+            vec![("a".into(), Ask::Mute), ("b".into(), Ask::Invite)]
+        );
+    }
+
+    #[test]
+    fn asks_expire() {
+        let stats = PeerStats::default();
+        stats.ask("a", Ask::Invite);
+        stats.expire_asks(Duration::from_secs(30));
+        assert_eq!(stats.requests().len(), 1);
+        stats.expire_asks(Duration::ZERO);
+        assert!(stats.requests().is_empty());
+    }
+
+    #[test]
+    fn changing_room_withdraws_invites_but_not_mutes() {
+        let stats = PeerStats::default();
+        stats.ask("a", Ask::Invite);
+        stats.ask("a", Ask::Mute);
+        stats.set_room(None);
+        assert_eq!(stats.requests().len(), 2, "the same room keeps both");
+        stats.set_room(Some("Kitchen".into()));
+        assert_eq!(kinds(&stats), vec![("a".into(), Ask::Mute)]);
+    }
+
+    #[test]
+    fn invites_are_per_inviter_and_clear_at_teardown() {
+        let stats = PeerStats::default();
+        stats.set_invite("a", Some("Kitchen".into()));
+        stats.set_invite("b", None);
+        stats.drop_invite("a");
+        assert_eq!(stats.invites().into_iter().collect::<Vec<_>>(), vec![("b".into(), None)]);
+        stats.set_muted_by(Some("b".into()));
+        stats.ask("b", Ask::Mute);
+        stats.clear_asks();
+        assert!(stats.invites().is_empty() && stats.requests().is_empty());
+        assert_eq!(stats.muted_by(), None);
     }
 
     #[test]

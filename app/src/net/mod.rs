@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use dioxus_native::prelude::*;
 
-pub use metrics::{Metrics, PeerStats};
+pub use metrics::{Ask, Metrics, PeerStats};
 pub use status::RemoteStatus;
 
 use crate::args::{Args, Peering};

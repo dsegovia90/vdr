@@ -154,6 +154,12 @@ impl PartialEq for Controls {
 }
 
 impl Controls {
+    /// Whether the microphone is on: the last [`set_enabled`](Self::set_enabled),
+    /// whoever called it -- our own button, or a peer's mute request.
+    pub fn enabled(&self) -> bool {
+        self.mic.lock().map(|mic| mic.enabled).unwrap_or(true)
+    }
+
     /// Mute or unmute.
     ///
     /// Muting releases the device rather than publishing silence, so the track

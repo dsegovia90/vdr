@@ -14,7 +14,10 @@ use dioxus_native::prelude::*;
 /// value, opening a menu *is* closing the other. Provided by the page with
 /// [`use_open_menu_provider`].
 #[derive(Clone, Copy)]
-pub struct OpenMenu(pub(super) Signal<Option<&'static str>>);
+///
+/// A string rather than a `&'static str` because a tile's menu is named after
+/// its person (`"tile:{id}"`); no bar menu's name has a colon.
+pub struct OpenMenu(pub(super) Signal<Option<String>>);
 
 /// Makes the shared [`OpenMenu`] available to every menu below.
 pub fn use_open_menu_provider() {
@@ -61,7 +64,7 @@ pub struct DeviceMenuProps {
 pub fn DeviceMenu(props: DeviceMenuProps) -> Element {
     let OpenMenu(mut current) = use_context::<OpenMenu>();
     let name = props.name;
-    let open = move || current() == Some(name);
+    let open = move || current.read().as_deref() == Some(name);
 
     rsx! {
         div { class: "relative",
@@ -74,7 +77,7 @@ pub fn DeviceMenu(props: DeviceMenuProps) -> Element {
                     "relative z-[6] flex h-10 w-6 items-center justify-center rounded-md text-xs text-neutral-400 hover:bg-neutral-800"
                 },
                 onclick: move |_| {
-                    let next = if open() { None } else { Some(name) };
+                    let next = if open() { None } else { Some(name.to_string()) };
                     current.set(next);
                 },
                 "\u{25BE}"

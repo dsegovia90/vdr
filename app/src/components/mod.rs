@@ -12,6 +12,7 @@ mod participant;
 mod stats;
 mod subroom;
 mod tile;
+mod tile_menu;
 
 pub use bar::ControlBar;
 pub use button::{Button, Size, Tone};
@@ -22,5 +23,5 @@ pub use connect::ConnectRow;
 pub use microphone::MicControl;
 pub use participant::ParticipantVideo;
 pub use stats::StatsRow;
-pub use subroom::{CrosstalkLevel, Rooms, SubroomMenu, use_crosstalk_provider, use_rooms_provider};
+pub use subroom::{CrosstalkLevel, Invites, Rooms, SubroomMenu, use_crosstalk_provider, use_rooms_provider};
 pub use tile::ParticipantTile;
