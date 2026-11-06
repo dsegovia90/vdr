@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the macOS app and zips it for sending to someone.
 #
-#   deploy/client/package-macos.sh      # writes dist/vid-macos-arm64-<commit>.zip
+#   deploy/client/package-macos.sh      # writes dist/vid-macos-<arch>-<commit>.zip
 #
 # `dx build`, not `dx bundle`: `dx bundle` hands off to a bundler that writes
 # its own minimal Info.plist and drops the camera and microphone usage keys,
@@ -11,9 +11,23 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root/app"
 
-dx build --renderer native --release
-
 app="target/dx/vdr/release/macos/Vdr.app"
+
+# **Universal: one app for Apple Silicon and Intel Macs.** Intel is a plain
+# cross-compile here (same SDK, no extra toolchain beyond the rustup target),
+# and each target keeps its own cargo output, so both binaries survive and
+# `lipo` joins them. Intel first, so the bundle dx leaves behind is the native
+# one, then the binary inside it is replaced with the joined one.
+rustup target add x86_64-apple-darwin >/dev/null
+dx build --renderer native --release --target x86_64-apple-darwin
+dx build --renderer native --release --target aarch64-apple-darwin
+lipo -create \
+  target/aarch64-apple-darwin/desktop-release/vdr \
+  target/x86_64-apple-darwin/desktop-release/vdr \
+  -output "$app/Contents/MacOS/vdr"
+# Joining drops the linker's ad-hoc signature, and Apple Silicon will not run
+# an unsigned binary at all. Re-sign ad-hoc: the same as before, nothing more.
+codesign --force --sign - "$app"
 plist="$app/Contents/Info.plist"
 for key in NSCameraUsageDescription NSMicrophoneUsageDescription; do
   /usr/libexec/PlistBuddy -c "Print :$key" "$plist" >/dev/null \
@@ -21,6 +35,7 @@ for key in NSCameraUsageDescription NSMicrophoneUsageDescription; do
 done
 
 arch="$(lipo -archs "$app/Contents/MacOS/vdr" | tr ' ' '+')"
+[ "$arch" = "x86_64+arm64" ] && arch=universal
 # The commit names the package; VID_COMMIT wins when set (see build-linux.sh).
 commit="${VID_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 out="$root/dist/vid-macos-$arch-$commit.zip"
