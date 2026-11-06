@@ -93,8 +93,11 @@ pub fn ControlBar(props: ControlBarProps) -> Element {
                 StatsRow { metrics: props.metrics.clone() }
             }
             // Only on a call: before one there is no room to divide.
-            if status.is_connected() {
-                SubroomMenu { audio: props.audio.clone(), local: props.local.clone(), me: props.me.clone() }
+            SubroomMenu {
+                audio: props.audio.clone(),
+                local: props.local.clone(),
+                me: props.me.clone(),
+                shown: status.is_connected(),
             }
             if leaving {
                 button {

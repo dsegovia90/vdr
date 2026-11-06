@@ -24,8 +24,12 @@ use crate::settings::Settings;
 /// This menu's name in the page's [`OpenMenu`].
 const NAME: &str = "subroom";
 
-/// The slider track's width in pixels: `w-48`. The two must change together.
-const TRACK: f64 = 192.0;
+/// The slider track's width in pixels: `w-40`. The two must change together.
+///
+/// Sized to fit the panel: `w-72` less its padding leaves 260 px for the
+/// slider row, which holds this, the percentage (`w-10`), the mute button
+/// (`w-8`) and two `gap-3`s.
+const TRACK: f64 = 160.0;
 
 /// Everyone's subroom, keyed by endpoint id: `None` is the main room. One map
 /// for the page, written by each tile as it samples its person, and read here.
@@ -48,13 +52,24 @@ pub struct SubroomMenuProps {
     pub local: Arc<PeerStats>,
     /// Our key in [`Rooms`], the same `who` our own tile has.
     pub me: String,
+    /// Whether we are on a call. Off a call the menu is hidden, not removed.
+    pub shown: bool,
 }
 
 #[component]
 pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
     let OpenMenu(mut current) = use_context::<OpenMenu>();
     let Rooms(rooms) = use_context::<Rooms>();
-    let open = move || current() == Some(NAME);
+    let shown = props.shown;
+    let open = move || shown && current() == Some(NAME);
+    // **Closed when the call goes.** The open flag is the page's, so left set
+    // through a reconnect it would bring the panel and its click-away layer
+    // back open the moment the call returned.
+    use_effect(use_reactive!(|shown| {
+        if !shown && *current.peek() == Some(NAME) {
+            current.set(None);
+        }
+    }));
     let mut crosstalk = use_signal({
         let audio = props.audio.clone();
         move || audio.crosstalk()
@@ -101,7 +116,9 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
     let shown = if now.muted { "Muted".to_string() } else { format!("{pct}%") };
 
     rsx! {
-        div { class: "relative shrink-0",
+        // **Mounted always, hidden off a call**, for the F9 reason below: the
+        // panel and layer under it carry a positive z-index.
+        div { class: if props.shown { "relative shrink-0" } else { "hidden relative shrink-0" },
             // Lifted above the click-catching layer for the reason the device
             // menus' ▾ are.
             button {
@@ -186,7 +203,7 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
                         // the same left edge, so `element_coordinates` gives
                         // the same x whichever of them the pointer is over.
                         div {
-                            class: "flex h-5 w-48 shrink-0 flex-row items-center",
+                            class: "flex h-5 w-40 shrink-0 flex-row items-center",
                             onmousedown: {
                                 let mut set_volume = set_volume.clone();
                                 move |evt: MouseEvent| {
@@ -212,7 +229,7 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
                                 let mut release = release;
                                 move |_| release()
                             },
-                            div { class: "relative h-2 w-48 rounded-full bg-neutral-700",
+                            div { class: "relative h-2 w-40 rounded-full bg-neutral-700",
                                 div {
                                     class: if now.muted {
                                         "absolute left-0 top-0 h-2 rounded-full bg-neutral-500"
@@ -293,6 +310,14 @@ pub(crate) fn open_subrooms(rooms: &BTreeMap<String, Option<String>>) -> Vec<(St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_slider_row_fits_the_panel() {
+        // `w-72` (288) less `p-1` and the row's `px-2.5` each side is 260;
+        // the row is the track, `gap-3`, `w-10`, `gap-3`, the `w-8` button,
+        // all `shrink-0`, so an overflow pushes the button outside the border.
+        assert!(TRACK + 12.0 + 40.0 + 12.0 + 32.0 <= 260.0);
+    }
 
     #[test]
     fn the_first_subroom_is_room_1() {
