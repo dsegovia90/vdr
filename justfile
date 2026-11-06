@@ -67,10 +67,24 @@ package-linux:
     scp -q "desktop:projects/vid/dist/vid-linux-x86_64-$commit.tar.gz" dist/
     echo "dist/vid-linux-x86_64-$commit.tar.gz"
 
-# Both packages, after clearing older ones out of dist/.
+# Linux log: dist/linux-build.log.
+
+# Both packages at once: macOS here, Linux on `desktop`; clears old ones first.
 package:
+    #!/usr/bin/env bash
+    set -uo pipefail
     rm -f dist/vid-*.zip dist/vid-*.tar.gz
-    just package-mac package-linux
+    mkdir -p dist
+    just package-linux > dist/linux-build.log 2>&1 &
+    linux=$!
+    just package-mac; mac=$?
+    wait $linux; linux=$?
+    [ $linux -eq 0 ] || { echo "linux failed:"; tail -5 dist/linux-build.log; }
+    echo; ls -1 dist/vid-* 2>/dev/null
+    exit $(( mac || linux ))
+
+alias binaries := package
+alias ci := package
 
 # Follow this machine's app log (what testers send after a bad call).
 log:
