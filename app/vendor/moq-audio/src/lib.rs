@@ -3,8 +3,9 @@
 //! Counterpart to [`moq-video`](https://crates.io/crates/moq-video) for audio
 //! tracks, and shaped the same way. Sits on top of [`moq_mux`] and [`hang`] and
 //! adds the missing piece for native callers: Rust-native Opus and uncompressed
-//! PCM codecs that turn raw samples into HANG audio tracks and back, plus AAC-LC
-//! on the way in, which is what the gateways (RTMP, SRT, HLS, gstreamer) publish.
+//! PCM codecs that turn raw samples into HANG audio tracks and back, plus AAC-LC,
+//! which is what the gateways (RTMP, SRT, HLS, gstreamer) publish. AAC decodes in
+//! software and encodes only through a platform encoder.
 //!
 //! - `capture` describes an audio source (`capture::Config`) and grabs buffers
 //!   per platform: a microphone via cpal (CoreAudio / WASAPI / ALSA) everywhere,
@@ -26,16 +27,16 @@
 //! - [`decode`] subscribes to an encoded track and decodes it back to PCM.
 //!   [`decode::Consumer`] is the mirror of [`encode::Producer`]. It reads AAC-LC
 //!   too, behind the default-on `aac` feature, since a broadcast that came in
-//!   through a gateway is AAC rather than one of the two codecs we encode.
+//!   through a gateway is AAC rather than one of the codecs we encode in software.
 //! - `playback` plays decoded PCM out a speaker. `playback::Engine` owns the
 //!   output device and mixes the `playback::Sink`s registered with it, so one
 //!   device serves every track in a call. Requires the `playback` feature, so
 //!   these names are unlinked here too.
 //! - `aec` keeps the speaker out of the microphone, which is what a conference
 //!   on a laptop needs to not send itself back. `playback::Engine::canceller`
-//!   builds an `aec::Canceller` from the mix it is playing and
-//!   `capture::Config::aec` hands it to the microphone. Requires the `aec`
-//!   feature, which implies both of the above.
+//!   builds cloneable `aec::Control` handles from the mix it is playing and
+//!   `capture::Config::aec` attaches their adaptive state to one microphone at
+//!   a time. Requires the `aec` feature, which implies both of the above.
 //!
 //! [`Format`] mirrors WebCodecs `AudioData.format`; the helpers convert between
 //! any supported layout and the interleaved `f32` representation libopus
@@ -43,7 +44,7 @@
 //! [`Activity`] it was decoded from, which is how a caller tells coded audio
 //! from the frames an Opus sender withholds while its input is silent. PCM
 //! layout lives on the producer / consumer via [`encode::Input`] /
-//! [`decode::Config`], not on each frame, so callers can't drift between calls.
+//! [`decode::Output`], not on each frame, so callers can't drift between calls.
 
 #[cfg(feature = "aac")]
 mod aac;
@@ -51,6 +52,7 @@ mod activity;
 mod error;
 mod format;
 mod frame;
+mod layout;
 mod opus;
 mod pcm;
 mod resample;
@@ -69,4 +71,4 @@ pub use activity::Activity;
 pub use error::Error;
 pub use format::Format;
 pub use frame::Frame;
-pub use resample::Resampler;
+pub use layout::Layout;

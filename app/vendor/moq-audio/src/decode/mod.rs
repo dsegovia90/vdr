@@ -9,14 +9,16 @@
 //! - [`Decoder`] decodes packets you supply (bring your own payloads) into
 //!   [`Decoded`] interleaved `f32` samples.
 //!
-//! [`Config`] configures [`Consumer`]'s PCM output layout. The lower-level
-//! [`Decoder`] emits the codec-native sample rate and channel count from the
-//! catalog.
+//! [`Options`] keeps subscription and output policy separate from the
+//! lower-level decoder [`Config`], whose [`Kind`] picks the backend: a
+//! platform decoder first where one takes the track, then software (libopus,
+//! PCM, and symphonia for AAC-LC).
 
+mod backend;
 mod consumer;
 mod decoded;
 mod decoder;
 
-pub use consumer::Consumer;
+pub use consumer::{Consumer, Options, Output, Start};
 pub use decoded::Decoded;
-pub use decoder::{Config, Decoder};
+pub use decoder::{Config, Decoder, Kind};

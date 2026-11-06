@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.91"
 name = "moq-audio"
-version = "0.0.22"
+version = "0.1.21"
 authors = ["Luke Curley <kixelated@gmail.com>"]
 build = false
 autolib = false
@@ -65,18 +65,22 @@ capture = [
     "dep:objc2-screen-capture-kit",
 ]
 default = ["aac"]
-pipewire = ["cpal/pipewire"]
+pipewire = ["cpal?/pipewire"]
 playback = [
     "dep:cpal",
     "dep:fixed-resample",
     "dep:tokio",
     "dep:tracing",
 ]
-pulseaudio = ["cpal/pulseaudio"]
+pulseaudio = ["cpal?/pulseaudio"]
 
 [lib]
 name = "moq_audio"
 path = "src/lib.rs"
+
+[[test]]
+name = "import"
+path = "tests/import.rs"
 
 [[test]]
 name = "playback"
@@ -94,7 +98,7 @@ version = "0.18"
 optional = true
 
 [dependencies.fixed-resample]
-version = "0.12"
+version = "0.13"
 features = [
     "channel",
     "resampler",
@@ -103,17 +107,17 @@ optional = true
 default-features = false
 
 [dependencies.hang]
-version = "0.20.10"
+version = "0.21.22"
 
 [dependencies.kio]
-version = "0.5.7"
+version = "0.6.4"
 optional = true
 
 [dependencies.moq-mux]
-version = "0.9.13"
+version = "0.10.22"
 
 [dependencies.moq-net]
-version = "0.2.18"
+version = "0.3.21"
 
 [dependencies.rand]
 version = "0.10.1"
@@ -123,7 +127,7 @@ version = "0.5.1"
 optional = true
 
 [dependencies.rubato]
-version = "4.0"
+version = "5.0"
 default-features = false
 
 [dependencies.sonora]

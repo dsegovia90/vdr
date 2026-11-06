@@ -1,9 +1,9 @@
 //! Play decoded PCM out a speaker, via [`cpal`] (CoreAudio / WASAPI / ALSA).
 //!
 //! The playback counterpart to `capture`, and where a
-// `capture` is deliberately not a doc link: the module is behind the
-// off-by-default `capture` feature, so a link to it fails the `-D warnings`
-// rustdoc build of a playback-only build (what `moq-cli`'s `play` enables).
+// `capture` is deliberately not a doc link: the module is behind its own
+// feature, so a link to it fails the `-D warnings` rustdoc build of a
+// playback-only build (what `moq-cli`'s `play` enables).
 //! [`decode::Consumer`](crate::decode::Consumer) ends up:
 //!
 //! ```no_run
@@ -11,14 +11,17 @@
 //! use moq_audio::playback;
 //!
 //! let engine = playback::Engine::open(playback::Config::default()).await?;
-//! let mut sink = engine.sink(playback::Input {
-//!     sample_rate: audio.sample_rate(),
-//!     channels: audio.channels(),
-//!     ..Default::default()
-//! })?;
+//! let mut input = playback::Input::default();
+//! input.sample_rate = audio.sample_rate();
+//! input.layout = audio.layout();
+//!
+//! let mut sink = engine.sink(input)?;
 //!
 //! while let Some(frame) = audio.read().await? {
-//!     sink.write(&frame.data)?;
+//!     let write = sink.write(&frame.data)?;
+//!     if write.dropped_sample_frames > 0 {
+//!         eprintln!("dropped {} live audio frames", write.dropped_sample_frames);
+//!     }
 //! }
 //! # Ok(())
 //! # }
@@ -42,12 +45,12 @@ mod sink;
 use std::sync::Arc;
 
 pub use device::{Device, devices};
-pub use sink::{Control, Input, Sink};
+pub use sink::{Control, Input, Sink, Write};
 
 #[cfg(feature = "aec")]
 pub(crate) use driver::Shared;
 #[cfg(feature = "aec")]
-pub(crate) use mixer::BUS_CHANNELS;
+pub(crate) use mixer::REFERENCE_CHANNELS;
 
 use crate::Error;
 
@@ -117,8 +120,8 @@ impl Engine {
 			shared: shared.clone(),
 		};
 
-		// cpal streams are `!Send`, so the device has to live on the thread that
-		// opens it.
+		// Everything slow or fallible about the device happens here, off the async
+		// runtime: opening it, switching it, and rebuilding it after an error.
 		std::thread::Builder::new()
 			.name("moq-audio-playback".into())
 			.spawn(move || driver::run(requests, commands, shared, config.device, opened))
@@ -134,13 +137,14 @@ impl Engine {
 	/// Add a stream to the mix, taking PCM in the layout `input` describes.
 	///
 	/// Independent of the device: several sinks can play at different rates and
-	/// channel counts, and each is resampled on its way to the mix. One device
+	/// layouts, and each is resampled and remixed to the device's on its way to
+	/// the mix. One device
 	/// mixes up to 64 of them, past which this returns an error rather than
 	/// handing back a sink that plays nothing.
 	pub fn sink(&self, input: Input) -> Result<Sink, Error> {
 		let sink = self
 			.shared
-			.add(|id, rate| sink::new(id, rate, input, self.shared.clone(), self.handle.clone()))?;
+			.add(|id, rate, bus| sink::new(id, rate, bus, input, self.shared.clone(), self.handle.clone()))?;
 
 		// Covers the case where the mixer's command queue was momentarily full,
 		// so a sink is never left silently unmixed.
@@ -148,18 +152,17 @@ impl Engine {
 		Ok(sink)
 	}
 
-	/// Build an echo canceller that subtracts this engine's mix from a
-	/// microphone.
+	/// Build echo-cancellation controls for this engine and one microphone.
 	///
-	/// Hand the result to
-	/// [`capture::Config::aec`](crate::capture::Config::aec). At most one is
-	/// live per engine: a second call replaces the first, which then cancels
-	/// nothing. Clone the canceller instead if two places need to reach it.
+	/// Hand a clone to [`capture::Config::aec`](crate::capture::Config::aec) and
+	/// keep another for UI toggles. Only one control set can own this engine's
+	/// reference; a second call returns [`Error::Busy`] until every control and
+	/// microphone attachment from the first is dropped.
 	///
 	/// Requires the `aec` feature.
 	#[cfg(feature = "aec")]
-	pub fn canceller(&self, config: crate::aec::Config) -> crate::aec::Canceller {
-		crate::aec::Canceller::new(self.shared.clone(), config)
+	pub fn canceller(&self, config: crate::aec::Config) -> Result<crate::aec::Control, Error> {
+		crate::aec::Control::new(self.shared.clone(), config)
 	}
 
 	/// Move playback to the device `config` names, or back to the system default

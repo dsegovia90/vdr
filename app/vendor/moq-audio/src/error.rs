@@ -5,8 +5,9 @@
 #[derive(Clone, Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-	/// The requested configuration is outside what the codec supports, e.g. a
-	/// sample rate, channel count, or frame duration Opus can't encode. The
+	/// The requested configuration is outside what the codec or device supports,
+	/// e.g. a sample rate, channel count, or frame duration Opus can't encode, or a
+	/// capture format the microphone can't deliver. The
 	/// caller asked for something impossible; picking different settings fixes it.
 	#[error("unsupported audio configuration: {0}")]
 	Unsupported(String),
@@ -30,6 +31,11 @@ pub enum Error {
 	#[error("audio playback: {0}")]
 	Playback(String),
 
+	/// Exclusive audio processing state is already owned by another live
+	/// capture or playback handle.
+	#[error("audio resource already in use: {0}")]
+	Busy(String),
+
 	/// A packet could not be decoded: truncated, corrupt, or using a codec
 	/// feature this build doesn't implement. The stream itself may be fine, so a
 	/// consumer can log this one and read the next packet.
@@ -45,13 +51,13 @@ pub enum Error {
 		expected: usize,
 	},
 
-	/// Rubato resampler construction error.
+	/// The sample-rate converter could not be constructed.
 	#[error("resample construction: {0}")]
-	ResamplerConstruction(#[from] rubato::ResamplerConstructionError),
+	ResamplerConstruction(String),
 
-	/// Rubato resampler runtime error.
+	/// The sample-rate converter rejected an input buffer or ratio change.
 	#[error("resample: {0}")]
-	Resample(#[from] rubato::ResampleError),
+	Resample(String),
 
 	/// hang catalog error.
 	#[error(transparent)]

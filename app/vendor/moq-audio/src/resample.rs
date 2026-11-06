@@ -2,20 +2,44 @@
 //!
 //! Wraps [`rubato`] with a small interleaved-`f32` interface so the
 //! producer/consumer doesn't have to convert to planar on every call.
-//! The resampler keeps the channel layout unchanged; [`remix`] converts mono
-//! and stereo after sample-rate conversion.
+//! The resampler keeps the channel layout unchanged; [`Remix`] converts between
+//! layouts after sample-rate conversion.
+
+use std::f32::consts::FRAC_1_SQRT_2;
 
 use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{
 	Async, FixedAsync, Resampler as RubatoTrait, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
-use crate::Error;
+use crate::layout::Speaker;
+use crate::{Error, Layout};
+
+#[derive(Debug, thiserror::Error)]
+enum BackendError {
+	#[error(transparent)]
+	Construction(#[from] rubato::ResamplerConstructionError),
+
+	#[error(transparent)]
+	Process(#[from] rubato::ResampleError),
+}
+
+impl BackendError {
+	fn into_public(self) -> Error {
+		match self {
+			Self::Construction(err) => Error::ResamplerConstruction(err.to_string()),
+			Self::Process(err) => Error::Resample(err.to_string()),
+		}
+	}
+}
 
 /// Sample-rate converter over interleaved `f32` PCM.
 pub struct Resampler {
 	resampler: Async<f32>,
 	chunk_frames: usize,
+	/// Rate the caller's input arrives at, for walking [`held`](Self::held) over
+	/// the frames each chunk consumes.
+	input_rate: u32,
 	/// Output frames per input frame, for sizing the flushed tail.
 	ratio: f64,
 	/// Output frames the sinc filter holds behind what it has already emitted.
@@ -31,6 +55,10 @@ pub struct Resampler {
 	output_planar: Vec<Vec<f32>>,
 	output_frames_max: usize,
 	pending: Vec<f32>,
+	/// Where the oldest input frame still buffered came from, walked forward as
+	/// chunks are consumed so it also names where the next input lands once
+	/// nothing is buffered. `None` until the first input.
+	held: Option<moq_net::Timestamp>,
 }
 
 impl Resampler {
@@ -45,6 +73,10 @@ impl Resampler {
 			return Err(Error::Unsupported("chunk_frames must be > 0".into()));
 		}
 
+		Self::new_inner(input_rate, output_rate, channels, chunk_frames).map_err(BackendError::into_public)
+	}
+
+	fn new_inner(input_rate: u32, output_rate: u32, channels: u32, chunk_frames: usize) -> Result<Self, BackendError> {
 		let params = SincInterpolationParameters {
 			sinc_len: 128,
 			f_cutoff: Some(0.95),
@@ -64,6 +96,7 @@ impl Resampler {
 		Ok(Self {
 			resampler,
 			chunk_frames,
+			input_rate,
 			ratio,
 			delay,
 			started: false,
@@ -73,24 +106,38 @@ impl Resampler {
 			output_planar,
 			output_frames_max,
 			pending: Vec::new(),
+			held: None,
 		})
 	}
 
 	/// Output frames dropped so far as the filter's startup silence.
 	///
 	/// The output runs that much shorter than the input it was built from, so a
-	/// caller stamping its output has to reach back over this as well as over what
-	/// is still buffered.
+	/// caller stamping its output has to reach back this far from the buffered
+	/// input's source timestamp.
 	pub fn skipped(&self) -> usize {
 		self.delay - self.skip
 	}
 
 	/// Input frames buffered from earlier calls, waiting for enough to fill a chunk.
-	///
-	/// The next output starts with these, so a caller stamping its output has to
-	/// reach back this far.
 	pub fn pending_frames(&self) -> usize {
 		self.pending.len() / self.channels
+	}
+
+	/// Where the input the next output starts with came from.
+	///
+	/// The resampler works in fixed chunks, so it holds back whatever didn't fill
+	/// one and the next output begins with those held frames rather than with the
+	/// samples just fed in. This is the stamp they arrived under, taken from
+	/// [`process`](Self::process) rather than derived by counting backwards from
+	/// the newest one, so a jump in the source timeline moves the audio after it
+	/// and leaves the audio before it where it belongs. Once nothing is buffered it
+	/// names where the next input lands, which is where a
+	/// [`drain`](Self::drain) or [`flush`](Self::flush) tail begins.
+	///
+	/// `None` until the first input, where the caller's own stamp is the answer.
+	pub(crate) fn held_at(&self) -> Option<moq_net::Timestamp> {
+		self.held
 	}
 
 	/// Drop everything held, buffered input and filter state alike, returning to
@@ -104,6 +151,7 @@ impl Resampler {
 		self.pending.clear();
 		self.skip = self.delay;
 		self.started = false;
+		self.held = None;
 	}
 
 	/// Resample what is still buffered, ending the stream.
@@ -115,10 +163,26 @@ impl Resampler {
 	/// audio.
 	///
 	/// Takes `self` because that padding runs the filter through silence the
-	/// caller never supplied: resampling more afterwards would carry that state
-	/// into it, across a gap nothing reported. Ending the stream is the only thing
-	/// this can be used for, so that is the only thing it can express.
+	/// caller never supplied: a stream that continues afterwards is a different
+	/// stream, which is what [`drain`](Self::drain) says out loud.
 	pub fn flush(mut self) -> Result<Vec<f32>, Error> {
+		self.drain()
+	}
+
+	/// End the current stream and start a new one in place, returning everything
+	/// the old one was still holding.
+	///
+	/// [`flush`](Self::flush) for a gap: the buffered input and the filter's tail
+	/// belong *before* the hole, so they come out as their own audio rather than
+	/// being filtered together with whatever follows it. Equivalent to a `flush`
+	/// followed by a fresh [`Resampler`], without rebuilding the filter tables.
+	pub fn drain(&mut self) -> Result<Vec<f32>, Error> {
+		let out = self.drained()?;
+		self.reset();
+		Ok(out)
+	}
+
+	fn drained(&mut self) -> Result<Vec<f32>, Error> {
 		// Not `pending == 0`: what the filter owes has nothing to do with what is
 		// buffered, so a stream that happens to end on a chunk boundary owes a tail
 		// just the same. Only one that never ran owes nothing.
@@ -149,7 +213,7 @@ impl Resampler {
 			// neither the output nor the skip, which cannot repeat.
 			let skip_before = self.skip;
 			self.pending.resize(self.chunk_frames * self.channels, 0.0);
-			let produced = self.process(&[])?;
+			let produced = self.convert().map_err(BackendError::into_public)?;
 			if produced.is_empty() && self.skip == skip_before {
 				break;
 			}
@@ -162,9 +226,12 @@ impl Resampler {
 
 	/// Resample interleaved `f32` input into interleaved `f32` output.
 	///
+	/// `at` is where the first of `samples` was presented, so buffered input keeps
+	/// its source timestamp across calls.
+	///
 	/// Returns whatever the resampler can produce given the input and
 	/// the chunk size; remaining samples are buffered for the next call.
-	pub fn process(&mut self, samples: &[f32]) -> Result<Vec<f32>, Error> {
+	pub fn process(&mut self, samples: &[f32], at: moq_net::Timestamp) -> Result<Vec<f32>, Error> {
 		if !samples.len().is_multiple_of(self.channels) {
 			return Err(Error::Misaligned {
 				got: samples.len(),
@@ -172,9 +239,31 @@ impl Resampler {
 			});
 		}
 
+		// Nothing buffered means the output resumes with these samples.
+		if self.pending.is_empty() {
+			self.held = Some(at);
+		}
+
 		self.started |= !samples.is_empty();
 		self.pending.extend_from_slice(samples);
+		let buffered = self.pending.len();
+		let out = self.convert().map_err(BackendError::into_public)?;
 
+		// Earlier calls leave less than one chunk, so consuming any chunk also
+		// consumes all their samples. The remainder belongs to this packet.
+		// Convert its total consumed duration once to preserve fractional progress.
+		if self.pending.len() < buffered {
+			let consumed = (samples.len() - self.pending.len()) / self.channels;
+			let elapsed =
+				moq_net::Timestamp::from_scale(consumed as u64, self.input_rate as u64)?.convert(at.scale())?;
+			self.held = Some(at.checked_add(elapsed)?);
+		}
+
+		Ok(out)
+	}
+
+	/// Convert every whole chunk that is buffered, keeping the remainder.
+	fn convert(&mut self) -> Result<Vec<f32>, BackendError> {
 		let chunk_samples = self.chunk_frames * self.channels;
 		let mut out = Vec::new();
 		while self.pending.len() >= chunk_samples {
@@ -215,38 +304,151 @@ impl Resampler {
 	}
 }
 
-/// Whether [`remix`] can produce this channel count, checked up front so a
-/// consumer fails at construction rather than on its first frame.
-pub(crate) fn validate_channels(count: u32) -> Result<(), Error> {
-	match count {
-		1 | 2 => Ok(()),
-		other => Err(Error::Unsupported(format!(
-			"channel remix only supports mono and stereo (got {other})"
-		))),
+/// A channel mix from one layout to another, each output channel a weighted sum
+/// of the input channels.
+///
+/// Refuses to give discrete channels speaker positions, though it will drop
+/// them from named channels.
+///
+/// Downmixing uses the ITU-R BS.775 coefficients: center and surrounds fold into
+/// the front pair at -3 dB and the LFE is dropped. Upmixing leaves the speakers
+/// the input lacks silent. Mono is the exception both ways: it plays at full
+/// level from both front speakers when there is no center, and a mono output
+/// averages the stereo downmix.
+pub(crate) struct Remix {
+	inputs: usize,
+	outputs: usize,
+	/// One row of `inputs` weights per output channel.
+	weights: Vec<f32>,
+}
+
+impl Remix {
+	pub(crate) fn new(input: Layout, output: Layout) -> Result<Self, Error> {
+		input.validate()?;
+		output.validate()?;
+
+		let (inputs, outputs) = (input.channels() as usize, output.channels() as usize);
+		// Dropping speaker positions is always safe; inventing them is not.
+		let unchanged = input == output || output == Layout::Discrete(inputs as u32);
+		let weights = match (input.speakers(), output.speakers()) {
+			_ if unchanged => (0..outputs)
+				.flat_map(|o| (0..inputs).map(move |i| if i == o { 1.0 } else { 0.0 }))
+				.collect(),
+			(Some(from), Some(to)) => weights(from, to),
+			_ => {
+				return Err(Error::Unsupported(format!(
+					"cannot convert audio layout {input:?} to {output:?} without speaker positions"
+				)));
+			}
+		};
+
+		Ok(Self {
+			inputs,
+			outputs,
+			weights,
+		})
+	}
+
+	/// Mix whole interleaved input frames into `output`, which holds as many
+	/// frames. Never allocates, so the audio thread can call it.
+	pub(crate) fn apply(&self, input: &[f32], output: &mut [f32]) {
+		for (frame, out) in input
+			.chunks_exact(self.inputs)
+			.zip(output.chunks_exact_mut(self.outputs))
+		{
+			for (sample, row) in out.iter_mut().zip(self.weights.chunks_exact(self.inputs)) {
+				*sample = row.iter().zip(frame).map(|(weight, input)| weight * input).sum();
+			}
+		}
+	}
+
+	/// Mix whole interleaved input frames into a new buffer.
+	pub(crate) fn process(&self, input: &[f32]) -> Vec<f32> {
+		let mut output = vec![0.0; input.len() / self.inputs * self.outputs];
+		self.apply(input, &mut output);
+		output
 	}
 }
 
-/// Remix interleaved mono/stereo PCM into the requested channel count.
-pub(crate) fn remix(samples: &[f32], input_channels: u32, output_channels: u32) -> Result<Vec<f32>, Error> {
-	match (input_channels, output_channels) {
-		(1, 1) | (2, 2) => Ok(samples.to_vec()),
-		(1, 2) => {
-			let mut output = Vec::with_capacity(samples.len() * 2);
-			for &sample in samples {
-				output.extend_from_slice(&[sample, sample]);
-			}
-			Ok(output)
-		}
-		(2, 1) => Ok(samples.chunks_exact(2).map(|pair| (pair[0] + pair[1]) * 0.5).collect()),
-		_ => Err(Error::Unsupported(format!(
-			"channel remix only supports mono and stereo (got {input_channels} to {output_channels})"
-		))),
+/// The weights mixing `input` speakers into `output` speakers, one row per output.
+fn weights(input: &[Speaker], output: &[Speaker]) -> Vec<f32> {
+	use Speaker::*;
+
+	// The only layout without a front pair. Average the stereo downmix rather
+	// than invent a center weight for every speaker.
+	if output == [FrontCenter] && input != [FrontCenter] {
+		let stereo = weights(input, &[FrontLeft, FrontRight]);
+		let (left, right) = stereo.split_at(input.len());
+		return left.iter().zip(right).map(|(l, r)| (l + r) * 0.5).collect();
 	}
+
+	let mut weights = vec![0.0; output.len() * input.len()];
+	let has = |speaker| output.contains(&speaker);
+
+	for (i, &speaker) in input.iter().enumerate() {
+		let mut feed = |to: Speaker, weight: f32| {
+			if let Some(o) = output.iter().position(|s| *s == to) {
+				weights[o * input.len() + i] += weight;
+			}
+		};
+
+		if has(speaker) {
+			feed(speaker, 1.0);
+			continue;
+		}
+
+		match speaker {
+			FrontCenter => {
+				let weight = if input == [FrontCenter] { 1.0 } else { FRAC_1_SQRT_2 };
+				feed(FrontLeft, weight);
+				feed(FrontRight, weight);
+			}
+			Lfe => {}
+			SideLeft | BackLeft | SideRight | BackRight => {
+				let (front, side, back) = match speaker {
+					SideLeft | BackLeft => (FrontLeft, SideLeft, BackLeft),
+					_ => (FrontRight, SideRight, BackRight),
+				};
+				// Side and back are the same surround to a layout with only one of them.
+				let other = if speaker == side { back } else { side };
+				if has(other) {
+					feed(other, 1.0);
+				} else {
+					feed(front, FRAC_1_SQRT_2);
+				}
+			}
+			BackCenter => {
+				if has(BackLeft) {
+					feed(BackLeft, FRAC_1_SQRT_2);
+					feed(BackRight, FRAC_1_SQRT_2);
+				} else if has(SideLeft) {
+					feed(SideLeft, FRAC_1_SQRT_2);
+					feed(SideRight, FRAC_1_SQRT_2);
+				} else {
+					feed(FrontLeft, 0.5);
+					feed(FrontRight, 0.5);
+				}
+			}
+			// Every output but mono, handled above, has a front pair.
+			FrontLeft | FrontRight => unreachable!("{output:?} has no front pair"),
+		}
+	}
+
+	weights
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn remix(samples: &[f32], input: Layout, output: Layout) -> Result<Vec<f32>, Error> {
+		Ok(Remix::new(input, output)?.process(samples))
+	}
+
+	/// `frames` into a stream at `rate`, as a timestamp in the source's own scale.
+	fn at(frames: u64, rate: u64) -> moq_net::Timestamp {
+		moq_net::Timestamp::from_scale(frames, rate).unwrap()
+	}
 
 	#[test]
 	fn rejects_zero_chunk_frames() {
@@ -260,8 +462,8 @@ mod tests {
 		let input: Vec<f32> = (0..44_100)
 			.map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44_100.0).sin() * 0.5)
 			.collect();
-		let mut out = r.process(&input).unwrap();
-		out.extend(r.process(&vec![0.0; 1024]).unwrap());
+		let mut out = r.process(&input, at(0, 44_100)).unwrap();
+		out.extend(r.process(&vec![0.0; 1024], at(44_100, 44_100)).unwrap());
 		assert!(
 			(47_000..50_000).contains(&out.len()),
 			"expected ~48k samples, got {}",
@@ -284,7 +486,7 @@ mod tests {
 		let mut input = vec![0.0f32; 1024];
 		input[1000] = 1.0;
 
-		let body = r.process(&input).unwrap();
+		let body = r.process(&input, at(0, 44_100)).unwrap();
 		let tail = r.flush().unwrap();
 
 		let peak = |samples: &[f32]| samples.iter().fold(0.0f32, |max, s| max.max(s.abs()));
@@ -304,7 +506,7 @@ mod tests {
 		let mut input = vec![0.0f32; 1764];
 		input[1750] = 1.0;
 
-		let body = r.process(&input).unwrap();
+		let body = r.process(&input, at(0, 44_100)).unwrap();
 		assert_eq!(r.pending_frames(), 0, "the input should divide evenly");
 
 		let tail = r.flush().unwrap();
@@ -324,7 +526,7 @@ mod tests {
 	fn flush_sizes_a_stream_shorter_than_a_chunk() {
 		let mut r = Resampler::new(44_100, 48_000, 1, 882).unwrap();
 
-		let body = r.process(&[0.25f32; 441]).unwrap();
+		let body = r.process(&[0.25f32; 441], at(0, 44_100)).unwrap();
 		let tail = r.flush().unwrap();
 
 		// 441 frames at 44.1 kHz is 480 at 48 kHz, and that is all it can be.
@@ -340,7 +542,7 @@ mod tests {
 	fn flush_survives_a_chunk_smaller_than_the_delay() {
 		let mut r = Resampler::new(44_100, 48_000, 1, 32).unwrap();
 
-		let body = r.process(&[0.5f32; 20]).unwrap();
+		let body = r.process(&[0.5f32; 20], at(0, 44_100)).unwrap();
 		let tail = r.flush().unwrap();
 
 		let total = body.len() + tail.len();
@@ -352,13 +554,199 @@ mod tests {
 		);
 	}
 
+	/// A gap ends one stream and starts another through the same filter, so the
+	/// drain has to hand back everything `flush` would and then be usable again,
+	/// with none of the first stream's audio reaching the second.
+	#[test]
+	fn drain_ends_the_stream_and_starts_a_new_one() {
+		let mut r = Resampler::new(44_100, 48_000, 1, 882).unwrap();
+
+		let mut input = vec![0.0f32; 1024];
+		input[1000] = 1.0;
+		let body = r.process(&input, at(0, 44_100)).unwrap();
+		let tail = r.drain().unwrap();
+
+		let peak = |samples: &[f32]| samples.iter().fold(0.0f32, |max, s| max.max(s.abs()));
+		assert!(peak(&tail) > 0.5, "the tail lost the sample: peak {}", peak(&tail));
+		assert!(
+			(1105..=1120).contains(&(body.len() + tail.len())),
+			"unexpected total: {}",
+			body.len() + tail.len()
+		);
+
+		// Silence in, silence out: nothing is carried over the gap.
+		assert_eq!(r.pending_frames(), 0);
+		assert_eq!(r.held_at(), None, "the drain should forget where the old stream was");
+		let after = r.process(&vec![0.0f32; 1024], at(2048, 44_100)).unwrap();
+		assert!(peak(&after) < 0.01, "audio crossed the gap: peak {}", peak(&after));
+	}
+
+	/// The output starts with the frames held back from an earlier call, so it
+	/// begins where those arrived rather than where the newest input did. Counting
+	/// backwards from the newest stamp gets the same answer only while the source
+	/// runs contiguous; a jump moves it by the whole jump.
+	#[test]
+	fn held_frames_keep_the_stamp_they_arrived_under() {
+		let mut r = Resampler::new(44_100, 48_000, 1, 882).unwrap();
+
+		// Half a chunk, so all of it is held and nothing comes out.
+		assert!(r.process(&[0.25f32; 441], at(0, 44_100)).unwrap().is_empty());
+		assert_eq!(r.held_at(), Some(at(0, 44_100)));
+
+		// A second later, and the output it completes still starts back at zero.
+		assert!(!r.process(&[0.25f32; 441], at(44_100, 44_100)).unwrap().is_empty());
+		assert_eq!(
+			r.held_at(),
+			Some(at(44_541, 44_100)),
+			"the tail starts at the end of the last packet consumed"
+		);
+	}
+
+	/// With nothing buffered the next output starts with the next input, so a
+	/// stream that resumes somewhere else stamps from there and not from where the
+	/// old one left off.
+	#[test]
+	fn an_emptied_buffer_re_anchors_on_the_next_input() {
+		let mut r = Resampler::new(44_100, 48_000, 1, 882).unwrap();
+
+		r.process(&[0.25f32; 882], at(0, 44_100)).unwrap();
+		assert_eq!(r.pending_frames(), 0);
+
+		r.process(&[0.25f32; 441], at(44_100, 44_100)).unwrap();
+		assert_eq!(r.held_at(), Some(at(44_100, 44_100)));
+	}
+
+	#[test]
+	fn leftover_frames_keep_the_new_packet_timestamp() {
+		let mut r = Resampler::new(44_100, 48_000, 1, 882).unwrap();
+		r.process(&[0.25; 441], at(0, 44_100)).unwrap();
+		r.process(&[0.25; 882], at(44_100, 44_100)).unwrap();
+		assert_eq!(r.pending_frames(), 441);
+		assert_eq!(r.held_at(), Some(at(44_541, 44_100)));
+	}
+
+	#[test]
+	fn held_timestamp_preserves_fractional_chunk_progress() {
+		let mut r = Resampler::new(11_025, 48_000, 1, 220).unwrap();
+		r.process(&vec![0.25; 11_025], at(0, 1000)).unwrap();
+		assert_eq!(r.pending_frames(), 25);
+		assert_eq!(r.held_at(), Some(at(997, 1000)));
+	}
+
 	#[test]
 	fn remix_mono_to_stereo_duplicates_samples() {
-		assert_eq!(remix(&[1.0, 2.0], 1, 2).unwrap(), [1.0, 1.0, 2.0, 2.0]);
+		assert_eq!(
+			remix(&[1.0, 2.0], Layout::Mono, Layout::Stereo).unwrap(),
+			[1.0, 1.0, 2.0, 2.0]
+		);
 	}
 
 	#[test]
 	fn remix_stereo_to_mono_averages_channels() {
-		assert_eq!(remix(&[1.0, 3.0, 2.0, 4.0], 2, 1).unwrap(), [2.0, 3.0]);
+		assert_eq!(
+			remix(&[1.0, 3.0, 2.0, 4.0], Layout::Stereo, Layout::Mono).unwrap(),
+			[2.0, 3.0]
+		);
+	}
+
+	/// One frame of 5.1 with a distinct level per speaker, in canonical order.
+	const FIVE_ONE: [f32; 6] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+
+	fn close(got: &[f32], want: &[f32]) {
+		assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+		for (g, w) in got.iter().zip(want) {
+			assert!((g - w).abs() < 1e-6, "{got:?} vs {want:?}");
+		}
+	}
+
+	#[test]
+	fn remix_downmixes_five_one_to_stereo_by_bs775() {
+		let h = FRAC_1_SQRT_2;
+		let [l, r, c, _lfe, ls, rs] = FIVE_ONE;
+		close(
+			&remix(&FIVE_ONE, Layout::FivePointOne, Layout::Stereo).unwrap(),
+			&[l + h * c + h * ls, r + h * c + h * rs],
+		);
+	}
+
+	#[test]
+	fn remix_downmixes_five_one_to_mono_through_stereo() {
+		let stereo = remix(&FIVE_ONE, Layout::FivePointOne, Layout::Stereo).unwrap();
+		close(
+			&remix(&FIVE_ONE, Layout::FivePointOne, Layout::Mono).unwrap(),
+			&[(stereo[0] + stereo[1]) * 0.5],
+		);
+	}
+
+	#[test]
+	fn remix_upmixes_stereo_into_the_front_pair() {
+		close(
+			&remix(&[0.25, 0.75], Layout::Stereo, Layout::FivePointOne).unwrap(),
+			&[0.25, 0.75, 0.0, 0.0, 0.0, 0.0],
+		);
+	}
+
+	#[test]
+	fn remix_upmixes_mono_into_the_center() {
+		close(
+			&remix(&[0.5], Layout::Mono, Layout::FivePointOne).unwrap(),
+			&[0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+		);
+		// Quad has no center, so mono plays from both fronts as it does in stereo.
+		close(
+			&remix(&[0.5], Layout::Mono, Layout::Quad).unwrap(),
+			&[0.5, 0.5, 0.0, 0.0],
+		);
+	}
+
+	/// 7.1 to 5.1 folds the back pair into the sides at full level, since a 5.1
+	/// surround pair is the only surround it has.
+	#[test]
+	fn remix_folds_back_into_side_surrounds() {
+		let seven = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+		close(
+			&remix(&seven, Layout::SevenPointOne, Layout::FivePointOne).unwrap(),
+			&[0.1, 0.2, 0.3, 0.4, 0.5 + 0.7, 0.6 + 0.8],
+		);
+	}
+
+	#[test]
+	fn remix_refuses_positions_it_would_invent() {
+		for (input, output) in [
+			(Layout::Discrete(6), Layout::Stereo),
+			(Layout::Mono, Layout::Discrete(2)),
+			(Layout::Discrete(0), Layout::Discrete(0)),
+		] {
+			assert!(
+				matches!(Remix::new(input, output), Err(Error::Unsupported(_))),
+				"{input:?} -> {output:?}"
+			);
+		}
+
+		assert_eq!(
+			remix(&[1.0, 2.0, 3.0], Layout::Discrete(3), Layout::Discrete(3)).unwrap(),
+			[1.0, 2.0, 3.0]
+		);
+		assert_eq!(
+			remix(&[1.0, 2.0, 3.0], Layout::TwoPointOne, Layout::Discrete(3)).unwrap(),
+			[1.0, 2.0, 3.0]
+		);
+		assert!(Remix::new(Layout::Discrete(3), Layout::TwoPointOne).is_err());
+	}
+
+	/// Every pair of named layouts converts, and the mix is sized to the output.
+	#[test]
+	fn remix_converts_between_every_named_layout() {
+		let layouts: Vec<Layout> = (1..=8)
+			.map(|n| Layout::from_channels(n).unwrap())
+			.chain([Layout::ThreePointZero, Layout::FourPointZero])
+			.collect();
+		for &input in &layouts {
+			for &output in &layouts {
+				let frame = vec![0.5; input.channels() as usize * 2];
+				let mixed = remix(&frame, input, output).unwrap();
+				assert_eq!(mixed.len(), output.channels() as usize * 2, "{input:?} -> {output:?}");
+			}
+		}
 	}
 }

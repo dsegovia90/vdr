@@ -1,7 +1,7 @@
 //! Acoustic echo cancellation: keep the speaker out of the microphone.
 //!
 //! Without this, anyone on a laptop without a headset sends the rest of the call
-//! back to itself. A [`Canceller`] comes from the [`playback::Engine`] doing the
+//! back to itself. A [`Control`] comes from the [`playback::Engine`] doing the
 //! playing, because cancelling an echo means knowing what was played, and goes
 //! into [`capture::Config`](crate::capture::Config) so the microphone it hears
 //! is already clean:
@@ -13,14 +13,17 @@
 //! let engine = playback::Engine::open(playback::Config::default()).await?;
 //!
 //! let mut capture = capture::Config::default();
-//! capture.aec = Some(engine.canceller(aec::Config::default()));
+//! let aec = engine.canceller(aec::Config::default())?;
+//! capture.aec = Some(aec.clone());
+//! // A UI thread can toggle the same canceller without owning the microphone.
+//! aec.set_enabled(false);
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! One canceller belongs to one microphone: it holds the adaptive filter that
-//! models the path from that speaker to that microphone. Clones share it, so
-//! clone for a mute button on a UI thread, not to run a second capture.
+//! One control owns one adaptive filter and one playback reference. Its clones
+//! can toggle that filter, but only one live microphone can attach to it. A
+//! second capture fails explicitly until the first releases its attachment.
 //!
 //! The work happens in the microphone callback, on 10 ms frames, which is what
 //! adds up to 10 ms of latency to the capture path. Both the echo reference and
@@ -36,12 +39,8 @@ use fixed_resample::{ResamplingChannelConfig, ResamplingCons, ResamplingProd, re
 use sonora::config::{EchoCanceller, GainController2, NoiseSuppression, NoiseSuppressionLevel};
 use sonora::{AudioProcessing, StreamConfig};
 
-/// vid patch: the type [`Canceller::statistics`] returns, so callers need no
-/// direct (and version-matched) dependency on sonora.
-pub use sonora::AudioProcessingStats;
-
 use crate::Error;
-use crate::playback::{self, BUS_CHANNELS};
+use crate::playback::{self, REFERENCE_CHANNELS};
 
 /// Sample rate the echo reference is resampled to on its way out of the mixer.
 ///
@@ -116,37 +115,37 @@ impl Config {
 	}
 }
 
-/// Removes the echo of a [`playback::Engine`] from a microphone.
+/// Controls echo cancellation between one [`playback::Engine`] and microphone.
 ///
 /// Built by [`Engine::canceller`](playback::Engine::canceller) and handed to
 /// [`capture::Config::aec`](crate::capture::Config::aec), which is the whole of
-/// the usual surface: the rest here is a mute button you can hold on another
-/// thread.
+/// the usual surface.
 ///
-/// Cheap to clone, and every clone drives the same adaptive filter. The
-/// reference tap on the engine goes away when the last clone drops.
+/// Cheap to clone. Every clone can toggle the same adaptive filter, but capture
+/// acquires an exclusive attachment before opening a microphone, so clones
+/// cannot run that state against two inputs. The playback reference goes away
+/// when the last control and attachment drop.
 #[derive(Clone)]
-pub struct Canceller {
+pub struct Control {
 	inner: Arc<Inner>,
 }
 
-impl Canceller {
-	/// Register a canceller against a running engine.
+impl Control {
+	/// Register echo cancellation against a running engine.
 	///
 	/// `pub(crate)`: [`Engine::canceller`](playback::Engine::canceller) is the
-	/// entry point, so a canceller can't exist without the reference it needs.
-	pub(crate) fn new(shared: Arc<playback::Shared>, config: Config) -> Self {
+	/// entry point, so a control cannot exist without the reference it needs.
+	pub(crate) fn new(shared: Arc<playback::Shared>, config: Config) -> Result<Self, Error> {
 		static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 		let inner = Arc::new(Inner {
 			id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
 			enabled: AtomicBool::new(true),
+			attached: AtomicBool::new(false),
 			discontinuous: AtomicBool::new(false),
 			config,
 			state: Arc::new(Mutex::new(State::default())),
 			shared: shared.clone(),
-			stats: Mutex::new(None),
-			reference: Mutex::new(None),
 		});
 
 		shared.set_reference(Reference {
@@ -154,9 +153,9 @@ impl Canceller {
 			alive: Arc::downgrade(&inner),
 			state: inner.state.clone(),
 			pending: None,
-		});
+		})?;
 
-		Self { inner }
+		Ok(Self { inner })
 	}
 
 	/// Turn cancellation on or off without reopening any device.
@@ -173,13 +172,13 @@ impl Canceller {
 		self.inner.enabled.load(Ordering::Relaxed)
 	}
 
-	/// Point the canceller at a microphone with this format.
+	/// Attach the adaptive state to a microphone with this format.
 	///
 	/// Called when `capture` opens a device, so the allocation lands there
 	/// rather than in the first callback. Capture is demand-gated, so this runs
 	/// again every time a listener comes back: the adaptive filter survives that
 	/// as long as the format hasn't changed, since it is still the same room.
-	pub(crate) fn open(&self, sample_rate: u32, channels: u32) -> Result<(), Error> {
+	pub(crate) fn attach(&self, sample_rate: u32, channels: u32) -> Result<Attachment, Error> {
 		// sonora reports a bad format per call, by which point we are on the
 		// audio thread and can only log it. Reject it while there is still a
 		// caller to hand an error to.
@@ -188,7 +187,7 @@ impl Canceller {
 				"echo cancellation needs a microphone between 8 and 384 kHz (got {sample_rate})"
 			)));
 		}
-		if channels == 0 || channels > BUS_CHANNELS as u32 {
+		if channels == 0 || channels > REFERENCE_CHANNELS as u32 {
 			return Err(Error::Unsupported(format!(
 				"echo cancellation accepts a mono or stereo microphone (got {channels} channels)"
 			)));
@@ -202,6 +201,15 @@ impl Canceller {
 			.render_config(reference_config())
 			.config(self.inner.config.build())
 			.build();
+
+		if self
+			.inner
+			.attached
+			.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+			.is_err()
+		{
+			return Err(Error::Busy("echo canceller is attached to another microphone".into()));
+		}
 
 		let mut state = self.inner.state.lock().unwrap();
 		if state.processor.is_none() || state.capture != capture {
@@ -219,75 +227,10 @@ impl Canceller {
 			reference.discard_frames(reference.available_frames());
 		}
 
-		Ok(())
-	}
-
-	/// Replace the microphone samples in `buf` with the same span, minus the
-	/// echo.
-	///
-	/// Interleaved at the format passed to [`open`](Self::open). Runs on the
-	/// microphone callback thread, so it never waits for the playback driver.
-	/// Contention during a reference switch passes this buffer through; the
-	/// next callback resumes cancellation.
-	pub(crate) fn process(&self, buf: &mut [f32]) {
-		let enabled = self.enabled();
-		let Ok(mut state) = self.inner.state.try_lock() else {
-			self.mark_discontinuous();
-			return;
-		};
-		if self.inner.discontinuous.swap(false, Ordering::Relaxed) {
-			state.reset();
-		}
-		state.process(buf, enabled);
-
-		// vid patch: the statistics, copied out once a second while the lock is
-		// already held. Read from another thread they would take this lock, and
-		// a contended callback passes its buffer through *uncancelled* -- a
-		// stats reader would leak echo. `try_lock` so this never waits either.
-		let now = std::time::Instant::now();
-		if state.stats_at.is_none_or(|at| now.duration_since(at) >= STATS_EVERY) {
-			state.stats_at = Some(now);
-			if let Some(processor) = &state.processor {
-				if let Ok(mut slot) = self.inner.stats.try_lock() {
-					*slot = Some(processor.statistics().clone());
-				}
-			}
-			// What the canceller was told was played over that second: whether
-			// a speaker signal reaches it at all, and how loud.
-			let rms = if state.reference_samples == 0 {
-				0.0
-			} else {
-				(state.reference_energy / state.reference_samples as f64).sqrt() as f32
-			};
-			if let Ok(mut slot) = self.inner.reference.try_lock() {
-				*slot = Some((state.reference_frames, rms));
-			}
-			state.reference_frames = 0;
-			state.reference_energy = 0.0;
-			state.reference_samples = 0;
-		}
-	}
-
-	/// The canceller's own measure of how it is doing: echo-return-loss
-	/// enhancement, its delay estimate, residual echo likelihood and more
-	/// (sonora's `AudioProcessingStats`), refreshed about once a second.
-	///
-	/// `None` until a microphone has opened and the first second has passed.
-	/// vid patch, not in moq-audio 0.0.22.
-	pub fn statistics(&self) -> Option<AudioProcessingStats> {
-		self.inner.stats.lock().ok().and_then(|stats| stats.clone())
-	}
-
-	/// How many 10 ms reference frames (what the speakers played) the canceller
-	/// received over the last second, and their RMS level. Zero frames means it
-	/// is cancelling against nothing. vid patch, not in moq-audio 0.0.22.
-	pub fn reference_activity(&self) -> Option<(u32, f32)> {
-		self.inner.reference.lock().ok().and_then(|reference| *reference)
-	}
-
-	/// Discard partial frames before processing the next capture buffer.
-	pub(crate) fn mark_discontinuous(&self) {
-		self.inner.discontinuous.store(true, Ordering::Relaxed);
+		drop(state);
+		Ok(Attachment {
+			inner: self.inner.clone(),
+		})
 	}
 
 	/// Number of microphone samples waiting for a complete AEC frame.
@@ -297,11 +240,58 @@ impl Canceller {
 	}
 }
 
-impl fmt::Debug for Canceller {
+impl fmt::Debug for Control {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_struct("Canceller")
+		f.debug_struct("Control")
 			.field("enabled", &self.enabled())
 			.finish_non_exhaustive()
+	}
+}
+
+/// The exclusive microphone-side attachment to an echo canceller.
+///
+/// Capture owns this for exactly one live stream. Dropping it releases the
+/// adaptive state for a later microphone while cloned [`Control`] handles stay
+/// valid for UI toggles.
+pub(crate) struct Attachment {
+	inner: Arc<Inner>,
+}
+
+impl Attachment {
+	/// Replace the microphone samples in `buf` with the same span, minus the
+	/// echo.
+	///
+	/// Interleaved at the format passed to [`Control::attach`]. Runs on the
+	/// microphone callback thread, so it never waits for the playback driver.
+	/// Contention during a reference switch passes this buffer through; the
+	/// next callback resumes cancellation.
+	pub(crate) fn process(&self, buf: &mut [f32]) {
+		let enabled = self.inner.enabled.load(Ordering::Relaxed);
+		let Ok(mut state) = self.inner.state.try_lock() else {
+			self.mark_discontinuous();
+			return;
+		};
+		if self.inner.discontinuous.swap(false, Ordering::Relaxed) {
+			state.reset();
+		}
+		state.process(buf, enabled);
+	}
+
+	/// Discard partial frames before processing the next capture buffer.
+	pub(crate) fn mark_discontinuous(&self) {
+		self.inner.discontinuous.store(true, Ordering::Relaxed);
+	}
+}
+
+impl Drop for Attachment {
+	fn drop(&mut self) {
+		let mut state = self.inner.state.lock().unwrap();
+		state.reset();
+		if let Some(reference) = &mut state.reference {
+			reference.discard_frames(reference.available_frames());
+		}
+		drop(state);
+		self.inner.attached.store(false, Ordering::Release);
 	}
 }
 
@@ -312,6 +302,8 @@ struct Inner {
 	/// so dropping the first doesn't take the second's tap with it.
 	id: u64,
 	enabled: AtomicBool,
+	/// Whether a live capture stream owns the adaptive state.
+	attached: AtomicBool,
 	/// Whether capture continuity broke since the last processed callback.
 	discontinuous: AtomicBool,
 	config: Config,
@@ -321,14 +313,7 @@ struct Inner {
 	state: Arc<Mutex<State>>,
 	/// The engine's registry, so dropping the last clone removes the tap.
 	shared: Arc<playback::Shared>,
-	/// vid patch: the latest statistics, written by the microphone callback.
-	stats: Mutex<Option<sonora::AudioProcessingStats>>,
-	/// vid patch: reference frames read over the last second, and their RMS.
-	reference: Mutex<Option<(u32, f32)>>,
 }
-
-/// vid patch: how often the microphone callback copies the statistics out.
-const STATS_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Drop for Inner {
 	fn drop(&mut self) {
@@ -343,12 +328,6 @@ impl Drop for Inner {
 struct State {
 	/// `None` until a microphone opens and reports its format.
 	processor: Option<AudioProcessing>,
-	/// vid patch: when the statistics were last copied out.
-	stats_at: Option<std::time::Instant>,
-	/// vid patch: reference frames read, and their energy, since the last copy.
-	reference_frames: u32,
-	reference_energy: f64,
-	reference_samples: u64,
 	capture: StreamConfig,
 	/// Reference from the output mixer, replaced whenever the output stream is
 	/// rebuilt and `None` while none is running.
@@ -377,11 +356,7 @@ impl Default for State {
 	fn default() -> Self {
 		Self {
 			processor: None,
-			stats_at: None,
-			reference_frames: 0,
-			reference_energy: 0.0,
-			reference_samples: 0,
-			// Replaced by `Canceller::open`; nothing is processed before then.
+			// Replaced by `Control::attach`; nothing is processed before then.
 			capture: reference_config(),
 			reference: None,
 			running: false,
@@ -406,9 +381,9 @@ impl State {
 		self.pending = Vec::with_capacity(headroom);
 		self.processed = Vec::with_capacity(headroom);
 
-		self.reference_frame = vec![0.0; REFERENCE_FRAME * BUS_CHANNELS];
-		self.render_in = vec![0.0; REFERENCE_FRAME * BUS_CHANNELS];
-		self.render_out = vec![0.0; REFERENCE_FRAME * BUS_CHANNELS];
+		self.reference_frame = vec![0.0; REFERENCE_FRAME * REFERENCE_CHANNELS];
+		self.render_in = vec![0.0; REFERENCE_FRAME * REFERENCE_CHANNELS];
+		self.render_out = vec![0.0; REFERENCE_FRAME * REFERENCE_CHANNELS];
 		self.capture_in = vec![0.0; frame * channels];
 		self.capture_out = vec![0.0; frame * channels];
 
@@ -435,11 +410,6 @@ impl State {
 			render_out,
 			capture_in,
 			capture_out,
-			// vid patch: read by `Canceller::process`, not here.
-			stats_at: _,
-			reference_frames,
-			reference_energy,
-			reference_samples,
 		} = self;
 
 		// No microphone has been opened against this canceller, so there is
@@ -481,16 +451,9 @@ impl State {
 		// than the last output callback, so it leads the echo by however much
 		// the output device buffers, however little that is.
 		if let Some(reference) = reference {
-			// vid patch: kept ready on every callback too, since a channel reset
-			// clears it, and a cleared flag is the same deadlock as above.
-			reference.set_output_stream_ready(true);
 			while reference.available_frames() >= REFERENCE_FRAME {
 				reference.read_interleaved(reference_frame, false);
-				// vid patch: what the canceller is actually told was played.
-				*reference_frames += 1;
-				*reference_energy += reference_frame.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>();
-				*reference_samples += reference_frame.len() as u64;
-				deinterleave(reference_frame, render_in, BUS_CHANNELS);
+				deinterleave(reference_frame, render_in, REFERENCE_CHANNELS);
 				let _ = process_render(processor, render_in, render_out);
 			}
 		}
@@ -521,7 +484,7 @@ impl State {
 
 /// The format the mixer's reference tap arrives in.
 fn reference_config() -> StreamConfig {
-	StreamConfig::new(REFERENCE_RATE, BUS_CHANNELS as u16)
+	StreamConfig::new(REFERENCE_RATE, REFERENCE_CHANNELS as u16)
 }
 
 /// Feed one reference frame to the echo model.
@@ -539,7 +502,7 @@ fn process_render(processor: &mut AudioProcessing, input: &[f32], output: &mut [
 ///
 /// Split by channel count rather than collected into a `Vec<&[f32]>` so the
 /// microphone callback doesn't allocate. Mono and stereo are the only counts
-/// [`Canceller::open`] accepts, which is also all Opus encodes.
+/// [`Control::attach`] accepts, which is also all Opus encodes.
 fn process_capture(
 	processor: &mut AudioProcessing,
 	config: &StreamConfig,
@@ -628,13 +591,7 @@ impl Reference {
 			return false;
 		}
 
-		let (prod, mut cons) = channel(rate);
-		// vid patch, the echo fix: mark this end ready now. fixed-resample
-		// discards every push until the consumer has *read* once, and the
-		// capture side only reads once a whole frame is waiting -- so neither
-		// side ever moved, the canceller never saw a sample of what played, and
-		// echo went straight through (measured: 0 reference frames a second).
-		cons.set_output_stream_ready(true);
+		let (prod, cons) = channel(rate);
 		self.state.lock().unwrap().reference = Some(cons);
 		self.pending = Some(prod);
 		true
@@ -645,7 +602,7 @@ impl Reference {
 /// canceller reads it back at [`REFERENCE_RATE`].
 fn channel(rate: u32) -> (ResamplingProd<f32>, ResamplingCons<f32>) {
 	resampling_channel::<f32>(
-		BUS_CHANNELS,
+		REFERENCE_CHANNELS,
 		rate,
 		REFERENCE_RATE,
 		true,
@@ -677,19 +634,17 @@ mod tests {
 
 	/// A canceller registered against an engine that never opened a device, so
 	/// the frame arithmetic can be tested without hardware.
-	fn detached() -> Canceller {
-		Canceller::new(Arc::new(playback::Shared::default()), Config::default())
+	fn detached() -> Control {
+		Control::new(Arc::new(playback::Shared::default()), Config::default()).unwrap()
 	}
 
-	fn opened(sample_rate: u32, channels: u32) -> Canceller {
-		let canceller = detached();
-		canceller.open(sample_rate, channels).unwrap();
-		canceller
+	fn opened(sample_rate: u32, channels: u32) -> Attachment {
+		detached().attach(sample_rate, channels).unwrap()
 	}
 
 	/// Give `canceller` a tap and hand back the end the mixer would push into,
 	/// built exactly as the driver builds it so the two can't drift.
-	fn tap(canceller: &Canceller) -> ResamplingProd<f32> {
+	fn tap(canceller: &Attachment) -> ResamplingProd<f32> {
 		let (prod, cons) = channel(REFERENCE_RATE);
 		canceller.inner.state.lock().unwrap().reference = Some(cons);
 		prod
@@ -697,17 +652,17 @@ mod tests {
 
 	/// Push one 10 ms stereo frame of `value` into the tap.
 	fn play(prod: &mut ResamplingProd<f32>, value: f32) {
-		prod.push_interleaved(&vec![value; REFERENCE_FRAME * BUS_CHANNELS]);
+		prod.push_interleaved(&vec![value; REFERENCE_FRAME * REFERENCE_CHANNELS]);
 	}
 
 	#[test]
 	fn rejects_formats_the_processor_cannot_take() {
 		let canceller = detached();
-		assert!(matches!(canceller.open(4_000, 1), Err(Error::Unsupported(_))));
-		assert!(matches!(canceller.open(48_000, 0), Err(Error::Unsupported(_))));
-		assert!(matches!(canceller.open(48_000, 6), Err(Error::Unsupported(_))));
-		canceller.open(48_000, 1).unwrap();
-		canceller.open(16_000, 2).unwrap();
+		assert!(matches!(canceller.attach(4_000, 1), Err(Error::Unsupported(_))));
+		assert!(matches!(canceller.attach(48_000, 0), Err(Error::Unsupported(_))));
+		assert!(matches!(canceller.attach(48_000, 6), Err(Error::Unsupported(_))));
+		drop(canceller.attach(48_000, 1).unwrap());
+		drop(canceller.attach(16_000, 2).unwrap());
 	}
 
 	#[test]
@@ -777,10 +732,13 @@ mod tests {
 	}
 
 	#[test]
-	fn disabled_passes_the_microphone_straight_through() {
-		let canceller = opened(48_000, 2);
-		canceller.set_enabled(false);
-		assert!(!canceller.enabled());
+	fn control_clones_toggle_one_attachment() {
+		let control = detached();
+		let ui = control.clone();
+		let canceller = control.attach(48_000, 2).unwrap();
+		ui.set_enabled(false);
+		assert!(!control.enabled());
+		assert!(matches!(ui.attach(48_000, 2), Err(Error::Busy(_))));
 
 		let mut buf = vec![0.5f32; 960 * 2];
 		canceller.process(&mut buf);
@@ -789,7 +747,7 @@ mod tests {
 
 	#[test]
 	fn reference_switch_contention_never_waits_on_the_callback() {
-		let canceller = opened(48_000, 1);
+		let canceller = Arc::new(opened(48_000, 1));
 		let locked = canceller.inner.state.lock().unwrap();
 		let callback = canceller.clone();
 		let (done, finished) = std::sync::mpsc::sync_channel(1);
@@ -837,14 +795,15 @@ mod tests {
 	/// otherwise resurface seconds later in the middle of a live stream.
 	#[test]
 	fn toggling_off_drops_buffered_samples() {
-		let canceller = opened(48_000, 1);
+		let control = detached();
+		let canceller = control.attach(48_000, 1).unwrap();
 		let frame = frame(48_000);
 
 		let mut buf = vec![0.5f32; frame * 3 / 2];
 		canceller.process(&mut buf);
 		assert!(!canceller.inner.state.lock().unwrap().pending.is_empty());
 
-		canceller.set_enabled(false);
+		control.set_enabled(false);
 		let mut buf = vec![0.5f32; frame / 2];
 		canceller.process(&mut buf);
 		assert!(buf.iter().all(|s| *s == 0.5), "passthrough altered the samples");
@@ -854,29 +813,58 @@ mod tests {
 		assert!(state.processed.is_empty(), "processed samples survived the toggle");
 	}
 
-	/// A second canceller takes the engine's one tap. The first must not take it
-	/// away again on its way out.
 	#[test]
-	fn a_replaced_canceller_leaves_the_tap_alone() {
+	fn engine_refuses_a_second_reference_until_the_first_drops() {
 		let shared = Arc::new(playback::Shared::default());
 
-		let first = Canceller::new(shared.clone(), Config::default());
-		let second = Canceller::new(shared.clone(), Config::default());
+		let first = Control::new(shared.clone(), Config::default()).unwrap();
+		assert!(matches!(
+			Control::new(shared.clone(), Config::default()),
+			Err(Error::Busy(_))
+		));
 		assert!(shared.has_reference());
 
 		drop(first);
-		assert!(shared.has_reference(), "the replacement lost its tap");
+		assert!(!shared.has_reference(), "the first reference outlived its controls");
 
+		let second = Control::new(shared.clone(), Config::default()).unwrap();
+		assert!(shared.has_reference(), "the released slot rejected a replacement");
 		drop(second);
-		assert!(!shared.has_reference(), "the tap outlived every canceller");
+		assert!(!shared.has_reference(), "the second reference outlived its controls");
 	}
 
 	#[test]
-	fn a_canceller_without_a_microphone_leaves_the_buffer_alone() {
-		let canceller = detached();
-		let mut buf = vec![0.5f32; 480];
-		canceller.process(&mut buf);
-		assert!(buf.iter().all(|s| *s == 0.5));
+	fn one_control_attaches_to_one_microphone() {
+		let control = detached();
+		let first = control.attach(48_000, 1).unwrap();
+		assert!(matches!(control.attach(48_000, 1), Err(Error::Busy(_))));
+
+		drop(first);
+		let second = control.attach(16_000, 2).expect("drop releases the attachment");
+		drop(second);
+	}
+
+	/// Dropping capture resets its buffers before another microphone can claim
+	/// the state, even if teardown overlaps the callback's processing lock.
+	#[test]
+	fn teardown_while_processing_releases_after_the_callback() {
+		let control = detached();
+		let attachment = control.attach(48_000, 1).unwrap();
+		let inner = attachment.inner.clone();
+		let processing = inner.state.lock().unwrap();
+		let (done, wait) = std::sync::mpsc::sync_channel(1);
+		let teardown = std::thread::spawn(move || {
+			drop(attachment);
+			done.send(()).unwrap();
+		});
+
+		assert!(matches!(control.attach(48_000, 1), Err(Error::Busy(_))));
+		assert!(wait.recv_timeout(Duration::from_millis(20)).is_err());
+
+		drop(processing);
+		wait.recv_timeout(Duration::from_secs(1)).unwrap();
+		teardown.join().unwrap();
+		drop(control.attach(48_000, 1).expect("teardown releases the state"));
 	}
 
 	/// Anything left queued in the tap is delay added on top of the hardware's,
@@ -933,7 +921,7 @@ mod tests {
 	/// the reference is noise and the microphone hears that same noise
 	/// attenuated and delayed, with nobody talking over it.
 	struct Room {
-		canceller: Canceller,
+		canceller: Attachment,
 		prod: ResamplingProd<f32>,
 		noise: Noise,
 		/// Frames played, newest last, so the delay can move mid-run.
@@ -953,7 +941,8 @@ mod tests {
 		/// The echo canceller on its own. Noise suppression would also attenuate
 		/// noise, and gain control would move the level under the measurement.
 		fn new(delay: usize) -> Self {
-			let canceller = detached();
+			let control = detached();
+			let canceller = control.attach(48_000, 1).unwrap();
 			let capture = StreamConfig::new(48_000, 1);
 			{
 				let mut state = canceller.inner.state.lock().unwrap();
@@ -987,10 +976,10 @@ mod tests {
 		fn round(&mut self) -> (f64, f64) {
 			let played: Vec<f32> = (0..self.frame).map(|_| self.noise.next()).collect();
 
-			let mut reference = vec![0.0f32; self.frame * BUS_CHANNELS];
+			let mut reference = vec![0.0f32; self.frame * REFERENCE_CHANNELS];
 			for (i, sample) in played.iter().enumerate() {
-				reference[i * BUS_CHANNELS] = *sample;
-				reference[i * BUS_CHANNELS + 1] = *sample;
+				reference[i * REFERENCE_CHANNELS] = *sample;
+				reference[i * REFERENCE_CHANNELS + 1] = *sample;
 			}
 			self.prod.push_interleaved(&reference);
 
@@ -1106,13 +1095,13 @@ mod tests {
 		let engine = playback::Engine::open(playback::Config::default())
 			.await
 			.expect("an output device");
-		let canceller = engine.canceller(Config::default());
-		canceller.open(48_000, 1).expect("a mono microphone");
+		let control = engine.canceller(Config::default()).expect("one echo reference");
+		let canceller = control.attach(48_000, 1).expect("a mono microphone");
 
 		let mut sink = engine
 			.sink(playback::Input {
 				sample_rate: 48_000,
-				channels: 2,
+				layout: crate::Layout::Stereo,
 				..Default::default()
 			})
 			.expect("a sink");
@@ -1123,16 +1112,16 @@ mod tests {
 		let mut tone = Vec::with_capacity(frames * 2 * 4);
 		for frame in 0..frames {
 			let value = (std::f32::consts::TAU * 440.0 * frame as f32 / 48_000.0).sin() * 0.5;
-			for _ in 0..BUS_CHANNELS {
+			for _ in 0..REFERENCE_CHANNELS {
 				tone.extend_from_slice(&value.to_le_bytes());
 			}
 		}
 
 		let mut energy = 0.0f64;
-		let mut buf = vec![0.0f32; REFERENCE_FRAME * BUS_CHANNELS];
+		let mut buf = vec![0.0f32; REFERENCE_FRAME * REFERENCE_CHANNELS];
 
 		for _ in 0..20 {
-			sink.write(&tone).expect("write");
+			let _ = sink.write(&tone).expect("write");
 			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
 			// Drain the tap the way the microphone callback would, and add up
