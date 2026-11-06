@@ -14,7 +14,7 @@ use dioxus_native::prelude::*;
 /// value, opening a menu *is* closing the other. Provided by the page with
 /// [`use_open_menu_provider`].
 #[derive(Clone, Copy)]
-pub struct OpenMenu(Signal<Option<&'static str>>);
+pub struct OpenMenu(pub(super) Signal<Option<&'static str>>);
 
 /// Makes the shared [`OpenMenu`] available to every menu below.
 pub fn use_open_menu_provider() {

@@ -112,6 +112,13 @@ pub struct Settings {
     /// The speakers or headphones the user last selected, as `moq_audio`'s
     /// output id. `None` is the system default, as for the microphone.
     pub output: Option<String>,
+
+    /// How loud everyone outside our subroom is, `0.0..=1.0`. `None` is the
+    /// default in [`crate::audio::Crosstalk`].
+    pub crosstalk_volume: Option<f32>,
+
+    /// Whether everyone outside our subroom is muted. `None` is unmuted.
+    pub crosstalk_muted: Option<bool>,
 }
 
 impl Settings {
@@ -417,6 +424,7 @@ mod tests {
             camera: Some("c922-uid".into()),
             microphone: Some("coreaudio:yeti".into()),
             output: Some("coreaudio:headphones".into()),
+            ..Settings::default()
         };
         let json = serde_json::to_string(&settings).expect("serialises");
         let back: Settings = serde_json::from_str(&json).expect("deserialises");
@@ -441,6 +449,7 @@ mod tests {
             camera: Some("c922-uid".into()),
             microphone: Some("coreaudio:yeti".into()),
             output: Some("coreaudio:headphones".into()),
+            ..Settings::default()
         };
         settings.write_to(&path);
         assert_eq!(Settings::load_from(&path), settings, "what was written comes back");
@@ -473,6 +482,20 @@ mod tests {
         assert_eq!(back.camera.as_deref(), Some("abc"));
         assert_eq!(back.microphone, None, "a missing microphone is the default");
         assert_eq!(back.output, None, "a missing output is the default");
+        assert_eq!(back.crosstalk_volume, None, "a missing volume is the default");
+        assert_eq!(back.crosstalk_muted, None, "a missing mute is the default");
+    }
+
+    #[test]
+    fn the_crosstalk_setting_round_trips() {
+        let settings = Settings {
+            crosstalk_volume: Some(0.65),
+            crosstalk_muted: Some(true),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialises");
+        let back: Settings = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(back, settings);
     }
 
     #[test]

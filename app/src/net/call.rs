@@ -296,7 +296,7 @@ const CONTROL_PRIORITY: u8 = 100;
 /// camera that is off is not a stalled stream, and only the sender can say
 /// which it is. Roles, candidacy and topology opinions extend this same
 /// document when they come, rather than inventing their own.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Presence {
     state: State,
     /// Absent reads as on: a peer that predates the field never turned it off.
@@ -308,6 +308,11 @@ struct Presence {
     /// seconds; what lets a peer measure each frame's delay. See `Clock`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     clock: Option<Clock>,
+    /// The subroom they are in; absent is the main room. Absent rather than
+    /// `null` there, so a document from the main room is byte-for-byte what a
+    /// build without subrooms sends, and such a build reads as the main room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    room: Option<String>,
 }
 
 impl Default for Presence {
@@ -317,6 +322,7 @@ impl Default for Presence {
             camera: true,
             mic: true,
             clock: None,
+            room: None,
         }
     }
 }
@@ -329,6 +335,7 @@ impl Presence {
             camera: local.camera_on(),
             mic: local.mic_on(),
             clock: local.clock(),
+            room: local.room(),
         }
     }
 }
@@ -930,6 +937,10 @@ async fn run(
                 hangup,
                 metrics: metrics.clone(),
                 in_room,
+                rooms: audio::Rooms {
+                    local: local.clone(),
+                    controls: controls.clone(),
+                },
             },
             engine,
         ));
@@ -1100,6 +1111,9 @@ async fn run(
         metrics.clear();
         drop(aec_report);
         controls.detach();
+        // The subroom was in a room that is gone now: the next call starts in
+        // its main room, not in a name nobody else is using.
+        local.set_room(None);
         // Aborting the loop above stops the per-participant tasks with it, but
         // the tiles are the interface's and have to be taken down by name.
         let _ = participants.unbounded_send(ParticipantEvent::Cleared);
@@ -1232,6 +1246,9 @@ struct Reports {
     /// for whoever comes next, and only Hang up leaves. And no single peer is
     /// "who we are connected to", so the status line stays on the room.
     in_room: bool,
+    /// Our own subroom and the volume for everyone outside it, which each
+    /// peer's audio task reads on every frame.
+    rooms: audio::Rooms,
 }
 
 /// Watches who is here, and gives each of them a tile and a decoder.
@@ -1257,6 +1274,7 @@ async fn attend(
         hangup,
         metrics,
         in_room,
+        rooms,
     } = reports;
     // The stats file, if asked for (`--stats`). A file that cannot be opened is
     // a line in the log, not a failed call.
@@ -1422,8 +1440,9 @@ async fn attend(
         if let Some(engine) = engine.clone() {
             let peer = id.to_string();
             let stats = stats.clone();
+            let rooms = rooms.clone();
             tasks.push(Abort(tokio::spawn(async move {
-                audio::subscribe(broadcast, peer, engine, stats).await;
+                audio::subscribe(broadcast, peer, engine, stats, Some(rooms)).await;
             })));
         } else {
             tracing::warn!("[audio] {id} cannot be heard: there is no output device");
@@ -1459,12 +1478,17 @@ async fn announce(
     loop {
         ticker.tick().await;
         let now = Presence::here(&local);
-        let changed = (now.camera, now.mic) != (said.camera, said.mic);
+        let changed = (now.camera, now.mic, &now.room) != (said.camera, said.mic, &said.room);
         if changed {
-            tracing::info!("now camera {}, mic {}", on_off(now.camera), on_off(now.mic));
+            tracing::info!(
+                "now camera {}, mic {}, room {}",
+                on_off(now.camera),
+                on_off(now.mic),
+                room_name(&now.room)
+            );
         }
         if changed || said_at.elapsed() >= CLOCK_EVERY {
-            say(&presence, now);
+            say(&presence, now.clone());
             said = now;
             said_at = tokio::time::Instant::now();
         }
@@ -1477,6 +1501,11 @@ const CLOCK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
+}
+
+/// A subroom for the log: its name, or "main" for none.
+fn room_name(room: &Option<String>) -> &str {
+    room.as_deref().unwrap_or("main")
 }
 
 /// Appends one second's measurements: a line per person we receive, and one
@@ -1580,15 +1609,24 @@ async fn listen(
                 camera,
                 mic,
                 clock,
+                room,
             })) => {
                 if let Some(clock) = clock {
                     stats.set_clock(clock);
                 }
-                tracing::debug!("{id} says {state:?}, camera {}, mic {}", on_off(camera), on_off(mic));
+                tracing::debug!(
+                    "{id} says {state:?}, camera {}, mic {}, room {}",
+                    on_off(camera),
+                    on_off(mic),
+                    room_name(&room)
+                );
                 // Their choice, for their tile: a card instead of a frozen
                 // frame, a badge instead of silence nobody can explain.
                 stats.set_camera(camera);
                 stats.set_mic(mic);
+                // Read by their audio task on every frame, which is what sets
+                // how loud they are to us.
+                stats.set_room(room);
                 if state == State::Leaving {
                     // Reported, not acted on: whether the call is over is a
                     // question about everyone, and the loop that tracks
@@ -1769,6 +1807,25 @@ mod presence_tests {
         let old: Presence = serde_json::from_str(r#"{"state":"here"}"#).unwrap();
         assert_eq!(old, Presence::default());
         assert!(old.camera && old.mic);
+        assert_eq!(old.room, None, "an older peer is in the main room");
+    }
+
+    #[test]
+    fn a_subroom_survives_the_round_trip() {
+        let said = Presence {
+            room: Some("Room 2".to_string()),
+            ..Presence::default()
+        };
+        let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
+        assert_eq!(heard.room.as_deref(), Some("Room 2"));
+        assert_eq!(heard, said);
+    }
+
+    #[test]
+    fn the_main_room_is_said_without_a_room_key() {
+        // So an older peer receives exactly the bytes it did before subrooms.
+        let json = serde_json::to_string(&Presence::default()).unwrap();
+        assert!(!json.contains("room"), "{json}");
     }
 
     #[test]
@@ -1781,6 +1838,7 @@ mod presence_tests {
                 wall_us: 1_700_000_000_000_000,
                 media_us: 42,
             }),
+            room: None,
         };
         let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
         assert_eq!(heard, said);

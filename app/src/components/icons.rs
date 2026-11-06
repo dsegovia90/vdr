@@ -106,3 +106,29 @@ pub fn PersonIcon() -> Element {
         }
     }
 }
+
+/// A speaker with sound coming out; struck through while muted.
+#[component]
+pub fn SpeakerIcon(off: bool) -> Element {
+    rsx! {
+        svg {
+            // Needed: blitz hands the serialized subtree to usvg, which only
+            // accepts a root in the SVG namespace.
+            xmlns: "http://www.w3.org/2000/svg",
+            width: "18",
+            height: "18",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M11 5L6 9H2v6h4l5 4V5z" }
+            path { d: "M15.5 8.5a5 5 0 0 1 0 7" }
+            path { d: "M19 5a10 10 0 0 1 0 14" }
+            if off {
+                path { d: "M3 3l18 18" }
+            }
+        }
+    }
+}

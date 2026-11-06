@@ -227,6 +227,16 @@ pub(super) fn drive(driver: encode::Driver) {
     }
 }
 
+/// What decides how loud a peer outside our subroom is: where we are, and the
+/// volume chosen for everyone who is somewhere else.
+#[derive(Clone)]
+pub(super) struct Rooms {
+    /// Ourselves, whose `room()` is the subroom we are in.
+    pub local: Arc<super::PeerStats>,
+    /// Holds the out-of-room volume and its mute.
+    pub controls: Arc<Controls>,
+}
+
 /// Waits for one peer's audio rendition, decodes it, and plays it.
 ///
 /// Runs until the track closes or the peer leaves, which aborts it. Every
@@ -239,8 +249,12 @@ pub(super) async fn subscribe(
     broadcast: moq_net::broadcast::Consumer,
     peer: String,
     engine: playback::Engine,
-    // Their tile's talking dot, and the audio counters for the stats file.
+    // Their tile's talking dot, the audio counters for the stats file, and
+    // the subroom they say they are in.
     stats: Arc<super::PeerStats>,
+    // `None` plays them at full volume always: the loopback has no presence,
+    // so no room to be outside of.
+    rooms: Option<Rooms>,
 ) {
     let mut catalog = match moq_mux::catalog::Consumer::<()>::new(
         &broadcast,
@@ -309,6 +323,9 @@ pub(super) async fn subscribe(
     let mut speaking = Speaking::new(stats.talking_flag());
     // When the last frame came, to spot a gap a listener would hear.
     let mut last_frame: Option<std::time::Instant> = None;
+    // The sink's own default. A peer already outside our subroom is turned down
+    // below before their first frame is written.
+    let mut volume = 1.0f32;
 
     while let Ok(Some(frame)) = consumer.read().await {
         stats.audio_frame();
@@ -337,6 +354,22 @@ pub(super) async fn subscribe(
             }
             decoded = 0;
             since = std::time::Instant::now();
+        }
+        // **Derived on every frame, never set on a change.** The volume follows
+        // from where they are and where we are *now*, so there is no "they
+        // left" or "I joined" event whose loss could leave someone in another
+        // subroom at full volume. Any change -- their presence, our click, the
+        // slider, a reconnect -- lands on the next frame, about 20 ms later.
+        // Applied after `loudness` above, so their talking dot is unaffected,
+        // and the quieter audio still goes into the mix the echo canceller
+        // hears.
+        let wanted = match &rooms {
+            Some(rooms) if stats.room() != rooms.local.room() => rooms.controls.crosstalk_volume(),
+            _ => 1.0,
+        };
+        if wanted != volume {
+            sink.set_volume(wanted);
+            volume = wanted;
         }
         if let Err(error) = sink.write(&frame.data) {
             if !warned {

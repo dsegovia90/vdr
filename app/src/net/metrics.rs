@@ -238,6 +238,9 @@ pub struct PeerStats {
     /// How their camera clock maps to wall-clock time, as they last said.
     /// For our own entry, the mapping we say. See [`Clock`].
     clock: std::sync::Mutex<Option<Clock>>,
+    /// The subroom they are in, as they say in their presence document, or
+    /// `None` for the main room. For our own entry, the one we chose.
+    room: std::sync::Mutex<Option<String>>,
     /// Delays of their frames this second, in ms, for the stats file.
     delays: std::sync::Mutex<Vec<u32>>,
     /// Audio frames decoded this second.
@@ -311,6 +314,7 @@ impl Default for PeerStats {
             camera_on: AtomicBool::new(true),
             mic_on: AtomicBool::new(true),
             clock: std::sync::Mutex::new(None),
+            room: std::sync::Mutex::new(None),
             delays: std::sync::Mutex::new(Vec::new()),
             audio_frames: AtomicU32::new(0),
             audio_gaps: AtomicU32::new(0),
@@ -352,6 +356,18 @@ impl PeerStats {
     /// Records whether their microphone is on.
     pub fn set_mic(&self, on: bool) {
         self.mic_on.store(on, Ordering::Relaxed);
+    }
+
+    /// The subroom they are in, or `None` for the main room.
+    pub fn room(&self) -> Option<String> {
+        self.room.lock().ok().and_then(|room| room.clone())
+    }
+
+    /// Records which subroom they are in; `None` is the main room.
+    pub fn set_room(&self, room: Option<String>) {
+        if let Ok(mut slot) = self.room.lock() {
+            *slot = room;
+        }
     }
 
     /// Their latest camera-to-wall-clock mapping, if they have said one.

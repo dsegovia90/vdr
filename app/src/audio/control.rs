@@ -108,11 +108,35 @@ struct Output {
     engine: Option<playback::Engine>,
 }
 
+/// How loud everyone outside our subroom is played, as the user set it.
+///
+/// A listener setting: it never crosses the wire, and it applies to every
+/// out-of-room peer at once.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Crosstalk {
+    /// `0.0..=1.0`. At `1.0` a subroom is only a label.
+    pub volume: f32,
+    /// Silent, whatever `volume` says; unmuting returns to it.
+    pub muted: bool,
+}
+
+impl Default for Crosstalk {
+    fn default() -> Self {
+        Self {
+            // A guess: quiet enough to talk over, loud enough to follow what
+            // the main room is doing.
+            volume: 0.2,
+            muted: false,
+        }
+    }
+}
+
 /// The shared handle: one per process, held by the interface and by the call.
 #[derive(Default)]
 pub struct Controls {
     mic: Mutex<Mic>,
     output: Mutex<Output>,
+    crosstalk: Mutex<Crosstalk>,
 }
 
 impl PartialEq for Controls {
@@ -243,6 +267,38 @@ impl Controls {
     pub(crate) fn attach_output(&self, engine: Option<&playback::Engine>) {
         if let Ok(mut output) = self.output.lock() {
             output.engine = engine.cloned();
+        }
+    }
+
+    /// The volume a peer outside our subroom plays at: `0.0` while muted.
+    ///
+    /// Read by every peer's audio task on every frame, so a change here is
+    /// heard within one frame.
+    pub fn crosstalk_volume(&self) -> f32 {
+        let crosstalk = self.crosstalk();
+        if crosstalk.muted { 0.0 } else { crosstalk.volume }
+    }
+
+    /// The out-of-room volume and mute, for the menu to show.
+    pub fn crosstalk(&self) -> Crosstalk {
+        self.crosstalk.lock().map(|c| *c).unwrap_or_default()
+    }
+
+    /// Sets the out-of-room volume, clamped to `0.0..=1.0`. A non-finite value
+    /// is ignored: it would otherwise reach every sink.
+    pub fn set_crosstalk_volume(&self, volume: f32) {
+        if !volume.is_finite() {
+            return;
+        }
+        if let Ok(mut crosstalk) = self.crosstalk.lock() {
+            crosstalk.volume = volume.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Mutes or unmutes everyone outside our subroom.
+    pub fn set_crosstalk_muted(&self, muted: bool) {
+        if let Ok(mut crosstalk) = self.crosstalk.lock() {
+            crosstalk.muted = muted;
         }
     }
 
@@ -400,6 +456,33 @@ mod tests {
 
     fn pcm(samples: &[f32]) -> Vec<u8> {
         samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn crosstalk_starts_quiet_and_unmuted() {
+        let controls = Controls::default();
+        assert_eq!(controls.crosstalk_volume(), 0.2);
+    }
+
+    #[test]
+    fn muted_crosstalk_is_silent_whatever_the_volume() {
+        let controls = Controls::default();
+        controls.set_crosstalk_volume(0.8);
+        controls.set_crosstalk_muted(true);
+        assert_eq!(controls.crosstalk_volume(), 0.0);
+        controls.set_crosstalk_muted(false);
+        assert_eq!(controls.crosstalk_volume(), 0.8, "unmuting returns to the volume");
+    }
+
+    #[test]
+    fn crosstalk_volume_is_clamped() {
+        let controls = Controls::default();
+        controls.set_crosstalk_volume(1.7);
+        assert_eq!(controls.crosstalk_volume(), 1.0);
+        controls.set_crosstalk_volume(-0.3);
+        assert_eq!(controls.crosstalk_volume(), 0.0);
+        controls.set_crosstalk_volume(f32::NAN);
+        assert_eq!(controls.crosstalk_volume(), 0.0, "NaN is ignored");
     }
 
     #[test]

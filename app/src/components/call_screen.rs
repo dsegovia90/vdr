@@ -6,7 +6,10 @@
 use cameras::DeviceId;
 use dioxus_native::prelude::*;
 
-use super::{ConnectRow, ControlBar, DropdownOption, ParticipantTile, layout, use_open_menu_provider};
+use super::{
+    ConnectRow, ControlBar, DropdownOption, ParticipantTile, layout, use_open_menu_provider,
+    use_rooms_provider,
+};
 use crate::camera::{FrameSlot, Mirror, use_camera_choice};
 use crate::net::use_remote;
 
@@ -14,6 +17,8 @@ use crate::net::use_remote;
 pub fn CallScreen() -> Element {
     // One open menu at a time across the bar; see `device_menu::OpenMenu`.
     use_open_menu_provider();
+    // Everyone's subroom, filled by the tiles and read by the subroom menu.
+    use_rooms_provider();
 
     // Shared between the capture thread that fills it and the paint source that
     // drains it on the render thread.
@@ -39,6 +44,8 @@ pub fn CallScreen() -> Element {
     let participants = remote.participants.read().clone();
     let tiles = 1 + participants.len();
     let tile = layout::tile_class(tiles);
+    // Our tile's `who`, and so our key among everyone's rooms.
+    let me = remote.me.read().clone().unwrap_or_default();
 
     rsx! {
         // Only while there is no call: your key and who to call. A call is the
@@ -63,7 +70,7 @@ pub fn CallScreen() -> Element {
                 stats: Some(remote.local.clone()),
                 // Our endpoint id once bound, so our avatar matches what
                 // others see; loopback has none, and any constant will do.
-                who: remote.me.read().clone().unwrap_or_default(),
+                who: me.clone(),
                 class: tile,
             }
             if let Some(class) = layout::break_after(tiles, 1) {
@@ -94,6 +101,7 @@ pub fn CallScreen() -> Element {
         ControlBar {
             audio: remote.audio.clone(),
             local: remote.local.clone(),
+            me,
             camera_on: (camera.enabled)(),
             cameras: camera_options,
             camera: camera.selected.read().as_ref().map(|id| id.0.clone()),

@@ -1,5 +1,5 @@
 //! The bottom control bar: microphone and camera on the left, what the call is
-//! doing in the middle, and Leave on the right.
+//! doing in the middle, and the subroom menu and Leave on the right.
 //!
 //! **Small on purpose.** Everything here used to be full-width rows above and
 //! below the video, and in a default-size window they left four people 46
@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use dioxus_native::prelude::*;
 
-use super::{CameraIcon, DeviceMenu, DropdownOption, LeaveIcon, MenuSection, MicControl, StatsRow};
+use super::{
+    CameraIcon, DeviceMenu, DropdownOption, LeaveIcon, MenuSection, MicControl, StatsRow, SubroomMenu,
+};
 use crate::audio::Controls;
 use crate::net::{Metrics, PeerStats, RemoteStatus};
 
@@ -19,6 +21,8 @@ pub struct ControlBarProps {
     pub audio: Arc<Controls>,
     /// Ourselves: the mic toggle records itself here for the room to hear of.
     pub local: Arc<PeerStats>,
+    /// Our endpoint id as our own tile has it, for the subroom menu.
+    pub me: String,
     /// Whether the camera is on, by the user's choice.
     pub camera_on: bool,
     /// Cameras to choose from, and the chosen one's `value`.
@@ -87,6 +91,10 @@ pub fn ControlBar(props: ControlBarProps) -> Element {
                 }
                 span { class: status_class, "{status}" }
                 StatsRow { metrics: props.metrics.clone() }
+            }
+            // Only on a call: before one there is no room to divide.
+            if status.is_connected() {
+                SubroomMenu { audio: props.audio.clone(), local: props.local.clone(), me: props.me.clone() }
             }
             if leaving {
                 button {

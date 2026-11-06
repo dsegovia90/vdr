@@ -5,12 +5,14 @@
 //! manage in this blitz revision -- but a row beneath costs nothing, cannot
 //! cover the picture, and is one less thing that depends on the renderer.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use dioxus_native::prelude::*;
 
-use super::{MicIcon, ParticipantVideo, PersonIcon};
+use super::{MicIcon, ParticipantVideo, PersonIcon, Rooms};
 use crate::camera::{FrameSlot, Mirror};
 use crate::channel::use_channel;
 use crate::net::PeerStats;
@@ -19,12 +21,14 @@ use crate::net::PeerStats;
 const POLL: Duration = Duration::from_millis(500);
 
 /// What a tile's label shows, sampled so rendering never touches the atomics.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct Reading {
     fps: Option<f32>,
     talking: bool,
     camera_on: bool,
     mic_on: bool,
+    /// Their subroom. Not shown on the tile; passed on to the page's [`Rooms`].
+    room: Option<String>,
 }
 
 impl Default for Reading {
@@ -34,6 +38,7 @@ impl Default for Reading {
             talking: false,
             camera_on: true,
             mic_on: true,
+            room: None,
         }
     }
 }
@@ -60,13 +65,43 @@ pub struct ParticipantTileProps {
 #[component]
 pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     let mut reading = use_signal(Reading::default);
+    let Rooms(mut rooms) = use_context::<Rooms>();
+    // **Who, as of this render.** Our own tile's `who` changes once, when the
+    // endpoint binds, and the callback below outlives that render; it reads
+    // this rather than the props it was created with.
+    let who = use_hook(|| Rc::new(RefCell::new(String::new())));
+    who.replace(props.who.clone());
+    // The key this tile last wrote, so a changed `who` or an unmount removes it:
+    // a stale entry would keep a subroom open after its last member left.
+    let written = use_hook(|| Rc::new(RefCell::new(None::<String>)));
 
     // A thread per tile, the stats row's pattern: it samples and sends, and it
     // ends on its own when the tile unmounts and the channel's receiver goes.
     // At most a handful of tiles, each asleep nearly all the time.
-    let tx = use_channel(move |next: Reading| {
-        if *reading.peek() != next {
-            reading.set(next);
+    let tx = use_channel({
+        let who = who.clone();
+        let written = written.clone();
+        move |next: Reading| {
+            let key = who.borrow().clone();
+            let stale = written.borrow().as_ref().filter(|old| **old != key).cloned();
+            if let Some(stale) = stale {
+                rooms.write().remove(&stale);
+            }
+            if rooms.peek().get(&key) != Some(&next.room) {
+                rooms.write().insert(key.clone(), next.room.clone());
+            }
+            written.replace(Some(key));
+            if *reading.peek() != next {
+                reading.set(next);
+            }
+        }
+    });
+    use_drop(move || {
+        if let Some(key) = written.take() {
+            // The page may be going too, taking the map with it.
+            if let Ok(mut map) = rooms.try_write() {
+                map.remove(&key);
+            }
         }
     });
     use_hook({
@@ -81,6 +116,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                         talking: stats.talking(),
                         camera_on: stats.camera_on(),
                         mic_on: stats.mic_on(),
+                        room: stats.room(),
                     };
                     if tx.unbounded_send(next).is_err() {
                         return;

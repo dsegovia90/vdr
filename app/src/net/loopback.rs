@@ -121,6 +121,7 @@ async fn pump(
             "loopback".to_string(),
             engine,
             stats.clone(),
+            None,
         ))
     });
 

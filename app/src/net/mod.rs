@@ -153,6 +153,15 @@ pub fn use_remote() -> Remote {
 
     use_hook(|| {
         let audio = Arc::new(Controls::default());
+        // The out-of-room volume, as last set. Read once here; the subroom
+        // menu saves it as it changes.
+        let saved = crate::settings::Settings::load();
+        if let Some(volume) = saved.crosstalk_volume {
+            audio.set_crosstalk_volume(volume);
+        }
+        if let Some(muted) = saved.crosstalk_muted {
+            audio.set_crosstalk_muted(muted);
+        }
         let metrics = Arc::new(Metrics::default());
         let local = Arc::new(PeerStats::default());
         let (tap, feed) = frame_tap();
