@@ -1,8 +1,8 @@
 //! A call: one peer directly, or a room of several on a relay.
 //!
 //! The shape is the loopback's with the pipe replaced by a real connection.
-//! `--listen` runs a `moq_native::Server` and `--dial` runs a
-//! `moq_native::Client` against it; after the handshake the two sides are
+//! `--listen` runs a `moq_tokio::Server` and `--dial` runs a
+//! `moq_tokio::Client` against it; after the handshake the two sides are
 //! identical, and so is everything below the transport.
 //!
 //! **Two modes, side by side.** A 1:1 call is peer to peer with no relay: the
@@ -77,13 +77,13 @@ struct Peer {
     /// Connection figures, when this side has a handle that outlives a single
     /// session. The listening side reports its own from inside the accept loop
     /// instead, since its session is what it has.
-    stats: Option<moq_native::ConnectionStatsReader>,
+    stats: Option<moq_tokio::ConnectionStatsReader>,
 }
 
 /// Everything [`connect`] needs, named rather than positional.
 struct Connect<'a> {
-    config: &'a moq_native::ClientConfig,
-    endpoint: &'a moq_native::iroh::Endpoint,
+    config: &'a moq_tokio::ClientConfig,
+    endpoint: &'a moq_tokio::iroh::Endpoint,
     outbound: &'a moq_net::origin::Producer,
     inbound: moq_net::origin::Producer,
     /// A peer's `iroh://<id>`, or a relay's room URL.
@@ -144,7 +144,7 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
             let mut connected = false;
             loop {
                 match session.status().await {
-                    Ok(moq_native::Status::Connected) => {
+                    Ok(moq_tokio::Status::Connected) => {
                         if connected {
                             tracing::info!("reconnected to {label}");
                             keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -163,7 +163,7 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
                         }
                         connected = true;
                     }
-                    Ok(moq_native::Status::Disconnected) => {
+                    Ok(moq_tokio::Status::Disconnected) => {
                         tracing::warn!("the session dropped; redialling {label}");
                         let _ = status.unbounded_send(RemoteStatus::Reconnecting);
                     }
@@ -428,15 +428,15 @@ fn identity() -> Option<String> {
 /// Retry pacing, shared by both sides.
 ///
 /// Only the dialling side redials -- the listener has nothing to dial -- but
-/// both sides read [`moq_native::Backoff::linger`] from the same value, because
+/// both sides read [`moq_tokio::Backoff::linger`] from the same value, because
 /// what it decides is how long each side holds the *other's* broadcast open
 /// waiting for it to come back. The two have to agree or one side tears down a
 /// call the other is still repairing.
 ///
 /// The escalation itself is left alone: 1 s, doubling to 5 s, is a sensible
 /// climb, and the jitter matters even between two peers.
-fn backoff() -> moq_native::Backoff {
-    let mut backoff = moq_native::Backoff::default();
+fn backoff() -> moq_tokio::Backoff {
+    let mut backoff = moq_tokio::Backoff::default();
     backoff.timeout = RETRY_BUDGET;
     backoff
 }
@@ -503,13 +503,13 @@ async fn run(
 
     report(RemoteStatus::Binding);
 
-    let mut client_config = moq_native::ClientConfig::default();
+    let mut client_config = moq_tokio::ClientConfig::default();
     client_config.backoff = backoff();
     // Read by `bind` below and applied to the endpoint's transport config, which
     // is what makes it symmetric: the listener shares this endpoint and so
     // inherits the same timeout without a config of its own.
     client_config.quic.idle_timeout = Some(IDLE_TIMEOUT);
-    let mut iroh = moq_native::iroh::EndpointConfig::default();
+    let mut iroh = moq_tokio::iroh::EndpointConfig::default();
     iroh.enabled = Some(true);
     iroh.secret = identity();
     let endpoint = iroh
@@ -725,7 +725,7 @@ async fn run(
             }
             Peering::Listen => {
                 report(RemoteStatus::Listening { me: me.to_string() });
-                let mut server_config = moq_native::ServerConfig::default();
+                let mut server_config = moq_tokio::ServerConfig::default();
 
                 server_config.bind = Some("[::]:0".to_string());
                 server_config.tls.generate = vec!["localhost".to_string()];

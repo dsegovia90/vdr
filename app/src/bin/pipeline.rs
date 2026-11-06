@@ -184,8 +184,8 @@ async fn run(
             println!("via relay {url}");
             let url: url::Url = url.parse().context("--relay must be a URL")?;
 
-            let client_config = moq_native::ClientConfig::default();
-            let mut iroh = moq_native::iroh::EndpointConfig::default();
+            let client_config = moq_tokio::ClientConfig::default();
+            let mut iroh = moq_tokio::iroh::EndpointConfig::default();
             iroh.enabled = Some(true);
             let endpoint = iroh
                 .bind(&client_config.quic)

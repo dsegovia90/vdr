@@ -75,22 +75,32 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # vello can share a device. Until someone does, it stays off. The Cargo.lock
 # also carries wgpu 29 via anyrender_vello_cpu -> pixels, which is target-gated
 # and never on the host (`cargo tree -i wgpu@29.0.4` prints nothing).
-moq-net   = { version = "0.2",  default-features = false }
-moq-mux   = { version = "0.9",  default-features = false }
+moq-net   = { version = "0.3",  default-features = false }
+moq-mux   = { version = "0.10", default-features = false }
 # The control plane, and it costs nothing: `moq-mux` already pulls this in to
 # publish the catalog, so declaring it adds no package to the build. The catalog
 # we read on every call is one of these documents, which is the evidence that
 # the model carries small structured state.
-moq-json  = { version = "0.3",  default-features = false }
-moq-video = { version = "0.0.22", default-features = false }
-moq-audio = { version = "0.0.22", default-features = false, features = ["capture", "playback", "aec"] }
-moq-native = { version = "0.19", default-features = false, features = ["iroh", "quinn", "aws-lc-rs"] }
+moq-json  = { version = "0.5",  default-features = false }
+# `openh264` is the software codec, opt-in since 0.1: without it a machine with
+# no hardware codec could neither send nor receive video.
+moq-video = { version = "0.1.21", default-features = false, features = ["openh264"] }
+moq-audio = { version = "0.1.21", default-features = false, features = ["capture", "playback", "aec"] }
+# Was `moq-native`, renamed upstream. Its QUIC backend is now `noq`.
+moq-tokio = { version = "0.19.34", default-features = false, features = ["iroh", "noq", "aws-lc-rs"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
 url = "2"
 wgpu = "30"
 
+# Hardware video on Linux: VA-API (Intel, AMD) and NVENC/NVDEC (Nvidia), each
+# falling back to openh264. Both `dlopen` their libraries, so the portable
+# package still starts on machines without libva or an Nvidia driver. VA-API
+# runs bindgen at build time, which needs clang (installed by build-linux.sh).
+[target.'cfg(target_os = "linux")'.dependencies]
+moq-video = { version = "0.1.21", default-features = false, features = ["openh264", "vaapi", "nvidia"] }
+
 # A patched moq-audio: exposes the echo canceller's own statistics (sonora's
-# ERLE, delay estimate, residual echo likelihood), which 0.0.22 keeps private.
+# ERLE, delay estimate, residual echo likelihood), which upstream keeps private, and carries the echo fix.
 # See vendor/moq-audio/PATCH.md. Drop this once upstream exposes them.
 [patch.crates-io]
 moq-audio = { path = "vendor/moq-audio" }

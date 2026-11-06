@@ -106,7 +106,7 @@ pub(super) fn publish(
     broadcast: moq_net::broadcast::Producer,
     catalog: moq_mux::catalog::Producer,
     engine: Option<&playback::Engine>,
-) -> Result<(encode::Publication, encode::Driver, Option<moq_audio::aec::Canceller>), String> {
+) -> Result<(encode::Publication, encode::Driver, Option<moq_audio::aec::Control>), String> {
     // Opus at 20 ms, the system default input.
     let mut options = encode::PublicationOptions::default();
     // A clone handed back for `report_aec`: clones share one adaptive filter,
@@ -128,8 +128,15 @@ pub(super) fn publish(
         // Defaults are noise suppression and auto gain both on, which is what a
         // browser gives a call. Costs up to 10 ms of capture latency.
         Some(engine) => {
-            canceller = Some(engine.canceller(moq_audio::aec::Config::default()));
-            options.capture.aec = canceller.clone();
+            match engine.canceller(moq_audio::aec::Config::default()) {
+                Ok(control) => {
+                    canceller = Some(control);
+                    options.capture.aec = canceller.clone();
+                }
+                // A second canceller on one engine is refused; the microphone
+                // then goes out uncancelled, which the log should say.
+                Err(error) => tracing::warn!("[audio] no echo cancellation: {error:#}"),
+            }
         }
         None => tracing::warn!(
             "[audio] no output device, so nothing to cancel and nothing to cancel it against"
@@ -152,7 +159,7 @@ pub(super) fn publish(
 /// then says whose machine fails to cancel and why, rather than leaving it to
 /// guesswork. Runs until the call aborts it.
 pub(super) async fn report_aec(
-    canceller: moq_audio::aec::Canceller,
+    canceller: moq_audio::aec::Control,
     metrics: Option<Arc<super::Metrics>>,
 ) {
     let mut ticker = tokio::time::interval(AEC_REPORT_EVERY);
@@ -276,11 +283,11 @@ pub(super) async fn subscribe(
             }
         };
 
-    let mut sink = match engine.sink(playback::Input {
-        format: moq_audio::Format::F32,
-        sample_rate: consumer.sample_rate(),
-        channels: consumer.channels(),
-    }) {
+    let mut input = playback::Input::default();
+    input.format = moq_audio::Format::F32;
+    input.sample_rate = consumer.sample_rate();
+    input.layout = consumer.layout();
+    let mut sink = match engine.sink(input) {
         Ok(sink) => sink,
         Err(error) => {
             tracing::error!("[audio] could not add {peer} to the mix: {error:#}");
@@ -290,7 +297,7 @@ pub(super) async fn subscribe(
     tracing::info!(
         "[audio] playing {peer} at {} Hz, {} channel(s)",
         consumer.sample_rate(),
-        consumer.channels()
+        consumer.layout().channels()
     );
 
     let mut warned = false;
@@ -343,12 +350,14 @@ pub(super) async fn subscribe(
 
 /// The decoder settings, which differ from the defaults in exactly one place.
 ///
-/// Built field by field because [`decode::Config`] is `#[non_exhaustive]`, so
-/// there is no struct literal to write.
-fn decode_config() -> decode::Config {
-    let mut config = decode::Config::default();
-    config.latency_max = Some(LATENCY_MAX);
-    config
+/// Built field by field because [`decode::Options`] is `#[non_exhaustive]`, so
+/// there is no struct literal to write. `max_age` is what moq-audio 0.1 calls
+/// the old `latency_max`, with the same trap: its default of zero skips a
+/// stalled group the moment a newer one exists.
+fn decode_config() -> decode::Options {
+    let mut options = decode::Options::default();
+    options.max_age = LATENCY_MAX;
+    options
 }
 
 /// Names the input a config will open, for the log.
