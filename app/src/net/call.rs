@@ -340,6 +340,13 @@ impl Presence {
     }
 }
 
+/// A peer's subroom as we hold it: a blank name, which comes off the wire
+/// unchecked, is the main room. Kept as a subroom it would show as one
+/// nobody can name or join, separate from main.
+fn subroom(room: Option<String>) -> Option<String> {
+    room.filter(|name| !name.trim().is_empty())
+}
+
 /// The serde default for the media flags.
 fn on() -> bool {
     true
@@ -1611,6 +1618,7 @@ async fn listen(
                 clock,
                 room,
             })) => {
+                let room = subroom(room);
                 if let Some(clock) = clock {
                     stats.set_clock(clock);
                 }
@@ -1799,7 +1807,7 @@ mod path_tests {
 
 #[cfg(test)]
 mod presence_tests {
-    use super::{Presence, State};
+    use super::{Presence, State, subroom};
     use crate::net::metrics::Clock;
 
     #[test]
@@ -1808,6 +1816,15 @@ mod presence_tests {
         assert_eq!(old, Presence::default());
         assert!(old.camera && old.mic);
         assert_eq!(old.room, None, "an older peer is in the main room");
+    }
+
+    #[test]
+    fn a_blank_room_is_the_main_room() {
+        for json in [r#"{"state":"here","room":""}"#, r#"{"state":"here","room":"  "}"#] {
+            let heard: Presence = serde_json::from_str(json).unwrap();
+            assert_eq!(subroom(heard.room), None, "{json}");
+        }
+        assert_eq!(subroom(Some("Room 1".into())).as_deref(), Some("Room 1"));
     }
 
     #[test]

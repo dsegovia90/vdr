@@ -87,7 +87,8 @@ pub fn CallScreen() -> Element {
         if labelled {
             let name = group.room.as_deref().unwrap_or("Main room");
             items.push(Item {
-                key: format!("room:{}", group.room.as_deref().unwrap_or("")),
+                // "main" has no colon, so no room name can produce it.
+                key: group.room.as_ref().map_or_else(|| "main".to_string(), |room| format!("room:{room}")),
                 label: Some((
                     format!("{name} \u{b7} {}", group.members.len()),
                     if mine { layout::LABEL_MINE } else { layout::LABEL },
