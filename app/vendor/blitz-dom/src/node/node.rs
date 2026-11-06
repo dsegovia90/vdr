@@ -1465,6 +1465,13 @@ impl Node {
         if matches_hoisted_content {
             if let Some(hoisted) = &self.stacking_context {
                 for hoisted_child in hoisted.pos_z_hoisted_children().rev() {
+                    // vid patch: the stacking context is a cache refreshed by
+                    // layout, so between a removal and the next layout it can
+                    // name a node that is gone. Skip it; `position` would index
+                    // the tree with its id and panic.
+                    if self.tree().get(hoisted_child.node_id).is_none() {
+                        continue;
+                    }
                     let pos = hoisted_child.position(self.tree(), self.id);
                     let x = x - pos.x;
                     let y = y - pos.y;
@@ -1480,7 +1487,13 @@ impl Node {
 
         // Call `.hit()` on each child in turn. If any return `Some` then return that value. Else return `Some(self.id).
         for child_id in self.paint_children.borrow().iter().flatten().rev() {
-            let child = self.with(*child_id);
+            // vid patch: `paint_children` is likewise refreshed by layout, and
+            // a pointer move between a removal and the next layout hit-tested
+            // a removed child and panicked here. A node that is gone cannot be
+            // hit.
+            let Some(child) = self.tree().get(*child_id) else {
+                continue;
+            };
             let child_position = child.taffy_position();
             let mut child_x = x;
             let mut child_y = y;
