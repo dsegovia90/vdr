@@ -70,7 +70,7 @@ fn init_logging() {
 /// the relay's certificate hash over plain HTTP with `reqwest`, which builds
 /// its client on rustls's *process* default -- and there is none, because both
 /// `aws-lc-rs` and `ring` are compiled into the tree, so rustls refuses to
-/// guess. The panic is inside moq-native's reconnect task, so all that reached
+/// guess. The panic is inside moq-native's (now moq-tokio's) reconnect task, so all that reached
 /// the call was "reconnect stopped". moq-native's own TLS passes a provider
 /// explicitly, which is why direct calls never hit this.
 ///

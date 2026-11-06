@@ -31,7 +31,7 @@ const IDENTITY: &str = "identity.key";
 /// The file our endpoint's secret key is kept in, creating its directory if
 /// that is missing.
 ///
-/// **We never read or write it** — the path is handed to `moq-native`, which
+/// **We never read or write it** — the path is handed to `moq-tokio`, which
 /// generates a key into it on first use and reads it back afterwards, so there
 /// is no key handling of ours to get wrong. The directory is ours to create,
 /// because that write does not.

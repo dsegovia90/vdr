@@ -49,7 +49,7 @@
 //!
 //! `--relay` joins a **room**: every participant connects to the same relay
 //! and the URL's path names the room, because the relay roots each session at
-//! the path it connected with. Three schemes, all handled by moq-native's
+//! the path it connected with. Three schemes, all handled by moq-tokio's
 //! client:
 //!
 //! - `http://host:port/room` -- a local dev relay. The client fetches and pins

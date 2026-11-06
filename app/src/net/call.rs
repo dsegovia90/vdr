@@ -68,7 +68,7 @@ impl Drop for Abort {
 /// rate control) had to be wired inside one arm as a special case.
 ///
 /// Anything per-connection belongs here rather than in a branch:
-/// `ConnectionStats` for rtt and loss would be the next one.
+/// Connection stats for rtt and loss came next (`stats`).
 struct Peer {
     /// Resolves when the connection ends, with why.
     closed: Pin<Box<dyn Future<Output = String> + Send>>,
@@ -184,7 +184,7 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
 /// **A room URL can carry its invitation** (`?jwt=…`, the relay's token), and
 /// anyone holding it can join that room until it expires, so it must never be
 /// written anywhere a log or a screenshot might travel. Only our own lines are
-/// covered: moq-native logs the full URL at `info` itself, which the default
+/// covered: moq-tokio logs the full URL at `info` itself, which the default
 /// `RUST_LOG=vdr=…` filter happens to hide.
 fn redacted(url: &url::Url) -> String {
     let mut clean = url.clone();
@@ -205,7 +205,7 @@ fn redacted(url: &url::Url) -> String {
 /// A call's final error, in words where we know what it means.
 ///
 /// The relay refusing a token arrives as a closed session (`code=6
-/// reason=unauthorized`), which moq-native retries like any drop until its
+/// reason=unauthorized`), which moq-native (now moq-tokio) retried like any drop until its
 /// budget runs out -- it does not tell a refusal from a flaky link until then.
 /// What reaches us at the end is transport text; this says what to do.
 fn explain(error: String) -> String {
@@ -436,10 +436,10 @@ const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// Which secret key the endpoint comes up with, and therefore who we are.
 ///
 /// Three answers, in order. `--secret` is forwarded into `IROH_SECRET` by
-/// `args`; moq-native reads its own `MOQ_IROH_SECRET`, so the two are bridged
+/// `args`; moq-tokio reads its own `MOQ_IROH_SECRET`, so the two are bridged
 /// here rather than teaching `args` a second variable. `--ephemeral` is `None`,
 /// a throwaway key, which is what every launch used to be. Otherwise a **path**,
-/// which moq-native generates into on first use and reads back afterwards
+/// which moq-tokio generates into on first use and reads back afterwards
 /// (hex parses as a key, anything else is treated as a file) -- so our id
 /// outlives the process and a key someone wrote down still dials.
 ///
