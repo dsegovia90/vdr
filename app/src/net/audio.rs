@@ -27,7 +27,7 @@ use std::time::Duration;
 use moq_audio::{capture, decode, encode, playback};
 use moq_mux::catalog::Stream as _;
 
-use crate::audio::{Speaking, Talking, loudness};
+use crate::audio::{Controls, Speaking, Talking, loudness};
 
 /// How far ahead newer audio has to be before a stalled group is abandoned.
 ///
@@ -47,18 +47,37 @@ const LATENCY_MAX: Duration = Duration::from_millis(200);
 /// its rate is fixed by the codec rather than by a camera.
 const REPORT_EVERY: u32 = 500;
 
-/// Opens the output device.
+/// Opens the output the user chose, and registers it with `controls` so a
+/// choice made mid-call can move it.
 ///
-/// `None` rather than an error: a machine with no usable output should still
-/// carry a call. The peer simply cannot be heard, which the log says once.
-pub(super) async fn open_playback() -> Option<playback::Engine> {
-    match playback::Engine::open(playback::Config::default()).await {
-        Ok(engine) => Some(engine),
+/// A chosen device that will not open -- unplugged since it was picked -- falls
+/// back to the system default with a warning, never to silence. `None` rather
+/// than an error when nothing opens at all: a machine with no usable output
+/// should still carry a call. The peer simply cannot be heard, which the log
+/// says once.
+pub(super) async fn open_playback(controls: &Controls) -> Option<playback::Engine> {
+    let chosen = controls.output();
+    let mut config = playback::Config::default();
+    config.device = chosen.clone();
+    let (opened, device) = match playback::Engine::open(config).await {
+        Err(error) if chosen.is_some() => {
+            tracing::warn!("[audio] could not open output {chosen:?}, using the system default: {error:#}");
+            (playback::Engine::open(playback::Config::default()).await, None)
+        }
+        opened => (opened, chosen),
+    };
+    let engine = match opened {
+        Ok(engine) => {
+            tracing::info!("[audio] playing through {}", device.as_deref().unwrap_or("the system default output"));
+            Some(engine)
+        }
         Err(error) => {
             tracing::warn!("[audio] no output device, so the peer will be silent: {error:#}");
             None
         }
-    }
+    };
+    controls.attach_output(engine.as_ref());
+    engine
 }
 
 /// Registers the microphone track on an existing broadcast and catalog.

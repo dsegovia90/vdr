@@ -658,7 +658,7 @@ async fn run(
         say(&presence, Presence::here(&local));
         let announcing = Abort(tokio::spawn(announce(presence.clone(), local.clone())));
 
-        let engine = audio::open_playback().await;
+        let engine = audio::open_playback(&controls).await;
         let mut aec_report = None;
         match audio::publish(broadcast.clone(), catalog, engine.as_ref()) {
             Ok((publication, driver, canceller)) => {

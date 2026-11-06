@@ -98,7 +98,7 @@ async fn pump(
     let mut producer =
         moq_video::encode::Producer::with_track(track, catalog.clone(), rendition.clone())?;
 
-    let engine = audio::open_playback().await;
+    let engine = audio::open_playback(&controls).await;
     match audio::publish(broadcast.clone(), catalog, engine.as_ref()) {
         Ok((publication, driver, canceller)) => {
             controls.attach(publication);

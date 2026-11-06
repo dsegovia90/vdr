@@ -33,9 +33,11 @@ pub struct DropdownOption {
     pub label: String,
 }
 
-#[derive(Clone, PartialEq, Props)]
-pub struct DeviceMenuProps {
-    /// Shown as the menu's heading, e.g. "Microphone".
+/// One list in a [`DeviceMenu`], under its own heading -- the microphone's menu
+/// has two, for the input and the output, as other calling apps do.
+#[derive(Clone, PartialEq)]
+pub struct MenuSection {
+    /// Shown as the section's heading, e.g. "Microphone".
     pub title: &'static str,
     /// The devices to choose from.
     pub options: Vec<DropdownOption>,
@@ -43,16 +45,23 @@ pub struct DeviceMenuProps {
     pub selected: Option<String>,
     /// Called with the chosen option's `value`.
     pub onchange: EventHandler<String>,
-    /// Looks for devices again; the menu's last item.
+}
+
+#[derive(Clone, PartialEq, Props)]
+pub struct DeviceMenuProps {
+    /// This menu's identity among the page's menus, e.g. "camera".
+    pub name: &'static str,
+    /// The lists, top to bottom.
+    pub sections: Vec<MenuSection>,
+    /// Looks for devices again; the menu's last item, covering every section.
     pub onrescan: EventHandler<()>,
 }
 
 #[component]
 pub fn DeviceMenu(props: DeviceMenuProps) -> Element {
     let OpenMenu(mut current) = use_context::<OpenMenu>();
-    // Titles are this menu's identity: one per device kind.
-    let title = props.title;
-    let open = move || current() == Some(title);
+    let name = props.name;
+    let open = move || current() == Some(name);
 
     rsx! {
         div { class: "relative",
@@ -65,41 +74,58 @@ pub fn DeviceMenu(props: DeviceMenuProps) -> Element {
                     "relative z-[6] flex h-10 w-6 items-center justify-center rounded-md text-xs text-neutral-400 hover:bg-neutral-800"
                 },
                 onclick: move |_| {
-                    let next = if open() { None } else { Some(title) };
+                    let next = if open() { None } else { Some(name) };
                     current.set(next);
                 },
                 "\u{25BE}"
             }
-            if open() {
+            // **Mounted always, hidden while closed -- never removed.** The
+            // layer and the panel have positive z-index, so blitz caches them
+            // in a stacking context; removing them left that cache naming a
+            // node that was gone, and a hit-test before the next layout
+            // panicked on it (blitz-dom `hit_inner`, finding F9). Hiding
+            // changes a style, not the tree.
+            Fragment {
                 // **Closes on any click outside the menu.** An invisible layer
                 // over the whole window, under the menu and the ▾ buttons: a
                 // click anywhere else -- the video, the bar -- lands here and
                 // only closes the menu. It does not go on to what is
                 // underneath, which is the usual behaviour for a menu.
                 div {
-                    class: "fixed inset-0 z-[5]",
+                    class: if open() { "fixed inset-0 z-[5]" } else { "hidden fixed inset-0 z-[5]" },
                     onclick: move |_| current.set(None),
                 }
-                div { class: "absolute bottom-full left-0 z-10 mb-2 w-72 rounded-lg border border-neutral-700 bg-neutral-900 p-1",
-                    div { class: "px-2.5 pb-1 pt-1.5 text-xs text-neutral-500", {props.title} }
-                    if props.options.is_empty() {
-                        div { class: "px-2.5 py-2 text-sm text-neutral-500", "None found" }
-                    }
-                    for option in props.options.iter() {
-                        div {
-                            class: if Some(&option.value) == props.selected.as_ref() {
-                                "rounded px-2.5 py-2 text-sm bg-blue-600 text-white"
-                            } else {
-                                "rounded px-2.5 py-2 text-sm text-neutral-200 hover:bg-neutral-800"
-                            },
-                            onclick: {
-                                let value = option.value.clone();
-                                move |_| {
-                                    props.onchange.call(value.clone());
-                                    current.set(None);
-                                }
-                            },
-                            {option.label.clone()}
+                div {
+                    class: if open() {
+                        "absolute bottom-full left-0 z-10 mb-2 w-72 rounded-lg border border-neutral-700 bg-neutral-900 p-1"
+                    } else {
+                        "hidden absolute bottom-full left-0 z-10 mb-2 w-72 rounded-lg border border-neutral-700 bg-neutral-900 p-1"
+                    },
+                    for (index, section) in props.sections.iter().enumerate() {
+                        if index > 0 {
+                            div { class: "my-1 h-px bg-neutral-800" }
+                        }
+                        div { class: "px-2.5 pb-1 pt-1.5 text-xs text-neutral-500", {section.title} }
+                        if section.options.is_empty() {
+                            div { class: "px-2.5 py-2 text-sm text-neutral-500", "None found" }
+                        }
+                        for option in section.options.iter() {
+                            div {
+                                class: if Some(&option.value) == section.selected.as_ref() {
+                                    "rounded px-2.5 py-2 text-sm bg-blue-600 text-white"
+                                } else {
+                                    "rounded px-2.5 py-2 text-sm text-neutral-200 hover:bg-neutral-800"
+                                },
+                                onclick: {
+                                    let value = option.value.clone();
+                                    let onchange = section.onchange;
+                                    move |_| {
+                                        onchange.call(value.clone());
+                                        current.set(None);
+                                    }
+                                },
+                                {option.label.clone()}
+                            }
                         }
                     }
                     div { class: "my-1 h-px bg-neutral-800" }

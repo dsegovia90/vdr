@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use dioxus_native::prelude::*;
 
-use super::{DeviceMenu, DropdownOption, MicIcon};
-use crate::audio::{Controls, MicStatus, Talking, use_shared_microphones};
+use super::{DeviceMenu, DropdownOption, MenuSection, MicIcon};
+use crate::audio::{Controls, MicStatus, Talking, use_shared_microphones, use_shared_outputs};
 use crate::channel::use_channel;
 use crate::net::PeerStats;
 use crate::settings::{self, Settings};
@@ -49,12 +49,16 @@ pub struct MicrophoneProps {
 #[component]
 pub fn MicControl(props: MicrophoneProps) -> Element {
     let devices = use_shared_microphones();
+    let outputs = use_shared_outputs();
     let mut meter = use_signal(Meter::default);
 
     let mut muted = use_signal(|| false);
     let mut selected = use_signal::<Option<String>>(|| None);
 
+    let mut output = use_signal::<Option<String>>(|| None);
+
     let saved = use_hook(|| Settings::load().microphone);
+    let saved_output = use_hook(|| Settings::load().output);
 
     let chosen_once = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
     use_effect({
@@ -73,6 +77,22 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
             selected.set(chosen.clone());
             audio.set_device(chosen);
             chosen_once.set(true);
+        }
+    });
+
+    // The remembered output, once the outputs have been scanned: the
+    // microphone's rule, applied once.
+    let output_once = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    use_effect({
+        let audio = props.audio.clone();
+        move || {
+            if output_once.get() || !*outputs.ready.read() {
+                return;
+            }
+            let chosen = settings::initial_output(&outputs.devices.read(), saved_output.as_deref());
+            output.set(chosen.clone());
+            audio.set_output(chosen);
+            output_once.set(true);
         }
     });
 
@@ -109,15 +129,13 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
         .devices
         .read()
         .iter()
-        .map(|device| DropdownOption {
-            value: device.id.clone(),
-
-            label: if device.default {
-                format!("{} (default)", device.name)
-            } else {
-                device.name.clone()
-            },
-        })
+        .map(|device| option(&device.id, &device.name, device.default))
+        .collect();
+    let output_options: Vec<DropdownOption> = outputs
+        .devices
+        .read()
+        .iter()
+        .map(|device| option(&device.id, &device.name, device.default))
         .collect();
     let has_devices = !options.is_empty();
 
@@ -157,25 +175,59 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
                 }
             }
             DeviceMenu {
-                title: "Microphone",
-                options,
-                selected: selected.read().clone(),
-                onchange: {
-                    let audio = props.audio.clone();
-                    move |value: String| {
-                        // Saved here rather than in an effect: this is the one
-                        // place a *person* changes the input.
-                        let chosen = value.clone();
-                        Settings::update(move |settings| settings.microphone = Some(chosen));
-                        audio.set_device(Some(value.clone()));
-                        selected.set(Some(value));
-                    }
+                name: "microphone",
+                sections: vec![
+                    MenuSection {
+                        title: "Microphone",
+                        options,
+                        selected: selected.read().clone(),
+                        onchange: EventHandler::new({
+                            let audio = props.audio.clone();
+                            move |value: String| {
+                                // Saved here rather than in an effect: this is the one
+                                // place a *person* changes the input.
+                                let chosen = value.clone();
+                                Settings::update(move |settings| settings.microphone = Some(chosen));
+                                audio.set_device(Some(value.clone()));
+                                selected.set(Some(value));
+                            }
+                        }),
+                    },
+                    MenuSection {
+                        title: "Speakers",
+                        options: output_options,
+                        selected: output.read().clone(),
+                        onchange: EventHandler::new({
+                            let audio = props.audio.clone();
+                            move |value: String| {
+                                let chosen = value.clone();
+                                Settings::update(move |settings| settings.output = Some(chosen));
+                                audio.set_output(Some(value.clone()));
+                                output.set(Some(value));
+                            }
+                        }),
+                    },
+                ],
+                onrescan: move |_| {
+                    devices.refresh.call(());
+                    outputs.refresh.call(());
                 },
-                onrescan: move |_| devices.refresh.call(()),
             }
             if let Some(problem) = problem {
                 span { class: "ml-1 text-xs text-red-400 whitespace-nowrap", "{problem}" }
             }
         }
+    }
+}
+
+/// A device as the menu lists it, marking the system default.
+fn option(id: &str, name: &str, default: bool) -> DropdownOption {
+    DropdownOption {
+        value: id.to_string(),
+        label: if default {
+            format!("{name} (default)")
+        } else {
+            name.to_string()
+        },
     }
 }

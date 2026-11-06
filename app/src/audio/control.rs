@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use moq_audio::{capture, encode};
+use moq_audio::{capture, encode, playback};
+
+use crate::net::runtime::runtime;
 
 /// Loudness, as RMS on a linear scale, above which a frame counts as speech.
 ///
@@ -97,10 +99,20 @@ impl Default for Mic {
     }
 }
 
+/// Where the call is heard: the chosen output, and the engine playing into it
+/// while a call is up. Separate for the reason [`Mic`] is.
+#[derive(Default)]
+struct Output {
+    /// `None` is the system default.
+    device: Option<String>,
+    engine: Option<playback::Engine>,
+}
+
 /// The shared handle: one per process, held by the interface and by the call.
 #[derive(Default)]
 pub struct Controls {
     mic: Mutex<Mic>,
+    output: Mutex<Output>,
 }
 
 impl PartialEq for Controls {
@@ -203,11 +215,69 @@ impl Controls {
         mic.publication = Some(publication);
     }
 
-    /// Forget the publication when its call ends.
+    /// Choose an output by the id [`devices`](super::devices) reports, or
+    /// `None` for the system default.
+    ///
+    /// **Live during a call.** The engine moves to the new device and keeps
+    /// every peer's sink, so nobody is reconnected; the echo canceller's
+    /// reference follows the engine, not the device.
+    pub fn set_output(&self, device: Option<String>) {
+        let Ok(mut output) = self.output.lock() else { return };
+        if output.device == device {
+            return;
+        }
+        output.device = device.clone();
+        let Some(engine) = output.engine.clone() else { return };
+        let Some(runtime) = runtime() else { return };
+        runtime.spawn(switch_output(engine, device));
+    }
+
+    /// The output a new call should open: the user's choice, or `None` for the
+    /// system default.
+    pub(crate) fn output(&self) -> Option<String> {
+        self.output.lock().ok().and_then(|output| output.device.clone())
+    }
+
+    /// Hand over the engine a new call just opened, so a choice made during
+    /// the call can move it.
+    pub(crate) fn attach_output(&self, engine: Option<&playback::Engine>) {
+        if let Ok(mut output) = self.output.lock() {
+            output.engine = engine.cloned();
+        }
+    }
+
+    /// Forget the publication and the engine when their call ends.
     pub(crate) fn detach(&self) {
         if let Ok(mut mic) = self.mic.lock() {
             mic.publication = None;
         }
+        if let Ok(mut output) = self.output.lock() {
+            output.engine = None;
+        }
+    }
+}
+
+/// Moves a live engine to `device`.
+///
+/// **A failed switch falls back to the system default.** `moq_audio` leaves the
+/// engine on no device at all when a switch fails, and a call that goes silent
+/// because a headset was unplugged between the scan and the click is worse
+/// than one that plays through the speakers.
+async fn switch_output(engine: playback::Engine, device: Option<String>) {
+    let mut config = playback::Config::default();
+    config.device = device.clone();
+    let Err(error) = engine.switch(config).await else {
+        tracing::info!("[audio] output switched to {}", device.as_deref().unwrap_or("the system default"));
+        return;
+    };
+    tracing::warn!("[audio] could not switch output to {device:?}: {error:#}");
+    if device.is_none() {
+        return;
+    }
+    if let Err(error) = engine.switch(playback::Config::default()).await {
+        tracing::warn!("[audio] the system default output failed too, so peers are silent: {error:#}");
+    } else {
+        tracing::info!("[audio] fell back to the system default output");
     }
 }
 

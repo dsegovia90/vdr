@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use dioxus_native::prelude::*;
 
-use super::{CameraIcon, DeviceMenu, DropdownOption, LeaveIcon, MicControl, StatsRow};
+use super::{CameraIcon, DeviceMenu, DropdownOption, LeaveIcon, MenuSection, MicControl, StatsRow};
 use crate::audio::Controls;
 use crate::net::{Metrics, PeerStats, RemoteStatus};
 
@@ -69,10 +69,13 @@ pub fn ControlBar(props: ControlBarProps) -> Element {
                         CameraIcon { off }
                     }
                     DeviceMenu {
-                        title: "Camera",
-                        options: props.cameras.clone(),
-                        selected: props.camera.clone(),
-                        onchange: move |value| props.on_camera_select.call(value),
+                        name: "camera",
+                        sections: vec![MenuSection {
+                            title: "Camera",
+                            options: props.cameras.clone(),
+                            selected: props.camera.clone(),
+                            onchange: props.on_camera_select,
+                        }],
                         onrescan: move |_| props.on_camera_rescan.call(()),
                     }
                 }

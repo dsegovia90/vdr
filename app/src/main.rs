@@ -104,6 +104,7 @@ fn warn_if_unbundled() {
 fn App() -> Element {
     camera::use_devices_provider();
     audio::use_microphones_provider();
+    audio::use_outputs_provider();
 
     rsx! {
         document::Title { "Vdr "}

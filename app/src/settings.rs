@@ -84,6 +84,10 @@ pub struct Settings {
     /// opened the picker expects. Kept while absent for the same reason the
     /// camera is.
     pub microphone: Option<String>,
+
+    /// The speakers or headphones the user last selected, as `moq_audio`'s
+    /// output id. `None` is the system default, as for the microphone.
+    pub output: Option<String>,
 }
 
 impl Settings {
@@ -258,6 +262,16 @@ pub fn initial_microphone(
     choose_microphone(&ids, persisted)
 }
 
+/// Which output to play through on startup: the microphone's rule, for the
+/// microphone's reasons -- outputs have a system default too.
+pub fn initial_output(
+    devices: &[moq_audio::playback::Device],
+    persisted: Option<&str>,
+) -> Option<String> {
+    let ids: Vec<&str> = devices.iter().map(|device| device.id.as_str()).collect();
+    choose_microphone(&ids, persisted)
+}
+
 /// The microphone-selection rule, over plain data.
 ///
 /// Deliberately *not* the camera's rule. That one falls back to the first
@@ -365,6 +379,7 @@ mod tests {
         let settings = Settings {
             camera: Some("c922-uid".into()),
             microphone: Some("coreaudio:yeti".into()),
+            output: Some("coreaudio:headphones".into()),
         };
         let json = serde_json::to_string(&settings).expect("serialises");
         let back: Settings = serde_json::from_str(&json).expect("deserialises");
@@ -388,6 +403,7 @@ mod tests {
         let settings = Settings {
             camera: Some("c922-uid".into()),
             microphone: Some("coreaudio:yeti".into()),
+            output: Some("coreaudio:headphones".into()),
         };
         settings.write_to(&path);
         assert_eq!(Settings::load_from(&path), settings, "what was written comes back");
@@ -419,6 +435,7 @@ mod tests {
             serde_json::from_str(r#"{"camera":"abc"}"#).expect("an older file is valid");
         assert_eq!(back.camera.as_deref(), Some("abc"));
         assert_eq!(back.microphone, None, "a missing microphone is the default");
+        assert_eq!(back.output, None, "a missing output is the default");
     }
 
     #[test]
@@ -437,6 +454,14 @@ mod tests {
             choose_microphone(&["coreaudio:one"], Some("coreaudio:gone")),
             None
         );
+    }
+
+    #[test]
+    fn a_file_written_before_outputs_existed_still_loads() {
+        let back: Settings = serde_json::from_str(r#"{"camera":"abc","microphone":"coreaudio:yeti"}"#)
+            .expect("an older file is valid");
+        assert_eq!(back.microphone.as_deref(), Some("coreaudio:yeti"));
+        assert_eq!(back.output, None);
     }
 
     #[test]
