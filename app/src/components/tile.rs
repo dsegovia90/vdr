@@ -189,9 +189,9 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     let label = if mine {
         "absolute bottom-2 left-2 flex flex-row items-center gap-2 rounded-md bg-black/50 px-2 py-1"
     } else if open {
-        "absolute bottom-2 left-2 z-[6] flex flex-row items-center gap-2 rounded-md bg-black/80 px-2 py-1"
+        "absolute bottom-2 left-2 z-[6] cursor-pointer flex flex-row items-center gap-2 rounded-md bg-black/80 px-2 py-1"
     } else {
-        "absolute bottom-2 left-2 flex flex-row items-center gap-2 rounded-md bg-black/50 px-2 py-1 hover:bg-black/70"
+        "absolute bottom-2 left-2 cursor-pointer flex flex-row items-center gap-2 rounded-md bg-black/50 px-2 py-1 hover:bg-black/70"
     };
 
     rsx! {

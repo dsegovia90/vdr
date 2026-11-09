@@ -118,7 +118,7 @@ pub fn TileMenu(props: TileMenuProps) -> Element {
             for item in offered {
                 div {
                     key: "{item:?}",
-                    class: "rounded px-2.5 py-2 text-sm text-neutral-200 hover:bg-neutral-800",
+                    class: "cursor-pointer rounded px-2.5 py-2 text-sm text-neutral-200 hover:bg-neutral-800",
                     onclick: {
                         let item = item.clone();
                         let local = props.local.clone();

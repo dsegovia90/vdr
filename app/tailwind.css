@@ -10,3 +10,11 @@
         color: #e8eaed;
     }
 }
+
+/* Blitz shows the hand only where `cursor` is set or over a link; it gives
+   buttons the arrow by default, which reads as "not clickable". */
+@layer base {
+    button {
+        cursor: pointer;
+    }
+}

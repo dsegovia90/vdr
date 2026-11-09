@@ -196,7 +196,7 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
                     for (from, room) in invited.iter() {
                         div {
                             key: "invite:{from}",
-                            class: "mb-1 rounded px-2.5 py-2 text-sm bg-emerald-600 text-white",
+                            class: "cursor-pointer mb-1 rounded px-2.5 py-2 text-sm bg-emerald-600 text-white",
                             onclick: {
                                 let mut join = join.clone();
                                 let room = room.clone();
@@ -213,9 +213,9 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
                         div {
                             key: "{name}",
                             class: if mine.as_ref() == Some(name) {
-                                "flex flex-row items-center gap-2 rounded px-2.5 py-2 text-sm bg-blue-600 text-white"
+                                "cursor-pointer flex flex-row items-center gap-2 rounded px-2.5 py-2 text-sm bg-blue-600 text-white"
                             } else {
-                                "flex flex-row items-center gap-2 rounded px-2.5 py-2 text-sm text-neutral-200 hover:bg-neutral-800"
+                                "cursor-pointer flex flex-row items-center gap-2 rounded px-2.5 py-2 text-sm text-neutral-200 hover:bg-neutral-800"
                             },
                             onclick: {
                                 let mut join = join.clone();
@@ -229,9 +229,9 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
                     }
                     div {
                         class: if mine.is_none() {
-                            "rounded px-2.5 py-2 text-sm bg-blue-600 text-white"
+                            "cursor-pointer rounded px-2.5 py-2 text-sm bg-blue-600 text-white"
                         } else {
-                            "rounded px-2.5 py-2 text-sm text-neutral-200 hover:bg-neutral-800"
+                            "cursor-pointer rounded px-2.5 py-2 text-sm text-neutral-200 hover:bg-neutral-800"
                         },
                         onclick: {
                             let mut join = join.clone();
@@ -240,7 +240,7 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
                         "Main room"
                     }
                     div {
-                        class: "rounded px-2.5 py-2 text-sm text-neutral-400 hover:bg-neutral-800",
+                        class: "cursor-pointer rounded px-2.5 py-2 text-sm text-neutral-400 hover:bg-neutral-800",
                         onclick: {
                             let mut join = join.clone();
                             move |_| join(Some(new_name.clone()))

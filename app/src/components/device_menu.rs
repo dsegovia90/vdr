@@ -115,9 +115,9 @@ pub fn DeviceMenu(props: DeviceMenuProps) -> Element {
                         for option in section.options.iter() {
                             div {
                                 class: if Some(&option.value) == section.selected.as_ref() {
-                                    "rounded px-2.5 py-2 text-sm bg-blue-600 text-white"
+                                    "cursor-pointer rounded px-2.5 py-2 text-sm bg-blue-600 text-white"
                                 } else {
-                                    "rounded px-2.5 py-2 text-sm text-neutral-200 hover:bg-neutral-800"
+                                    "cursor-pointer rounded px-2.5 py-2 text-sm text-neutral-200 hover:bg-neutral-800"
                                 },
                                 onclick: {
                                     let value = option.value.clone();
@@ -133,7 +133,7 @@ pub fn DeviceMenu(props: DeviceMenuProps) -> Element {
                     }
                     div { class: "my-1 h-px bg-neutral-800" }
                     div {
-                        class: "rounded px-2.5 py-2 text-sm text-neutral-400 hover:bg-neutral-800",
+                        class: "cursor-pointer rounded px-2.5 py-2 text-sm text-neutral-400 hover:bg-neutral-800",
                         onclick: move |_| {
                             props.onrescan.call(());
                             current.set(None);
