@@ -92,6 +92,7 @@ pub fn use_shared_outputs() -> UseOutputs {
 fn use_devices<D, F, Fut>(what: &'static str, scan: F, describe: fn(&D) -> String) -> UseDevices<D>
 where
     D: Send + 'static,
+    D: Listed,
     F: Fn() -> Fut + Copy + 'static,
     Fut: Future<Output = Result<Vec<D>, moq_audio::Error>> + Send + 'static,
 {
@@ -111,7 +112,7 @@ where
         };
         let scanning = scan();
         runtime.spawn(async move {
-            match scanning.await {
+            match scanning.await.map(listable) {
                 Ok(list) => {
                     // Ids as well as names, for the reason the camera log gives:
                     // the id is what gets persisted, and two devices are allowed
@@ -134,5 +135,141 @@ where
         devices,
         ready,
         refresh,
+    }
+}
+
+/// What the filter needs from a device, so one filter serves both lists.
+trait Listed {
+    fn name(&self) -> &str;
+    fn id(&self) -> &str;
+}
+
+impl Listed for moq_audio::capture::Device {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Listed for moq_audio::playback::Device {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Drops devices nobody should pick from a menu, logging each at debug.
+fn listable<D: Listed>(list: Vec<D>) -> Vec<D> {
+    list.into_iter()
+        .filter(|device| match skip_reason(device.name(), device.id()) {
+            None => true,
+            Some(reason) => {
+                tracing::debug!("skipping {} ({}): {reason}", device.name(), device.id());
+                false
+            }
+        })
+        .collect()
+}
+
+/// The virtual audio drivers conferencing apps install for their own loopback
+/// (screen-share audio, their own echo path), matched case-insensitively
+/// against a device's name or id. Nobody picks one of these on purpose, and
+/// one chosen by accident means a silent call.
+///
+/// Only those. Virtual devices a user installs and routes on purpose --
+/// Krisp, BlackHole, Loopback, VB-Cable -- stay listed.
+///
+/// Both as observed on macOS. Matches stay this narrow on purpose: a broad
+/// "webex" would also hide Cisco's Webex Desk, a real USB speakerphone.
+const CONFERENCING_LOOPBACKS: &[(&str, &str)] = &[
+    ("zoomaudiodevice", "Zoom's loopback driver"),
+    ("zoom.us", "Zoom's loopback driver"),
+    ("microsoft teams audio", "Teams' loopback driver"),
+    ("msloopbackdriver", "Teams' loopback driver"),
+];
+
+/// Why a device is left out of the menu, or `None` to list it.
+///
+/// **ALSA lists every PCM it has a hint for**, and cpal's ALSA host (the only
+/// Linux host in this build) passes them all through: `default`, then per
+/// card `sysdefault`, `front`, `surround*`, `iec958`, `hdmi`, `dmix`,
+/// `dsnoop`, the raw `hw` and `plughw`, and plugin PCMs such as `pipewire` and
+/// `pulse`. Only two kinds are worth offering. `default` is the system route
+/// -- PipeWire or PulseAudio on a modern desktop -- and `sysdefault:CARD=X`
+/// is the one per-card entry that converts formats. The rest are raw or
+/// plugin PCMs that either fail to open (a raw `hw:` did, offering no sample
+/// format the engine can write) or duplicate those two. Other hosts --
+/// CoreAudio, WASAPI, a future PipeWire host -- list real devices and pass
+/// through.
+///
+/// If picking a card by its `sysdefault` entry still fails on PipeWire
+/// machines, the proper fix is enabling `moq-audio`'s `pipewire` feature on
+/// Linux and preferring that host, which needs libpipewire on the Linux build
+/// machine. That is inferred, not tested.
+fn skip_reason(name: &str, id: &str) -> Option<&'static str> {
+    let (name, id_lower) = (name.to_lowercase(), id.to_lowercase());
+    if let Some((_, reason)) = CONFERENCING_LOOPBACKS
+        .iter()
+        .find(|(needle, _)| name.contains(needle) || id_lower.contains(needle))
+    {
+        return Some(reason);
+    }
+    match id.strip_prefix("alsa:") {
+        Some(pcm) if pcm != "default" && !pcm.starts_with("sysdefault:CARD=") => {
+            Some("an ALSA PCM that is neither the system default nor a card's sysdefault")
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skip_reason;
+
+    fn worth_listing(name: &str, id: &str) -> bool {
+        skip_reason(name, id).is_none()
+    }
+
+    #[test]
+    fn mac_conferencing_drivers_are_hidden() {
+        assert!(worth_listing("MacBook Pro Microphone", "coreaudio:BuiltInMicrophoneDevice"));
+        assert!(worth_listing("MacBook Pro Speakers", "coreaudio:BuiltInSpeakerDevice"));
+        assert!(!worth_listing("Microsoft Teams Audio", "coreaudio:MSLoopbackDriverDevice_UID"));
+        assert!(!worth_listing("ZoomAudioDevice", "coreaudio:zoom.us.zoomaudiodevice.001"));
+    }
+
+    #[test]
+    fn user_chosen_virtual_devices_stay() {
+        assert!(worth_listing("BlackHole 2ch", "coreaudio:BlackHole2ch_UID"));
+        assert!(worth_listing("Krisp Microphone", "coreaudio:KrispMicrophone"));
+        assert!(worth_listing("Cisco Webex Desk", "coreaudio:CiscoWebexDesk"));
+    }
+
+    #[test]
+    fn matching_ignores_case() {
+        assert!(!worth_listing("ZOOMAUDIODEVICE", "coreaudio:x"));
+        assert!(!worth_listing("Some Device", "wasapi:MSLOOPBACKDRIVER"));
+    }
+
+    #[test]
+    fn alsa_keeps_default_and_sysdefault_only() {
+        assert!(worth_listing("Default ALSA Output", "alsa:default"));
+        assert!(worth_listing("HDA Intel PCH", "alsa:sysdefault:CARD=PCH"));
+        assert!(!worth_listing("HDA Intel PCH", "alsa:hw:CARD=1,DEV=0"));
+        assert!(!worth_listing("HDA Intel PCH", "alsa:plughw:CARD=1,DEV=0"));
+        assert!(!worth_listing("HDA Intel PCH", "alsa:front:CARD=PCH,DEV=0"));
+        assert!(!worth_listing("PipeWire Sound Server", "alsa:pipewire"));
+        assert!(!worth_listing("PulseAudio Sound Server", "alsa:pulse"));
+        assert!(!worth_listing("HDMI 0", "alsa:hdmi:CARD=PCH,DEV=0"));
+    }
+
+    #[test]
+    fn other_hosts_pass_through() {
+        assert!(worth_listing("USB Audio", "coreaudio:AppleUSBAudioEngine:1234"));
+        assert!(worth_listing("Speakers", "wasapi:{0.0.0.00000000}.{abc}"));
     }
 }
