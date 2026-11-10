@@ -143,8 +143,12 @@ impl StackingContext {
             return cached;
         }
 
-        let child_rect = |child: &HoistedPaintChild| -> Rect<f32> {
-            let node = &tree[child.node_id];
+        // vid patch: like the hit-test walks, this reads the stacking
+        // context's cache, which can name a node removed since the last
+        // layout. Indexing the tree with that id panicked (a leaving peer's
+        // tiles, with the pointer moving). A node that is gone has no box.
+        let child_rect = |child: &HoistedPaintChild| -> Option<Rect<f32>> {
+            let node = tree.get(child.node_id)?;
             let position = child.position(tree, sc_root_id);
             let location = node.final_layout().location;
             let mut overflow = *node.scrollable_overflow();
@@ -153,19 +157,19 @@ impl StackingContext {
             }
             let left = position.x + location.x;
             let top = position.y + location.y;
-            Rect {
+            Some(Rect {
                 left: left + (overflow.x0 / scale) as f32,
                 top: top + (overflow.y0 / scale) as f32,
                 right: left + (overflow.x1 / scale) as f32,
                 bottom: top + (overflow.y1 / scale) as f32,
-            }
+            })
         };
 
         let mut area = Rect::ZERO;
-        if let Some((first, rest)) = self.children.split_first() {
-            area = child_rect(first);
-            for child in rest {
-                let pos = child_rect(child);
+        let mut rects = self.children.iter().filter_map(child_rect);
+        if let Some(first) = rects.next() {
+            area = first;
+            for pos in rects {
                 area.left = area.left.min(pos.left);
                 area.top = area.top.min(pos.top);
                 area.right = area.right.max(pos.right);

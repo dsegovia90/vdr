@@ -19,7 +19,12 @@ tree). A pointer event in that window panicked the UI thread:
 - `node.rs:1483` (`paint_children`): a tile appearing as someone joined, and
   Leave clearing every tile (vid 26, real call).
 
-Both now skip an id the tree no longer has. A node that is gone cannot be hit,
+- `layout/paint_tree.rs` `hoisted_content_bbox`: the helper both walks
+  call, indexing the same hoisted children (`tree[child.node_id]`). A peer
+  leaving while sharing removed their two tiles; the next pointer move
+  panicked here (2026-11-10, screen share live check).
+
+All three now skip an id the tree no longer has. A node that is gone cannot be hit,
 and the next layout refreshes the caches. vid's own workaround for the menu
 (kept mounted, hidden) stays; it is harmless.
 
