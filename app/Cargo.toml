@@ -10,13 +10,15 @@ edition = "2021"
 # through to X11 capture, which sees only XWayland windows. Unlike VA-API and
 # NVENC it links libpipewire-0.3 rather than `dlopen`ing it.
 #
-# **Off, because the portable build cannot compile it.** That build runs in
-# Ubuntu 22.04 for its glibc 2.35, and 22.04's PipeWire (0.3.48) is too old for
-# the `pipewire`/`libspa` 0.10 crates: libspa fails on `spa_meta_region_is_valid`,
-# `spa_meta_first` and `spa_video_info_raw.flags`, all newer than 0.3.48
-# (observed 2026-11-10). A newer image raises the glibc floor. On a recent distro
-# build with `--features wayland-share`. Only Linux reads it: moq-video gates the
-# PipeWire code to Linux itself.
+# **Off by default; the Linux package turns it on** (`build-linux.sh` passes
+# `--features wayland-share` to `dx build`). Off here so `cargo test`/clippy on a
+# Linux box need no PipeWire headers. The `pipewire`/`libspa` 0.10 crates need
+# PipeWire 0.3.65 or newer to compile; the portable build's Ubuntu 22.04 (kept
+# for its glibc 2.35) has 0.3.48, so that script builds a newer PipeWire from
+# source to compile and link against, and the binary loads the recipient's own
+# `libpipewire-0.3.so.0` at runtime. On a recent distro, build with
+# `--features wayland-share`. Only Linux reads it: moq-video gates the PipeWire
+# code to Linux itself.
 wayland-share = ["moq-video/pipewire"]
 
 [dependencies]
@@ -115,7 +117,7 @@ wgpu = "30"
 # runs bindgen at build time, which needs clang (installed by build-linux.sh).
 #
 # Screen capture on Linux is X11's (`capture`). Wayland's, through the desktop
-# portal and PipeWire, is the `wayland-share` feature below, off for now.
+# portal and PipeWire, is the `wayland-share` feature above, on in the Linux package.
 [target.'cfg(target_os = "linux")'.dependencies]
 moq-video = { version = "0.1.21", default-features = false, features = ["openh264", "vaapi", "nvidia", "capture"] }
 

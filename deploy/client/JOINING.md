@@ -22,10 +22,12 @@ Keep it to yourself: anyone holding it can join that room until it expires.
 ## Linux
 
 1. Unpack `vid-linux-…tar.gz` and run `./vdr` from the unpacked folder.
-2. It needs `libasound2`, `libvulkan1` with a Vulkan driver (`mesa-vulkan-drivers`
+2. It needs `libasound2`, `libpipewire-0.3-0`, `libvulkan1` with a Vulkan driver (`mesa-vulkan-drivers`
    on most machines), and an X11 or Wayland desktop.
-3. Screen sharing is offered on X11 desktops only for now; on Wayland the
-   button does not appear.
+3. Screen sharing is offered on X11 and on Wayland. On Wayland your desktop picks
+   what to share, through PipeWire and the xdg-desktop-portal service with
+   your desktop's backend (`xdg-desktop-portal-gnome`, `-kde`, `-wlr`, or
+   `xdg-desktop-portal-hyprland` on Hyprland), which most desktops install.
 
 ## Join
 
