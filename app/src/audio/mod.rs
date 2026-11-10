@@ -8,6 +8,7 @@
 //! capture loop to run. `moq_audio` owns the device lifecycle -- opening,
 //! replacing, retrying, releasing -- so what is left here is the choosing.
 
+pub(crate) mod catchup;
 mod control;
 mod devices;
 

@@ -1643,8 +1643,12 @@ async fn attend(
             let peer = id.to_string();
             let stats = stats.clone();
             let rooms = rooms.clone();
+            if crate::args::Args::get().audio_stall.is_some() {
+                static IGNORED: std::sync::Once = std::sync::Once::new();
+                IGNORED.call_once(|| tracing::warn!("--audio-stall is for --loopback only; ignored in a call"));
+            }
             tasks.push(Abort(tokio::spawn(async move {
-                audio::subscribe(broadcast, peer, engine, stats, Some(rooms)).await;
+                audio::subscribe(broadcast, peer, engine, stats, Some(rooms), None).await;
             })));
         } else {
             tracing::warn!("[audio] {id} cannot be heard: there is no output device");
@@ -1741,6 +1745,7 @@ fn write_stats(
         delays.sort_unstable();
         let pick = |q: f64| (!delays.is_empty()).then(|| delays[((delays.len() - 1) as f64 * q).round() as usize]);
         let (gaps, dry) = stats.audio_trouble();
+        let sync = stats.audio_sync();
         let line = serde_json::json!({
             "t": t, "me": me, "peer": peer,
             "camera": stats.camera_on(), "mic": stats.mic_on(),
@@ -1748,6 +1753,17 @@ fn write_stats(
             "delay_p50_ms": pick(0.5), "delay_p95_ms": pick(0.95),
             "audio_fps": stats.take_audio_frames(),
             "audio_gaps": gaps, "audio_dry": dry,
+            "audio_buffered_ms": sync.map(|s| s.buffered_ms),
+            "audio_buffered_min_ms": sync.map(|s| s.buffered_min_ms),
+            "audio_buffered_max_ms": sync.map(|s| s.buffered_max_ms),
+            "audio_floor_ms": sync.map(|s| s.floor_ms),
+            "audio_late_ms": sync.map(|s| s.late_ms),
+            "video_late_ms": stats.video_late_ms(),
+            "audio_rate": sync.map(|s| s.rate),
+            "audio_removed_ms": sync.map(|s| s.removed_ms),
+            "audio_skips": sync.map(|s| s.skips),
+            "audio_overflow_ms": sync.map(|s| s.overflow_ms),
+            "audio_discarded_ms": sync.map(|s| s.discarded_ms),
         });
         lines.push_str(&line.to_string());
         lines.push('\n');

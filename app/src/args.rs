@@ -26,6 +26,8 @@
 //! vdr --ephemeral                         # a throwaway key, not the saved one
 //! vdr --encode-width 1920                 # encode at capture size, for A/B tests
 //! vdr --stats s7-alice.jsonl              # one line of measurements a second
+//! vdr --no-catchup                        # measure audio sync, never speed it up
+//! vdr --loopback --audio-stall 800        # hold audio back once, to make a backlog
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry (19c) is a second
@@ -217,6 +219,13 @@ pub struct Args {
     /// Where to append the once-a-second measurements (JSON lines), for the
     /// `s7-report` tool. Off unless asked for.
     pub stats: Option<std::path::PathBuf>,
+    /// Measure a peer's audio sync but never speed it up (`--no-catchup`).
+    /// For hearing the difference in one call, and a way out if it misbehaves.
+    pub no_catchup: bool,
+    /// Loopback only: once, ten seconds in, stop reading decoded audio for
+    /// this long, so it queues and lands as a burst (`--audio-stall <ms>`).
+    /// Reproduces a network stall's backlog on one machine.
+    pub audio_stall: Option<std::time::Duration>,
 }
 
 impl Args {
@@ -248,6 +257,8 @@ impl Args {
         let mut ephemeral = false;
         let mut encode_width = None;
         let mut stats = None;
+        let mut no_catchup = false;
+        let mut audio_stall = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -293,6 +304,12 @@ impl Args {
                     Some(path) => stats = Some(std::path::PathBuf::from(path)),
                     None => tracing::error!("--stats needs a file path"),
                 },
+                "--no-catchup" => no_catchup = true,
+                "--audio-stall" => match args.next().as_deref().map(str::parse::<u64>) {
+                    Some(Ok(ms)) => audio_stall = Some(std::time::Duration::from_millis(ms)),
+                    Some(Err(error)) => tracing::error!("--audio-stall is not a number: {error}"),
+                    None => tracing::error!("--audio-stall needs a duration in ms"),
+                },
                 other => tracing::warn!("ignoring unknown argument {other}"),
             }
         }
@@ -304,6 +321,8 @@ impl Args {
             ephemeral,
             encode_width,
             stats,
+            no_catchup,
+            audio_stall,
         }
     }
 }

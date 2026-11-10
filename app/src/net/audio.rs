@@ -16,10 +16,14 @@
 //! on the way out. Audio plays at the pace the output device pulls it and video
 //! paints whenever a frame lands.
 //!
-//! Almost none of the hard part is ours. `moq-audio` ships the jitter buffer,
-//! the resampling drift correction, the device lifecycle across stop / replace /
-//! failure, and the echo canceller. What is here is the wiring and the handful
-//! of settings whose defaults are wrong for a call.
+//! Most of the hard part is not ours. `moq-audio` ships the jitter buffer, the
+//! device lifecycle across stop / replace / failure, and the echo canceller.
+//! What it does **not** do is correct drift: its sink resamples at a fixed
+//! ratio, so a peer whose microphone runs fast against our speaker builds up
+//! delay -- as does every network stall's backlog -- that only the sink's
+//! overflow at about 2.3 s would ever drop. That is why `audio::catchup` sits
+//! between the decoder and the sink. The rest here is wiring and the handful of
+//! settings whose defaults are wrong for a call.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +31,7 @@ use std::time::Duration;
 use moq_audio::{capture, decode, encode, playback};
 use moq_mux::catalog::Stream as _;
 
+use crate::audio::catchup::{self, Catchup, Outcome};
 use crate::audio::{Controls, Speaking, Talking, loudness};
 
 /// How far ahead newer audio has to be before a stalled group is abandoned.
@@ -36,8 +41,10 @@ use crate::audio::{Controls, Speaking, Talking, loudness};
 ///
 /// It is a *skip threshold*, not a playout delay: it costs nothing in the
 /// steady state and only bounds how far behind live the consumer will chase a
-/// group that has stalled. The padding that actually rides out jitter is
-/// `playback::Sink`'s own 50 ms, which is not ours to choose.
+/// group that has stalled. The padding that actually rides out jitter is the
+/// sink's: `playback::Input::latency`, whose 50 ms default we leave alone.
+/// Catch-up's thresholds are measured against that depth, so changing it moves
+/// them.
 const LATENCY_MAX: Duration = Duration::from_millis(200);
 
 /// How many decoded audio frames between rate reports.
@@ -255,6 +262,8 @@ pub(super) async fn subscribe(
     // `None` plays them at full volume always: the loopback has no presence,
     // so no room to be outside of.
     rooms: Option<Rooms>,
+    // The loopback's `--audio-stall`: hold decoded audio back this long, once.
+    stall: Option<Duration>,
 ) {
     let mut catalog = match moq_mux::catalog::Consumer::<()>::new(
         &broadcast,
@@ -301,18 +310,17 @@ pub(super) async fn subscribe(
     input.format = moq_audio::Format::F32;
     input.sample_rate = consumer.sample_rate();
     input.layout = consumer.layout();
-    let mut sink = match engine.sink(input) {
+    // Kept: a skip to live opens a fresh sink with the same input.
+    let mut sink = match engine.sink(input.clone()) {
         Ok(sink) => sink,
         Err(error) => {
             tracing::error!("[audio] could not add {peer} to the mix: {error:#}");
             return;
         }
     };
-    tracing::info!(
-        "[audio] playing {peer} at {} Hz, {} channel(s)",
-        consumer.sample_rate(),
-        consumer.layout().channels()
-    );
+    let rate = consumer.sample_rate();
+    let channels = consumer.layout().channels() as usize;
+    tracing::info!("[audio] playing {peer} at {rate} Hz, {channels} channel(s)");
 
     let mut warned = false;
     let mut decoded = 0u32;
@@ -327,22 +335,69 @@ pub(super) async fn subscribe(
     // below before their first frame is written.
     let mut volume = 1.0f32;
 
-    while let Ok(Some(frame)) = consumer.read().await {
+    let enabled = !crate::args::Args::get().no_catchup;
+    let mut catchup = Catchup::new(rate, channels, enabled);
+    // Reused for every block, so the decode loop allocates nothing new.
+    let mut samples: Vec<f32> = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    // Until a sink has accepted its first samples its buffer is empty because
+    // nothing has played yet, not because playback went dry.
+    let mut fresh = true;
+    let mut audio_late = super::metrics::Lateness::default();
+    let mut report = Window::new();
+    let mut snapshot = Window::new();
+    let mut overflow_frames = 0u64;
+    let mut discarded = Duration::ZERO;
+    // The depth our last write should have left, and when: what the next read
+    // is checked against for the sink's own discard.
+    let mut expected: Option<(Duration, std::time::Instant)> = None;
+    let mut stall = stall;
+    let mut first_frame: Option<std::time::Instant> = None;
+    // Frames read during the loopback's stall, played as one burst after it.
+    let mut held: std::collections::VecDeque<moq_audio::Frame> = std::collections::VecDeque::new();
+
+    loop {
+        let frame = match held.pop_front() {
+            Some(frame) => frame,
+            None => match consumer.read().await {
+                Ok(Some(frame)) => frame,
+                _ => break,
+            },
+        };
         stats.audio_frame();
         let now = std::time::Instant::now();
+        let first = *first_frame.get_or_insert(now);
         if last_frame.is_some_and(|last| now - last > super::metrics::AUDIO_GAP) {
             stats.audio_gap();
+            report.gaps += 1;
         }
+        // Read once, before the write, which is the low point of each cycle:
+        // what catch-up steers by, and the dry check below.
+        let depth = sink.buffered();
         // Checked before this frame refills it: an empty buffer with frames
         // still arriving is playback that went silent while it should not have.
         // moq-audio counts no underruns itself, so this is the closest there is.
-        // Not on the first frame, whose buffer is empty because nothing has
-        // played yet -- counted, that read as one dropout per stream.
-        if last_frame.is_some() && sink.buffered().is_zero() {
+        // Not before the first write lands, or that read as one dropout per
+        // stream.
+        if !fresh && depth.is_zero() {
             stats.audio_ran_dry();
         }
+        // **The sink's overflow discard happens on the device's side**, inside
+        // its read, so no write ever reports it: a write is refused only when
+        // the ring is completely full. It shows instead as the depth falling
+        // far further than playing out since the last write explains.
+        if let Some((left, at)) = expected {
+            let should_be = left.saturating_sub(now - at);
+            if should_be > depth + DISCARD_MIN {
+                let lost = should_be - depth;
+                discarded += lost;
+                report.discarded += lost;
+            }
+        }
         last_frame = Some(now);
-        speaking.set(talking.push(loudness(&frame.data)));
+        let rms = loudness(&frame.data);
+        speaking.set(talking.push(rms));
+        let late = audio_late.observe(frame.timestamp.as_micros() as u64, super::metrics::wall_us());
         decoded += 1;
         if decoded == REPORT_EVERY {
             let elapsed = since.elapsed().as_secs_f32();
@@ -371,14 +426,207 @@ pub(super) async fn subscribe(
             sink.set_volume(wanted);
             volume = wanted;
         }
-        if let Err(error) = sink.write(&frame.data) {
-            if !warned {
+
+        // The decoder emits little-endian `f32`, which is what the sink takes.
+        samples.clear();
+        samples.extend(frame.data.as_chunks::<4>().0.iter().map(|chunk| f32::from_le_bytes(*chunk)));
+        let silent = catchup::is_silent(rms, frame.activity);
+        let outcome = catchup.process(&mut samples, depth, silent);
+        let written = match outcome {
+            // Idle: the decoder's own bytes, untouched.
+            Outcome::Play { changed: false } => Some(sink.write(&frame.data)),
+            Outcome::Play { changed: true } => {
+                bytes.clear();
+                bytes.extend(samples.iter().flat_map(|sample| sample.to_le_bytes()));
+                Some(sink.write(&bytes))
+            }
+            Outcome::Drop => None,
+            Outcome::SkipToLive => {
+                tracing::warn!(
+                    "[sync] {peer}: {} ms behind, skipped to live",
+                    catchup.floor().as_millis()
+                );
+                // Faded out by the mixer's own ramp before the backlog goes,
+                // and the fresh sink starts silent and ramps in, so the jump
+                // makes no click.
+                sink.set_volume(0.0);
+                tokio::time::sleep(SKIP_FADE).await;
+                match engine.sink(input.clone()) {
+                    Ok(replacement) => {
+                        sink = replacement;
+                        sink.set_volume(volume);
+                        catchup.skipped();
+                        fresh = true;
+                        expected = None;
+                        // A fresh sink may refuse its first write, as every
+                        // sink does before the device has read; that is not an
+                        // overflow.
+                        if let Ok(write) = sink.write(&frame.data) {
+                            fresh = write.accepted_sample_frames == 0;
+                        }
+                        None
+                    }
+                    // Late is better than silent for the rest of the call:
+                    // keep the old sink, turned back up, and let catch-up
+                    // drain it.
+                    Err(error) => {
+                        tracing::warn!("[sync] {peer}: could not open a fresh sink, so not skipping: {error:#}");
+                        sink.set_volume(volume);
+                        catchup.skip_failed();
+                        Some(sink.write(&frame.data))
+                    }
+                }
+            }
+        };
+        if let Outcome::Drop = outcome {
+            expected = Some((depth, now));
+        }
+        match written {
+            Some(Ok(write)) => {
+                if write.accepted_sample_frames > 0 {
+                    fresh = false;
+                }
+                let accepted = Duration::from_secs_f64(write.accepted_sample_frames as f64 / rate.max(1) as f64);
+                expected = Some((depth + accepted, now));
+                // An empty sink drops a write only before the device has read
+                // from it. Anywhere else, a drop is the sink overflowing.
+                if !depth.is_zero() {
+                    let dropped = write.dropped_sample_frames as u64;
+                    overflow_frames += dropped;
+                    report.overflow_frames += dropped;
+                }
+            }
+            Some(Err(error)) if !warned => {
                 tracing::warn!("[audio] playback is dropping samples: {error:#}");
                 warned = true;
+            }
+            Some(Err(_)) | None => {}
+        }
+
+        report.observe(depth);
+        snapshot.observe(depth);
+        let video_late = stats.video_late_ms();
+        if now - report.since >= SYNC_REPORT_EVERY {
+            let (min, last, max) = (report.min_ms(), report.last_ms(), report.max_ms());
+            let removed = catchup.removed();
+            let video = video_late.map_or("?".to_string(), |v| format!("+{v}"));
+            // Their mouth to our ear, less video's own lateness: audio's
+            // transit lateness plus the buffer above the sink's own 50 ms.
+            let behind = video_late.map_or("?".to_string(), |v| {
+                format!("{}", late as i64 + last as i64 - 50 - v as i64)
+            });
+            let speed = if enabled { format!("{:.2}x", catchup.rate()) } else { "off".to_string() };
+            tracing::info!(
+                "[sync] {peer}: buffered {min}/{last}/{max} ms (floor {}), audio late +{late} ms, \
+                 video late {video} ms, audio behind video ≈{behind} ms, gaps {}, catch-up {speed}, \
+                 removed {:.0}+{:.0} ms, skips {}, sink discarded {} ms, write overflow {} ms",
+                catchup.floor().as_millis(),
+                report.gaps,
+                removed.voiced_ms,
+                removed.silent_ms,
+                catchup.skips(),
+                report.discarded.as_millis(),
+                report.overflow_frames * 1000 / rate.max(1) as u64,
+            );
+            report = Window::new();
+        }
+        if now - snapshot.since >= SNAPSHOT_EVERY {
+            let removed = catchup.removed();
+            stats.set_audio_sync(super::metrics::SyncSnapshot {
+                buffered_ms: snapshot.last_ms(),
+                buffered_min_ms: snapshot.min_ms(),
+                buffered_max_ms: snapshot.max_ms(),
+                floor_ms: catchup.floor().as_millis() as u32,
+                late_ms: late,
+                rate: catchup.rate(),
+                removed_ms: (removed.voiced_ms + removed.silent_ms) as u32,
+                skips: catchup.skips(),
+                overflow_ms: (overflow_frames * 1000 / rate.max(1) as u64) as u32,
+                discarded_ms: discarded.as_millis() as u32,
+            });
+            snapshot = Window::new();
+        }
+
+        // The loopback's stall. Held back *after* decoding: the track keeps
+        // being read at its own pace, so nothing upstream -- the consumer's
+        // age limit, the publisher's retention -- can expire the backlog,
+        // and it lands whole, as one burst, when the hold ends.
+        if let Some(hold) = stall {
+            if now - first >= STALL_AFTER {
+                tracing::info!("[sync] {peer}: holding audio back for {} ms", hold.as_millis());
+                let until = std::time::Instant::now() + hold;
+                while std::time::Instant::now() < until {
+                    match consumer.read().await {
+                        Ok(Some(frame)) => held.push_back(frame),
+                        _ => break,
+                    }
+                }
+                stall = None;
             }
         }
     }
     tracing::info!("[audio] {peer}'s audio track ended");
+}
+
+/// How often a `[sync]` line is logged per peer. Often enough to see a drift
+/// slope or a step within a minute, rare enough not to drown the log.
+const SYNC_REPORT_EVERY: Duration = Duration::from_secs(5);
+
+/// How often the stats file's sync numbers are refreshed: its own cadence.
+const SNAPSHOT_EVERY: Duration = Duration::from_secs(1);
+
+/// How long the old sink is given to fade out before it goes: three times the
+/// mixer's 3 ms volume ramp.
+const SKIP_FADE: Duration = Duration::from_millis(10);
+
+/// A fall in depth this much beyond what playing out explains is the sink
+/// discarding its backlog (at about 2.3 s), not jitter.
+const DISCARD_MIN: Duration = Duration::from_millis(500);
+
+/// How far into a peer's audio the loopback's `--audio-stall` holds it back.
+const STALL_AFTER: Duration = Duration::from_secs(10);
+
+/// The buffer depths seen over one reporting window.
+struct Window {
+    since: std::time::Instant,
+    min: Duration,
+    max: Duration,
+    last: Duration,
+    gaps: u32,
+    overflow_frames: u64,
+    discarded: Duration,
+}
+
+impl Window {
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            min: Duration::MAX,
+            max: Duration::ZERO,
+            last: Duration::ZERO,
+            gaps: 0,
+            overflow_frames: 0,
+            discarded: Duration::ZERO,
+        }
+    }
+
+    fn observe(&mut self, depth: Duration) {
+        self.min = self.min.min(depth);
+        self.max = self.max.max(depth);
+        self.last = depth;
+    }
+
+    fn min_ms(&self) -> u32 {
+        if self.min == Duration::MAX { 0 } else { self.min.as_millis() as u32 }
+    }
+
+    fn max_ms(&self) -> u32 {
+        self.max.as_millis() as u32
+    }
+
+    fn last_ms(&self) -> u32 {
+        self.last.as_millis() as u32
+    }
 }
 
 /// The decoder settings, which differ from the defaults in exactly one place.

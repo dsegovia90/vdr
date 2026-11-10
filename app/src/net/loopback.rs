@@ -122,6 +122,7 @@ async fn pump(
             engine,
             stats.clone(),
             None,
+            crate::args::Args::get().audio_stall,
         ))
     });
 
@@ -131,7 +132,7 @@ async fn pump(
     let decode = tokio::spawn(async move {
         // The same per-tile rate a peer's tile shows, so loopback can be read
         // the same way.
-        let meter = FpsMeter::new(stats);
+        let meter = FpsMeter::new(stats.clone());
         let mut consumer = match moq_video::decode::Consumer::new(
             &consumer_broadcast,
             &rendition,
@@ -150,6 +151,9 @@ async fn pump(
 
         while let Ok(Some(frame)) = consumer.read().await {
             meter.frame();
+            // For the `[sync]` line's video lateness, which a call reads the
+            // same way.
+            stats.frame_arrived(frame.timestamp.as_micros() as u64);
             if let Some(frame) = from_decoded(frame) {
                 slot.publish(frame);
             }

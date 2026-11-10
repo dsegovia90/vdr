@@ -259,6 +259,13 @@ pub struct PeerStats {
     audio_gaps: AtomicU32,
     /// Times their playback buffer was found empty while frames still came.
     audio_dry: AtomicU32,
+    /// How late their camera frames arrive against the earliest any has, and
+    /// the latest reading in ms ([`UNKNOWN`] before the first).
+    video_late: std::sync::Mutex<Lateness>,
+    video_late_ms: AtomicU32,
+    /// Their playout buffer and what catch-up did to it, as their audio task
+    /// last said. `None` before their first audio.
+    audio_sync: std::sync::Mutex<Option<SyncSnapshot>>,
     /// Whether they are sharing a screen: a peer's from their presence
     /// document, ours set by the share thread while it publishes.
     sharing: AtomicBool,
@@ -342,6 +349,68 @@ pub fn wall_us() -> u64 {
         .map_or(0, |since| since.as_micros() as u64)
 }
 
+/// How late a stream is running, against the earliest it has ever been.
+///
+/// Keeps the smallest `wall - media` offset seen; a frame's lateness is how far
+/// its own offset sits above that. The two clocks need not agree on anything:
+/// their constant difference cancels, so no NTP and no clock mapping from the
+/// sender is needed. What is left is extra transit time plus the drift between
+/// their media clock and our wall clock, so it shows *growth*, never an
+/// absolute delay.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Lateness {
+    least: Option<i64>,
+    last: Option<i64>,
+}
+
+/// A jump this large in one step is the sender's timeline restarting (their
+/// microphone or camera reopening), not lateness: start again from it.
+const LATENESS_RESET_US: i64 = 2_000_000;
+
+impl Lateness {
+    /// Notes a frame stamped `media_us` arriving at `now_us`, and returns how
+    /// late it is in ms.
+    pub fn observe(&mut self, media_us: u64, now_us: u64) -> u32 {
+        let offset = now_us as i64 - media_us as i64;
+        if self.last.is_some_and(|last| (offset - last).abs() > LATENESS_RESET_US) {
+            self.least = None;
+        }
+        self.last = Some(offset);
+        let least = self.least.map_or(offset, |least| least.min(offset));
+        self.least = Some(least);
+        ((offset - least) / 1000) as u32
+    }
+}
+
+/// One peer's playout buffer and what catch-up has done to it, for the stats
+/// file. Depths are as sampled just before each write.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SyncSnapshot {
+    /// The depth at the latest write, and the least and most over the last
+    /// second.
+    pub buffered_ms: u32,
+    pub buffered_min_ms: u32,
+    pub buffered_max_ms: u32,
+    /// The least depth over the last second of audio, which catch-up steers by.
+    pub floor_ms: u32,
+    /// How late their audio arrives against the earliest it has.
+    pub late_ms: u32,
+    /// The playback rate catch-up is aiming for; 1.0 when idle.
+    pub rate: f32,
+    /// Audio catch-up has taken out, over the whole call.
+    pub removed_ms: u32,
+    /// Times it jumped to live.
+    pub skips: u32,
+    /// Audio a write was refused for a full ring, over the whole call. Rare:
+    /// the sink discards before its ring fills, which is the next field.
+    pub overflow_ms: u32,
+    /// Audio the sink discarded to snap back from its 2.3 s overflow, over the
+    /// whole call. Inferred from the depth falling far more than playing out
+    /// explains, because the discard happens on the device's side and nothing
+    /// reports it.
+    pub discarded_ms: u32,
+}
+
 /// A pause between audio frames that a listener would hear: three missing 20 ms
 /// frames, minus some scheduling slack.
 pub const AUDIO_GAP: Duration = Duration::from_millis(60);
@@ -372,6 +441,9 @@ impl Default for PeerStats {
             audio_frames: AtomicU32::new(0),
             audio_gaps: AtomicU32::new(0),
             audio_dry: AtomicU32::new(0),
+            video_late: std::sync::Mutex::new(Lateness::default()),
+            video_late_ms: AtomicU32::new(UNKNOWN),
+            audio_sync: std::sync::Mutex::new(None),
             sharing: AtomicBool::new(false),
             share_problem: std::sync::Mutex::new(None),
             share_turn: std::sync::atomic::AtomicU64::new(0),
@@ -600,8 +672,15 @@ impl PeerStats {
 
     /// Notes a frame of theirs stamped `media_us` arriving now. Without a clock
     /// from them yet, there is nothing to measure against, and nothing is noted.
+    ///
+    /// Their lateness is noted either way: it needs no clock from them, only
+    /// our own, because it is measured against their earliest frame.
     pub(super) fn frame_arrived(&self, media_us: u64) {
-        let Some(delay) = self.clock().and_then(|clock| clock.delay_ms(media_us, wall_us())) else {
+        let now = wall_us();
+        if let Ok(mut late) = self.video_late.lock() {
+            self.video_late_ms.store(late.observe(media_us, now), Ordering::Relaxed);
+        }
+        let Some(delay) = self.clock().and_then(|clock| clock.delay_ms(media_us, now)) else {
             return;
         };
         if let Ok(mut delays) = self.delays.lock() {
@@ -640,6 +719,27 @@ impl PeerStats {
             self.audio_gaps.load(Ordering::Relaxed),
             self.audio_dry.load(Ordering::Relaxed),
         )
+    }
+
+    /// How late their latest camera frame was against their earliest, in ms,
+    /// or `None` before any arrived.
+    pub(super) fn video_late_ms(&self) -> Option<u32> {
+        match self.video_late_ms.load(Ordering::Relaxed) {
+            UNKNOWN => None,
+            ms => Some(ms),
+        }
+    }
+
+    /// Their audio's latest sync numbers, for the stats file.
+    pub(super) fn audio_sync(&self) -> Option<SyncSnapshot> {
+        self.audio_sync.lock().ok().and_then(|sync| *sync)
+    }
+
+    /// Records their audio's sync numbers.
+    pub(super) fn set_audio_sync(&self, sync: SyncSnapshot) {
+        if let Ok(mut slot) = self.audio_sync.lock() {
+            *slot = Some(sync);
+        }
     }
 
     /// Records whether they are talking. For our own tile, from the
@@ -857,6 +957,34 @@ mod tests {
         stats.clear_asks();
         assert!(stats.invites().is_empty() && stats.requests().is_empty());
         assert_eq!(stats.muted_by(), None);
+    }
+
+    #[test]
+    fn lateness_is_relative_and_restarts_on_a_jump() {
+        // A constant offset between unrelated clocks reads as on time.
+        let mut late = Lateness::default();
+        for i in 0..100u64 {
+            assert_eq!(late.observe(i * 20_000, 5_000_000_000 + i * 20_000), 0);
+        }
+        // Media running 1 % slow against the wall: 10 ms late per second.
+        let mut late = Lateness::default();
+        let mut last = 0;
+        for i in 0..=50u64 {
+            last = late.observe(i * 99_000, 7_000_000 + i * 100_000);
+        }
+        assert_eq!(last, 50, "5 s at 1 %");
+        // Their timeline restarts 3 s on: that is the new earliest.
+        assert_eq!(late.observe(0, 7_000_000 + 5_100_000 + 3_000_000), 0);
+        assert_eq!(late.observe(100_000, 7_000_000 + 8_100_000 + 140_000), 40);
+    }
+
+    #[test]
+    fn video_lateness_needs_no_clock() {
+        let stats = PeerStats::default();
+        assert_eq!(stats.video_late_ms(), None);
+        stats.frame_arrived(123);
+        assert_eq!(stats.video_late_ms(), Some(0));
+        assert!(stats.take_delays().is_empty(), "still no delay without a clock");
     }
 
     #[test]
