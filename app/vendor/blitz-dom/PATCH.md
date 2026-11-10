@@ -28,8 +28,12 @@ All three now skip an id the tree no longer has. A node that is gone cannot be h
 and the next layout refreshes the caches. vid's own workaround for the menu
 (kept mounted, hidden) stays; it is harmless.
 
-## Leaving
+## Upstream has the same fix, unreleased
 
-Report upstream (DioxusLabs/blitz) with the two traces in vid's finding F9.
-Drop this vendoring and the `[patch]` in `app/Cargo.toml` once a blitz
-release that dioxus-native can take carries a fix.
+blitz `main` commit `f102663` (PR #1244, 2026-10-23, "Skip nodes dropped
+since the last resolve during hit testing") changes the same three places
+the same way. It is after `v0.3.0-beta.4` (2026-10-16), the newest
+`blitz-dom` on crates.io as of 2026-11-10, and every `dioxus-native`
+release pins beta.4 or older. Drop this vendoring and the `[patch]` in
+`app/Cargo.toml` once dioxus-native takes a blitz-dom released after that
+commit.
