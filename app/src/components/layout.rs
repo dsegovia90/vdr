@@ -34,6 +34,16 @@
 //! card has the same size; the rows and labels are counted from the groups.
 //! With one group and no labels this is exactly the table above.
 //!
+//! **Share mode.** Let *here* be the shares whose sharer is in my room, our
+//! own included. If *here* is empty, the page is the grouped rows above, and
+//! a share from another room is one more card after its sharer's camera,
+//! dimmed with that group. If *here* is not empty, the shares in it fill the
+//! area above a strip, split equally ([`share_grid`]); the strip along the
+//! bottom holds every camera, my room's first, then everyone else's cameras
+//! and shares, each dimmed as their group is ([`strip`]). Group labels are
+//! hidden. **Both modes are one keyed list in one container**: switching
+//! changes classes and order, never parents, so no card remounts.
+//!
 //! **Every class here is a whole literal.** Tailwind finds classes by scanning
 //! the source, so one assembled with `format!` would never get a rule, and
 //! would look exactly like a layout this renderer does not support. The
@@ -85,6 +95,85 @@ pub(super) const LABEL: &str = "basis-full h-6 truncate px-1 text-center text-xs
 
 /// The label of the group we are in, brighter, so you can see where you are.
 pub(super) const LABEL_MINE: &str = "basis-full h-6 truncate px-1 text-center text-xs leading-6 text-neutral-200";
+
+/// The strip's height with its margin, in rem: the `8rem` in [`SHARE`] and
+/// [`STRIP`]. The three must change together, as [`LABEL_PX`] and its
+/// classes must. Only the tests read it.
+#[cfg(test)]
+const STRIP_REM: usize = 8;
+
+/// A share in my room, in share mode: one cell of the grid above the strip.
+/// The height is a row's share of what the strip leaves, less the 12px margin
+/// (`my-1.5`); the width a column's share less the `gap-x-3`s, and a pixel
+/// more, so rounding can never push the last cell of a row onto the next. No
+/// aspect ratio: the cell is whatever shape the grid gives it, and the screen
+/// is fitted whole inside it.
+pub(super) const SHARE: &str = "relative my-1.5 h-[calc((100%-8rem)/var(--share-rows)-12px)] w-[calc((100%-(var(--share-cols)-1)*12px)/var(--share-cols)-1px)]";
+
+/// A card in the strip, in share mode: a camera, or a share from another room.
+/// One row of 16:9 cards, narrowed (and cropped, `fit::card`) when too many
+/// for the width; the pixel is the same rounding margin as [`SHARE`]'s.
+pub(super) const STRIP: &str = "relative my-1.5 aspect-video h-[calc(8rem-12px)] max-w-[calc((100%-(var(--strip-n)-1)*12px)/var(--strip-n)-1px)]";
+
+/// A group label in share mode: hidden, never removed, so the keyed list
+/// keeps its shape across modes.
+pub(super) const LABEL_HIDDEN: &str = "hidden";
+
+/// The line break that ends the share grid, putting the strip on a row of its
+/// own.
+pub(super) const SHARE_BREAK: &str = "basis-full h-0";
+
+/// A share, for deciding the mode: the room its sharer is in.
+pub(super) struct Share<'a> {
+    pub room: Option<&'a str>,
+}
+
+/// The shares in my room (`ours`), by index: what fills the area above the
+/// strip. Empty is rows mode. Our own share is passed with our own room, so it
+/// is always here.
+pub(super) fn here(shares: &[Share], ours: Option<&str>) -> Vec<usize> {
+    shares
+        .iter()
+        .enumerate()
+        .filter(|(_, share)| share.room == ours)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The share grid for `n` shares, `(columns, rows)`: one whole, two side by
+/// side, three or four as 2×2, five or six as 3×2, then three columns.
+pub(super) fn share_grid(n: usize) -> (usize, usize) {
+    match n {
+        0 | 1 => (1, 1),
+        2 => (2, 1),
+        3 | 4 => (2, 2),
+        n => (3, n.div_ceil(3)),
+    }
+}
+
+/// The container's inline `style` in share mode: the numbers [`SHARE`] and
+/// [`STRIP`] divide by. Never zero, as [`sizing`].
+pub(super) fn share_sizing(grid: (usize, usize), strip: usize) -> String {
+    let (cols, rows) = grid;
+    format!(
+        "--share-cols:{};--share-rows:{};--strip-n:{}",
+        cols.max(1),
+        rows.max(1),
+        strip.max(1)
+    )
+}
+
+/// The strip's cards in share mode, by index into the ids the groups were
+/// built from: my room's cards first (its shares are in `here`, above, and
+/// skipped), then every other group's, shares included, in group order.
+pub(super) fn strip(groups: &[Group], ours: Option<&str>, here: &[usize]) -> Vec<usize> {
+    let mine = groups.iter().filter(|group| group.room.as_deref() == ours);
+    let others = groups.iter().filter(|group| group.room.as_deref() != ours);
+    mine.chain(others)
+        .flat_map(|group| group.members.iter().copied())
+        .filter(|index| !here.contains(index))
+        .collect()
+}
 
 /// One subroom's tiles: `None` is the main room. `members` index the ids the
 /// groups were built from.
@@ -312,6 +401,59 @@ mod tests {
         assert!(LABEL.contains("basis-full h-6 "));
         assert!(LABEL_MINE.contains("basis-full h-6 "));
         assert_eq!(TILE.matches(&format!("var(--labels)*{LABEL_PX}px")).count(), 3);
+    }
+
+    #[test]
+    fn share_grids_split_equally() {
+        let grids: Vec<_> = (1..=8).map(share_grid).collect();
+        assert_eq!(grids, [(1, 1), (2, 1), (2, 2), (2, 2), (3, 2), (3, 2), (3, 3), (3, 3)]);
+        for n in 1..=12 {
+            let (cols, rows) = share_grid(n);
+            assert!(cols * rows >= n, "{n} shares fit");
+            assert!(cols * (rows - 1) < n, "{n} shares leave no empty row");
+        }
+    }
+
+    #[test]
+    fn share_sizing_never_divides_by_zero() {
+        assert_eq!(share_sizing((0, 0), 0), "--share-cols:1;--share-rows:1;--strip-n:1");
+        assert_eq!(share_sizing(share_grid(5), 4), "--share-cols:3;--share-rows:2;--strip-n:4");
+    }
+
+    #[test]
+    fn here_is_the_shares_in_my_room() {
+        let none: [Share; 0] = [];
+        assert!(here(&none, None).is_empty());
+        let shares = [
+            Share { room: Some("Room 1") },
+            Share { room: None },
+            Share { room: Some("Room 1") },
+        ];
+        assert_eq!(here(&shares, Some("Room 1")), [0, 2], "ours, and one in our room");
+        assert_eq!(here(&shares, None), [1], "only main's from main");
+        assert!(here(&shares[1..2], Some("Room 2")).is_empty(), "one elsewhere is rows mode");
+    }
+
+    #[test]
+    fn the_strip_puts_my_room_first_and_skips_its_shares() {
+        // Cards: me (Room 1), my share, a (main), a's share, b (Room 1), c (Room 2).
+        let rooms = map(&[("me", Some("Room 1")), ("b", Some("Room 1")), ("c", Some("Room 2"))]);
+        let ids = ["me", "me", "a", "a", "b", "c"];
+        let groups = groups(&ids, &rooms);
+        // My share (1) is above; a's share (3) is in main, so in the strip.
+        assert_eq!(strip(&groups, Some("Room 1"), &[1]), [0, 4, 2, 3, 5]);
+        // From main with a's share above: main's cameras, then the rest.
+        assert_eq!(strip(&groups, None, &[3]), [2, 0, 1, 4, 5]);
+    }
+
+    #[test]
+    fn the_strip_height_is_the_one_the_share_cells_leave() {
+        assert_eq!(STRIP_REM, 8);
+        assert!(SHARE.contains(&format!("(100%-{STRIP_REM}rem)")));
+        assert!(STRIP.contains(&format!("h-[calc({STRIP_REM}rem-12px)]")));
+        // The strip card's margin is the 12px its height leaves out.
+        assert!(STRIP.starts_with("relative my-1.5 "));
+        assert!(SHARE.starts_with("relative my-1.5 "));
     }
 
     #[test]

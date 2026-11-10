@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 
 use super::call::{Keyframes, SCREEN_PRIORITY, screen_path, video_track};
+use crate::camera::{FrameSlot, from_decoded};
 use super::metrics::PeerStats;
 use super::runtime::runtime;
 
@@ -69,6 +70,9 @@ impl ShareSource {
 pub struct ShareWish {
     wish: Arc<watch::Sender<Option<ShareSource>>>,
     generation: Arc<std::sync::atomic::AtomicU64>,
+    /// What we are sharing, as our own share card shows it: frames from the
+    /// capture, before encoding, scaled down. Cleared when a share ends.
+    preview: FrameSlot,
 }
 
 impl ShareWish {
@@ -76,7 +80,13 @@ impl ShareWish {
         Self {
             wish: Arc::new(watch::Sender::new(None)),
             generation: Arc::default(),
+            preview: FrameSlot::default(),
         }
+    }
+
+    /// Our own share's preview frames, for its card.
+    pub fn preview(&self) -> FrameSlot {
+        self.preview.clone()
     }
 
     /// What we currently want shared.
@@ -268,6 +278,36 @@ const KEYFRAME_EVERY: Duration = Duration::from_secs(4);
 /// (see `PeerStats::begin_share`). Never `0`, which is nobody's.
 static TURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// The widest preview of our own share. The card it fills is a fraction of
+/// the window, and each preview frame is a GPU scale plus a copy back to the
+/// CPU (about 1.5 MB at this size), so it is kept well under the encode size.
+const PREVIEW_MAX_WIDTH: u32 = 1280;
+
+/// The preview's size for an encode size: the same shape, at most
+/// [`PREVIEW_MAX_WIDTH`] wide, even, never larger than the frame.
+fn preview_size(width: u32, height: u32) -> (u32, u32) {
+    if width <= PREVIEW_MAX_WIDTH {
+        return (width & !1, height & !1);
+    }
+    let scaled = (height as u64 * PREVIEW_MAX_WIDTH as u64 / width as u64) as u32;
+    (PREVIEW_MAX_WIDTH, (scaled & !1).max(2))
+}
+
+/// One preview frame from a captured one, scaled on the GPU where it can be
+/// and read back. `None` if the platform refuses either step; the share goes on
+/// without a preview frame rather than failing.
+fn preview(frame: &moq_video::Frame) -> Option<crate::camera::Frame> {
+    let size = frame.size();
+    let (width, height) = preview_size(size.width, size.height);
+    let mut config = moq_video::resize::Config::default();
+    config.output = moq_video::Output::Cpu;
+    let scaled = frame
+        .resize(moq_video::Size::new(width.max(2), height.max(2)), &config)
+        .map_err(|error| tracing::debug!("[share] no preview frame: {error:#}"))
+        .ok()?;
+    from_decoded(scaled)
+}
+
 /// How long a stop may take before the leave goes on without it.
 pub(super) const STOP_WITHIN: Duration = Duration::from_millis(500);
 
@@ -333,6 +373,8 @@ pub(super) struct Call {
     pub local: Arc<PeerStats>,
     /// Set when a session comes back; the screen's flag is ours to take.
     pub keyframe: Arc<Keyframes>,
+    /// Where our own card's preview goes.
+    pub preview: FrameSlot,
 }
 
 /// One share in progress, from the serving task's side.
@@ -497,6 +539,7 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
         me,
         local,
         keyframe,
+        preview: shown,
     } = call;
     let fail = |text: String| local.set_own_share_problem(turn, text);
     let Some(mut stream) = open(&source, &mut stop, &local, turn).await else {
@@ -572,9 +615,15 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
             stop: &mut stop,
             local: &local,
             turn,
+            preview: &shown,
         })
         .await
     };
+    // Only the current share's: a replaced one finishing late must not blank
+    // the next one's card.
+    if local.share_is_current(turn) || !local.sharing() {
+        shown.clear();
+    }
     match &outcome {
         Ok(()) => tracing::info!("[share] stopped sharing {}", source.key()),
         Err(error) => {
@@ -603,6 +652,7 @@ struct Steering<'a> {
     stop: &'a mut oneshot::Receiver<()>,
     local: &'a PeerStats,
     turn: u64,
+    preview: &'a FrameSlot,
 }
 
 /// Reads, encodes and publishes until stopped or the source is gone.
@@ -622,6 +672,7 @@ async fn pump(
         stop,
         local,
         turn,
+        preview: shown,
     } = steering;
     // **Our own clock**, not the capture's: a reopened capture restarts its
     // timeline, and the stream's timestamps must keep rising across that.
@@ -645,7 +696,14 @@ async fn pump(
             read = tokio::time::timeout(wait, stream.read()) => read,
         };
         let mut frame = match read {
-            Ok(Ok(Some(frame))) => frame,
+            Ok(Ok(Some(frame))) => {
+                // Fresh frames only; a still screen's re-send changes nothing
+                // on the card.
+                if let Some(seen) = preview(&frame) {
+                    shown.publish(seen);
+                }
+                frame
+            }
             Err(_still) => match last.take() {
                 Some(frame) => {
                     repeats += 1;
@@ -812,6 +870,14 @@ mod tests {
         assert!(wish.get().is_some());
         wish.clear_if(&ShareSource::Display(None));
         assert_eq!((wish.generation(), wish.get()), (start + 2, None));
+    }
+
+    #[test]
+    fn previews_are_at_most_1280_wide_and_even() {
+        assert_eq!(preview_size(976, 490), (976, 490));
+        assert_eq!(preview_size(977, 491), (976, 490));
+        assert_eq!(preview_size(2560, 1440), (1280, 720));
+        assert_eq!(preview_size(1728, 1116), (1280, 826));
     }
 
     #[test]

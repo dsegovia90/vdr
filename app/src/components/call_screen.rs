@@ -27,6 +27,9 @@ struct Item {
     /// Whether the card is a shared screen rather than a camera.
     screen: bool,
     tile: bool,
+    /// The card's size and placement: `layout::TILE` in rows, `SHARE` or
+    /// `STRIP` in share mode.
+    class: &'static str,
     dim: &'static str,
     line_break: Option<&'static str>,
 }
@@ -108,48 +111,115 @@ pub fn CallScreen() -> Element {
     let labels = if labelled { groups.len() } else { 0 };
     let sizing = layout::sizing(layout::rows(&groups, cols), cols, labels);
 
+    // **Share mode** when a share's sharer is in our room, ours included; see
+    // `layout`. A share's room is its sharer's.
+    let room_of = |index: usize| rooms.get(ids[index]).and_then(Option::as_deref);
+    let shares: Vec<usize> = (0..cards.len()).filter(|&index| cards[index].1).collect();
+    let share_rooms: Vec<layout::Share> = shares
+        .iter()
+        .map(|&index| layout::Share { room: room_of(index) })
+        .collect();
+    let here: Vec<usize> = layout::here(&share_rooms, ours.as_deref())
+        .into_iter()
+        .map(|position| shares[position])
+        .collect();
+    let share_mode = !here.is_empty();
+    let strip = layout::strip(&groups, ours.as_deref(), &here);
+    let sizing = if share_mode {
+        layout::share_sizing(layout::share_grid(here.len()), strip.len())
+    } else {
+        sizing
+    };
+
+    // Each card once, by index, with the key it keeps in both modes.
+    let mut card_items: Vec<Option<Item>> = Vec::with_capacity(tiles);
+    for (index, (peer, screen)) in cards.iter().cloned().enumerate() {
+        // **Ours is keyed with a constant**, not `who`: that changes when the
+        // endpoint binds, and a new key would remount it. A peer's carries the
+        // arrival, so a source that comes back with a new slot gets a new tile
+        // (see `Participant::generation`). Keys with colons never meet a room
+        // label's: ids are hex.
+        let key = match (&peer, screen) {
+            (None, false) => "self".to_string(),
+            (None, true) => "screen:self".to_string(),
+            (Some(peer), false) => format!("{}:{}", peer.id, peer.generation),
+            (Some(peer), true) => format!("screen:{}:{}", peer.id, peer.generation),
+        };
+        let mine = room_of(index) == ours.as_deref();
+        card_items.push(Some(Item {
+            key,
+            label: None,
+            peer,
+            screen,
+            tile: true,
+            class: layout::TILE,
+            dim: if mine { UNDIMMED } else { dim },
+            line_break: None,
+        }));
+    }
+    let mut take = |index: usize| card_items[index].take();
+
     let mut items = Vec::with_capacity(tiles + labels);
+    let mut label_items = Vec::with_capacity(labels);
     for group in &groups {
         let mine = group.room == ours;
         if labelled {
             let name = group.room.as_deref().unwrap_or("Main room");
-            items.push(Item {
+            label_items.push(Item {
                 // "main" has no colon, so no room name can produce it.
                 key: group.room.as_ref().map_or_else(|| "main".to_string(), |room| format!("room:{room}")),
                 label: Some((
                     // People, not cards: a screen is not someone else.
                     format!("{name} \u{b7} {}", people(&group.members, &ids)),
-                    if mine { layout::LABEL_MINE } else { layout::LABEL },
+                    if share_mode {
+                        layout::LABEL_HIDDEN
+                    } else if mine {
+                        layout::LABEL_MINE
+                    } else {
+                        layout::LABEL
+                    },
                 )),
                 peer: None,
                 screen: false,
                 tile: false,
+                class: layout::TILE,
                 dim: UNDIMMED,
                 line_break: None,
             });
         }
-        for (position, &index) in group.members.iter().enumerate() {
-            let (peer, screen) = cards[index].clone();
-            // **Ours is keyed with a constant**, not `who`: that changes when
-            // the endpoint binds, and a new key would remount it. A peer's
-            // carries the arrival, so a source that comes back with a new
-            // slot gets a new tile (see `Participant::generation`). Keys
-            // with colons never meet a room label's: ids are hex.
-            let key = match (&peer, screen) {
-                (None, false) => "self".to_string(),
-                (None, true) => "screen:self".to_string(),
-                (Some(peer), false) => format!("{}:{}", peer.id, peer.generation),
-                (Some(peer), true) => format!("screen:{}:{}", peer.id, peer.generation),
-            };
-            items.push(Item {
-                key,
-                label: None,
-                peer,
-                screen,
-                tile: true,
-                dim: if mine { UNDIMMED } else { dim },
-                line_break: layout::break_after(cols, group.members.len(), position + 1),
-            });
+    }
+    if share_mode {
+        // The shares above, the break, the strip; then the labels, hidden but
+        // kept, so a return to rows does not mount them anew.
+        for (position, &index) in here.iter().enumerate() {
+            if let Some(mut item) = take(index) {
+                item.class = layout::SHARE;
+                item.dim = UNDIMMED;
+                if position + 1 == here.len() {
+                    item.line_break = Some(layout::SHARE_BREAK);
+                }
+                items.push(item);
+            }
+        }
+        for &index in &strip {
+            if let Some(mut item) = take(index) {
+                item.class = layout::STRIP;
+                items.push(item);
+            }
+        }
+        items.extend(label_items);
+    } else {
+        let mut labels = label_items.into_iter();
+        for group in &groups {
+            if labelled {
+                items.extend(labels.next());
+            }
+            for (position, &index) in group.members.iter().enumerate() {
+                if let Some(mut item) = take(index) {
+                    item.line_break = layout::break_after(cols, group.members.len(), position + 1);
+                    items.push(item);
+                }
+            }
         }
     }
 
@@ -179,16 +249,20 @@ pub fn CallScreen() -> Element {
                         if let Some(participant) = item.peer {
                             ShareTile {
                                 label: format!("{} \u{b7} screen", participant.short()),
-                                slot: Some(participant.slot.clone()),
-                                class: layout::TILE,
+                                slot: participant.slot.clone(),
+                                class: item.class,
                                 dim: item.dim,
                             }
                         } else {
                             ShareTile {
                                 label: "You \u{b7} screen",
-                                slot: None,
-                                class: layout::TILE,
+                                slot: remote.share.preview(),
+                                class: item.class,
                                 dim: item.dim,
+                                stop: {
+                                    let share = remote.share.clone();
+                                    EventHandler::new(move |_| share.set(None))
+                                },
                             }
                         }
                         if let Some(class) = item.line_break {
@@ -205,7 +279,7 @@ pub fn CallScreen() -> Element {
                                 mirror: Mirror::None,
                                 stats: Some(participant.stats.clone()),
                                 who: participant.id.clone(),
-                                class: layout::TILE,
+                                class: item.class,
                                 dim: item.dim,
                                 local: remote.local.clone(),
                                 me: me.clone(),
@@ -224,7 +298,7 @@ pub fn CallScreen() -> Element {
                                 // matches what others see; loopback has none,
                                 // and any constant will do.
                                 who: me.clone(),
-                                class: layout::TILE,
+                                class: item.class,
                                 dim: item.dim,
                                 local: remote.local.clone(),
                                 me: me.clone(),

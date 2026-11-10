@@ -33,8 +33,8 @@ Keep it to yourself: anyone holding it can join that room until it expires.
 
 - The buttons at the bottom left turn your microphone and camera on and off;
   the small ▾ beside each picks a different device.
-- The screen button next to them shares your screen; its ▾ picks a display or
-  a single window. Click it again to stop.
+- The screen button next to them lists your displays and windows; pick one to
+  share it. Click the button again, or Stop on your screen's card, to stop.
 - **Leave** is at the bottom right.
 
 Headphones avoid echo if you are in the same room as another participant.

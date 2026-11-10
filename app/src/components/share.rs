@@ -30,9 +30,12 @@ pub struct ShareControlProps {
 /// The Share button, and where the platform lists them, a ▾ of displays and
 /// windows.
 ///
-/// The button shares the main display, or on Wayland opens the system's own
-/// picker; again, it stops. Picking from the ▾ shares that instead, replacing
-/// any share already running.
+/// **The button never starts a share by itself.** Not sharing, it opens the
+/// list -- what "the main display" means is not obvious on a Mac with several,
+/// and guessing confused the first person to try it -- and picking from the
+/// list shares. Sharing, it stops. The ▾ opens the same list, to switch source.
+/// Where there is no list (Wayland, where the system's portal is the picker),
+/// the button starts the portal directly.
 #[component]
 pub fn ShareControl(props: ShareControlProps) -> Element {
     let OwnShare(own) = use_context::<OwnShare>();
@@ -146,14 +149,14 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
                 onclick: {
                     let share = props.share.clone();
                     move |_| {
-                        // The first listed display when we have a list, so the
-                        // ▾ shows it checked and picking it there is no change;
-                        // the main display (or Wayland's picker) otherwise.
-                        let display = displays
-                            .peek()
-                            .first()
-                            .map_or(ShareSource::Display(None), |option| option.source.clone());
-                        let next = if on { None } else { Some(display) };
+                        if !on && share_lists() {
+                            // The ▾'s own list, opened from here: the menu is
+                            // the ▾'s, keyed by name, so this is all it takes.
+                            let next = if current.peek().as_deref() == Some(NAME) { None } else { Some(NAME.to_string()) };
+                            current.set(next);
+                            return;
+                        }
+                        let next = if on { None } else { Some(ShareSource::Display(None)) };
                         share.set(next.clone());
                         clicked.set(share.generation());
                         wish.set(next);
@@ -193,17 +196,19 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
 pub struct ShareTileProps {
     /// The label's text, e.g. "3929461d · screen".
     pub label: String,
-    /// Their decoded screen, or `None` for our own share, which we do not
-    /// show back to ourselves: a self-view of a screen is a tunnel of mirrors
-    /// and a second decode.
-    pub slot: Option<FrameSlot>,
-    /// Size and placement, `layout::TILE`.
+    /// The screen's frames: a peer's decoded, or our own capture's preview.
+    pub slot: FrameSlot,
+    /// Size and placement: `layout::TILE`, `SHARE` or `STRIP`.
     pub class: &'static str,
     /// The dim layer, as their camera's tile has it.
     pub dim: &'static str,
+    /// Our own share's Stop, which makes the card ours: it says so and
+    /// offers the button. `None` on a peer's.
+    #[props(default)]
+    pub stop: Option<EventHandler<()>>,
 }
 
-/// A shared screen, as one more tile beside its sharer's camera.
+/// A shared screen's card: a peer's, or our own with its Stop button.
 ///
 /// **Not a `ParticipantTile`**: that writes its person's room into the page's
 /// map and removes it when it unmounts, so a share ending would delete its
@@ -212,25 +217,33 @@ pub struct ShareTileProps {
 pub fn ShareTile(props: ShareTileProps) -> Element {
     rsx! {
         div { class: props.class,
-            if let Some(slot) = props.slot.clone() {
-                ParticipantVideo {
-                    label: props.label.clone(),
-                    slot,
-                    // Never mirrored and never cropped: it is text and
-                    // windows, the right way round, to the edge.
-                    mirror: Mirror::None,
-                    fit: Fit::Contain,
-                    class: "absolute inset-0",
+            ParticipantVideo {
+                label: props.label.clone(),
+                slot: props.slot.clone(),
+                // Never mirrored and never cropped: it is text and windows,
+                // the right way round, to the edge.
+                mirror: Mirror::None,
+                fit: Fit::Contain,
+                class: "absolute inset-0",
+            }
+            if let Some(stop) = props.stop {
+                div { class: "absolute bottom-2 left-2 flex flex-row items-center gap-2 rounded-md bg-black/50 py-1 pl-2 pr-1",
+                    span { class: "whitespace-nowrap text-xs text-neutral-200", "You are sharing your screen" }
+                    // Plain red and white: see `icons` on palette colours.
+                    button {
+                        class: "rounded bg-red-600 px-2 py-0.5 text-xs text-white hover:bg-red-500",
+                        onclick: move |_| stop.call(()),
+                        "Stop"
+                    }
                 }
             } else {
-                div { class: "absolute inset-0 flex items-center justify-center rounded-[12px] bg-neutral-800 text-sm text-neutral-300",
-                    "Sharing your screen"
+                div { class: "absolute bottom-2 left-2 rounded-md bg-black/50 px-2 py-1",
+                    span { class: "whitespace-nowrap text-xs text-neutral-200", "{props.label}" }
                 }
             }
-            div { class: "absolute bottom-2 left-2 rounded-md bg-black/50 px-2 py-1",
-                span { class: "whitespace-nowrap text-xs text-neutral-200", "{props.label}" }
-            }
-            // Last, so it covers the rest; see `ParticipantTile`.
+            // Last, so it covers the rest; see `ParticipantTile`. Our own card
+            // is always in our room, so never dimmed, and its Stop is never
+            // under a layer.
             div { class: props.dim }
         }
     }

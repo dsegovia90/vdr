@@ -1019,6 +1019,7 @@ async fn run(
                 me: me.to_string(),
                 local: local.clone(),
                 keyframe: keyframe.clone(),
+                preview: share.preview(),
             },
             share.clone(),
             share_quit,
