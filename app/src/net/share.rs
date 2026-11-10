@@ -279,8 +279,8 @@ const KEYFRAME_EVERY: Duration = Duration::from_secs(4);
 static TURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The widest preview of our own share. The card it fills is a fraction of
-/// the window, and each preview frame is a GPU scale plus a copy back to the
-/// CPU (about 1.5 MB at this size), so it is kept well under the encode size.
+/// the window, and every preview frame is copied back to the CPU at its own
+/// size (about 1.6 MB of I420 at 1280×826), so it is kept under the encode size.
 const PREVIEW_MAX_WIDTH: u32 = 1280;
 
 /// The preview's size for an encode size: the same shape, at most
@@ -293,16 +293,35 @@ fn preview_size(width: u32, height: u32) -> (u32, u32) {
     (PREVIEW_MAX_WIDTH, (scaled & !1).max(2))
 }
 
-/// One preview frame from a captured one, scaled on the GPU where it can be
-/// and read back. `None` if the platform refuses either step; the share goes on
-/// without a preview frame rather than failing.
+/// One preview frame from a captured one. `None` if the platform refuses;
+/// the share goes on without a preview frame rather than failing.
+///
+/// **Scaled where the frame lives, then read back small.** moq-video's
+/// `Output::Cpu` would download the whole capture first and scale it on the
+/// CPU, so the native resize is used instead (a GPU transfer on macOS) and only
+/// the scaled surface is read back, by `from_decoded`. A frame already at
+/// preview size is read back as it is, without a resize.
 fn preview(frame: &moq_video::Frame) -> Option<crate::camera::Frame> {
     let size = frame.size();
     let (width, height) = preview_size(size.width, size.height);
-    let mut config = moq_video::resize::Config::default();
-    config.output = moq_video::Output::Cpu;
+    if (width, height) == (size.width, size.height) {
+        let i420 = frame
+            .surface
+            .to_i420()
+            .map_err(|error| tracing::debug!("[share] no preview frame: {error:#}"))
+            .ok()?;
+        return Some(crate::camera::Frame {
+            width,
+            height,
+            timestamp: Duration::from_micros(frame.timestamp.as_micros() as u64),
+            pixels: crate::camera::Pixels::I420(i420.into_owned().into_data().into()),
+        });
+    }
     let scaled = frame
-        .resize(moq_video::Size::new(width.max(2), height.max(2)), &config)
+        .resize(
+            moq_video::Size::new(width.max(2), height.max(2)),
+            &moq_video::resize::Config::default(),
+        )
         .map_err(|error| tracing::debug!("[share] no preview frame: {error:#}"))
         .ok()?;
     from_decoded(scaled)
@@ -695,17 +714,16 @@ async fn pump(
             _ = &mut *stop => return Ok(()),
             read = tokio::time::timeout(wait, stream.read()) => read,
         };
+        // Whether this frame is new: only new ones reach our card's preview.
+        let fresh;
         let mut frame = match read {
             Ok(Ok(Some(frame))) => {
-                // Fresh frames only; a still screen's re-send changes nothing
-                // on the card.
-                if let Some(seen) = preview(&frame) {
-                    shown.publish(seen);
-                }
+                fresh = true;
                 frame
             }
             Err(_still) => match last.take() {
                 Some(frame) => {
+                    fresh = false;
                     repeats += 1;
                     frame
                 }
@@ -775,6 +793,16 @@ async fn pump(
             producer
                 .publish(&encoded)
                 .map_err(|error| format!("publish failed: {error:#}"))?;
+        }
+        // **After** the encode and publish, so the preview never delays what
+        // the room sees. Fresh frames only: a still screen's re-send changes
+        // nothing on the card. And only while this share is the current one
+        // and not told to stop: a share abandoned by a leave could otherwise
+        // paint into the card of the share that replaced it, and never clear.
+        if fresh && local.share_is_current(turn) {
+            if let Some(seen) = preview(&frame) {
+                shown.publish(seen);
+            }
         }
         last = Some(frame);
         sent += 1;

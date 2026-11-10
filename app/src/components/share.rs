@@ -229,7 +229,6 @@ pub fn ShareTile(props: ShareTileProps) -> Element {
             if let Some(stop) = props.stop {
                 div { class: "absolute bottom-2 left-2 flex flex-row items-center gap-2 rounded-md bg-black/50 py-1 pl-2 pr-1",
                     span { class: "whitespace-nowrap text-xs text-neutral-200", "You are sharing your screen" }
-                    // Plain red and white: see `icons` on palette colours.
                     button {
                         class: "rounded bg-red-600 px-2 py-0.5 text-xs text-white hover:bg-red-500",
                         onclick: move |_| stop.call(()),
