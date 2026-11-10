@@ -38,6 +38,9 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
     let OwnShare(own) = use_context::<OwnShare>();
     let OpenMenu(mut current) = use_context::<OpenMenu>();
     let mut wish = use_signal(|| None::<ShareSource>);
+    // The wish's generation as of our own last click. A poll that read the
+    // wish before the click must not undo what the click showed.
+    let mut clicked = use_signal(|| 0u64);
     let mut displays = use_signal(Vec::<ShareOption>::new);
     let mut windows = use_signal(Vec::<ShareOption>::new);
     let mut listed = use_signal(|| false);
@@ -50,8 +53,8 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
         }
     }));
 
-    let wishes = use_channel(move |next: Option<ShareSource>| {
-        if *wish.peek() != next {
+    let wishes = use_channel(move |(generation, next): (u64, Option<ShareSource>)| {
+        if generation >= *clicked.peek() && *wish.peek() != next {
             wish.set(next);
         }
     });
@@ -61,7 +64,10 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
             let spawned = std::thread::Builder::new()
                 .name("share-wish".into())
                 .spawn(move || loop {
-                    if wishes.unbounded_send(share.get()).is_err() {
+                    // The generation first: the value read after it is at
+                    // least that new (see `ShareWish`).
+                    let generation = share.generation();
+                    if wishes.unbounded_send((generation, share.get())).is_err() {
                         return;
                     }
                     std::thread::sleep(POLL);
@@ -123,6 +129,7 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
                 .map(|option| option.source.clone());
             if let Some(source) = chosen {
                 share.set(Some(source.clone()));
+                clicked.set(share.generation());
                 wish.set(Some(source));
             }
         }
@@ -139,8 +146,16 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
                 onclick: {
                     let share = props.share.clone();
                     move |_| {
-                        let next = if on { None } else { Some(ShareSource::Display(None)) };
+                        // The first listed display when we have a list, so the
+                        // ▾ shows it checked and picking it there is no change;
+                        // the main display (or Wayland's picker) otherwise.
+                        let display = displays
+                            .peek()
+                            .first()
+                            .map_or(ShareSource::Display(None), |option| option.source.clone());
+                        let next = if on { None } else { Some(display) };
                         share.set(next.clone());
+                        clicked.set(share.generation());
                         wish.set(next);
                     }
                 },

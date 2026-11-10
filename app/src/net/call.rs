@@ -369,9 +369,10 @@ struct Presence {
     /// from someone not sharing is what a build without shares sends.
     ///
     /// The announce of the screen's broadcast says this too, but presence says
-    /// it in the same document as the sharer's room, and goes with the control
-    /// broadcast: a share whose sender crashed can linger on the relay, its
-    /// presence does not.
+    /// it in the same document as the sharer's room. And the share goes with
+    /// the control broadcast: a share whose sender left can linger on the
+    /// relay for a few seconds, so a receiver drops the share's tile when the
+    /// sharer's control broadcast goes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     sharing: bool,
 }
@@ -1231,6 +1232,10 @@ async fn run(
         // The mic button stays red if the mic is still off, which is honest
         // on its own.
         local.clear_asks();
+        // Ends every share's turn, so the bar's "Screen recording is off"
+        // does not outlive the call, and a straggling share thread can write
+        // nothing into the next one.
+        local.begin_share(0);
         // The subroom was in a room that is gone now: the next call starts in
         // its main room, not in a name nobody else is using.
         local.set_room(None);
@@ -1518,7 +1523,17 @@ async fn attend(
                     if present.remove(id) && present.is_empty() {
                         alone(&hangup, id.to_string(), in_room);
                     }
-                    if !attending.contains_key(id) && !sharing.contains_key(id) {
+                    // Their screen goes with them, rather than lingering on
+                    // the relay after a leave. Their camera is left to its own
+                    // retract, which `Leaving` already hastens.
+                    if sharing.remove(id).is_some() {
+                        tracing::info!("{id} left while sharing; dropping their screen");
+                        let _ = participants.unbounded_send(ParticipantEvent::Left {
+                            id: id.to_string(),
+                            feed: Feed::Screen,
+                        });
+                    }
+                    if !attending.contains_key(id) {
                         people.remove(id);
                     }
                 }
@@ -1593,9 +1608,9 @@ async fn attend(
         let Some(broadcast) = broadcast else {
             tracing::info!("{id} left");
             attending.remove(id);
-            // Forgotten once both of their broadcasts are gone, so a rejoin
+            // Forgotten once all of their broadcasts are gone, so a rejoin
             // with the same key starts from "on" rather than their last word.
-            if !present.contains(id) {
+            if !present.contains(id) && !sharing.contains_key(id) {
                 people.remove(id);
             }
             let _ = participants.unbounded_send(ParticipantEvent::Left {

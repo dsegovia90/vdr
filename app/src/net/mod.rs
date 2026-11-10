@@ -55,6 +55,11 @@ pub struct Participant {
     pub stats: Arc<PeerStats>,
     /// Which of their sources this is: their camera, or a screen they share.
     pub feed: Feed,
+    /// Which arrival of this source this is, unique for the run. Part of the
+    /// tile's key: a tile's video widget is built once, from the first slot it
+    /// is given, so the same source arriving again with a new slot needs a new
+    /// tile, or it would paint the old slot's last frame forever.
+    pub generation: u64,
 }
 
 /// One of a person's sources. Someone sharing a screen is one person with two
@@ -149,13 +154,21 @@ pub fn use_remote() -> Remote {
     let mut status = use_signal(|| RemoteStatus::Binding);
     let mut me = use_signal(|| Option::<String>::None);
     let mut participants = use_signal(Vec::<Participant>::new);
+    let mut arrivals = 0u64;
     let joined = use_channel(move |event: ParticipantEvent| match event {
         ParticipantEvent::Joined { id, slot, stats, feed } => {
+            arrivals += 1;
             let mut list = participants.write();
             // A second announce of the same source replaces the first: two
             // entries would be two tiles under one key.
             list.retain(|p| !(p.id == id && p.feed == feed));
-            list.push(Participant { id, slot, stats, feed })
+            list.push(Participant {
+                id,
+                slot,
+                stats,
+                feed,
+                generation: arrivals,
+            })
         }
         ParticipantEvent::Left { id, feed } => {
             participants.write().retain(|p| !(p.id == id && p.feed == feed))
@@ -213,6 +226,7 @@ pub fn use_remote() -> Remote {
                     slot,
                     stats,
                     feed: Feed::Camera,
+                    generation: 0,
                 }]);
             }
             peering => {

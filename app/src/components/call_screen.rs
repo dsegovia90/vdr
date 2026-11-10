@@ -117,7 +117,8 @@ pub fn CallScreen() -> Element {
                 // "main" has no colon, so no room name can produce it.
                 key: group.room.as_ref().map_or_else(|| "main".to_string(), |room| format!("room:{room}")),
                 label: Some((
-                    format!("{name} \u{b7} {}", group.members.len()),
+                    // People, not cards: a screen is not someone else.
+                    format!("{name} \u{b7} {}", people(&group.members, &ids)),
                     if mine { layout::LABEL_MINE } else { layout::LABEL },
                 )),
                 peer: None,
@@ -130,13 +131,15 @@ pub fn CallScreen() -> Element {
         for (position, &index) in group.members.iter().enumerate() {
             let (peer, screen) = cards[index].clone();
             // **Ours is keyed with a constant**, not `who`: that changes when
-            // the endpoint binds, and a new key would remount it. A screen's
-            // key has a colon, which no endpoint id does.
+            // the endpoint binds, and a new key would remount it. A peer's
+            // carries the arrival, so a source that comes back with a new
+            // slot gets a new tile (see `Participant::generation`). Keys
+            // with colons never meet a room label's: ids are hex.
             let key = match (&peer, screen) {
                 (None, false) => "self".to_string(),
                 (None, true) => "screen:self".to_string(),
-                (Some(peer), false) => peer.id.clone(),
-                (Some(peer), true) => format!("screen:{}", peer.id),
+                (Some(peer), false) => format!("{}:{}", peer.id, peer.generation),
+                (Some(peer), true) => format!("screen:{}:{}", peer.id, peer.generation),
             };
             items.push(Item {
                 key,
@@ -258,5 +261,26 @@ pub fn CallScreen() -> Element {
             leave: remote.cancel,
             share: remote.share.clone(),
         }
+    }
+}
+
+/// How many people a group's cards belong to: someone sharing has two cards.
+fn people(members: &[usize], ids: &[&str]) -> usize {
+    members
+        .iter()
+        .map(|&index| ids[index])
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::people;
+
+    #[test]
+    fn a_sharer_is_counted_once() {
+        let ids = ["me", "a", "a", "b"];
+        assert_eq!(people(&[0, 1, 2, 3], &ids), 3);
+        assert_eq!(people(&[1, 2], &ids), 1);
     }
 }

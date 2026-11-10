@@ -14,9 +14,9 @@
 //! **Not moq-video's `publish_capture`.** That releases the source whenever no
 //! one is subscribed and opens it again on demand, which is a second open per
 //! share (and on Wayland, a bet that the portal restores the grant without a
-//! second picker). It also counts its keyframe interval in frames and has no
-//! keyframe for a rejoining session. The loop here keeps the source open for
-//! exactly as long as the person shares.
+//! second picker). It also has no keyframe for a rejoining session. The loop
+//! here keeps the source open for exactly as long as the person shares, and
+//! cuts keyframes by the wall clock (see [`KEYFRAME_EVERY`]).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,29 +60,61 @@ impl ShareSource {
 ///
 /// A watch, not a queue: only the latest wish matters, and every attempt needs
 /// to read it.
+///
+/// **Numbered.** Every change bumps a generation after the value is written, so
+/// a reader polling from another thread can tell a value read before a click
+/// from one read after it: read [`generation`](Self::generation) first, then
+/// [`get`](Self::get), and the value is at least that new.
 #[derive(Clone)]
-pub struct ShareWish(pub(super) Arc<watch::Sender<Option<ShareSource>>>);
+pub struct ShareWish {
+    wish: Arc<watch::Sender<Option<ShareSource>>>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+}
 
 impl ShareWish {
     pub fn new() -> Self {
-        Self(Arc::new(watch::Sender::new(None)))
+        Self {
+            wish: Arc::new(watch::Sender::new(None)),
+            generation: Arc::default(),
+        }
     }
 
     /// What we currently want shared.
     pub fn get(&self) -> Option<ShareSource> {
-        self.0.borrow().clone()
+        self.wish.borrow().clone()
+    }
+
+    /// How many times the wish has changed.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Asks for `source` to be shared, replacing any share; `None` stops.
     pub fn set(&self, source: Option<ShareSource>) {
-        self.0.send_replace(source);
+        self.wish.send_replace(source);
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Back to `None` if the wish is still `source`: a share that ended by
+    /// itself, where a newer pick must stand.
+    fn clear_if(&self, source: &ShareSource) {
+        let cleared = self.wish.send_if_modified(|wish| {
+            let same = wish.as_ref() == Some(source);
+            if same {
+                *wish = None;
+            }
+            same
+        });
+        if cleared {
+            self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
 impl PartialEq for ShareWish {
     /// Identity, never contents -- see `audio::Controls` for why.
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.wish, &other.wish)
     }
 }
 
@@ -222,9 +254,19 @@ const MAX_SHARE: (u32, u32) = (2560, 1440);
 /// for the next change. One near-empty frame a second is the price.
 const HEARTBEAT: Duration = Duration::from_secs(1);
 
-/// The keyframe interval. Longer than the camera's two seconds: a screen is
-/// mostly still, and a keyframe of a full screen is large.
+/// The keyframe interval, **by the wall clock.** Longer than the camera's two
+/// seconds: a screen is mostly still, and a keyframe of a full screen is large.
+///
+/// The encoder's own interval is counted in frames, and a still screen sends
+/// one frame a second ([`HEARTBEAT`]), so 4 s at 15 fps would be a keyframe a
+/// minute -- a minute a late joiner waits for a picture. The loop cuts one
+/// itself once this much time has passed; the encoder's count is the backstop
+/// while frames flow at the full rate.
 const KEYFRAME_EVERY: Duration = Duration::from_secs(4);
+
+/// Each share's turn, so a share being replaced cannot write over the next
+/// (see `PeerStats::begin_share`). Never `0`, which is nobody's.
+static TURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// How long a stop may take before the leave goes on without it.
 pub(super) const STOP_WITHIN: Duration = Duration::from_millis(500);
@@ -304,12 +346,23 @@ struct Running {
 }
 
 impl Running {
-    /// Stops the share and waits for it to finish, within [`STOP_WITHIN`].
-    async fn stop(self) {
-        let Running { source, stop, done } = self;
+    /// Stops the share and waits for it to finish, however long that takes.
+    ///
+    /// Unbounded on purpose when replacing: a share still setting up its
+    /// encoder can take longer than [`STOP_WITHIN`], and a replacement started
+    /// alongside it would have two shares announcing one path.
+    async fn finish(self) {
+        let Running { stop, done, .. } = self;
         let _ = stop.send(());
-        if tokio::time::timeout(STOP_WITHIN, done).await.is_err() {
-            tracing::warn!("[share] {} did not stop within {STOP_WITHIN:?}", source.key());
+        let _ = done.await;
+    }
+
+    /// Stops the share and waits for it within [`STOP_WITHIN`], for a leave,
+    /// which must not hang on it.
+    async fn stop(self) {
+        let key = self.source.key();
+        if tokio::time::timeout(STOP_WITHIN, self.finish()).await.is_err() {
+            tracing::warn!("[share] {key} did not stop within {STOP_WITHIN:?}");
         }
     }
 }
@@ -325,14 +378,21 @@ impl Running {
 /// sharing", a refused permission -- sets `wanted` back to `None`, so the
 /// button shows it has ended.
 pub(super) async fn serve(call: Call, wanted: ShareWish, mut quit: oneshot::Receiver<()>) {
-    let wanted = wanted.0;
-    let mut wishes = wanted.subscribe();
+    let mut wishes = wanted.wish.subscribe();
     let mut running: Option<Running> = None;
     loop {
         let wish = wishes.borrow_and_update().clone();
         if wish != running.as_ref().map(|running| running.source.clone()) {
             if let Some(previous) = running.take() {
-                previous.stop().await;
+                // Raced against a leave, which bounds it instead.
+                let key = previous.source.key();
+                tokio::select! {
+                    () = previous.finish() => {}
+                    _ = &mut quit => {
+                        tracing::warn!("[share] leaving while {key} was still stopping");
+                        return;
+                    }
+                }
             }
             if let Some(source) = wish {
                 running = start(source, call.clone());
@@ -355,14 +415,7 @@ pub(super) async fn serve(call: Call, wanted: ShareWish, mut quit: oneshot::Rece
             }
             () = ended => {
                 if let Some(ended) = running.take() {
-                    // Only if it is still the wish: a newer pick stands.
-                    wanted.send_if_modified(|wish| {
-                        let same = wish.as_ref() == Some(&ended.source);
-                        if same {
-                            *wish = None;
-                        }
-                        same
-                    });
+                    wanted.clear_if(&ended.source);
                 }
             }
         }
@@ -376,6 +429,10 @@ pub(super) async fn serve(call: Call, wanted: ShareWish, mut quit: oneshot::Rece
 fn start(source: ShareSource, call: Call) -> Option<Running> {
     let (stop, stopped) = oneshot::channel();
     let (finished, done) = oneshot::channel();
+    // Taken here, on the serving task, so turns begin in the order the person
+    // asked for them, whatever order the threads run in.
+    let turn = TURNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    call.local.begin_share(turn);
     let spawned = std::thread::Builder::new().name("share".into()).spawn({
         let source = source.clone();
         move || {
@@ -383,7 +440,7 @@ fn start(source: ShareSource, call: Call) -> Option<Running> {
                 tracing::warn!("[share] no runtime, so the screen cannot be shared");
                 return;
             };
-            runtime.block_on(share(source, call, stopped));
+            runtime.block_on(share(source, call, turn, stopped));
             let _ = finished.send(());
         }
     });
@@ -401,6 +458,7 @@ async fn open(
     source: &ShareSource,
     stop: &mut oneshot::Receiver<()>,
     local: &PeerStats,
+    turn: u64,
 ) -> Option<moq_video::capture::Stream> {
     let mut config = moq_video::capture::Config::default();
     config.source = source.capture();
@@ -414,23 +472,34 @@ async fn open(
             Ok(stream) => Some(stream),
             Err(error) => {
                 tracing::warn!("[share] could not open {}: {error:#}", source.key());
-                local.set_share_problem(Some(problem(&error, cfg!(target_os = "macos"))));
+                local.set_own_share_problem(turn, problem(&error, cfg!(target_os = "macos")));
                 None
             }
         },
     }
 }
 
+/// Whether the share has been told to stop, without waiting. A dropped sender
+/// says the same as a sent stop.
+fn stopped(stop: &mut oneshot::Receiver<()>) -> bool {
+    !matches!(stop.try_recv(), Err(oneshot::error::TryRecvError::Empty))
+}
+
 /// One share, start to finish, on the share thread.
-async fn share(source: ShareSource, call: Call, mut stop: oneshot::Receiver<()>) {
+///
+/// **A stop is honoured during set-up too**, not only once frames flow: the
+/// probe and the encoder can take longer than a person takes to pick another
+/// source, and a share that announced after being replaced would flash a tile
+/// at everyone.
+async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Receiver<()>) {
     let Call {
         outbound,
         me,
         local,
         keyframe,
     } = call;
-    local.set_share_problem(None);
-    let Some(mut stream) = open(&source, &mut stop, &local).await else {
+    let fail = |text: String| local.set_own_share_problem(turn, text);
+    let Some(mut stream) = open(&source, &mut stop, &local, turn).await else {
         return;
     };
     let (width, height) = share_size(stream.width(), stream.height());
@@ -440,7 +509,7 @@ async fn share(source: ShareSource, call: Call, mut stop: oneshot::Receiver<()>)
         Ok(broadcast) => broadcast,
         Err(error) => {
             tracing::warn!("[share] could not create the screen's broadcast: {error:#}");
-            local.set_share_problem(Some(format!("Could not share the screen: {error}")));
+            fail(format!("Could not share the screen: {error}"));
             return;
         }
     };
@@ -448,7 +517,7 @@ async fn share(source: ShareSource, call: Call, mut stop: oneshot::Receiver<()>)
         Ok(parts) => parts,
         Err(error) => {
             tracing::warn!("[share] {error}");
-            local.set_share_problem(Some(format!("Could not share the screen: {error}")));
+            fail(format!("Could not share the screen: {error}"));
             broadcast.close();
             return;
         }
@@ -461,20 +530,33 @@ async fn share(source: ShareSource, call: Call, mut stop: oneshot::Receiver<()>)
         Ok(encoder) => encoder,
         Err(error) => {
             tracing::warn!("[share] could not build an encoder: {error:#}");
-            local.set_share_problem(Some(problem(&error, false)));
+            fail(problem(&error, false));
             broadcast.close();
             return;
         }
     };
+    if stopped(&mut stop) || !local.share_is_current(turn) {
+        tracing::info!("[share] {} was stopped while it set up; not announcing it", source.key());
+        broadcast.close();
+        return;
+    }
     if let Err(error) = broadcast.announce(moq_net::origin::Route::default()) {
         tracing::warn!("[share] could not announce the screen: {error:#}");
+        fail(format!("Could not share the screen: {error}"));
         broadcast.close();
         return;
     }
     // A keyframe asked for before this share began is already answered: a
     // new encoder's first picture is one.
     keyframe.screen.store(false, std::sync::atomic::Ordering::Relaxed);
-    local.set_sharing(true);
+    // Checked again: the announce is quick, but a stop can land during it,
+    // and `sharing` must never be said by a share that is going. A stop seen
+    // here also skips the loop, which must not poll a receiver `try_recv`
+    // has already taken the value from.
+    let going = stopped(&mut stop);
+    if !going {
+        local.set_own_sharing(turn, true);
+    }
     tracing::info!(
         "[share] sharing {} at {width}x{height}, {} kbps, with {}",
         stream.label(),
@@ -482,15 +564,24 @@ async fn share(source: ShareSource, call: Call, mut stop: oneshot::Receiver<()>)
         encoder.name()
     );
 
-    let outcome = pump(&source, &mut stream, &mut encoder, &mut producer, &mut config, Steering {
-        keyframe: &keyframe,
-        stop: &mut stop,
-        local: &local,
-    })
-    .await;
+    let outcome = if going {
+        Ok(())
+    } else {
+        pump(&source, &mut stream, &mut encoder, &mut producer, &mut config, Steering {
+            keyframe: &keyframe,
+            stop: &mut stop,
+            local: &local,
+            turn,
+        })
+        .await
+    };
     match &outcome {
         Ok(()) => tracing::info!("[share] stopped sharing {}", source.key()),
-        Err(error) => tracing::warn!("[share] the share ended: {error}"),
+        Err(error) => {
+            tracing::warn!("[share] the share ended: {error}");
+            let short: String = error.chars().take(80).collect();
+            fail(format!("The screen share stopped: {short}"));
+        }
     }
     drop(stream);
 
@@ -502,7 +593,7 @@ async fn share(source: ShareSource, call: Call, mut stop: oneshot::Receiver<()>)
         }
     }
     producer.finish().ok();
-    local.set_sharing(false);
+    local.set_own_sharing(turn, false);
     broadcast.close();
 }
 
@@ -511,6 +602,7 @@ struct Steering<'a> {
     keyframe: &'a Keyframes,
     stop: &'a mut oneshot::Receiver<()>,
     local: &'a PeerStats,
+    turn: u64,
 }
 
 /// Reads, encodes and publishes until stopped or the source is gone.
@@ -525,7 +617,12 @@ async fn pump(
     config: &mut moq_video::encode::Config,
     steering: Steering<'_>,
 ) -> Result<(), String> {
-    let Steering { keyframe, stop, local } = steering;
+    let Steering {
+        keyframe,
+        stop,
+        local,
+        turn,
+    } = steering;
     // **Our own clock**, not the capture's: a reopened capture restarts its
     // timeline, and the stream's timestamps must keep rising across that.
     let started = Instant::now();
@@ -535,15 +632,17 @@ async fn pump(
     let mut sent = 0u32;
     let mut repeats = 0u32;
     let mut since = Instant::now();
+    // The first picture of a new encoder is a keyframe.
+    let mut keyed = Instant::now();
     loop {
-        if keyframe.screen.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            if let Err(error) = encoder.cut() {
-                tracing::warn!("[share] could not ask the encoder for a keyframe: {error:#}");
-            }
-        }
+        // Never waits past a keyframe that is due, so a still screen re-sends
+        // its last frame as that keyframe, on time.
+        let wait = HEARTBEAT
+            .min(KEYFRAME_EVERY.saturating_sub(keyed.elapsed()))
+            .max(Duration::from_millis(10));
         let read = tokio::select! {
             _ = &mut *stop => return Ok(()),
-            read = tokio::time::timeout(HEARTBEAT, stream.read()) => read,
+            read = tokio::time::timeout(wait, stream.read()) => read,
         };
         let mut frame = match read {
             Ok(Ok(Some(frame))) => frame,
@@ -562,7 +661,7 @@ async fn pump(
                 }
                 reopened = Some(Instant::now());
                 tracing::info!("[share] {} ended; reopening it", source.key());
-                let Some(fresh) = open(source, stop, local).await else {
+                let Some(fresh) = open(source, stop, local, turn).await else {
                     return Ok(());
                 };
                 *stream = fresh;
@@ -579,6 +678,7 @@ async fn pump(
                     *config = encoder_config(width, height, Some(config.kind.clone()));
                     *encoder = moq_video::encode::Encoder::new(config)
                         .map_err(|error| format!("could not rebuild the encoder: {error:#}"))?;
+                    keyed = Instant::now();
                     tracing::info!("[share] source now {width}x{height}");
                 }
                 continue;
@@ -588,6 +688,21 @@ async fn pump(
                 return Ok(());
             }
         };
+        // Asked for on the frame about to be encoded, which this thread owns.
+        let rejoined = keyframe.screen.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if rejoined || keyed.elapsed() >= KEYFRAME_EVERY {
+            match encoder.cut() {
+                Ok(()) => tracing::debug!(
+                    "[share] keyframe after {:.1} s{}",
+                    keyed.elapsed().as_secs_f32(),
+                    if rejoined { ", for a rejoined session" } else { "" }
+                ),
+                Err(error) => tracing::warn!("[share] could not ask the encoder for a keyframe: {error:#}"),
+            }
+            // Reset either way: a backend that cannot cut would otherwise be
+            // asked on every frame.
+            keyed = Instant::now();
+        }
         if frame.size() != encoder.size() {
             frame = frame
                 .resize(encoder.size(), &moq_video::resize::Config::default())
@@ -683,6 +798,20 @@ mod tests {
         let long = window_label("Code", &"x".repeat(100));
         assert_eq!(long.chars().count(), 48);
         assert!(long.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn every_change_of_wish_is_numbered() {
+        let wish = ShareWish::new();
+        let start = wish.generation();
+        wish.set(Some(ShareSource::Display(None)));
+        assert_eq!(wish.generation(), start + 1);
+        // A share ending clears only its own wish.
+        wish.clear_if(&ShareSource::Window("other".into()));
+        assert_eq!(wish.generation(), start + 1);
+        assert!(wish.get().is_some());
+        wish.clear_if(&ShareSource::Display(None));
+        assert_eq!((wish.generation(), wish.get()), (start + 2, None));
     }
 
     #[test]

@@ -265,6 +265,11 @@ pub struct PeerStats {
     /// Why our last share did not start or ended early, in words for the bar.
     /// Our own entry only; cleared when the next share is attempted.
     share_problem: std::sync::Mutex<Option<String>>,
+    /// Which of our shares may write `sharing` and `share_problem`: the
+    /// newest one begun. Our own entry only. A share being replaced finishes
+    /// on its own thread after the next has begun, and must not clear the
+    /// new one's flag or report into it.
+    share_turn: std::sync::atomic::AtomicU64,
 }
 
 /// "Camera time `media_us` was wall-clock time `wall_us`" -- what lets another
@@ -369,6 +374,7 @@ impl Default for PeerStats {
             audio_dry: AtomicU32::new(0),
             sharing: AtomicBool::new(false),
             share_problem: std::sync::Mutex::new(None),
+            share_turn: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -440,6 +446,35 @@ impl PeerStats {
     /// Records whether they are sharing a screen.
     pub fn set_sharing(&self, on: bool) {
         self.sharing.store(on, Ordering::Relaxed);
+    }
+
+    /// Makes `turn` our current share, clearing the last one's problem. Turns
+    /// must be unique; `0` is nobody's, which is how a leave ends them all.
+    pub fn begin_share(&self, turn: u64) {
+        self.share_turn.store(turn, Ordering::SeqCst);
+        self.set_share_problem(None);
+        if turn == 0 {
+            self.set_sharing(false);
+        }
+    }
+
+    /// Whether `turn` is still our current share.
+    pub fn share_is_current(&self, turn: u64) -> bool {
+        turn != 0 && self.share_turn.load(Ordering::SeqCst) == turn
+    }
+
+    /// Records whether we share, if `turn` is still the current share.
+    pub fn set_own_sharing(&self, turn: u64, on: bool) {
+        if self.share_is_current(turn) {
+            self.set_sharing(on);
+        }
+    }
+
+    /// Records why our share failed, if `turn` is still the current share.
+    pub fn set_own_share_problem(&self, turn: u64, problem: String) {
+        if self.share_is_current(turn) {
+            self.set_share_problem(Some(problem));
+        }
     }
 
     /// Why our last share failed, if it did.
@@ -676,6 +711,32 @@ impl Drop for FpsMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_share_cannot_touch_the_next() {
+        let local = PeerStats::default();
+        local.begin_share(1);
+        local.begin_share(2);
+        local.set_own_sharing(2, true);
+        // The old share finishing late, after the new one said `sharing`.
+        local.set_own_sharing(1, false);
+        local.set_own_share_problem(1, "old".into());
+        assert!(local.sharing());
+        assert_eq!(local.share_problem(), None);
+    }
+
+    #[test]
+    fn a_leave_ends_every_turn() {
+        let local = PeerStats::default();
+        local.begin_share(3);
+        local.set_own_share_problem(3, "Screen recording is off".into());
+        local.begin_share(0);
+        assert_eq!(local.share_problem(), None);
+        assert!(!local.sharing());
+        local.set_own_sharing(3, true);
+        local.set_own_sharing(0, true);
+        assert!(!local.sharing(), "turn 0 is nobody's");
+    }
 
     #[test]
     fn a_frame_maps_through_the_senders_clock() {
