@@ -15,7 +15,7 @@ use dioxus_native::prelude::*;
 
 use super::device_menu::OpenMenu;
 use super::tile_menu::{TileMenu, menu_name};
-use super::{Invites, MicIcon, ParticipantVideo, PersonIcon, Rooms};
+use super::{Invites, MicIcon, OwnShare, ParticipantVideo, PersonIcon, Rooms};
 use crate::audio::Crosstalk;
 use crate::camera::{FrameSlot, Mirror};
 use crate::channel::use_channel;
@@ -38,6 +38,10 @@ struct Reading {
     /// Who invites us, to which room. Our own tile only; passed on to the
     /// page's [`Invites`].
     invites: BTreeMap<String, Option<String>>,
+    /// Whether we share a screen, and why a share failed. Our own tile only;
+    /// passed on to the page's [`OwnShare`].
+    sharing: bool,
+    share_problem: Option<String>,
 }
 
 impl Default for Reading {
@@ -50,6 +54,8 @@ impl Default for Reading {
             room: None,
             muted_by: None,
             invites: BTreeMap::new(),
+            sharing: false,
+            share_problem: None,
         }
     }
 }
@@ -86,6 +92,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     let mut reading = use_signal(Reading::default);
     let Rooms(mut rooms) = use_context::<Rooms>();
     let Invites(mut invites) = use_context::<Invites>();
+    let OwnShare(mut own_share) = use_context::<OwnShare>();
     let OpenMenu(mut current) = use_context::<OpenMenu>();
     // Both are "" before the endpoint binds, and a peer's id is never ours.
     let mine = props.who == props.me;
@@ -117,6 +124,10 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
             if mine && *invites.peek() != next.invites {
                 invites.set(next.invites.clone());
             }
+            let share = (next.sharing, next.share_problem.clone());
+            if mine && *own_share.peek() != share {
+                own_share.set(share);
+            }
             if *reading.peek() != next {
                 reading.set(next);
             }
@@ -145,6 +156,8 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                         room: stats.room(),
                         muted_by: stats.muted_by(),
                         invites: stats.invites(),
+                        sharing: stats.sharing(),
+                        share_problem: stats.share_problem(),
                     };
                     if tx.unbounded_send(next).is_err() {
                         return;

@@ -8,11 +8,11 @@ use dioxus_native::prelude::*;
 
 use super::tile::{UNDIMMED, dim_class};
 use super::{
-    ConnectRow, ControlBar, CrosstalkLevel, DropdownOption, ParticipantTile, Rooms, layout,
+    ConnectRow, ControlBar, CrosstalkLevel, DropdownOption, OwnShare, ParticipantTile, Rooms, ShareTile, layout,
     use_crosstalk_provider, use_open_menu_provider, use_rooms_provider,
 };
 use crate::camera::{FrameSlot, Mirror, use_camera_choice};
-use crate::net::{Participant, use_remote};
+use crate::net::{Feed, Participant, use_remote};
 
 /// One child of the tile area, in order: a group's label, or a card with the
 /// line break after it. All in one keyed list, so someone changing subroom
@@ -24,6 +24,8 @@ struct Item {
     label: Option<(String, &'static str)>,
     /// The peer whose card this is: `None` for our own, and for a label.
     peer: Option<Participant>,
+    /// Whether the card is a shared screen rather than a camera.
+    screen: bool,
     tile: bool,
     dim: &'static str,
     line_break: Option<&'static str>,
@@ -62,16 +64,41 @@ pub fn CallScreen() -> Element {
 
     // Read into a Vec first: holding the signal's guard across the nodes below
     // would keep it borrowed while they render.
-    let participants = remote.participants.read().clone();
-    let tiles = 1 + participants.len();
+    let all = remote.participants.read().clone();
+    let (cameras, screens): (Vec<Participant>, Vec<Participant>) =
+        all.into_iter().partition(|participant| participant.feed == Feed::Camera);
+    let OwnShare(own_share) = use_context::<OwnShare>();
+    let (sharing, _) = own_share();
     // Our tile's `who`, and so our key among everyone's rooms.
     let me = remote.me.read().clone().unwrap_or_default();
+
+    // **Every card in order: ours, then each camera followed by that person's
+    // screen.** A screen is one more card in its sharer's group, so it is
+    // grouped by its sharer's id; a screen whose sharer has no camera card
+    // goes at the end, still in their group. `None` is our own card.
+    let mut cards: Vec<(Option<Participant>, bool)> = vec![(None, false)];
+    if sharing {
+        cards.push((None, true));
+    }
+    for camera in &cameras {
+        cards.push((Some(camera.clone()), false));
+        if let Some(screen) = screens.iter().find(|screen| screen.id == camera.id) {
+            cards.push((Some(screen.clone()), true));
+        }
+    }
+    for screen in &screens {
+        if !cameras.iter().any(|camera| camera.id == screen.id) {
+            cards.push((Some(screen.clone()), true));
+        }
+    }
+    let tiles = cards.len();
 
     let rooms = rooms.read().clone();
     let ours = rooms.get(&me).cloned().flatten();
     let dim = dim_class(crosstalk());
-    let ids: Vec<&str> = std::iter::once(me.as_str())
-        .chain(participants.iter().map(|participant| participant.id.as_str()))
+    let ids: Vec<&str> = cards
+        .iter()
+        .map(|(peer, _)| peer.as_ref().map_or(me.as_str(), |peer| peer.id.as_str()))
         .collect();
     let groups = layout::groups(&ids, &rooms);
     let cols = layout::columns(tiles);
@@ -94,19 +121,28 @@ pub fn CallScreen() -> Element {
                     if mine { layout::LABEL_MINE } else { layout::LABEL },
                 )),
                 peer: None,
+                screen: false,
                 tile: false,
                 dim: UNDIMMED,
                 line_break: None,
             });
         }
         for (position, &index) in group.members.iter().enumerate() {
-            let peer = index.checked_sub(1).map(|peer| participants[peer].clone());
+            let (peer, screen) = cards[index].clone();
+            // **Ours is keyed with a constant**, not `who`: that changes when
+            // the endpoint binds, and a new key would remount it. A screen's
+            // key has a colon, which no endpoint id does.
+            let key = match (&peer, screen) {
+                (None, false) => "self".to_string(),
+                (None, true) => "screen:self".to_string(),
+                (Some(peer), false) => peer.id.clone(),
+                (Some(peer), true) => format!("screen:{}", peer.id),
+            };
             items.push(Item {
-                // **Ours is keyed with a constant**, not `who`: that changes
-                // when the endpoint binds, and a new key would remount it.
-                key: peer.as_ref().map_or_else(|| "self".to_string(), |peer| peer.id.clone()),
+                key,
                 label: None,
                 peer,
+                screen,
                 tile: true,
                 dim: if mine { UNDIMMED } else { dim },
                 line_break: layout::break_after(cols, group.members.len(), position + 1),
@@ -136,7 +172,26 @@ pub fn CallScreen() -> Element {
                     if let Some((text, class)) = item.label {
                         div { class, "{text}" }
                     }
-                    if item.tile {
+                    if item.tile && item.screen {
+                        if let Some(participant) = item.peer {
+                            ShareTile {
+                                label: format!("{} \u{b7} screen", participant.short()),
+                                slot: Some(participant.slot.clone()),
+                                class: layout::TILE,
+                                dim: item.dim,
+                            }
+                        } else {
+                            ShareTile {
+                                label: "You \u{b7} screen",
+                                slot: None,
+                                class: layout::TILE,
+                                dim: item.dim,
+                            }
+                        }
+                        if let Some(class) = item.line_break {
+                            div { class }
+                        }
+                    } else if item.tile {
                         if let Some(participant) = item.peer {
                             ParticipantTile {
                                 label: participant.short(),
@@ -201,6 +256,7 @@ pub fn CallScreen() -> Element {
             status: remote.status,
             metrics: remote.metrics.clone(),
             leave: remote.cancel,
+            share: remote.share.clone(),
         }
     }
 }

@@ -132,3 +132,29 @@ pub fn SpeakerIcon(off: bool) -> Element {
         }
     }
 }
+
+/// A monitor; its screen filled in while we are sharing it.
+#[component]
+pub fn ScreenIcon(on: bool) -> Element {
+    rsx! {
+        svg {
+            // Needed: blitz hands the serialized subtree to usvg, which only
+            // accepts a root in the SVG namespace.
+            xmlns: "http://www.w3.org/2000/svg",
+            width: "18",
+            height: "18",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            rect { x: "2", y: "3", width: "20", height: "14", rx: "2" }
+            path { d: "M8 21h8" }
+            path { d: "M12 17v4" }
+            if on {
+                rect { x: "5", y: "6", width: "14", height: "8", rx: "1", fill: "currentColor", stroke: "none" }
+            }
+        }
+    }
+}

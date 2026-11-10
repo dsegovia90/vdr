@@ -17,3 +17,8 @@ publisher = "exampleinc"
 [macos.plist]
 NSCameraUsageDescription = "Vdr shows your camera in the call and sends it to the person you are calling."
 NSMicrophoneUsageDescription = "Vdr sends your voice to the person you are calling."
+# Screen recording is a request-and-check permission rather than a usage-key
+# gate, and Apple documents no key for it; this one is named by third-party
+# guides only. An unknown key is ignored, so it costs nothing to have the string
+# in place in case macOS does read it.
+NSScreenCaptureUsageDescription = "Vdr shows your screen to the people in your call."

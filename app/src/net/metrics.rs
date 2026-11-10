@@ -259,6 +259,12 @@ pub struct PeerStats {
     audio_gaps: AtomicU32,
     /// Times their playback buffer was found empty while frames still came.
     audio_dry: AtomicU32,
+    /// Whether they are sharing a screen: a peer's from their presence
+    /// document, ours set by the share thread while it publishes.
+    sharing: AtomicBool,
+    /// Why our last share did not start or ended early, in words for the bar.
+    /// Our own entry only; cleared when the next share is attempted.
+    share_problem: std::sync::Mutex<Option<String>>,
 }
 
 /// "Camera time `media_us` was wall-clock time `wall_us`" -- what lets another
@@ -361,6 +367,8 @@ impl Default for PeerStats {
             audio_frames: AtomicU32::new(0),
             audio_gaps: AtomicU32::new(0),
             audio_dry: AtomicU32::new(0),
+            sharing: AtomicBool::new(false),
+            share_problem: std::sync::Mutex::new(None),
         }
     }
 }
@@ -421,6 +429,28 @@ impl PeerStats {
         };
         if changed {
             self.retain_asks(|request| request.kind != Ask::Invite);
+        }
+    }
+
+    /// Whether they are sharing a screen.
+    pub fn sharing(&self) -> bool {
+        self.sharing.load(Ordering::Relaxed)
+    }
+
+    /// Records whether they are sharing a screen.
+    pub fn set_sharing(&self, on: bool) {
+        self.sharing.store(on, Ordering::Relaxed);
+    }
+
+    /// Why our last share failed, if it did.
+    pub fn share_problem(&self) -> Option<String> {
+        self.share_problem.lock().ok().and_then(|problem| problem.clone())
+    }
+
+    /// Records why our share failed; `None` as a new one is attempted.
+    pub fn set_share_problem(&self, problem: Option<String>) {
+        if let Ok(mut slot) = self.share_problem.lock() {
+            *slot = problem;
         }
     }
 

@@ -1,5 +1,6 @@
-//! The bottom control bar: microphone and camera on the left, what the call is
-//! doing in the middle, and the subroom menu and Leave on the right.
+//! The bottom control bar: microphone, camera and screen sharing on the left,
+//! what the call is doing in the middle, and the subroom menu and Leave on the
+//! right.
 //!
 //! **Small on purpose.** Everything here used to be full-width rows above and
 //! below the video, and in a default-size window they left four people 46
@@ -10,10 +11,11 @@ use std::sync::Arc;
 use dioxus_native::prelude::*;
 
 use super::{
-    CameraIcon, DeviceMenu, DropdownOption, LeaveIcon, MenuSection, MicControl, StatsRow, SubroomMenu,
+    CameraIcon, DeviceMenu, DropdownOption, LeaveIcon, MenuSection, MicControl, OwnShare, ShareControl, StatsRow,
+    SubroomMenu,
 };
 use crate::audio::Controls;
-use crate::net::{Metrics, PeerStats, RemoteStatus};
+use crate::net::{Metrics, PeerStats, RemoteStatus, ShareWish, share_available};
 
 #[derive(Clone, PartialEq, Props)]
 pub struct ControlBarProps {
@@ -42,11 +44,15 @@ pub struct ControlBarProps {
     pub metrics: Arc<Metrics>,
     /// Leaves the call, or cancels one not yet made.
     pub leave: Callback<()>,
+    /// What we want to share; the call serves it.
+    pub share: ShareWish,
 }
 
 #[component]
 pub fn ControlBar(props: ControlBarProps) -> Element {
     let status = props.status.read().clone();
+    let OwnShare(own_share) = use_context::<OwnShare>();
+    let (_, share_problem) = own_share();
     let off = !props.camera_on;
     // Only once something is under way: idle, there is nothing to leave, and
     // the connect row at the top is where the next step is.
@@ -83,11 +89,19 @@ pub fn ControlBar(props: ControlBarProps) -> Element {
                         onrescan: move |_| props.on_camera_rescan.call(()),
                     }
                 }
+                // Only on a call: loopback and idle have nobody to show it to.
+                // And only where this build can capture the screen.
+                ShareControl { share: props.share.clone(), shown: status.is_connected() && share_available() }
             }
             // The middle shrinks and truncates first, so the buttons never move.
             div { class: "flex min-w-0 flex-1 flex-row items-center gap-2",
                 if let Some(problem) = props.camera_problem.clone() {
                     span { class: "shrink-0 text-xs text-red-400", "{problem} \u{b7}" }
+                }
+                // Truncated rather than kept whole like the camera's: the
+                // permission sentence is long, and the rest is in the log.
+                if let Some(problem) = share_problem {
+                    span { class: "min-w-0 truncate text-xs text-red-400", "{problem} \u{b7}" }
                 }
                 span { class: status_class, "{status}" }
                 StatsRow { metrics: props.metrics.clone() }

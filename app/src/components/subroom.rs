@@ -50,11 +50,19 @@ pub struct Rooms(pub Signal<BTreeMap<String, Option<String>>>);
 #[derive(Clone, Copy)]
 pub struct Invites(pub Signal<BTreeMap<String, Option<String>>>);
 
-/// Makes the shared [`Rooms`] and [`Invites`] available to the tiles and the
-/// menu below.
+/// Whether we are sharing a screen, and why our last share failed. Written by
+/// our own tile, which already samples our entry, and read by the bar and the
+/// page; the same half-second lag as [`Rooms`], so a share the system ended
+/// shows within it.
+#[derive(Clone, Copy)]
+pub struct OwnShare(pub Signal<(bool, Option<String>)>);
+
+/// Makes the shared [`Rooms`], [`Invites`] and [`OwnShare`] available to the
+/// tiles and the menus below.
 pub fn use_rooms_provider() {
     use_context_provider(|| Rooms(Signal::new(BTreeMap::new())));
     use_context_provider(|| Invites(Signal::new(BTreeMap::new())));
+    use_context_provider(|| OwnShare(Signal::new((false, None))));
 }
 
 /// Moves us to `room` (`None` is main). Ours is written straight into the map

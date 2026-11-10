@@ -1,7 +1,7 @@
 use dioxus_native::CustomWidgetAttr;
 use dioxus_native::prelude::*;
 
-use crate::camera::{use_pipeline_cache, FrameSlot, Mirror, VideoPaintSource};
+use crate::camera::{use_pipeline_cache, Fit, FrameSlot, Mirror, VideoPaintSource};
 
 /// One video tile: whatever is publishing into `slot`, scaled to fit.
 ///
@@ -24,6 +24,10 @@ pub struct ParticipantVideoProps {
     pub slot: FrameSlot,
     /// Self-view mirrors; everyone else must not.
     pub mirror: Mirror,
+    /// A camera is cropped to its card (the default); a shared screen is
+    /// shown whole. Fixed for the stream, like `mirror`.
+    #[props(default)]
+    pub fit: Fit,
     /// Sizing and placement, which belong to whoever lays the tiles out.
     #[props(default)]
     pub class: String,
@@ -36,7 +40,8 @@ pub fn ParticipantVideo(props: ParticipantVideoProps) -> Element {
         let label = props.label.clone();
         let slot = props.slot.clone();
         let mirror = props.mirror;
-        move || CustomWidgetAttr::new(VideoPaintSource::new(label, slot, mirror, cache))
+        let fit = props.fit;
+        move || CustomWidgetAttr::new(VideoPaintSource::new(label, slot, mirror, fit, cache))
     });
 
     rsx! {

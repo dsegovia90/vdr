@@ -71,6 +71,55 @@ pub(super) fn card(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Card {
     }
 }
 
+/// How a stream fills its box.
+///
+/// A camera fills its card, its sides cropped as far as square ([`card`]). A
+/// shared screen must never be cropped: text at its edge is still text someone
+/// is reading ([`contain`]). Fixed for a stream's lifetime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Fit {
+    /// A camera: see [`card`].
+    #[default]
+    Card,
+    /// A shared screen: all of it, as large as fits.
+    Contain,
+}
+
+/// Lays out `src` video whole inside a `dst` canvas: as large as fits both
+/// axes, centred, nothing cropped. The bars either side are left unpainted, so
+/// the page shows through, as [`card`] leaves its sides.
+pub(super) fn contain(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Card {
+    let whole = Card {
+        x: 0,
+        y: 0,
+        width: dst_w,
+        height: dst_h,
+        crop_x: 1.0,
+    };
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return whole;
+    }
+    let video = src_w as f64 / src_h as f64;
+    let canvas = dst_w as f64 / dst_h as f64;
+    if canvas >= video {
+        // Wider than the video: bars left and right.
+        let width = ((dst_h as f64 * video).round() as u32).clamp(1, dst_w);
+        Card {
+            x: (dst_w - width) / 2,
+            width,
+            ..whole
+        }
+    } else {
+        // Taller than the video: bars above and below.
+        let height = ((dst_w as f64 / video).round() as u32).clamp(1, dst_h);
+        Card {
+            y: (dst_h - height) / 2,
+            height,
+            ..whole
+        }
+    }
+}
+
 /// Bytes per row of a tightly packed RGBA buffer, tolerating the row padding
 /// `to_rgba8` leaves in place for frames that were already RGBA.
 pub(super) fn row_stride(len: usize, width: u32, height: u32) -> u32 {
@@ -174,6 +223,39 @@ mod tests {
         let c = card(0, 720, 640, 360);
         assert_eq!((c.width, c.height, c.crop_x), (640, 360, 1.0));
         let c = card(1280, 720, 0, 360);
+        assert_eq!(c.crop_x, 1.0);
+    }
+
+    #[test]
+    fn contain_letterboxes_a_wide_source_in_a_square() {
+        let c = contain(1920, 1080, 400, 400);
+        assert_eq!((c.x, c.y, c.width, c.height), (0, 87, 400, 225));
+        assert_eq!(c.crop_x, 1.0);
+    }
+
+    #[test]
+    fn contain_pillarboxes_a_4_3_source_in_16_9() {
+        let c = contain(1024, 768, 1280, 720);
+        assert_eq!((c.x, c.y, c.width, c.height), (160, 0, 960, 720));
+        assert_eq!(c.crop_x, 1.0);
+    }
+
+    #[test]
+    fn contain_never_crops() {
+        for (sw, sh, dw, dh) in [(1710, 1106, 300, 500), (1280, 720, 100, 1000), (800, 1200, 1600, 300), (16, 9, 16, 9)] {
+            let c = contain(sw, sh, dw, dh);
+            assert_eq!(c.crop_x, 1.0, "{sw}x{sh} in {dw}x{dh}");
+            assert!(c.x + c.width <= dw && c.y + c.height <= dh, "{sw}x{sh} in {dw}x{dh}: {c:?}");
+        }
+    }
+
+    #[test]
+    fn contain_survives_zero_dimensions() {
+        let c = contain(0, 720, 640, 360);
+        assert_eq!((c.width, c.height, c.crop_x), (640, 360, 1.0));
+        let c = contain(1280, 720, 0, 360);
+        assert_eq!(c.crop_x, 1.0);
+        let c = contain(1280, 720, 640, 0);
         assert_eq!(c.crop_x, 1.0);
     }
 

@@ -15,12 +15,17 @@ Keep it to yourself: anyone holding it can join that room until it expires.
    and choose Open**, then Open again. (If macOS says it is "damaged", run
    `xattr -dr com.apple.quarantine /Applications/Vdr.app` in Terminal once.)
 3. Allow camera and microphone when asked.
+4. To share your screen, macOS asks once for **Screen Recording**: turn Vdr on
+   in System Settings › Privacy & Security › Screen & System Audio Recording,
+   then let it quit and reopen. Each new build of Vdr may ask again.
 
 ## Linux
 
 1. Unpack `vid-linux-…tar.gz` and run `./vdr` from the unpacked folder.
 2. It needs `libasound2`, `libvulkan1` with a Vulkan driver (`mesa-vulkan-drivers`
    on most machines), and an X11 or Wayland desktop.
+3. Screen sharing is offered on X11 desktops only for now; on Wayland the
+   button does not appear.
 
 ## Join
 
@@ -28,6 +33,8 @@ Keep it to yourself: anyone holding it can join that room until it expires.
 
 - The buttons at the bottom left turn your microphone and camera on and off;
   the small ▾ beside each picks a different device.
+- The screen button next to them shares your screen; its ▾ picks a display or
+  a single window. Click it again to stop.
 - **Leave** is at the bottom right.
 
 Headphones avoid echo if you are in the same room as another participant.

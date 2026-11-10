@@ -17,7 +17,7 @@ use dioxus_native::prelude::*;
 use active::Active;
 use rate::FrameRate;
 
-pub use fit::Mirror;
+pub use fit::{Fit, Mirror};
 use fit::Card;
 
 /// How round a video card's corners are, in CSS pixels; scaled by the window's
@@ -60,6 +60,8 @@ pub struct VideoPaintSource {
     /// Fixed for this stream's lifetime: mirroring is about whose face it is,
     /// which does not change.
     mirror: Mirror,
+    /// Fixed likewise: a camera is cropped to its card, a screen never.
+    fit: Fit,
     /// Shared with every other stream, so they do not each recompile the shader.
     cache: PipelineCache,
     /// Last `slot.cleared()` value acted on. When it moves, the camera was
@@ -77,6 +79,7 @@ impl VideoPaintSource {
         label: impl Into<String>,
         slot: FrameSlot,
         mirror: Mirror,
+        fit: Fit,
         cache: PipelineCache,
     ) -> Self {
         let rate = FrameRate::new(slot.published());
@@ -88,6 +91,7 @@ impl VideoPaintSource {
             rate,
             last_cleared,
             mirror,
+            fit,
             cache,
         }
     }
@@ -204,7 +208,10 @@ impl VideoPaintSource {
             .source
             .as_ref()
             .map_or((16, 9), |source| (source.width, source.height));
-        let card = fit::card(video_w, video_h, width, height);
+        let card = match self.fit {
+            Fit::Card => fit::card(video_w, video_h, width, height),
+            Fit::Contain => fit::contain(video_w, video_h, width, height),
+        };
         let resized = active.ensure_target(ctx, card.width, card.height, scale);
 
         if uploaded || resized || blanked {

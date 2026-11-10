@@ -29,7 +29,7 @@ lipo -create \
 # an unsigned binary at all. Re-sign ad-hoc: the same as before, nothing more.
 codesign --force --sign - "$app"
 plist="$app/Contents/Info.plist"
-for key in NSCameraUsageDescription NSMicrophoneUsageDescription; do
+for key in NSCameraUsageDescription NSMicrophoneUsageDescription NSScreenCaptureUsageDescription; do
   /usr/libexec/PlistBuddy -c "Print :$key" "$plist" >/dev/null \
     || { echo "missing $key in $plist -- refusing to package an app that would crash" >&2; exit 1; }
 done

@@ -23,6 +23,7 @@ mod codec_check;
 mod metrics;
 mod loopback;
 pub(crate) mod runtime;
+mod share;
 mod status;
 
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use dioxus_native::prelude::*;
 
 pub use metrics::{Ask, Metrics, PeerStats};
+pub use share::{ShareOption, ShareSource, ShareWish, available as share_available, lists as share_lists, sources as share_sources};
 pub use status::RemoteStatus;
 
 use crate::args::{Args, Peering};
@@ -49,7 +51,18 @@ pub struct Participant {
     /// Their decoded frames.
     pub slot: FrameSlot,
     /// What their tile says about them: frame rate, and whether they talk.
+    /// A screen carries its sharer's entry, so its tile reads their room.
     pub stats: Arc<PeerStats>,
+    /// Which of their sources this is: their camera, or a screen they share.
+    pub feed: Feed,
+}
+
+/// One of a person's sources. Someone sharing a screen is one person with two
+/// entries, told apart by this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Feed {
+    Camera,
+    Screen,
 }
 
 impl Participant {
@@ -71,9 +84,10 @@ pub(super) enum ParticipantEvent {
         id: String,
         slot: FrameSlot,
         stats: Arc<PeerStats>,
+        feed: Feed,
     },
-    /// They stopped.
-    Left { id: String },
+    /// They stopped publishing that source.
+    Left { id: String, feed: Feed },
     /// The call is over; everyone goes.
     Cleared,
 }
@@ -117,6 +131,8 @@ pub struct Remote {
     /// our camera and microphone are on. The controls write it; the call
     /// announces it in our presence document.
     pub local: Arc<PeerStats>,
+    /// What we want to share. The bar writes it; each call attempt serves it.
+    pub share: ShareWish,
 }
 
 /// Starts whichever remote path the command line asked for.
@@ -134,10 +150,16 @@ pub fn use_remote() -> Remote {
     let mut me = use_signal(|| Option::<String>::None);
     let mut participants = use_signal(Vec::<Participant>::new);
     let joined = use_channel(move |event: ParticipantEvent| match event {
-        ParticipantEvent::Joined { id, slot, stats } => {
-            participants.write().push(Participant { id, slot, stats })
+        ParticipantEvent::Joined { id, slot, stats, feed } => {
+            let mut list = participants.write();
+            // A second announce of the same source replaces the first: two
+            // entries would be two tiles under one key.
+            list.retain(|p| !(p.id == id && p.feed == feed));
+            list.push(Participant { id, slot, stats, feed })
         }
-        ParticipantEvent::Left { id } => participants.write().retain(|p| p.id != id),
+        ParticipantEvent::Left { id, feed } => {
+            participants.write().retain(|p| !(p.id == id && p.feed == feed))
+        }
         ParticipantEvent::Cleared => participants.write().clear(),
     });
     // Status crosses from the call thread, which cannot touch a signal.
@@ -164,6 +186,7 @@ pub fn use_remote() -> Remote {
         }
         let metrics = Arc::new(Metrics::default());
         let local = Arc::new(PeerStats::default());
+        let share = ShareWish::new();
         let (tap, feed) = frame_tap();
         // The decision, not the feed, is what gets deferred. The call thread
         // takes the feed at startup and parks on this receiver after binding,
@@ -189,6 +212,7 @@ pub fn use_remote() -> Remote {
                     id: "loopback".to_string(),
                     slot,
                     stats,
+                    feed: Feed::Camera,
                 }]);
             }
             peering => {
@@ -200,6 +224,7 @@ pub fn use_remote() -> Remote {
                     audio.clone(),
                     metrics.clone(),
                     local.clone(),
+                    share.clone(),
                 );
                 // `--listen` / `--dial` decide immediately; `Idle` waits for the
                 // UI. The CLI path is deliberately unchanged: it is how two
@@ -234,6 +259,7 @@ pub fn use_remote() -> Remote {
             audio,
             metrics,
             local,
+            share,
         }
     })
 }

@@ -22,6 +22,8 @@ sudo=""
 [ "$(id -u)" -eq 0 ] || sudo="sudo"
 
 # System packages need root; set SKIP_PACKAGES=1 once they are installed.
+# PipeWire's headers are for the off-by-default `wayland-share` feature
+# (app/Cargo.toml says why it is off); harmless when it is.
 # Build headers only: Vulkan *drivers* are a runtime need, and asking for
 # Fedora's mesa-vulkan-drivers conflicts with RPM Fusion's freeworld build, which
 # provides the same thing.
@@ -31,7 +33,7 @@ if [ -z "${SKIP_PACKAGES:-}" ]; then
       gcc gcc-c++ pkgconf-pkg-config cmake clang git curl \
       alsa-lib-devel systemd-devel libv4l-devel fontconfig-devel \
       libX11-devel libXcursor-devel libXrandr-devel libXi-devel libxkbcommon-devel \
-      wayland-devel vulkan-loader-devel \
+      wayland-devel vulkan-loader-devel pipewire-devel \
       openssl-devel
   elif command -v apt-get >/dev/null; then
     $sudo apt-get update
@@ -39,7 +41,7 @@ if [ -z "${SKIP_PACKAGES:-}" ]; then
       build-essential pkg-config cmake clang curl git \
       libasound2-dev libudev-dev libv4l-dev libfontconfig1-dev \
       libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxkbcommon-dev \
-      libwayland-dev libvulkan-dev \
+      libwayland-dev libvulkan-dev libpipewire-0.3-dev libspa-0.2-dev \
       libssl-dev
   fi
 fi

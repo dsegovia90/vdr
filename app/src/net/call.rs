@@ -36,8 +36,9 @@ use moq_mux::catalog::Stream as _;
 use super::adapt;
 use super::audio;
 use super::runtime::runtime;
+use super::share::{self, ShareWish};
 use super::status::RemoteStatus;
-use super::ParticipantEvent;
+use super::{Feed, ParticipantEvent};
 use crate::args::Peering;
 use super::Metrics;
 use super::metrics::{Ask, Clock, FpsMeter, PeerStats, Request};
@@ -93,7 +94,28 @@ struct Connect<'a> {
     /// The room's label when this is a room on a relay, `None` for one peer.
     room: Option<String>,
     status: UnboundedSender<RemoteStatus>,
-    keyframe: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    keyframe: Arc<Keyframes>,
+}
+
+/// Set when a session comes back, read by the encode loops: a subscriber that
+/// rejoins mid-stream cannot decode until a keyframe arrives.
+///
+/// **One flag per encode loop.** Each loop `swap`s its flag back to false as
+/// it acts on it, so a single flag read by the camera and the screen would
+/// give the keyframe to whichever loop looked first and leave the other
+/// frozen.
+#[derive(Default)]
+pub(super) struct Keyframes {
+    pub camera: std::sync::atomic::AtomicBool,
+    pub screen: std::sync::atomic::AtomicBool,
+}
+
+impl Keyframes {
+    /// Asks every loop for a keyframe.
+    fn ask(&self) {
+        self.camera.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.screen.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Dials out and keeps redialling: a peer directly, or a room on a relay.
@@ -147,7 +169,7 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
                     Ok(moq_tokio::Status::Connected) => {
                         if connected {
                             tracing::info!("reconnected to {label}");
-                            keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
+                            keyframe.ask();
                         } else if room.is_some() {
                             tracing::info!("joined {label}");
                         }
@@ -244,8 +266,8 @@ fn room_label(url: &url::Url) -> String {
 /// therefore has to stay **last**, which is why the participant's id goes in
 /// front of it rather than behind.
 ///
-/// One broadcast per (participant, role). A shared screen would be
-/// `<id>/screen.hang`: a second source from one person, not a second person.
+/// One broadcast per (participant, role). A shared screen is [`SCREEN`]: a
+/// second source from one person, not a second person.
 /// Audio rides here with the camera because the two together are one
 /// participant's live presence.
 const CAMERA: &str = "camera.hang";
@@ -254,6 +276,31 @@ const CAMERA: &str = "camera.hang";
 fn camera_path(participant: &str) -> String {
     format!("{participant}/{CAMERA}")
 }
+
+/// What a participant publishes a shared screen under, beside their camera.
+///
+/// Shaped exactly like the camera's broadcast (one H.264 rendition, track
+/// [`TRACK`]), so it is told apart by this path and never by its catalog. The
+/// `.hang` suffix stays last for the same reason as [`CAMERA`]'s. A build that
+/// predates sharing reads this path as nobody (`participant_of` is `None`), so
+/// it sees no share and no error.
+const SCREEN: &str = "screen.hang";
+
+/// Where `participant` publishes their screen.
+pub(super) fn screen_path(participant: &str) -> String {
+    format!("{participant}/{SCREEN}")
+}
+
+/// Whose shared screen an announced path is, the twin of [`participant_of`].
+fn sharer_of(path: &str) -> Option<&str> {
+    let id = path.strip_suffix(SCREEN)?.strip_suffix('/')?;
+    (!id.is_empty()).then_some(id)
+}
+
+/// A shared screen's delivery priority: above camera video
+/// ([`VIDEO_PRIORITY`]), because the screen is what the room is looking at,
+/// and below audio (80) and control ([`CONTROL_PRIORITY`]).
+pub(super) const SCREEN_PRIORITY: u8 = 70;
 
 /// Where a participant says what they are doing, rather than shows it.
 ///
@@ -318,6 +365,15 @@ struct Presence {
     /// without them sends, and such a build ignores the field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     requests: Vec<Request>,
+    /// Whether they are sharing a screen. Absent is not sharing, so a document
+    /// from someone not sharing is what a build without shares sends.
+    ///
+    /// The announce of the screen's broadcast says this too, but presence says
+    /// it in the same document as the sharer's room, and goes with the control
+    /// broadcast: a share whose sender crashed can linger on the relay, its
+    /// presence does not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    sharing: bool,
 }
 
 impl Default for Presence {
@@ -329,6 +385,7 @@ impl Default for Presence {
             clock: None,
             room: None,
             requests: Vec::new(),
+            sharing: false,
         }
     }
 }
@@ -343,6 +400,7 @@ impl Presence {
             clock: local.clock(),
             room: local.room(),
             requests: local.requests(),
+            sharing: local.sharing(),
         }
     }
 }
@@ -419,6 +477,45 @@ fn encoder_kind() -> moq_video::encode::Kind {
         EncoderChoice::Hardware => moq_video::encode::Kind::Hardware,
         EncoderChoice::Software => moq_video::encode::Kind::Software,
     }
+}
+
+/// Picks the encoder for `config`, then gives `broadcast` a catalog and a
+/// video track carrying what that encoder will produce.
+///
+/// The probe encodes one real frame through the chosen backend, so a hardware
+/// encoder that opens but cannot encode fails here, before anything is
+/// advertised -- and then software gets a turn, recorded in `config.kind` for
+/// the encoder built after. Asking for hardware only (`--encoder hardware`)
+/// means no second turn. Shared by the camera and the shared screen.
+///
+/// One function rather than a `probe` returning the rendition, because the
+/// rendition's type is `hang`'s, which is deliberately not a dependency here.
+pub(super) async fn video_track(
+    broadcast: &mut moq_net::broadcast::Producer,
+    config: &mut moq_video::encode::Config,
+    priority: u8,
+) -> Result<(moq_mux::catalog::Producer, moq_video::encode::Producer), String> {
+    config.kind = encoder_kind();
+    let rendition = match config.probe().await {
+        Ok(rendition) => rendition,
+        Err(error) if config.kind == moq_video::encode::Kind::Auto => {
+            tracing::warn!("[video] the hardware encoder failed its probe, using software: {error:#}");
+            config.kind = moq_video::encode::Kind::Software;
+            config
+                .probe()
+                .await
+                .map_err(|error| format!("could not probe the encoder: {error:#}"))?
+        }
+        Err(error) => return Err(format!("could not probe the encoder: {error:#}")),
+    };
+    let catalog = moq_mux::catalog::Producer::new(broadcast, Default::default())
+        .map_err(|error| format!("could not create a catalog: {error:#}"))?;
+    let track = broadcast
+        .create_track(TRACK, catalog.track_info(priority))
+        .map_err(|error| format!("could not create a track: {error:#}"))?;
+    let producer = moq_video::encode::Producer::with_track(track, catalog.clone(), rendition)
+        .map_err(|error| format!("could not publish video: {error:#}"))?;
+    Ok((catalog, producer))
 }
 
 /// [`FRAMERATE`] as the encoder takes it: an exact fraction.
@@ -499,6 +596,7 @@ fn backoff() -> moq_tokio::Backoff {
 /// The thread outlives any one call: an ending is reported and then the loop
 /// goes back to idle, so a call that drops for good can be replaced without
 /// restarting the app. Only losing the interface itself ends this.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn(
     decisions: futures_channel::mpsc::UnboundedReceiver<Peering>,
     feed: FrameFeed,
@@ -507,6 +605,7 @@ pub(super) fn spawn(
     controls: Arc<Controls>,
     metrics: Arc<Metrics>,
     local: Arc<PeerStats>,
+    share: ShareWish,
 ) {
     let spawned = std::thread::Builder::new()
         .name("call".into())
@@ -518,7 +617,7 @@ pub(super) fn spawn(
                 return;
             };
             runtime.block_on(async move {
-                match run(decisions, feed, &status, participants, controls, metrics, local).await {
+                match run(decisions, feed, &status, participants, controls, metrics, local, share).await {
                     Ok(()) => {
                         tracing::info!("call ended");
                         let _ = status.unbounded_send(RemoteStatus::Ended);
@@ -541,6 +640,7 @@ pub(super) fn spawn(
 /// Errors are formatted rather than typed: they come from several crates with
 /// several error types, none of which the UI can do anything with beyond
 /// showing the text.
+#[allow(clippy::too_many_arguments)]
 async fn run(
     mut decisions: futures_channel::mpsc::UnboundedReceiver<Peering>,
     feed: FrameFeed,
@@ -549,6 +649,7 @@ async fn run(
     controls: Arc<Controls>,
     metrics: Arc<Metrics>,
     local: Arc<PeerStats>,
+    share: ShareWish,
 ) -> Result<(), String> {
     let report = |next: RemoteStatus| {
         let _ = status.unbounded_send(next);
@@ -657,37 +758,13 @@ async fn run(
     // rejoins mid-stream cannot decode until a keyframe arrives, and the encoder
     // already inserts one every two seconds -- so this only buys back that wait,
     // but the wait is a frozen tile and worth buying.
-    let keyframe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // The probe encodes one real frame through the chosen backend, so a
-        // hardware encoder that opens but cannot encode fails here, before
-        // anything is advertised -- and then software gets a turn. Asking for
-        // hardware only (`--encoder hardware`) means no second turn.
-        config.kind = encoder_kind();
-        let rendition = match config.probe().await {
-            Ok(rendition) => rendition,
-            Err(error) if config.kind == moq_video::encode::Kind::Auto => {
-                tracing::warn!("[video] the hardware encoder failed its probe, using software: {error:#}");
-                config.kind = moq_video::encode::Kind::Software;
-                config
-                    .probe()
-                    .await
-                    .map_err(|error| format!("could not probe the encoder: {error:#}"))?
-            }
-            Err(error) => return Err(format!("could not probe the encoder: {error:#}")),
-        };
-
+    let keyframe = Arc::new(Keyframes::default());
         let outbound = moq_tokio::origin::spawn();
         let mut broadcast = outbound
             .create_broadcast(camera_path(&me.to_string()))
             .map_err(|error| format!("could not create a broadcast: {error:#}"))?;
-        let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default())
-            .map_err(|error| format!("could not create a catalog: {error:#}"))?;
-        let track = broadcast
-            .create_track(TRACK, catalog.track_info(VIDEO_PRIORITY))
-            .map_err(|error| format!("could not create a track: {error:#}"))?;
-        let mut producer =
-            moq_video::encode::Producer::with_track(track, catalog.clone(), rendition)
-                .map_err(|error| format!("could not publish video: {error:#}"))?;
+        // Probed before anything is announced; see `video_track`.
+        let (catalog, mut producer) = video_track(&mut broadcast, &mut config, VIDEO_PRIORITY).await?;
 
         // Announced beside the camera, and said before anything is shown: the
         // peer knows we are here whether or not a frame ever arrives.
@@ -880,10 +957,7 @@ async fn run(
                                         // some time before that is true.
                                         if empty_since.take().is_some() {
                                             tracing::info!("the peer is back");
-                                            keyframe.store(
-                                                true,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
+                                            keyframe.ask();
                                             let _ = status.unbounded_send(
                                                 RemoteStatus::Connected { peer: None },
                                             );
@@ -933,6 +1007,21 @@ async fn run(
                 }
             })
         });
+
+        // The person's wish to share a screen, served for this attempt. Its
+        // own broadcast on the same outbound origin, so a share started now
+        // reaches whoever this attempt connects to.
+        let (quit_sharing, share_quit) = tokio::sync::oneshot::channel();
+        let mut sharing = Abort(tokio::spawn(share::serve(
+            share::Call {
+                outbound: outbound.clone(),
+                me: me.to_string(),
+                local: local.clone(),
+                keyframe: keyframe.clone(),
+            },
+            share.clone(),
+            share_quit,
+        )));
 
         // One loop for everything that arrives, because it all starts at the
         // same place: a participant announcing themselves. It replaces two
@@ -1004,7 +1093,7 @@ async fn run(
                     Steering {
                         scale,
                         target: &target,
-                        keyframe: &keyframe,
+                        keyframe: &keyframe.camera,
                         stop: &stop,
                         local: &local,
                     },
@@ -1074,6 +1163,19 @@ async fn run(
                 Err(error) => return Err(format!("the encode thread failed: {error}")),
             },
         };
+
+        // **The share stops first**, by the same rule as the camera below: its
+        // media finished and its broadcast closed before `Leaving` is said.
+        // The wish goes too, so the next call does not start sharing.
+        share.set(None);
+        let _ = quit_sharing.send(());
+        if tokio::time::timeout(share::STOP_WITHIN + std::time::Duration::from_millis(100), &mut sharing.0)
+            .await
+            .is_err()
+        {
+            tracing::warn!("[share] the share did not stop in time; leaving anyway");
+        }
+        drop(sharing);
 
         // **Finish the media, then say goodbye, then unannounce** -- in that
         // order, because each step is only true once the one before it is.
@@ -1320,6 +1422,9 @@ async fn attend(
     let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut listening: std::collections::HashMap<String, Abort> =
         std::collections::HashMap::new();
+    // Whose shared screen we are decoding. A map of its own: a share comes and
+    // goes without its sharer doing either.
+    let mut sharing: std::collections::HashMap<String, Abort> = std::collections::HashMap::new();
     // One per person, shared by their presence reader and their tile, so what
     // they say about their camera reaches the tile showing it. Either
     // broadcast may be announced first, hence get-or-insert at both.
@@ -1413,9 +1518,61 @@ async fn attend(
                     if present.remove(id) && present.is_empty() {
                         alone(&hangup, id.to_string(), in_room);
                     }
-                    if !attending.contains_key(id) {
+                    if !attending.contains_key(id) && !sharing.contains_key(id) {
                         people.remove(id);
                     }
+                }
+            }
+            continue;
+        }
+
+        if let Some(id) = sharer_of(&path) {
+            if id == me {
+                continue;
+            }
+            match broadcast {
+                Some(broadcast) => {
+                    tracing::info!("{id} is sharing a screen");
+                    let slot = FrameSlot::default();
+                    // The person's entry, so the share's tile reads their room.
+                    let stats = people.entry(id.to_string()).or_default().clone();
+                    let _ = participants.unbounded_send(ParticipantEvent::Joined {
+                        id: id.to_string(),
+                        slot: slot.clone(),
+                        stats,
+                        feed: Feed::Screen,
+                    });
+                    // The seam for a shared screen's sound, which is not sent
+                    // yet. It would ride in this broadcast, and be played as
+                    // the camera branch below plays a voice: with a clone of
+                    // `engine`, `audio::subscribe(broadcast, ..)`.
+                    let _audio: Option<moq_audio::playback::Engine> = None;
+                    sharing.insert(
+                        id.to_string(),
+                        Abort(tokio::spawn(watch(
+                            broadcast,
+                            slot,
+                            format!("{id}/screen"),
+                            // A screen arriving is not the call connecting.
+                            None,
+                            // **A meter of its own**: `watch` writes frame
+                            // rate and delay into it, and the share must not
+                            // overwrite their camera's numbers.
+                            Arc::new(PeerStats::default()),
+                            metrics.clone(),
+                        ))),
+                    );
+                }
+                None => {
+                    tracing::info!("{id} stopped sharing");
+                    sharing.remove(id);
+                    if !present.contains(id) && !attending.contains_key(id) {
+                        people.remove(id);
+                    }
+                    let _ = participants.unbounded_send(ParticipantEvent::Left {
+                        id: id.to_string(),
+                        feed: Feed::Screen,
+                    });
                 }
             }
             continue;
@@ -1441,7 +1598,10 @@ async fn attend(
             if !present.contains(id) {
                 people.remove(id);
             }
-            let _ = participants.unbounded_send(ParticipantEvent::Left { id: id.to_string() });
+            let _ = participants.unbounded_send(ParticipantEvent::Left {
+                id: id.to_string(),
+                feed: Feed::Camera,
+            });
             continue;
         };
 
@@ -1452,6 +1612,7 @@ async fn attend(
             id: id.to_string(),
             slot: slot.clone(),
             stats: stats.clone(),
+            feed: Feed::Camera,
         });
 
         let mut tasks = vec![Abort(tokio::spawn(watch(
@@ -1504,15 +1665,16 @@ async fn announce(
         ticker.tick().await;
         local.expire_asks(ASK_FOR);
         let now = Presence::here(&local);
-        let changed = (now.camera, now.mic, &now.room, &now.requests)
-            != (said.camera, said.mic, &said.room, &said.requests);
+        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing)
+            != (said.camera, said.mic, &said.room, &said.requests, said.sharing);
         if changed {
             let asking = match now.requests.len() {
                 0 => String::new(),
                 n => format!(", asking {n}"),
             };
+            let sharing = if now.sharing { ", sharing" } else { "" };
             tracing::info!(
-                "now camera {}, mic {}, room {}{asking}",
+                "now camera {}, mic {}, room {}{asking}{sharing}",
                 on_off(now.camera),
                 on_off(now.mic),
                 room_name(&now.room)
@@ -1653,6 +1815,7 @@ async fn listen(
                 clock,
                 room,
                 requests,
+                sharing,
             })) => {
                 let room = subroom(room);
                 if let Some(clock) = clock {
@@ -1668,6 +1831,7 @@ async fn listen(
                 // frame, a badge instead of silence nobody can explain.
                 stats.set_camera(camera);
                 stats.set_mic(mic);
+                stats.set_sharing(sharing);
                 // Read by their audio task on every frame, which is what sets
                 // how loud they are to us.
                 stats.set_room(room.clone());
@@ -1921,6 +2085,16 @@ mod path_tests {
         // Catalog-format detection keys off it, and a path that loses it fails
         // as a timeout rather than an error -- so the id goes in front.
         assert!(camera_path("anyone").ends_with(".hang"));
+        assert!(screen_path("anyone").ends_with(".hang"));
+    }
+
+    #[test]
+    fn a_sharer_is_read_off_the_screen_path() {
+        assert_eq!(sharer_of("abc/screen.hang"), Some("abc"));
+        assert_eq!(sharer_of(&screen_path("3929461daf6e4354")), Some("3929461daf6e4354"));
+        for path in ["abc/camera.hang", "abc/control", "screen.hang", "/screen.hang"] {
+            assert_eq!(sharer_of(path), None, "{path} should not be a share");
+        }
     }
 }
 
@@ -2019,6 +2193,27 @@ mod presence_tests {
     }
 
     #[test]
+    fn sharing_survives_the_round_trip() {
+        let said = Presence {
+            sharing: true,
+            ..Presence::default()
+        };
+        let json = serde_json::to_string(&said).unwrap();
+        assert!(json.contains(r#""sharing":true"#), "{json}");
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard, said);
+    }
+
+    #[test]
+    fn not_sharing_is_said_without_a_sharing_key() {
+        // So an older peer receives exactly the bytes it did before shares.
+        let json = serde_json::to_string(&Presence::default()).unwrap();
+        assert!(!json.contains("sharing"), "{json}");
+        let old: Presence = serde_json::from_str(r#"{"state":"here"}"#).unwrap();
+        assert!(!old.sharing);
+    }
+
+    #[test]
     fn the_main_room_is_said_without_a_room_key() {
         // So an older peer receives exactly the bytes it did before subrooms.
         let json = serde_json::to_string(&Presence::default()).unwrap();
@@ -2037,6 +2232,7 @@ mod presence_tests {
             }),
             room: None,
             requests: Vec::new(),
+            sharing: false,
         };
         let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
         assert_eq!(heard, said);
