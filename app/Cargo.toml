@@ -3,6 +3,7 @@ name = "vdr"
 version = "0.1.0"
 authors = ["Daniel Segovia <segoarce90@gmail.com>"]
 edition = "2021"
+license = "MIT OR Apache-2.0"
 
 [features]
 # Screen sharing on Wayland: moq-video's portal + PipeWire capture. It is the
