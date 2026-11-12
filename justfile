@@ -91,3 +91,8 @@ alias ci := package
 # Follow this machine's app log (what testers send after a bad call).
 log:
     tail -f ~/Library/Application\ Support/vdr/vdr.log
+
+# Regenerate THIRD_PARTY_LICENSES after a dependency change; the packages copy
+# it. Needs cargo-about: cargo install cargo-about --locked --features cli
+notices:
+    cd {{app}} && cargo about generate --locked --fail --features wayland-share about.hbs -o ../THIRD_PARTY_LICENSES

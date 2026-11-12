@@ -1,0 +1,61 @@
+# cargo-about configuration for THIRD_PARTY_LICENSES at the repo root.
+# Regenerate with `just notices`; the packaging scripts only copy the file.
+#
+# `accepted` is also the order of preference: for a crate offered under
+# several licences (`MIT OR Apache-2.0`), the first one listed here is the one
+# its notice is shown under. Every entry is needed by some crate in the graph;
+# a new licence fails generation until it is reviewed and added here.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    # webpki-roots: the Mozilla CA list, under the Linux Foundation's
+    # permissive data licence.
+    "CDLA-Permissive-2.0",
+]
+
+# One file for both packages: the macOS universal app and the Linux build,
+# whose `wayland-share` feature pulls in the PipeWire and portal crates.
+# Linux-only crates resolve fine from a Mac, so this runs anywhere.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+
+# Build scripts and test tooling are not in the shipped binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# This app itself: its own licence files sit beside the notices.
+private = { ignore = true }
+
+# aws-lc-sys ships one combined LICENSE (AWS-LC, BoringSSL, OpenSSL, fiat-crypto
+# and others, each with its copyright lines). cargo-about cannot split it, and
+# fell back to bare ISC and BSD-3-Clause templates with no copyright holder.
+# Ship the whole file instead. OpenSSL-derived code in AWS-LC is Apache-2.0,
+# so the OpenSSL licence itself is not needed. The checksum pins this version:
+# a new aws-lc-sys fails generation until the file is looked at again.
+[aws-lc-sys.clarify]
+license = "ISC AND Apache-2.0 AND MIT AND BSD-3-Clause"
+
+[[aws-lc-sys.clarify.files]]
+path = "LICENSE"
+license = "ISC AND Apache-2.0 AND MIT AND BSD-3-Clause"
+checksum = "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e"
+
+# aws-lc-rs likewise: one LICENSE with both texts, the ISC one carrying
+# Amazon's copyright line that the fallback template lacks.
+[aws-lc-rs.clarify]
+license = "ISC AND Apache-2.0"
+
+[[aws-lc-rs.clarify.files]]
+path = "LICENSE"
+license = "ISC AND Apache-2.0"
+checksum = "b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7"
