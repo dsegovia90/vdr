@@ -3,8 +3,8 @@ name = "Vdr"
 
 
 [bundle]
-identifier = "com.example"
-publisher = "exampleinc"
+identifier = "com.github.dsegovia90.vdr"
+publisher = "Daniel Segovia"
 
 
 #

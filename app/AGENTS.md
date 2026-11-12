@@ -21,8 +21,7 @@ Four facts that break the build if you get them wrong:
    so the versions must match. Run `cargo tree -i wgpu` before touching any renderer
    dependency.
 4. **Work from `app/`, and run with `dx`, not `cargo`.** `dx serve --renderer
-   native`. The crate at the repo root is an unrelated `cargo new` stub, and
-   `cargo run` comes up unstyled because `asset!` only resolves inside a dx
+   native`. `cargo run` comes up unstyled because `asset!` only resolves inside a dx
    bundle.
 
 The full picture — layout, the paint path, and notes on what this renderer does
