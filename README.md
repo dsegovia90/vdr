@@ -36,7 +36,11 @@ under `app/vendor/` (each has a `PATCH.md`).
   people as the relay's bandwidth allows. A room URL is one of:
   - `https://relay.example.com:4443/<room>` -- a relay with a real certificate;
   - `iroh://<relay-endpoint-id>/<room>` -- a relay with iroh enabled, reached by
-    its key;
+    its key: no certificate, no DNS name, and the relay needs no open port
+    (it works from behind a home router). Everyone finds the relay through
+    iroh's public relay servers and then talks to it directly where NAT
+    allows; where it does not, iroh carries that person's traffic through
+    those servers instead, today without telling you;
   - `http://localhost:4443/<room>` -- a local development relay (the client
     fetches and pins its self-signed certificate).
 
@@ -146,7 +150,11 @@ public = ""                     # anyone may join any room; see below for tokens
 
 [iroh]
 enabled = true                  # also accept iroh:// rooms
-secret = "iroh-secret.key"      # created on first run; keeps the relay's key stable
+secret = "iroh-secret.key"      # created on first run (pre-create it as 64 hex
+                                # chars if the config dir is read-only); keeps
+                                # the relay's endpoint id stable
+bind_v4 = "0.0.0.0:4444"        # optional: a fixed UDP port you can forward, so
+                                # peers reach the relay directly without hole punching
 ```
 
 The relay logs its iroh key at startup (`iroh listening endpoint_id=…`); that is
