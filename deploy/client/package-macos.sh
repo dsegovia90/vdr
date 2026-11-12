@@ -25,6 +25,11 @@ lipo -create \
   target/aarch64-apple-darwin/desktop-release/vdr \
   target/x86_64-apple-darwin/desktop-release/vdr \
   -output "$app/Contents/MacOS/vdr"
+# Licences inside the bundle, so they travel with the app on its own too.
+# Before signing: the signature seals Contents/Resources.
+for f in LICENSE-MIT LICENSE-APACHE THIRD_PARTY_LICENSES; do
+  cp "$root/$f" "$app/Contents/Resources/$f"
+done
 # Joining drops the linker's ad-hoc signature, and Apple Silicon will not run
 # an unsigned binary at all. Re-sign ad-hoc: the same as before, nothing more.
 codesign --force --sign - "$app"
@@ -47,6 +52,7 @@ stage="$(mktemp -d)/vdr"
 mkdir -p "$stage"
 ditto "$app" "$stage/Vdr.app"
 cp "$root/deploy/client/JOINING.md" "$stage/JOINING.md"
+cp "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$root/THIRD_PARTY_LICENSES" "$stage/"
 ditto -c -k --keepParent "$stage" "$out"
 rm -rf "$(dirname "$stage")"
 echo "$out"

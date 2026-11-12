@@ -127,6 +127,7 @@ commit="${VDR_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || ech
 out="$root/dist/vdr-linux-$arch-$commit.tar.gz"
 mkdir -p "$root/dist"
 cp "$root/deploy/client/JOINING.md" "$dir/JOINING.md"
+cp "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$root/THIRD_PARTY_LICENSES" "$dir/"
 tar -czf "$out" -C "$(dirname "$dir")" "$(basename "$dir")"
 echo "$out"
 echo "Recipients need ALSA, the Vulkan loader and a Vulkan driver, and X11 or Wayland;"
