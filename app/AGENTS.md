@@ -1,4 +1,4 @@
-# vid / `vdr` — read this before changing dependencies
+# vdr — read this before changing dependencies
 
 This file used to be generic Dioxus 0.7 boilerplate. Every dependency
 instruction in it was wrong for this repo, and following it breaks the build, so

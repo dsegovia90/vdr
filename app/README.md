@@ -1,4 +1,4 @@
-# vid
+# vdr
 
 A peer-to-peer video calling app built on [Dioxus 0.7](https://dioxuslabs.com/learn/0.7) running on
 **dioxus-native** ([Blitz](https://github.com/DioxusLabs/blitz)) — Stylo for CSS,

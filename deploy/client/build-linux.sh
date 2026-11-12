@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Builds vid on Linux (Fedora or Debian/Ubuntu) and packs it for sending.
+# Builds vdr on Linux (Fedora or Debian/Ubuntu) and packs it for sending.
 #
-#   deploy/client/build-linux.sh            # writes dist/vid-linux-<arch>-<commit>.tar.gz
+#   deploy/client/build-linux.sh            # writes dist/vdr-linux-<arch>-<commit>.tar.gz
 #
 # Run it on Linux: the app links the system's camera (V4L2), audio (ALSA) and
 # graphics (Vulkan, X11/Wayland) libraries, so it cannot be cross-built from a
@@ -120,11 +120,11 @@ bin="$(find target/dx/vdr/release/linux -type f -name vdr -perm -u+x | head -1)"
 dir="$(dirname "$bin")"
 
 arch="$(uname -m)"
-# The commit names the package. VID_COMMIT wins when set: a worktree copied to
+# The commit names the package. VDR_COMMIT wins when set: a worktree copied to
 # another machine has a .git file pointing at a path that does not exist there,
 # so rev-parse would fail and stop the build.
-commit="${VID_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
-out="$root/dist/vid-linux-$arch-$commit.tar.gz"
+commit="${VDR_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+out="$root/dist/vdr-linux-$arch-$commit.tar.gz"
 mkdir -p "$root/dist"
 cp "$root/deploy/client/JOINING.md" "$dir/JOINING.md"
 tar -czf "$out" -C "$(dirname "$dir")" "$(basename "$dir")"

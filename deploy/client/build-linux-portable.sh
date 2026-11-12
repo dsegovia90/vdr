@@ -18,11 +18,11 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 podman run --rm \
   -v "$root:/src:Z" \
-  -v vid-linux-target:/src/app/target \
-  -v vid-linux-cargo:/root/.cargo \
-  -v vid-linux-rustup:/root/.rustup \
+  -v vdr-linux-target:/src/app/target \
+  -v vdr-linux-cargo:/root/.cargo \
+  -v vdr-linux-rustup:/root/.rustup \
   -w /src \
   -e PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  -e VID_COMMIT="${VID_COMMIT:-}" \
+  -e VDR_COMMIT="${VDR_COMMIT:-}" \
   docker.io/library/ubuntu:22.04 \
   bash -c 'apt-get update -qq && apt-get install -y -qq git curl ca-certificates >/dev/null && (cd / && git config --global --add safe.directory /src) && deploy/client/build-linux.sh'

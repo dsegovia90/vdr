@@ -1,4 +1,4 @@
-# Joining a vid call
+# Joining a vdr call
 
 You were sent an **invite link** that looks like:
 
@@ -10,7 +10,7 @@ Keep it to yourself: anyone holding it can join that room until it expires.
 
 ## macOS (Apple Silicon or Intel)
 
-1. Unzip `vid-macos-…zip` and move **Vdr.app** to Applications.
+1. Unzip `vdr-macos-…zip` and move **Vdr.app** to Applications.
 2. The app is not signed by Apple yet, so the first time, **right-click Vdr.app
    and choose Open**, then Open again. (If macOS says it is "damaged", run
    `xattr -dr com.apple.quarantine /Applications/Vdr.app` in Terminal once.)
@@ -21,7 +21,7 @@ Keep it to yourself: anyone holding it can join that room until it expires.
 
 ## Linux
 
-1. Unpack `vid-linux-…tar.gz` and run `./vdr` from the unpacked folder.
+1. Unpack `vdr-linux-…tar.gz` and run `./vdr` from the unpacked folder.
 2. It needs `libasound2`, `libpipewire-0.3-0`, `libvulkan1` with a Vulkan driver (`mesa-vulkan-drivers`
    on most machines), and an X11 or Wayland desktop.
 3. Screen sharing is offered on X11 and on Wayland. On Wayland your desktop picks

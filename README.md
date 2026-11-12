@@ -1,4 +1,4 @@
-# vid
+# vdr
 
 A video room that a small team leaves open all day. Cameras stay on, the way
 desks in one office are in view of each other, so you can see whether someone

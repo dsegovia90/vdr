@@ -1,7 +1,7 @@
-# vid -- common commands. `just` lists them.
+# vdr -- common commands. `just` lists them.
 #
 # Room URLs carry join tokens, so they live in `.env` (gitignored), not here:
-#   VID_ROOM=https://relay.example.com:4443/<room>?jwt=<token>
+#   VDR_ROOM=https://relay.example.com:4443/<room>?jwt=<token>
 
 set dotenv-load
 
@@ -29,10 +29,10 @@ run *args: build
 # In-process camera -> H.264 -> screen round trip, audio included.
 loopback: (run "--loopback")
 
-# Join the room in .env's VID_ROOM; output also goes to ~/vid-call.log.
-call room=env("VID_ROOM", ""): build
-    @test -n "{{room}}" || { echo "set VID_ROOM in .env, or: just call '<url>'"; exit 1; }
-    RUST_BACKTRACE=1 RUST_LOG={{log}} {{bundle}} --relay '{{room}}' 2>&1 | tee ~/vid-call.log
+# Join the room in .env's VDR_ROOM; output also goes to ~/vdr-call.log.
+call room=env("VDR_ROOM", ""): build
+    @test -n "{{room}}" || { echo "set VDR_ROOM in .env, or: just call '<url>'"; exit 1; }
+    RUST_BACKTRACE=1 RUST_LOG={{log}} {{bundle}} --relay '{{room}}' 2>&1 | tee ~/vdr-call.log
 
 # Join a room on a local relay (start one with `just relay`).
 local room="dev": (run "--relay http://localhost:4443/" + room)
@@ -64,10 +64,10 @@ package-linux:
     set -euo pipefail
     commit=$(git rev-parse --short HEAD)
     rsync -a --delete --exclude '/app/target' --exclude '/target' --exclude '/dist' \
-      --exclude '/.claude' --exclude '/doc/dstack' --exclude '/.env' ./ {{LINUX_HOST}}:projects/vid/
-    ssh {{LINUX_HOST}} "cd ~/projects/vid && VID_COMMIT=$commit deploy/client/build-linux-portable.sh"
-    scp -q "{{LINUX_HOST}}:projects/vid/dist/vid-linux-x86_64-$commit.tar.gz" dist/
-    echo "dist/vid-linux-x86_64-$commit.tar.gz"
+      --exclude '/.claude' --exclude '/doc/dstack' --exclude '/.env' ./ {{LINUX_HOST}}:projects/vdr/
+    ssh {{LINUX_HOST}} "cd ~/projects/vdr && VDR_COMMIT=$commit deploy/client/build-linux-portable.sh"
+    scp -q "{{LINUX_HOST}}:projects/vdr/dist/vdr-linux-x86_64-$commit.tar.gz" dist/
+    echo "dist/vdr-linux-x86_64-$commit.tar.gz"
 
 # Linux log: dist/linux-build.log.
 
@@ -75,14 +75,14 @@ package-linux:
 package:
     #!/usr/bin/env bash
     set -uo pipefail
-    rm -f dist/vid-*.zip dist/vid-*.tar.gz
+    rm -f dist/vdr-*.zip dist/vdr-*.tar.gz
     mkdir -p dist
     just package-linux > dist/linux-build.log 2>&1 &
     linux=$!
     just package-mac; mac=$?
     wait $linux; linux=$?
     if [ $linux -eq 0 ]; then rm -f dist/linux-build.log; else echo "linux failed, see dist/linux-build.log:"; tail -5 dist/linux-build.log; fi
-    echo; ls -1 dist/vid-* 2>/dev/null
+    echo; ls -1 dist/vdr-* 2>/dev/null
     exit $(( mac || linux ))
 
 alias binaries := package

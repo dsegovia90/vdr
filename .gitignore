@@ -19,5 +19,5 @@ CLAUDE.md
 # Packaged builds for sending (deploy/client/)
 /dist/
 
-# Local secrets: room URLs with join tokens (justfile reads VID_ROOM)
+# Local secrets: room URLs with join tokens (justfile reads VDR_ROOM)
 .env
