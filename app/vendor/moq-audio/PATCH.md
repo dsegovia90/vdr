@@ -66,7 +66,14 @@ plain numbers, so nothing allocates on the audio thread.
 
 ## Leaving
 
-Report §1 upstream first (moq-dev/moq, `rs/moq-audio`): it breaks echo
-cancellation for every user, and the fix is two lines. Then propose §2. Drop the
-vendored copy and the `[patch.crates-io]` entry in `app/Cargo.toml` once a
-release carries both.
+**§1 is fixed on upstream `main`, not in any release** (checked 2026-11-12).
+moq commit 877d6fe27 (PR #6050, 2026-10-20) marks the reference consumer
+ready on every capture callback, with the regression test
+`a_resampled_tap_starts_flowing`; ac44f9277 (#6865) later replaced
+fixed-resample with moq-audio's own `ring.rs`, which keeps the same gate and
+the same fix. Every crates.io release through 0.1.23 (`origin/release`,
+2026-11-11) still has the deadlock. The way out is a backport PR of that one
+line plus its test to `release`, or waiting for a release cut from `main`,
+whose API is breaking and would need a migration here. §2 is on neither.
+Drop the vendored copy and the `[patch.crates-io]` entry in `app/Cargo.toml`
+once a release carries §1; §2 then needs its own home or an upstream PR.
