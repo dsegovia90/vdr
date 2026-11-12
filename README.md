@@ -74,19 +74,22 @@ is your responsibility.
 
 ## Running your own relay
 
-Rooms use the stock `moq-relay` from <https://github.com/moq-dev/moq>:
+Rooms use the stock `moq-relay` from <https://github.com/moq-dev/moq>. Install
+the release this app is tested against; newer relays (and moq `main` since
+2026-11) have dropped the iroh transport, so a newer one serves `https://`
+rooms only:
 
 ```sh
-git clone https://github.com/moq-dev/moq && cd moq
-cargo build --release --bin moq-relay
-./target/release/moq-relay relay.toml
+cargo install moq-relay --version 0.14.15 --locked
+cargo install moq-token-cli --version 0.5.46 --locked
+moq-relay relay.toml
 ```
 
 A minimal `relay.toml`:
 
 ```toml
 [server]
-listen = "[::]:4443"            # UDP: QUIC only
+bind = "[::]:4443"              # UDP: QUIC only
 
 [server.tls]
 cert = "/path/to/fullchain.pem"   # a certificate for the relay's hostname
@@ -102,12 +105,12 @@ secret = "iroh-secret.key"      # created on first run; keeps the relay's key st
 
 The relay logs its iroh key at startup (`iroh listening endpoint_id=…`); that is
 the `<relay-endpoint-id>` in an `iroh://` room URL. For a quick local relay
-with a self-signed certificate, `just relay` runs the moq repository's own
+with a self-signed certificate, `just relay` builds a moq checkout and runs its
 `demo/relay/localhost.toml`; join it with `http://localhost:4443/<room>`.
 
 **Tokens.** To keep a relay private, give it a signing key and drop the
 `public` line, so a connection without a valid token is refused. The token tool
-is `moq-token`, from the same repository (`cargo install moq-token-cli`):
+is `moq-token` (installed above):
 
 ```sh
 moq-token generate --out root.jwk                 # once; keep it secret
