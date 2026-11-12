@@ -4988,8 +4988,6 @@ dependencies = [
 [[package]]
 name = "moq-video"
 version = "0.1.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42349c61b6994b3096207013badcdbf7b26cde8fcbd4324bf4b26716451c0b8e"
 dependencies = [
  "anyhow",
  "ashpd",

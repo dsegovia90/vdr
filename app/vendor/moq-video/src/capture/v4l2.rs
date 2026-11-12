@@ -1,0 +1,791 @@
+//! Native V4L2 webcam capture (Linux), replacing nokhwa.
+//!
+//! Streams MMAP buffers through the [`moq_v4l`] crate and converts each frame to CPU
+//! [`I420`] for the encoder. Two source formats cover essentially all UVC
+//! webcams: YUYV (raw 4:2:2, resampled directly) and MJPEG (decoded to RGB with
+//! the pure-Rust [`zune_jpeg`], then converted). This is the CPU path feeding
+//! NVENC / VAAPI / openh264; there's no GPU surface here.
+
+use moq_v4l::buffer::Type as BufType;
+use moq_v4l::capability::Flags;
+use moq_v4l::frameinterval::FrameIntervalEnum;
+use moq_v4l::framesize::FrameSizeEnum;
+use moq_v4l::io::mmap::Stream as MmapStream;
+use moq_v4l::io::traits::CaptureStream;
+use moq_v4l::video::Capture;
+use moq_v4l::video::capture::Parameters;
+use moq_v4l::{Device, Format, FourCC};
+
+use super::channel::FrameChannel;
+use super::mode::{self, Request};
+use super::pump::{self, Geometry};
+use super::{Config, Mode, Rate, Stream};
+use crate::frame::{I420, Surface};
+use crate::{Error, Size};
+
+/// List V4L2 capture nodes that [`open`] can negotiate, by the paths [`open_device`] accepts.
+pub(super) fn cameras() -> Result<Vec<super::Camera>, Error> {
+	let mut nodes = moq_v4l::context::enum_devices();
+	nodes.sort_by_key(moq_v4l::context::Node::index);
+
+	let cameras = nodes
+		.into_iter()
+		.filter_map(|node| {
+			let path = node.path().to_string_lossy().into_owned();
+			let device = match Device::with_path(node.path()) {
+				Ok(device) => device,
+				Err(err) => {
+					tracing::debug!(device = %path, error = %err, "could not inspect V4L2 node");
+					return None;
+				}
+			};
+			let capabilities = match device.query_caps() {
+				Ok(capabilities) => capabilities,
+				Err(err) => {
+					tracing::debug!(device = %path, error = %err, "could not query V4L2 node");
+					return None;
+				}
+			};
+			if !capabilities.capabilities.contains(Flags::VIDEO_CAPTURE)
+				|| !capabilities.capabilities.contains(Flags::STREAMING)
+			{
+				return None;
+			}
+			// A device with no YUYV or MJPEG would list an id `open` refuses, and
+			// hide the PipeWire entry for the same path that could still open it.
+			match convertible(&device) {
+				Ok(true) => {}
+				Ok(false) => {
+					tracing::debug!(device = %path, "V4L2 node offers no YUYV or MJPEG");
+					return None;
+				}
+				Err(err) => {
+					tracing::debug!(device = %path, error = %err, "could not list V4L2 formats");
+					return None;
+				}
+			}
+
+			let name = node.name().filter(|name| !name.is_empty()).unwrap_or(capabilities.card);
+			Some(super::Camera { id: path, name })
+		})
+		.collect();
+	Ok(cameras)
+}
+
+/// Whether the device offers a capture format [`Source`] converts.
+fn convertible(device: &Device) -> Result<bool, Error> {
+	convertible_with(|index| {
+		// All fields are integers or byte arrays; reserved fields must be zero.
+		let mut entry: moq_v4l::sys::v4l2_fmtdesc = unsafe { std::mem::zeroed() };
+		entry.index = index;
+		entry.type_ = BufType::VideoCapture as u32;
+		// The request matches the initialized argument's type and size.
+		let result = unsafe {
+			moq_v4l::v4l2::ioctl(
+				device.handle().fd(),
+				moq_v4l::v4l2::vidioc::VIDIOC_ENUM_FMT,
+				&mut entry as *mut _ as *mut std::ffi::c_void,
+			)
+		};
+		Ok(enumeration(result)?.map(|()| FourCC::from(entry.pixelformat)))
+	})
+}
+
+// Read one entry at a time, like `frame_sizes`: moq-v4l's `enum_formats` treats
+// every error as end-of-list.
+fn convertible_with(mut format: impl FnMut(u32) -> Result<Option<FourCC>, Error>) -> Result<bool, Error> {
+	for index in 0..=u32::MAX {
+		match format(index)? {
+			Some(fourcc) if Source::from_fourcc(fourcc).is_some() => return Ok(true),
+			Some(_) => {}
+			None => return Ok(false),
+		}
+	}
+	Err(Error::Codec(anyhow::anyhow!("V4L2 format index overflow")))
+}
+
+/// List the modes a V4L2 camera reports, for the formats this backend converts.
+///
+/// `VIDIOC_ENUM_FRAMESIZES` and `VIDIOC_ENUM_FRAMEINTERVALS` describe a device
+/// without configuring it, which is what makes this answerable before the camera
+/// opens. `VIDIOC_S_FMT` cannot: it asks and applies in one step, which is why
+/// [`negotiate`] has to probe.
+///
+/// Only YUYV and MJPEG are enumerated, so what comes back is what [`open`] could
+/// negotiate rather than everything the driver advertises. Sizes reported for
+/// both formats are merged, and their rates with them: the encoder sees I420
+/// either way, so which format carried a mode is not something a caller can act
+/// on.
+pub(super) fn modes(selector: Option<&str>) -> Result<Vec<Mode>, Error> {
+	let (device, _) = open_device(selector)?;
+	let mut reported = Vec::new();
+
+	for candidate in Source::ALL {
+		let fourcc = candidate.fourcc();
+		let enumerated = frame_sizes(&device, fourcc)?;
+		for size in enumerated {
+			for (width, height) in reported_sizes(size) {
+				let size = Size::new(width, height);
+				reported.push((size, framerates(&device, fourcc, size)?));
+			}
+		}
+	}
+	Ok(mode::modes(reported))
+}
+
+/// The sizes worth reporting from one `VIDIOC_ENUM_FRAMESIZES` entry.
+///
+/// A discrete entry is one size. A stepwise or continuous entry describes a
+/// whole rectangle of them, which on a driver with a one-pixel step is millions,
+/// so only its smallest and largest I420-compatible sizes are reported.
+fn reported_sizes(size: FrameSizeEnum) -> Vec<(u32, u32)> {
+	let sizes = match size {
+		FrameSizeEnum::Discrete(discrete) => vec![(discrete.width, discrete.height)],
+		FrameSizeEnum::Stepwise(stepwise) => {
+			let Some((min_width, max_width)) = bounds(stepwise.min_width, stepwise.max_width, stepwise.step_width)
+			else {
+				return Vec::new();
+			};
+			let Some((min_height, max_height)) = bounds(stepwise.min_height, stepwise.max_height, stepwise.step_height)
+			else {
+				return Vec::new();
+			};
+			let smallest = (min_width, min_height);
+			let largest = (max_width, max_height);
+			if smallest == largest {
+				vec![smallest]
+			} else {
+				vec![smallest, largest]
+			}
+		}
+	};
+	sizes
+		.into_iter()
+		.filter(|&(width, height)| Size::new(width, height).validate("camera resolution").is_ok())
+		.collect()
+}
+
+/// First and last nonzero even values on the driver's step grid.
+pub(super) fn bounds(min: u32, max: u32, step: u32) -> Option<(u32, u32)> {
+	if min == max {
+		return (min != 0 && min.is_multiple_of(2)).then_some((min, min));
+	}
+	if min > max || step == 0 {
+		return None;
+	}
+	let mut first = if min == 0 { step } else { min };
+	let mut last = min + (max - min) / step * step;
+	if !first.is_multiple_of(2) {
+		if step.is_multiple_of(2) {
+			return None;
+		}
+		first = first.checked_add(step)?;
+	}
+	if !last.is_multiple_of(2) {
+		last = last.checked_sub(step)?;
+	}
+	(first <= last).then_some((first, last))
+}
+
+// Read one entry at a time: moq-v4l's collection helpers treat every error after
+// the first entry as end-of-list, hiding device failures and malformed replies.
+fn frame_sizes(device: &Device, fourcc: FourCC) -> Result<Vec<FrameSizeEnum>, Error> {
+	let mut sizes = Vec::new();
+	for index in 0..=u32::MAX {
+		// All fields are integers or integer unions; reserved fields must be zero.
+		let mut entry: moq_v4l::sys::v4l2_frmsizeenum = unsafe { std::mem::zeroed() };
+		entry.index = index;
+		entry.pixel_format = fourcc.into();
+		// The request matches the initialized argument's type and size.
+		let result = unsafe {
+			moq_v4l::v4l2::ioctl(
+				device.handle().fd(),
+				moq_v4l::v4l2::vidioc::VIDIOC_ENUM_FRAMESIZES,
+				&mut entry as *mut _ as *mut std::ffi::c_void,
+			)
+		};
+		if enumeration(result)?.is_none() {
+			return Ok(sizes);
+		}
+		sizes.push(FrameSizeEnum::try_from(entry).map_err(|e| Error::Codec(anyhow::anyhow!(e)))?);
+	}
+	Err(Error::Codec(anyhow::anyhow!("V4L2 frame size index overflow")))
+}
+
+fn enumeration<T>(result: std::io::Result<T>) -> Result<Option<T>, Error> {
+	match result {
+		Ok(value) => Ok(Some(value)),
+		Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(None),
+		Err(error) => Err(Error::SourceUnavailable(format!("V4L2 enumeration: {error}"))),
+	}
+}
+
+/// Exact discrete rates; continuous and stepwise intervals have no finite list.
+fn framerates(device: &Device, fourcc: FourCC, size: Size) -> Result<Vec<Rate>, Error> {
+	let mut rates = Vec::new();
+	for index in 0..=u32::MAX {
+		// All fields are integers or integer unions; reserved fields must be zero.
+		let mut entry: moq_v4l::sys::v4l2_frmivalenum = unsafe { std::mem::zeroed() };
+		entry.index = index;
+		entry.pixel_format = fourcc.into();
+		entry.width = size.width;
+		entry.height = size.height;
+		// The request matches the initialized argument's type and size.
+		let result = unsafe {
+			moq_v4l::v4l2::ioctl(
+				device.handle().fd(),
+				moq_v4l::v4l2::vidioc::VIDIOC_ENUM_FRAMEINTERVALS,
+				&mut entry as *mut _ as *mut std::ffi::c_void,
+			)
+		};
+		if enumeration(result)?.is_none() {
+			return Ok(rates);
+		}
+		let interval = FrameIntervalEnum::try_from(entry).map_err(|e| Error::Codec(anyhow::anyhow!(e)))?;
+		if let FrameIntervalEnum::Discrete(interval) = interval {
+			rates.push(rate(interval)?);
+		}
+	}
+	Err(Error::Codec(anyhow::anyhow!("V4L2 frame interval index overflow")))
+}
+
+fn rate(interval: moq_v4l::Fraction) -> Result<Rate, Error> {
+	Rate::new(interval.denominator, interval.numerator)
+		.map_err(|error| Error::Codec(anyhow::anyhow!("invalid V4L2 frame interval: {error}")))
+}
+
+/// Open a V4L2 camera and stream its frames over a pump thread.
+pub(super) async fn open(config: &Config, device: Option<&str>) -> Result<Stream, Error> {
+	let config = config.clone();
+	// The camera opens on the pump thread, so the selector has to be owned.
+	let device = device.map(str::to_string);
+	let chan = FrameChannel::new();
+	let (geo, guard) = pump::spawn(
+		chan.clone(),
+		move || {
+			let camera = Camera::open(&config, device.as_deref())?;
+			let geometry = Geometry {
+				width: camera.width,
+				height: camera.height,
+				framerate: camera.framerate,
+				label: camera.name.clone(),
+			};
+			Ok((camera, geometry))
+		},
+		Camera::read,
+	)
+	.await?;
+
+	Ok(Stream::new(
+		chan,
+		geo.width,
+		geo.height,
+		geo.framerate,
+		geo.label,
+		None,
+		Box::new(guard),
+	))
+}
+
+/// Fallback geometry when the caller doesn't pin a resolution; the driver picks
+/// the nearest mode it supports. PipeWire cameras default to the same size.
+pub(super) const DEFAULT_WIDTH: u32 = 1280;
+pub(super) const DEFAULT_HEIGHT: u32 = 720;
+
+/// Driver buffers to keep in flight; a small ring lets capture overlap encode.
+const BUFFER_COUNT: u32 = 4;
+
+/// The negotiated source format, chosen once at open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+	/// Raw 4:2:2; resampled to I420 with no color-space conversion.
+	Yuyv,
+	/// Motion-JPEG; decoded per frame.
+	Mjpeg,
+}
+
+impl Source {
+	/// Every format we can convert, cheapest first. The order only breaks ties
+	/// between modes that fit the requested size and rate equally well.
+	const ALL: [Self; 2] = [Self::Yuyv, Self::Mjpeg];
+
+	fn fourcc(self) -> FourCC {
+		FourCC::new(match self {
+			Self::Yuyv => b"YUYV",
+			Self::Mjpeg => b"MJPG",
+		})
+	}
+
+	fn from_fourcc(fourcc: FourCC) -> Option<Self> {
+		Self::ALL.into_iter().find(|source| source.fourcc() == fourcc)
+	}
+
+	fn cost(self) -> u8 {
+		match self {
+			Self::Yuyv => 0,
+			Self::Mjpeg => 1,
+		}
+	}
+}
+
+pub(crate) struct Camera {
+	stream: MmapStream<'static>,
+	source: Source,
+	width: u32,
+	height: u32,
+	/// Bytes per row of the YUYV buffer (`bytesperline`); unused for MJPEG.
+	stride: u32,
+	framerate: Option<Rate>,
+	name: String,
+}
+
+impl Camera {
+	fn open(config: &Config, selector: Option<&str>) -> Result<Self, Error> {
+		let (device, name) = open_device(selector)?;
+		let width = config.width.unwrap_or(DEFAULT_WIDTH);
+		let height = config.height.unwrap_or(DEFAULT_HEIGHT);
+
+		let (format, source, rate) = negotiate(
+			&device,
+			&name,
+			Request {
+				size: Size::new(width, height),
+				framerate: config.framerate,
+			},
+		)?;
+
+		let (width, height, stride) = (format.width, format.height, format.stride);
+		Size::new(width, height).validate("camera resolution")?;
+
+		let framerate = rate;
+
+		// The stream owns a clone of the device's `Arc<Handle>`, so the fd stays
+		// open after `device` drops here; the mmap'd buffers live with the stream.
+		let stream = MmapStream::with_buffers(&device, BufType::VideoCapture, BUFFER_COUNT)
+			.map_err(|e| Error::Codec(anyhow::anyhow!("V4L2 stream init: {e}")))?;
+
+		tracing::info!(device = %name, width, height, "opened V4L2 capture");
+		Ok(Self {
+			stream,
+			source,
+			width,
+			height,
+			stride,
+			framerate,
+			name,
+		})
+	}
+
+	/// Pull the next frame. Blocks one frame interval; the pump thread calls this
+	/// in a loop and checks its stop flag between calls.
+	fn read(&mut self) -> Result<pump::Read, Error> {
+		let (buf, meta) = CaptureStream::next(&mut self.stream)
+			.map_err(|error| Error::SourceUnavailable(format!("V4L2 camera {}: {error}", self.name)))?;
+
+		let i420 = match self.source {
+			Source::Yuyv => I420::from_yuyv(buf, self.stride, crate::Size::new(self.width, self.height))?,
+			Source::Mjpeg => {
+				// Only `bytesused` of the buffer holds the JPEG; the rest is stale.
+				let jpeg = buf.get(..meta.bytesused as usize).unwrap_or(buf);
+				I420::from_mjpeg(jpeg, crate::Size::new(self.width, self.height))?
+			}
+		};
+		let timestamp = u64::try_from(meta.timestamp.sec)
+			.ok()
+			.and_then(|seconds| seconds.checked_mul(1_000_000))
+			.and_then(|micros| {
+				u64::try_from(meta.timestamp.usec)
+					.ok()
+					.and_then(|part| micros.checked_add(part))
+			})
+			.and_then(|micros| moq_net::Timestamp::from_micros(micros).ok());
+		Ok(match timestamp {
+			Some(timestamp) => pump::Read::FrameAt(Surface::I420(i420), timestamp),
+			None => pump::Read::Frame(Surface::I420(i420)),
+		})
+	}
+}
+
+/// Open `device`: a bare integer selects `/dev/videoN` by index, anything
+/// else is a device path. `None` opens index 0.
+fn open_device(device: Option<&str>) -> Result<(Device, String), Error> {
+	match device {
+		None => {
+			let device = Device::new(0).map_err(|error| open_error("/dev/video0", error))?;
+			Ok((device, "/dev/video0".to_string()))
+		}
+		Some(spec) => match spec.parse::<usize>() {
+			Ok(index) => {
+				let name = format!("/dev/video{index}");
+				let device = Device::new(index).map_err(|error| open_error(&name, error))?;
+				Ok((device, format!("/dev/video{index}")))
+			}
+			Err(_) => {
+				let device = Device::with_path(spec).map_err(|error| open_error(spec, error))?;
+				Ok((device, spec.to_string()))
+			}
+		},
+	}
+}
+
+fn open_error(device: &str, error: std::io::Error) -> Error {
+	match error.kind() {
+		std::io::ErrorKind::PermissionDenied => Error::PermissionDenied(format!("{device}: {error}")),
+		_ => Error::SourceUnavailable(format!("{device}: {error}")),
+	}
+}
+
+/// Negotiate the format we can convert to I420 that lands closest to `want`.
+///
+/// V4L2's non-mutating `VIDIOC_TRY_FMT` is optional, so use the required
+/// `VIDIOC_S_FMT`. It asks and applies in one step, substituting the driver's
+/// nearest supported mode for anything it doesn't have. Each format we handle
+/// is applied in turn and scored against the requested geometry and frame rate, then the
+/// winner is applied again to leave the device on it.
+///
+/// Taking the first reply instead would pin most laptop webcams to VGA: USB
+/// bandwidth doesn't fit uncompressed 4:2:2 above that, so they offer YUYV only
+/// at small sizes and reach HD through MJPEG alone. Asking such a camera for
+/// YUYV at 1080p gets 640x480 back, which is a valid YUYV mode and nowhere near
+/// what the caller asked for.
+fn negotiate(device: &Device, name: &str, want: Request) -> Result<(Format, Source, Option<Rate>), Error> {
+	let framerate = want.framerate;
+	negotiate_with(name, want, |format| {
+		let format = set_format(device, format)?;
+		if let Some(fps) = framerate {
+			let interval = moq_v4l::Fraction::new(fps.denominator(), fps.numerator());
+			match Capture::set_params(device, &Parameters::new(interval)) {
+				Ok(_) => {}
+				Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTTY)) => {}
+				Err(error) => return Err(open_error(name, error)),
+			}
+		}
+		let rate = match Capture::params(device) {
+			Ok(params) if params.interval.numerator != 0 && params.interval.denominator != 0 => {
+				Some(rate(params.interval)?)
+			}
+			Ok(_) => None,
+			Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTTY)) => None,
+			Err(error) => return Err(open_error(name, error)),
+		};
+		Ok((format, rate))
+	})
+}
+
+fn negotiate_with(
+	name: &str,
+	want: Request,
+	mut apply: impl FnMut(Format) -> Result<(Format, Option<Rate>), Error>,
+) -> Result<(Format, Source, Option<Rate>), Error> {
+	let mut replies = Vec::with_capacity(Source::ALL.len());
+	let mut offered = Vec::new();
+	let mut probe_error = None;
+	for candidate in Source::ALL {
+		let (got, rate) = match apply(Format::new(want.size.width, want.size.height, candidate.fourcc())) {
+			Ok(got) => got,
+			Err(error) => {
+				probe_error = Some(error);
+				continue;
+			}
+		};
+		let description = format!("{}x{} {}", got.width, got.height, got.fourcc);
+		if !offered.contains(&description) {
+			offered.push(description);
+		}
+		if let Some(source) = Source::from_fourcc(got.fourcc) {
+			replies.push((got, source, rate));
+		}
+	}
+
+	let Some((best, source, _)) = closest(replies, want) else {
+		if offered.is_empty() {
+			let Some(error) = probe_error else {
+				return Err(Error::Codec(anyhow::anyhow!("camera {name} has no formats to probe")));
+			};
+			return Err(error);
+		}
+		let offered = offered.join(", ");
+		let wanted = Source::ALL.map(|source| source.fourcc().to_string()).join(", ");
+		return Err(Error::Codec(anyhow::anyhow!(
+			"camera {name} has no encodable {wanted} mode (the driver returned {offered})"
+		)));
+	};
+
+	// A successful probe may have left the device on another candidate.
+	let (applied, rate) = apply(Format::new(best.width, best.height, best.fourcc))?;
+	if applied.fourcc != best.fourcc || applied.width != best.width || applied.height != best.height {
+		return Err(Error::Codec(anyhow::anyhow!(
+			"camera {name} would not re-apply the {}x{} {} mode it just negotiated",
+			best.width,
+			best.height,
+			best.fourcc
+		)));
+	}
+	Ok((applied, source, rate))
+}
+
+/// Prefer geometry, then the accepted rate nearest the request, then conversion cost.
+fn closest(
+	replies: impl IntoIterator<Item = (Format, Source, Option<Rate>)>,
+	want: Request,
+) -> Option<(Format, Source, Option<Rate>)> {
+	mode::nearest(replies, want, |(format, source, rate)| mode::Candidate {
+		size: Size::new(format.width, format.height),
+		framerate: *rate,
+		cost: source.cost(),
+	})
+}
+
+fn set_format(device: &Device, format: Format) -> Result<Format, Error> {
+	Capture::set_format(device, &format).map_err(|e| Error::Codec(anyhow::anyhow!("V4L2 set format: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use moq_v4l::framesize::{Discrete, Stepwise};
+
+	fn request(width: u32, height: u32) -> Request {
+		Request {
+			size: Size::new(width, height),
+			framerate: None,
+		}
+	}
+
+	fn reply(width: u32, height: u32, source: Source) -> (Format, Source, Option<Rate>) {
+		(Format::new(width, height, source.fourcc()), source, None)
+	}
+
+	fn stepwise(min: (u32, u32), max: (u32, u32), step: u32) -> FrameSizeEnum {
+		FrameSizeEnum::Stepwise(Stepwise {
+			min_width: min.0,
+			max_width: max.0,
+			step_width: step,
+			min_height: min.1,
+			max_height: max.1,
+			step_height: step,
+		})
+	}
+
+	/// A discrete entry is the one mode it names.
+	#[test]
+	fn a_discrete_frame_size_is_reported_as_itself() {
+		let size = FrameSizeEnum::Discrete(Discrete {
+			width: 1280,
+			height: 720,
+		});
+		assert_eq!(reported_sizes(size), vec![(1280, 720)]);
+	}
+
+	#[test]
+	fn unencodable_frame_sizes_are_not_reported() {
+		for (width, height) in [(0, 480), (640, 0), (641, 480), (640, 481)] {
+			assert!(reported_sizes(FrameSizeEnum::Discrete(Discrete { width, height })).is_empty());
+		}
+	}
+
+	#[test]
+	fn rates_preserve_fractional_and_sub_one_fps_intervals() {
+		let ntsc = rate(moq_v4l::Fraction::new(1001, 30000)).unwrap();
+		assert_eq!(ntsc.numerator(), 30000);
+		assert_eq!(ntsc.rounded(), 30);
+		assert_eq!(ntsc.denominator(), 1001);
+		let slow = rate(moq_v4l::Fraction::new(2, 1)).unwrap();
+		assert_eq!(slow.numerator(), 1);
+		assert_eq!(slow.rounded(), 1);
+		assert_eq!(slow.denominator(), 2);
+		assert!(slow < ntsc);
+		assert!(rate(moq_v4l::Fraction::new(0, 30)).is_err());
+		assert!(rate(moq_v4l::Fraction::new(1, 0)).is_err());
+	}
+
+	#[test]
+	fn equivalent_rates_deduplicate_and_sort_numerically() {
+		use std::collections::BTreeSet;
+
+		let rates: BTreeSet<_> = [(1001, 30000), (1, 30), (2, 60), (2, 1)]
+			.into_iter()
+			.map(|(n, d)| rate(moq_v4l::Fraction::new(n, d)).unwrap())
+			.collect();
+		assert_eq!(rates.len(), 3);
+		assert_eq!(*rates.last().unwrap(), rate(moq_v4l::Fraction::new(1, 30)).unwrap());
+		assert_eq!(*rates.first().unwrap(), rate(moq_v4l::Fraction::new(2, 1)).unwrap());
+	}
+
+	#[test]
+	fn enumeration_only_stops_on_einval() {
+		assert_eq!(enumeration(Ok(42)).unwrap(), Some(42));
+		assert!(
+			enumeration::<()>(Err(std::io::Error::from_raw_os_error(libc::EINVAL)))
+				.unwrap()
+				.is_none()
+		);
+		for code in [libc::EIO, libc::ENODEV, libc::EACCES] {
+			assert!(enumeration::<()>(Err(std::io::Error::from_raw_os_error(code))).is_err());
+		}
+	}
+
+	#[test]
+	fn negotiation_selects_and_reapplies_the_format_accepting_the_requested_rate() {
+		let mut formats = Vec::new();
+		let want = Request {
+			size: Size::new(1280, 720),
+			framerate: Some(Rate::new(60, 1).unwrap()),
+		};
+		let (_, source, accepted) = negotiate_with("camera", want, |format| {
+			formats.push(format.fourcc);
+			let fps = if format.fourcc == Source::Yuyv.fourcc() { 30 } else { 60 };
+			Ok((format, Some(rate(moq_v4l::Fraction::new(1, fps)).unwrap())))
+		})
+		.unwrap();
+		assert_eq!(source, Source::Mjpeg);
+		assert_eq!(accepted.unwrap().rounded(), 60);
+		assert_eq!(
+			formats,
+			[Source::Yuyv.fourcc(), Source::Mjpeg.fourcc(), Source::Mjpeg.fourcc()]
+		);
+	}
+
+	/// A one-pixel step over a 4K range is 8 million modes, and reporting them
+	/// would say nothing the two corners do not.
+	#[test]
+	fn a_stepwise_frame_size_is_reported_as_its_corners() {
+		let size = stepwise((32, 32), (3840, 2160), 1);
+		assert_eq!(reported_sizes(size), vec![(32, 32), (3840, 2160)]);
+	}
+
+	/// A range whose corners coincide is one mode, not the same one twice.
+	#[test]
+	fn a_stepwise_frame_size_of_one_mode_is_reported_once() {
+		let size = stepwise((640, 480), (640, 480), 1);
+		assert_eq!(reported_sizes(size), vec![(640, 480)]);
+	}
+
+	#[test]
+	fn stepwise_sizes_keep_even_interior_endpoints() {
+		assert_eq!(
+			reported_sizes(stepwise((1, 1), (1919, 1079), 1)),
+			vec![(2, 2), (1918, 1078)]
+		);
+		assert_eq!(reported_sizes(stepwise((1, 1), (20, 20), 3)), vec![(4, 4), (16, 16)]);
+		assert_eq!(reported_sizes(stepwise((0, 0), (3, 3), 1)), vec![(2, 2)]);
+		assert!(reported_sizes(stepwise((1, 1), (19, 19), 2)).is_empty());
+	}
+
+	#[test]
+	fn stepwise_bounds_match_the_enumerated_grid() {
+		for min in 0..8 {
+			for max in min..16 {
+				for step in 1..8 {
+					let values: Vec<_> = (min..=max)
+						.step_by(step as usize)
+						.filter(|value| *value != 0 && value % 2 == 0)
+						.collect();
+					let expected = values.first().zip(values.last()).map(|(&first, &last)| (first, last));
+					assert_eq!(bounds(min, max, step), expected, "{min}..={max}, step {step}");
+				}
+			}
+		}
+		assert_eq!(bounds(u32::MAX - 4, u32::MAX, 3), Some((u32::MAX - 1, u32::MAX - 1)));
+		assert_eq!(bounds(0, u32::MAX, u32::MAX), None);
+		assert_eq!(bounds(2, 2, 0), Some((2, 2)));
+		assert_eq!(bounds(2, 4, 0), None);
+		assert_eq!(bounds(4, 2, 1), None);
+	}
+
+	/// The case that motivates scoring at all, taken from a real UVC webcam:
+	/// YUYV tops out at VGA while MJPEG reaches 720p, so a 720p request has to
+	/// land on MJPEG even though YUYV is probed first and answers successfully.
+	#[test]
+	fn prefers_the_nearer_mode_over_the_cheaper_one() {
+		let replies = [reply(640, 480, Source::Yuyv), reply(1280, 720, Source::Mjpeg)];
+		let (format, source, _) = closest(replies, request(1280, 720)).expect("a reply is usable");
+		assert_eq!(source, Source::Mjpeg);
+		assert_eq!((format.width, format.height), (1280, 720));
+	}
+
+	/// When both formats reach the requested size, the cheaper one wins regardless
+	/// of probe order: YUYV resamples, MJPEG costs a full JPEG decode per frame.
+	#[test]
+	fn breaks_ties_toward_the_cheaper_format() {
+		let replies = [reply(640, 480, Source::Mjpeg), reply(640, 480, Source::Yuyv)];
+		let (_, source, _) = closest(replies, request(640, 480)).expect("a reply is usable");
+		assert_eq!(source, Source::Yuyv);
+	}
+
+	/// An exact odd mode cannot feed I420, so a nearby even mode has to win rather
+	/// than letting `Camera::open` reject the selected result.
+	#[test]
+	fn ignores_a_nearer_mode_the_pipeline_cannot_encode() {
+		let replies = [reply(1279, 719, Source::Mjpeg), reply(1280, 720, Source::Yuyv)];
+		let (format, source, _) = closest(replies, request(1279, 719)).expect("an even reply is usable");
+		assert_eq!(source, Source::Yuyv);
+		assert_eq!((format.width, format.height), (1280, 720));
+	}
+
+	/// A YUYV-only driver may reject MJPEG instead of substituting its supported
+	/// mode, which must not discard the valid reply from the first probe.
+	#[test]
+	fn keeps_a_valid_mode_when_another_probe_fails() {
+		let mut calls = 0;
+		let (format, source, _) = negotiate_with("camera", request(640, 480), |requested| {
+			calls += 1;
+			match calls {
+				1 => Ok((Format::new(640, 480, Source::Yuyv.fourcc()), None)),
+				2 => Err(Error::Codec(anyhow::anyhow!("MJPEG is unsupported"))),
+				3 => Ok((requested, None)),
+				_ => panic!("unexpected format probe"),
+			}
+		})
+		.expect("the YUYV reply is usable");
+
+		assert_eq!(calls, 3);
+		assert_eq!(source, Source::Yuyv);
+		assert_eq!((format.width, format.height), (640, 480));
+	}
+
+	/// When every candidate is rejected, preserve the last real driver error.
+	#[test]
+	fn returns_an_error_when_every_probe_fails() {
+		let mut calls = 0;
+		let error = negotiate_with("camera", request(640, 480), |_| {
+			calls += 1;
+			Err(Error::Codec(anyhow::anyhow!("probe {calls} failed")))
+		})
+		.expect_err("no format probe succeeded");
+
+		assert_eq!(calls, Source::ALL.len());
+		assert_eq!(error.to_string(), "probe 2 failed");
+	}
+
+	/// Zero and odd dimensions cannot feed I420, so they leave nothing to score.
+	#[test]
+	fn no_usable_reply_is_none() {
+		let replies = [reply(0, 720, Source::Yuyv), reply(1279, 719, Source::Mjpeg)];
+		assert!(closest(replies, request(1280, 720)).is_none());
+	}
+
+	#[test]
+	fn only_devices_offering_a_converted_format_are_cameras() {
+		let formats = |list: &'static [&'static [u8; 4]]| {
+			move |index: u32| Ok(list.get(index as usize).map(|fourcc| FourCC::new(fourcc)))
+		};
+		assert!(!convertible_with(formats(&[])).unwrap());
+		assert!(!convertible_with(formats(&[b"NV12", b"RGB3"])).unwrap());
+		assert!(convertible_with(formats(&[b"NV12", b"MJPG"])).unwrap());
+		assert!(convertible_with(formats(&[b"YUYV"])).unwrap());
+		let failed = convertible_with(|_| Err(Error::SourceUnavailable("ENUM_FMT".into())));
+		assert!(failed.is_err());
+	}
+
+	/// Every format we advertise round-trips through its fourcc, which is what
+	/// lets `negotiate` recognize the driver's substitution.
+	#[test]
+	fn fourcc_round_trips() {
+		for source in Source::ALL {
+			assert_eq!(Source::from_fourcc(source.fourcc()), Some(source));
+		}
+		assert_eq!(Source::from_fourcc(FourCC::new(b"GREY")), None);
+	}
+}
