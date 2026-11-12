@@ -13,8 +13,8 @@
 //! The location comes from `directories`' `data_local_dir()`
 //! (`~/Library/Application Support/vdr/settings.json` on macOS). That is the
 //! same directory `dioxus-sdk-storage`'s own desktop backend uses, so it is the
-//! conventional spot rather than one we invented — see ticket 17 for why we do
-//! not use that crate itself.
+//! conventional spot rather than one we invented. That crate itself is not used:
+//! it needs the `dioxus` umbrella and panics on filesystem errors.
 
 use cameras::{Device, DeviceId};
 use serde::{Deserialize, Serialize};
@@ -252,7 +252,7 @@ pub fn initial_device(
 /// In order: `--camera` if it matches something, then the remembered device if
 /// it is still connected, then whatever the OS listed first. The last is
 /// arbitrary — enumeration order is not stable across launches, which is the
-/// whole reason this ticket exists — but it is only reached when there is
+/// whole reason the choice is remembered — but it is only reached when there is
 /// nothing better to go on.
 fn choose(
     devices: &[(&DeviceId, &str)],
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn a_remembered_camera_wins_over_enumeration_order() {
-        // The point of the whole ticket: the C922 is second in this run's
+        // The point of remembering: the C922 is second in this run's
         // ordering and must still be the one opened.
         let devices = devices();
         assert_eq!(

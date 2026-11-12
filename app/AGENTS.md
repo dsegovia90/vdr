@@ -25,10 +25,5 @@ Four facts that break the build if you get them wrong:
    `cargo run` comes up unstyled because `asset!` only resolves inside a dx
    bundle.
 
-The full picture lives in two places:
-
-- **`app/README.md`** — layout, the paint path, and notes on what this renderer
-  does and does not support.
-- **`CLAUDE.md` at the repo root** — build commands, the load-bearing pins, and
-  the behaviours that look like bugs and are not. It is deliberately untracked,
-  so a fresh clone will not have it.
+The full picture — layout, the paint path, and notes on what this renderer does
+and does not support — is in **`app/README.md`**.

@@ -5,11 +5,11 @@
 #
 # Run it on Linux: the app links the system's camera (V4L2), audio (ALSA) and
 # graphics (Vulkan, X11/Wayland) libraries, so it cannot be cross-built from a
-# Mac. It needs no screen or camera to *build* -- a Proxmox VM or LXC will do --
+# Mac. It needs no screen or camera to *build* -- a VM or container will do --
 # but running it does.
 #
 # UNVERIFIED: the package list is the set this kind of app usually needs, plus
-# what ticket 26's first Linux build (2026-09-15) recorded. This blitz version
+# what the first Linux build (2026-09-15) recorded. This blitz version
 # (v0.3.0-beta.4) has not been built on Linux yet. If a build step fails on a
 # missing library, add its -dev package here. First Fedora build (2026-11-05):
 # fontconfig was the only one missing -- blitz uses it to find system fonts.
@@ -57,7 +57,7 @@ if ! cargo --version >/dev/null 2>&1; then
     . "$HOME/.cargo/env"
   fi
 fi
-# The dx version this repo is built with (CLAUDE.md).
+# The dx version this repo is built with (see app/README.md).
 command -v dx >/dev/null || cargo install dioxus-cli --version 0.7.10 --locked
 
 # PipeWire headers for `wayland-share`. The Rust bindings (pipewire/libspa 0.10)

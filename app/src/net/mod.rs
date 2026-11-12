@@ -120,8 +120,8 @@ pub struct Remote {
     /// Takes back a choice that has not become a call yet, returning to idle.
     ///
     /// Only meaningful while [`RemoteStatus::is_cancellable`] -- once a peer is
-    /// connected, stopping is a hang-up and there is no channel on which to
-    /// tell them. Ticket 29.
+    /// connected, stopping is a hang-up, which the peer has to be told about;
+    /// that goes through Leave instead.
     pub cancel: Callback<()>,
     /// Live numbers for the call: rtt, loss, bitrate, incoming frame rate.
     pub metrics: Arc<Metrics>,
@@ -210,7 +210,7 @@ pub fn use_remote() -> Remote {
         // A stream rather than a one-shot: a choice can be taken back while it
         // is still only a choice (`Peering::Idle` means "cancel"). Once a peer
         // is connected the UI stops offering it -- stopping then is a hang-up,
-        // which the peer would have to be told about. Ticket 29.
+        // which the peer has to be told about, so it goes through Leave.
         let (decide, decided) = futures_channel::mpsc::unbounded::<Peering>();
 
         match Args::get().peering.clone() {

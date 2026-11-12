@@ -1,11 +1,12 @@
-//! Reads the stats files of a test call and says whether it met S7.
+//! Reads the stats files of a test call and says whether it met the
+//! quality bar below.
 //!
 //! ```sh
-//! cargo run --release --bin s7-report -- alice.jsonl bob.jsonl carol.jsonl dave.jsonl
+//! cargo run --release --bin call-report -- alice.jsonl bob.jsonl carol.jsonl dave.jsonl
 //! ```
 //!
 //! Each file is what one participant wrote with `vdr --stats`: once a second,
-//! a line per person it received and a line about its own link. S7 asks, for
+//! a line per person it received and a line about its own link. The bar is, for
 //! every pair of (receiver, sender):
 //!
 //! - **frame rate:** at least 24 fps (a rolling 5 s mean, less half a frame of
@@ -64,7 +65,7 @@ struct Second {
 fn main() {
     let paths: Vec<String> = std::env::args().skip(1).collect();
     if paths.is_empty() {
-        eprintln!("usage: s7-report <stats.jsonl>...");
+        eprintln!("usage: call-report <stats.jsonl>...");
         std::process::exit(2);
     }
 
@@ -156,7 +157,7 @@ fn main() {
         println!("NO DATA: no received streams in these files.");
         std::process::exit(1);
     }
-    println!("S7: {}", if all_pass { "PASS" } else { "FAIL" });
+    println!("call: {}", if all_pass { "PASS" } else { "FAIL" });
     std::process::exit(if all_pass { 0 } else { 1 });
 }
 

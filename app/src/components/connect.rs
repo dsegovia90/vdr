@@ -1,10 +1,8 @@
 //! Choosing who to call, without the command line.
 //!
-//! **Inline, never an overlay.** Absolutely-positioned content paints but never
-//! receives clicks in this blitz revision — `Node::hit` will not descend into a
-//! child overflowing its parent's box — so a modal or popover here would look
-//! right and be dead to the mouse. Ticket 0 tracks the renderer fix; until then
-//! this is a row in normal flow, the same shape `dropdown.rs` was forced into.
+//! **A row in normal flow.** It was made inline because an older blitz would
+//! not deliver clicks to absolutely-positioned content. The pinned tag does, so
+//! an overlay would work here now; the row simply has not needed to change.
 //!
 //! This does not replace `--dial` / `--listen`. Those are how two instances get
 //! driven from a script, which is how the network path is tested; see

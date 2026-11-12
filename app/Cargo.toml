@@ -29,15 +29,16 @@ cameras = "0.3.2"
 #
 # Pinned to a git tag because blitz 0.2.x ships stylo 0.8, which fails to
 # compile once `derive_more`'s debug/eq features are unified into the graph.
-# `v0.3.0-beta.4` carries stylo 0.22 and wgpu 30 (ticket 0, moved from rev
-# `f83b2bc`). It is a tag, not crates.io, because no `dioxus-native` 0.7.x
+# `v0.3.0-beta.4` carries stylo 0.22 and wgpu 30 (moved from rev `f83b2bc`,
+# whose stylo no longer compiled). It is a tag, not crates.io, because no `dioxus-native` 0.7.x
 # release carries a new blitz; 0.8.0-alpha.3 does, but needs Dioxus 0.8.
 #
 # Known cost of beta.4: colours are oversaturated on wide-gamut (P3) screens.
 # wgpu 30's Metal backend tells the layer to do no colour matching. The fix is
-# merged upstream (wgpu #10286, anyrender #138) but unreleased; see ticket 0.
+# merged upstream (wgpu #10286, anyrender #138) but unreleased. Do not
+# compensate in our shader: that would double-correct once the fix ships.
 #
-# The unification used to come from `iroh-live`; ticket 20e removed it and the
+# The unification used to come from `iroh-live`; that dependency is gone and the
 # pin is still load-bearing, because `hang 0.20` (via moq-mux/moq-video) and
 # `iroh 1.1` both pull `derive_more` in on their own. Verify with
 # `cargo tree -i derive_more` before concluding this pin is stale.
@@ -55,7 +56,7 @@ futures-channel = "0.3"
 # with the set `moq-native` already asks for, so this adds nothing to the build.
 iroh = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false }
-# Settings persistence (ticket 17). `directories` gives the per-platform config
+# Settings persistence. `directories` gives the per-platform config
 # location -- `data_local_dir()`, which is what dioxus-sdk-storage's own desktop
 # backend uses, so this is the conventional spot and not one we invented.
 # `serde`/`serde_json` are already in the tree via the moq stack, so declaring
@@ -63,7 +64,7 @@ futures-util = { version = "0.3", default-features = false }
 #
 # NOT `dioxus-sdk-storage`, the official crate: it needs the `dioxus` umbrella
 # (31 packages) and `unwrap()`s every filesystem error, which would take the app
-# down on a read-only home directory. See `doc/dstack/vid/tickets/17.md`.
+# down on a read-only home directory.
 # The Copy button for our own key. dioxus-native's `convert_clipboard_data` is
 # `unimplemented!()` and blitz's clipboard is private to its keyboard handler,
 # so writing to the clipboard needs this directly. Already compiled underneath
@@ -82,8 +83,8 @@ tracing = "0.1"
 # default log filter in `main.rs` builds one.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# The moq stack: the whole network path, since ticket 20e retired the last of
-# `iroh-live`/`moq-media`. `hang` is deliberately NOT a direct dependency -- the
+# The moq stack: the whole network path (it replaced `iroh-live` and
+# `moq-media`). `hang` is deliberately NOT a direct dependency -- the
 # catalog types we touch reach us through `moq-mux`.
 #
 # Keep moq-video's `render` feature OFF. It used to be forbidden because it

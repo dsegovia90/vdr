@@ -123,11 +123,11 @@ fn pick_format(candidates: &[(cameras::PixelFormat, u32)], want: u32) -> Option<
 /// converted on the CPU by `frames::from_capture`, and MJPEG pays a JPEG
 /// decode before that conversion.
 ///
-/// **Deliberately not ticket 2b's ordering.** 2b chose NV12 as the capture
-/// format because it is cheaper to *encode* and uploads as planes rather than
+/// **Deliberately not NV12 first.** NV12 is the better capture format on
+/// paper, because it is cheaper to *encode* and uploads as planes rather than
 /// 4 bytes per pixel. Neither saving exists yet: captured NV12 goes through the
 /// same CPU conversion to RGBA as everything else, so preferring it here would
-/// cost frames today for a benefit that arrives with the 15a/2b work. Revisit
+/// cost frames today for a benefit that needs an NV12 upload path. Revisit
 /// when capture NV12 has a path that is not `to_rgba8`.
 fn cost(format: cameras::PixelFormat) -> u8 {
     match format {

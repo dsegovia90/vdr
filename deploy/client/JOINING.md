@@ -59,9 +59,9 @@ Start it from a terminal instead, so it writes measurements to a file:
 
 ```sh
 # macOS
-/Applications/Vdr.app/Contents/MacOS/vdr --relay "<invite link>" --stats ~/s7-<your-name>.jsonl
+/Applications/Vdr.app/Contents/MacOS/vdr --relay "<invite link>" --stats ~/call-<your-name>.jsonl
 # Linux
-./vdr --relay "<invite link>" --stats ~/s7-<your-name>.jsonl
+./vdr --relay "<invite link>" --stats ~/call-<your-name>.jsonl
 ```
 
 Check your clock is in sync first (macOS: `sntp -t 1 time.apple.com`; Linux:

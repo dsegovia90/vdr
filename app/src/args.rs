@@ -25,12 +25,12 @@
 //! vdr --encoder software                  # auto | hardware | software, auto by default
 //! vdr --ephemeral                         # a throwaway key, not the saved one
 //! vdr --encode-width 1920                 # encode at capture size, for A/B tests
-//! vdr --stats s7-alice.jsonl              # one line of measurements a second
+//! vdr --stats alice.jsonl                 # one line of measurements a second
 //! vdr --no-catchup                        # measure audio sync, never speed it up
 //! vdr --loopback --audio-stall 800        # hold audio back once, to make a backlog
 //! ```
 //!
-//! **The command line is not going away.** In-app key entry (19c) is a second
+//! **The command line is not going away.** In-app key entry is a second
 //! way in, not a replacement: driving two instances from a script is how the
 //! network path gets tested, and a headless session has no other way to do it.
 //!
@@ -69,14 +69,15 @@ use iroh::EndpointId;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Peering {
     /// No decision yet: bind an endpoint, show our key, and wait for the user
-    /// to dial someone or choose to wait for a call. The default (ticket 19c).
+    /// to dial someone or choose to wait for a call. The default, so the app can
+    /// be started without the command line.
     Idle,
     /// No peer: the second tile shows our own camera round-tripped through the
     /// codec instead. See [`super::loopback`].
     ///
-    /// Was the default until 19c. Kept behind `--loopback` because it is the
-    /// diagnostic that tells a broken pipeline apart from a broken connection --
-    /// 20d-1 was measured on it.
+    /// Was the default before in-app connecting. Kept behind `--loopback`
+    /// because it is the diagnostic that tells a broken pipeline apart from a
+    /// broken connection.
     Loopback,
     /// Wait for someone to dial us.
     Listen,
@@ -86,7 +87,7 @@ pub enum Peering {
     ///
     /// A second mode beside `Listen`/`Dial`, not a replacement: a 1:1 call
     /// still goes direct, which needs nothing running anywhere. Merging the two
-    /// is the topology switch's job (ticket 22).
+    /// (switching topology as a call grows) is not done yet.
     Join(url::Url),
 }
 
@@ -217,7 +218,7 @@ pub struct Args {
     /// looks fine. The bitrate follows the size, so this moves both.
     pub encode_width: Option<u32>,
     /// Where to append the once-a-second measurements (JSON lines), for the
-    /// `s7-report` tool. Off unless asked for.
+    /// `call-report` tool. Off unless asked for.
     pub stats: Option<std::path::PathBuf>,
     /// Measure a peer's audio sync but never speed it up (`--no-catchup`).
     /// For hearing the difference in one call, and a way out if it misbehaves.

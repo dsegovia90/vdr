@@ -8,6 +8,8 @@ set dotenv-load
 app    := justfile_directory() / "app"
 bundle := app / "target/dx/vdr/release/macos/Vdr.app/Contents/MacOS/vdr"
 log    := env("RUST_LOG", "vdr=info,moq_audio=info")
+# The Linux box `package-linux` builds on, as an ssh host.
+LINUX_HOST := env("LINUX_HOST", "desktop")
 
 default:
     @just --list
@@ -48,28 +50,28 @@ check:
 tailwind:
     cd {{app}} && ~/.dx/tools/tailwindcss-v4.1.5/tailwindcss --input tailwind.css --output assets/tailwind.css
 
-# Did a call meet S7? Pass each participant's --stats file.
+# Did a call meet the quality bar? Pass each participant's --stats file.
 report +files:
-    cargo run --manifest-path {{app}}/Cargo.toml --release --bin s7-report -- {{ files }}
+    cargo run --manifest-path {{app}}/Cargo.toml --release --bin call-report -- {{ files }}
 
 # Mac zip into dist/.
 package-mac:
     deploy/client/package-macos.sh
 
-# Portable Linux tarball, built on `desktop`, copied into dist/.
+# Portable Linux tarball, built over ssh on LINUX_HOST, copied into dist/.
 package-linux:
     #!/usr/bin/env bash
     set -euo pipefail
     commit=$(git rev-parse --short HEAD)
     rsync -a --delete --exclude '/app/target' --exclude '/target' --exclude '/dist' \
-      --exclude '/.claude' --exclude '/doc/dstack' --exclude '/.env' ./ desktop:projects/vid/
-    ssh desktop "cd ~/projects/vid && VID_COMMIT=$commit deploy/client/build-linux-portable.sh"
-    scp -q "desktop:projects/vid/dist/vid-linux-x86_64-$commit.tar.gz" dist/
+      --exclude '/.claude' --exclude '/doc/dstack' --exclude '/.env' ./ {{LINUX_HOST}}:projects/vid/
+    ssh {{LINUX_HOST}} "cd ~/projects/vid && VID_COMMIT=$commit deploy/client/build-linux-portable.sh"
+    scp -q "{{LINUX_HOST}}:projects/vid/dist/vid-linux-x86_64-$commit.tar.gz" dist/
     echo "dist/vid-linux-x86_64-$commit.tar.gz"
 
 # Linux log: dist/linux-build.log.
 
-# Both packages at once: macOS here, Linux on `desktop`; clears old ones first.
+# Both packages at once: macOS here, Linux on LINUX_HOST; clears old ones first.
 package:
     #!/usr/bin/env bash
     set -uo pipefail

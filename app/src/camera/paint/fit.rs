@@ -145,12 +145,7 @@ pub(super) fn row_stride(len: usize, width: u32, height: u32) -> u32 {
 pub enum Mirror {
     /// The local preview of your own camera.
     SelfView,
-    /// Remote participants, and anything bound for an encoder.
-    ///
-    /// Unconstructed until task 2a puts a decoder behind a `FrameSlot`. It
-    /// exists now because the alternative was leaving mirroring hardcoded on,
-    /// which is a bug the moment there is a second stream.
-    #[allow(dead_code)]
+    /// Remote participants, screen shares, and anything bound for an encoder.
     None,
 }
 

@@ -1,6 +1,6 @@
 # vid
 
-A camera preview built on [Dioxus 0.7](https://dioxuslabs.com/learn/0.7) running on
+A peer-to-peer video calling app built on [Dioxus 0.7](https://dioxuslabs.com/learn/0.7) running on
 **dioxus-native** ([Blitz](https://github.com/DioxusLabs/blitz)) — Stylo for CSS,
 Vello for painting. There is no webview and no JavaScript engine in this build.
 
@@ -62,9 +62,9 @@ used `use_wgpu` and `canvas { "src": id }`).
 - **`wgpu` is 30**, fixed by the pinned blitz tag (`v0.3.0-beta.4`) ->
   anyrender_vello_hybrid 0.11. Textures are handed to the renderer, so both must
   be the same wgpu version. On wide-gamut screens colours are oversaturated
-  until an upstream fix ships (ticket 0).
+  until an upstream fix (wgpu #10286) is released.
 - **No `<select>`.** Blitz ships no interactive select widget, hence
-  `components/dropdown.rs`.
+  `components/device_menu.rs`.
 - **The video element is positioned absolutely inside its tile.** It has no
   useful intrinsic size, and as an ordinary flex/grid child its own pixel size
   fed back into the grid, resizing every frame. Out of layout, it can only take

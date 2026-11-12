@@ -11,7 +11,7 @@
 //! the room is a client of. Each participant publishes once and the relay fans
 //! out, so the uplink cost does not grow with the room. To this module a relay
 //! is just a server we dial, which is why `--dial` and `--relay` share
-//! [`connect`]. A participant hosting the relay itself is ticket 22.
+//! [`connect`]. A participant hosting the relay itself is not built yet.
 //!
 //! Every arm converges on [`Peer`], so the claim above is structural rather
 //! than a description: anything per-connection is reached the same way
@@ -20,7 +20,8 @@
 //! Each side keeps **two origins** -- `outbound` for what we publish, `inbound`
 //! for what arrives. They are separate `Origin`s, so both peers can publish at
 //! the same well-known path without colliding, and neither needs to know the
-//! other's id to subscribe. Per-participant paths are ticket 12's job.
+//! other's id to subscribe. Rooms are different: there each participant
+//! publishes under its own id (see [`participant_of`]).
 //!
 //! What we hand the encoder is the same [`FrameFeed`] the loopback uses: the
 //! pump's fan-out tap. Nothing in `camera/` knows whether a peer is involved.
@@ -445,8 +446,8 @@ fn controller_of(path: &str) -> Option<&str> {
 ///
 /// **Self-declared, and therefore not proof.** Between two peers who dialled
 /// each other this is simply who they said they were, which is all it needs to
-/// be; once a relay is in the middle, token path-scoping is what makes it
-/// binding (ticket 23's job, not this one's).
+/// be; once a relay is in the middle, only a token scoped to each participant's
+/// path would make it binding, and a room token is scoped to the room.
 fn participant_of(path: &str) -> Option<&str> {
     let id = path.strip_suffix(CAMERA)?.strip_suffix('/')?;
     (!id.is_empty()).then_some(id)
@@ -698,7 +699,7 @@ async fn run(
 
     loop {
         // The decision may already be made (`--listen` / `--dial`) or may be the
-        // user's to make (19c). Either way it is awaited *here*, after binding and
+        // user's to make, in the app. Either way it is awaited *here*, after binding and
         // before the camera: our key must be visible while we wait, and waiting on
         // the camera first would hide it behind a device that may never open.
         report(
@@ -1726,7 +1727,7 @@ fn room_name(room: &Option<String>) -> &str {
 }
 
 /// Appends one second's measurements: a line per person we receive, and one
-/// for our link. Read by `s7-report`.
+/// for our link. Read by `call-report`.
 ///
 /// Delays are only as good as the two machines' clocks agree (NTP keeps that to
 /// a few ms), and run from encode, a few ms after capture, to decode -- the
@@ -1970,8 +1971,8 @@ impl Drop for Invited {
 /// Opens a decoder from one participant's catalog and drains frames into their
 /// slot.
 ///
-/// **The catalog is theirs, never a local guess.** 20c failed here by passing a
-/// *local* config and a hardcoded track name instead, and got `Net(Remote(30))`
+/// **The catalog is theirs, never a local guess.** An early version failed here
+/// by passing a *local* config and a hardcoded track name instead, and got `Net(Remote(30))`
 /// for it.
 async fn watch(
     broadcast: moq_net::broadcast::Consumer,
@@ -1983,8 +1984,8 @@ async fn watch(
     stats: Arc<PeerStats>,
     metrics: Arc<Metrics>,
 ) {
-    // The catalog is the peer's description of what it is sending. 20c failed
-    // here by passing a *local* config and a hardcoded track name instead, and
+    // The catalog is the peer's description of what it is sending. An early
+    // version failed here by passing a *local* config and a hardcoded track name instead, and
     // got `Net(Remote(30))` for it.
     let mut catalog = match moq_mux::catalog::Consumer::<()>::new(
         &broadcast,

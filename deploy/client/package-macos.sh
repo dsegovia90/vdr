@@ -5,7 +5,7 @@
 #
 # `dx build`, not `dx bundle`: `dx bundle` hands off to a bundler that writes
 # its own minimal Info.plist and drops the camera and microphone usage keys,
-# and macOS kills an app that lacks them on first use (CLAUDE.md).
+# and macOS kills an app that lacks them on first use.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"

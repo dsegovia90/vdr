@@ -15,9 +15,9 @@ id (`Node::with` is `get(id).unwrap()`; `hoisted_child_position` indexes the
 tree). A pointer event in that window panicked the UI thread:
 
 - `node.rs:1472` (hoisted): picking a device in a menu removed its z-indexed
-  layer and panel (vid ticket 42).
+  layer and panel.
 - `node.rs:1483` (`paint_children`): a tile appearing as someone joined, and
-  Leave clearing every tile (vid 26, real call).
+  Leave clearing every tile (seen in a real call).
 
 - `layout/paint_tree.rs` `hoisted_content_bbox`: the helper both walks
   call, indexing the same hoisted children (`tree[child.node_id]`). A peer
