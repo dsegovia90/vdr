@@ -42,7 +42,7 @@ use super::status::RemoteStatus;
 use super::{Feed, ParticipantEvent};
 use crate::args::Peering;
 use super::Metrics;
-use super::metrics::{Ask, Clock, FpsMeter, PeerStats, Request};
+use super::metrics::{Ask, Clock, Counts, FpsMeter, Path, PeerStats, Request, classify};
 use crate::audio::Controls;
 use crate::camera::{FrameFeed, FrameSlot, encode_size, from_decoded};
 
@@ -80,6 +80,45 @@ struct Peer {
     /// session. The listening side reports its own from inside the accept loop
     /// instead, since its session is what it has.
     stats: Option<moq_tokio::connection::Monitor>,
+}
+
+/// Samples which way our iroh traffic goes, once a second, for as long as the
+/// attempt lasts; logs each change, so a log answers the question afterwards.
+///
+/// From the endpoint's byte counters: see [`Path`] for why
+/// those and not the connection's paths, and for the relay-trickle caveat.
+async fn watch_path(endpoint: moq_tokio::iroh::Endpoint, metrics: Arc<Metrics>) {
+    let read = || {
+        let socket = &endpoint.metrics().socket;
+        Counts {
+            direct: socket.send_ipv4.get()
+                + socket.send_ipv6.get()
+                + socket.recv_data_ipv4.get()
+                + socket.recv_data_ipv6.get(),
+            relay: socket.send_relay.get() + socket.recv_data_relay.get(),
+        }
+    };
+    let mut prev = read();
+    let mut shown = Path::Unknown;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    // The first tick is immediate and would compare a sample with itself.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let next = read();
+        let path = classify(&prev, &next);
+        prev = next;
+        metrics.set_path(path);
+        if path != shown {
+            shown = path;
+            match path {
+                Path::Direct => tracing::info!("iroh path: direct"),
+                Path::Relayed => tracing::info!("iroh path: via n0 relay"),
+                Path::Mixed => tracing::info!("iroh path: mixed"),
+                Path::Unknown => tracing::info!("iroh path: idle"),
+            }
+        }
+    }
 }
 
 /// Everything [`connect`] needs, named rather than positional.
@@ -823,6 +862,14 @@ async fn run(
 
         // Read before the match below takes `peering` apart.
         let in_room = matches!(peering, Peering::Join(_));
+        // Only an iroh call has a path worth naming: an `https://` room goes
+        // over plain QUIC, and the endpoint's counters would only ever say
+        // "nothing moved".
+        let over_iroh = match &peering {
+            Peering::Join(url) => url.scheme() == "iroh",
+            Peering::Dial(_) | Peering::Listen => true,
+            Peering::Loopback | Peering::Idle => false,
+        };
         let peer_transport: Peer = match peering {
             Peering::Dial(peer) => {
                 report(RemoteStatus::Dialing {
@@ -1009,6 +1056,7 @@ async fn run(
                 }
             })
         });
+        let pathing = over_iroh.then(|| Abort(tokio::spawn(watch_path(endpoint.clone(), metrics.clone()))));
 
         // The person's wish to share a screen, served for this attempt. Its
         // own broadcast on the same outbound origin, so a share started now
@@ -1227,6 +1275,8 @@ async fn run(
         if let Some(reporting) = reporting {
             reporting.abort();
         }
+        // Before the clear, which resets the path, so nothing writes after it.
+        drop(pathing);
         metrics.clear();
         drop(aec_report);
         controls.detach();

@@ -19,7 +19,7 @@ use std::time::Duration;
 use dioxus_native::prelude::*;
 
 use crate::channel::use_channel;
-use crate::net::Metrics;
+use crate::net::{Metrics, Path};
 
 /// How often the numbers are sampled.
 ///
@@ -36,6 +36,7 @@ struct Sample {
     estimate_kbps: Option<u32>,
     encode_size: Option<(u32, u32)>,
     codecs: (Option<String>, Option<String>),
+    path: Path,
 }
 
 #[derive(Clone, PartialEq, Props)]
@@ -62,6 +63,7 @@ pub fn StatsRow(props: StatsProps) -> Element {
                             estimate_kbps: metrics.estimate_kbps(),
                             encode_size: metrics.encode_size(),
                             codecs: metrics.codecs(),
+                            path: metrics.path(),
                         };
                         if tx.unbounded_send(next).is_err() {
                             return;
@@ -101,6 +103,14 @@ pub fn StatsRow(props: StatsProps) -> Element {
     }
     if let Some(loss) = reading.loss {
         parts.push(format!("{loss:.2}% loss"));
+    }
+    // Only ever set on an iroh call: whether it reaches the peer directly or
+    // through n0's relay servers.
+    match reading.path {
+        Path::Direct => parts.push("direct".to_string()),
+        Path::Relayed => parts.push("via n0 relay".to_string()),
+        Path::Mixed => parts.push("mixed path".to_string()),
+        Path::Unknown => {}
     }
 
     // Nothing to say before a call connects, and an empty row of dashes would

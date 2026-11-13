@@ -18,7 +18,7 @@
 //! rather than an absence of information.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,62 @@ impl std::fmt::Display for AecStats {
     }
 }
 
+/// Which way our iroh traffic went over the last sample: straight to the peer,
+/// or through one of n0's relay servers.
+///
+/// **Read off the endpoint's byte counters, not off the connection.**
+/// moq-tokio never hands out the iroh `Connection`, so watching its paths
+/// directly is out of reach. The endpoint's counters are the next best thing,
+/// and here they are exact rather than approximate: a call has one iroh peer
+/// (the relay, or the person dialled), so endpoint-wide is per-connection.
+///
+/// This is the measurement, not the enforcement. Known caveat, unverified:
+/// iroh may keep a trickle going over the relay after it has chosen a direct
+/// path (keepalives), which would read as `Mixed` on a call whose media is in
+/// fact direct. We show what the counters say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Path {
+    /// Nothing moved, or the call is not over iroh at all.
+    #[default]
+    Unknown = 0,
+    Direct = 1,
+    Relayed = 2,
+    /// Both moved: the moment of a migration, or a relay trickle beside a
+    /// direct path.
+    Mixed = 3,
+}
+
+impl Path {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Path::Direct,
+            2 => Path::Relayed,
+            3 => Path::Mixed,
+            _ => Path::Unknown,
+        }
+    }
+}
+
+/// Running byte totals in both directions, split by how they travelled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Counts {
+    /// Over IPv4 or IPv6, straight to the peer.
+    pub direct: u64,
+    /// Through an n0 relay server.
+    pub relay: u64,
+}
+
+/// Which path carried traffic between two samples of the counters.
+pub(super) fn classify(prev: &Counts, next: &Counts) -> Path {
+    match (next.direct > prev.direct, next.relay > prev.relay) {
+        (true, false) => Path::Direct,
+        (false, true) => Path::Relayed,
+        (true, true) => Path::Mixed,
+        (false, false) => Path::Unknown,
+    }
+}
+
 /// Live numbers for the current call.
 #[derive(Default)]
 pub struct Metrics {
@@ -92,6 +148,8 @@ pub struct Metrics {
     /// ("videotoolbox", "vaapi", "openh264"...), so a tester can say which
     /// they got without opening a log.
     codecs: std::sync::Mutex<(Option<String>, Option<String>)>,
+    /// A [`Path`], as its discriminant.
+    path: AtomicU8,
 }
 
 impl Metrics {
@@ -123,6 +181,15 @@ impl Metrics {
     /// The encoder and decoder backends in use, as `(encoder, decoder)`.
     pub fn codecs(&self) -> (Option<String>, Option<String>) {
         self.codecs.lock().map(|codecs| codecs.clone()).unwrap_or_default()
+    }
+
+    /// Whether our iroh traffic is going direct or through n0's relays.
+    pub fn path(&self) -> Path {
+        Path::from_u8(self.path.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn set_path(&self, path: Path) {
+        self.path.store(path as u8, Ordering::Relaxed);
     }
 
     pub(super) fn set_encoder(&self, name: &str) {
@@ -188,6 +255,7 @@ impl Metrics {
         if let Ok(mut codecs) = self.codecs.lock() {
             *codecs = (None, None);
         }
+        self.set_path(Path::Unknown);
         for field in [
             &self.rtt_ms,
             &self.loss_bp,
@@ -811,6 +879,32 @@ impl Drop for FpsMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_is_whichever_counters_moved() {
+        let at = |direct, relay| Counts { direct, relay };
+        assert_eq!(classify(&at(0, 0), &at(0, 0)), Path::Unknown);
+        assert_eq!(classify(&at(500, 300), &at(500, 300)), Path::Unknown);
+        assert_eq!(classify(&at(0, 0), &at(1200, 0)), Path::Direct);
+        assert_eq!(classify(&at(0, 0), &at(0, 1200)), Path::Relayed);
+        // Hole punching succeeds mid-second: both moved.
+        assert_eq!(classify(&at(0, 5000), &at(800, 6000)), Path::Mixed);
+        // ...and the second after, only direct does.
+        assert_eq!(classify(&at(800, 6000), &at(9000, 6000)), Path::Direct);
+    }
+
+    #[test]
+    fn a_path_survives_its_atomic() {
+        let metrics = Metrics::default();
+        assert_eq!(metrics.path(), Path::Unknown);
+        for path in [Path::Direct, Path::Relayed, Path::Mixed, Path::Unknown] {
+            metrics.set_path(path);
+            assert_eq!(metrics.path(), path);
+        }
+        metrics.set_path(Path::Relayed);
+        metrics.clear();
+        assert_eq!(metrics.path(), Path::Unknown);
+    }
 
     #[test]
     fn a_replaced_share_cannot_touch_the_next() {
