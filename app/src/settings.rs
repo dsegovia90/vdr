@@ -95,6 +95,12 @@ pub fn log_path() -> Option<std::path::PathBuf> {
 /// and the log of a failed call was lost. The startup line says where the
 /// log went.
 ///
+/// Nothing removes the folder on exit, on purpose: the log is what a test run
+/// is read by afterwards, and a crash skips the exit path anyway. The system
+/// sweeps its temp folder on its own (macOS after three days unused and at
+/// reboot, Linux at reboot or by systemd-tmpfiles), which is why it is the
+/// temp folder and not a scratch location of our own.
+///
 /// Read from the raw arguments rather than [`crate::args::Args`], because
 /// logging is set up before the arguments are parsed, and the parser reports
 /// through logging.
