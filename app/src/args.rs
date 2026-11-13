@@ -23,7 +23,7 @@
 //! vdr --camera facetime                   # picks a camera by name
 //! vdr --quality high                      # 720p rung; low | mid | high, mid by default
 //! vdr --encoder software                  # auto | hardware | software, auto by default
-//! vdr --ephemeral                         # a throwaway key, not the saved one
+//! vdr --ephemeral                         # a throwaway key and data folder
 //! vdr --encode-width 1920                 # encode at capture size, for A/B tests
 //! vdr --stats alice.jsonl                 # one line of measurements a second
 //! vdr --no-catchup                        # measure audio sync, never speed it up

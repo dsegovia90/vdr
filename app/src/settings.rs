@@ -40,8 +40,7 @@ const IDENTITY: &str = "identity.key";
 /// last week still dials. Deleting this file is how you stop being that person,
 /// and `--ephemeral` is how you run without one at all.
 pub fn identity_path() -> Option<std::path::PathBuf> {
-    let dirs = directories::BaseDirs::new()?;
-    let dir = dirs.data_local_dir().join(APP_DIR);
+    let dir = data_dir()?;
     if let Err(error) = std::fs::create_dir_all(&dir) {
         tracing::warn!("could not create {}: {error}", dir.display());
         return None;
@@ -80,10 +79,31 @@ fn private(path: &std::path::Path) {
 /// from. `None` where the platform has no such folder, and then the log goes to
 /// stderr only.
 pub fn log_path() -> Option<std::path::PathBuf> {
-    let dirs = directories::BaseDirs::new()?;
-    let dir = dirs.data_local_dir().join(APP_DIR);
+    let dir = data_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("vdr.log"))
+}
+
+/// The app's data folder: identity, settings and logs.
+///
+/// An `--ephemeral` run gets its own folder under the system temp directory
+/// (`$TMPDIR` on macOS, `/tmp` on Linux), named by process id, and leaves the
+/// real one alone. The flag already means "nothing of this run persists",
+/// and a second copy of the app on the same machine, started to test
+/// something while someone is on a real call, would otherwise write the
+/// same log file and rotate the real call's log away. That happened once,
+/// and the log of a failed call was lost. The startup line says where the
+/// log went.
+///
+/// Read from the raw arguments rather than [`crate::args::Args`], because
+/// logging is set up before the arguments are parsed, and the parser reports
+/// through logging.
+pub fn data_dir() -> Option<std::path::PathBuf> {
+    if std::env::args().any(|arg| arg == "--ephemeral") {
+        return Some(std::env::temp_dir().join(format!("{APP_DIR}-{}", std::process::id())));
+    }
+    let dirs = directories::BaseDirs::new()?;
+    Some(dirs.data_local_dir().join(APP_DIR))
 }
 
 /// Everything the app remembers between launches.
@@ -226,8 +246,7 @@ impl Settings {
 /// `None` rather than a panic: `BaseDirs::new` fails when the environment has no
 /// home directory at all, which is unusual but not our business to crash over.
 fn path() -> Option<std::path::PathBuf> {
-    let dirs = directories::BaseDirs::new()?;
-    Some(dirs.data_local_dir().join(APP_DIR).join(FILE))
+    Some(data_dir()?.join(FILE))
 }
 
 /// Which camera to open on startup.

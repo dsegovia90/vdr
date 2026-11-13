@@ -31,12 +31,19 @@ fn main() {
 /// the file. Present on master too; quietened here rather than fixed.
 const DEFAULT_LOG: &str = "warn,vdr=info,moq_audio=info,vello_common=error";
 
+/// How many earlier runs' logs are kept beside the current one.
+///
+/// One was not enough: someone reporting a call that went wrong usually
+/// starts the app again before they get round to sending anything, and a
+/// second start (a quick retry, a test instance on the same machine) took the
+/// one copy with it. Three covers an afternoon.
+const KEPT_LOGS: u32 = 3;
+
 /// Logs to stderr and to `vdr.log` in the app's data folder.
 ///
-/// The file is truncated at each launch, with the previous run kept beside it
-/// as `vdr.prev.log`: someone reporting a call that went wrong usually starts
-/// the app again before they get round to sending anything. An explicit
-/// `RUST_LOG` still decides what is written to both.
+/// The file is truncated at each launch, with earlier runs kept beside it as
+/// `vdr.1.log` (the last run) up to `vdr.3.log`. An explicit `RUST_LOG` still
+/// decides what is written to all of them.
 fn init_logging() {
     use tracing_subscriber::prelude::*;
 
@@ -45,7 +52,7 @@ fn init_logging() {
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG))
     };
     let file = settings::log_path().and_then(|path| {
-        let _ = std::fs::rename(&path, path.with_file_name("vdr.prev.log"));
+        rotate(&path);
         std::fs::File::create(&path).ok()
     });
 
@@ -61,6 +68,23 @@ fn init_logging() {
     if let Some(path) = settings::log_path() {
         tracing::info!("logging to {}", path.display());
     }
+}
+
+/// Shifts `vdr.log` to `vdr.1.log`, `vdr.1.log` to `vdr.2.log`, and so on,
+/// dropping the oldest. Renames only, so a run with no log folder loses
+/// nothing but the file.
+fn rotate(path: &std::path::Path) {
+    let numbered = |n: u32| path.with_file_name(format!("vdr.{n}.log"));
+    // Before the numbering, the one kept run was `vdr.prev.log`. Carried over
+    // once as the last run, so an upgrade does not lose it.
+    let prev = path.with_file_name("vdr.prev.log");
+    if prev.exists() && !numbered(1).exists() {
+        let _ = std::fs::rename(&prev, numbered(1));
+    }
+    for n in (1..KEPT_LOGS).rev() {
+        let _ = std::fs::rename(numbered(n), numbered(n + 1));
+    }
+    let _ = std::fs::rename(path, numbered(1));
 }
 
 /// Picks rustls's crypto backend for the whole process, once, before anything
@@ -117,5 +141,42 @@ fn App() -> Element {
         div { class: "flex h-screen flex-col gap-4 overflow-hidden p-6",
             components::CallScreen {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_last_three_runs_are_kept() {
+        let dir = std::env::temp_dir().join(format!("vdr-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vdr.log");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        for run in 1..=5 {
+            rotate(&path);
+            std::fs::write(&path, run.to_string()).unwrap();
+        }
+        assert_eq!(read("vdr.log").as_deref(), Some("5"));
+        assert_eq!(read("vdr.1.log").as_deref(), Some("4"));
+        assert_eq!(read("vdr.2.log").as_deref(), Some("3"));
+        assert_eq!(read("vdr.3.log").as_deref(), Some("2"));
+        assert_eq!(read("vdr.4.log"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_old_single_copy_becomes_the_last_run() {
+        let dir = std::env::temp_dir().join(format!("vdr-rotate-prev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vdr.log");
+        std::fs::write(dir.join("vdr.prev.log"), "old").unwrap();
+        std::fs::write(&path, "last").unwrap();
+        rotate(&path);
+        assert_eq!(std::fs::read_to_string(dir.join("vdr.1.log")).unwrap(), "last");
+        assert_eq!(std::fs::read_to_string(dir.join("vdr.2.log")).unwrap(), "old");
+        assert!(!dir.join("vdr.prev.log").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
