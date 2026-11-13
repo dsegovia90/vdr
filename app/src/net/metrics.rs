@@ -122,9 +122,20 @@ pub(super) struct Counts {
     pub relay: u64,
 }
 
+/// Bytes per sample under which a side is a heartbeat, not traffic.
+///
+/// iroh keeps the relay path alive as a backup while a direct path carries
+/// the call, with a QUIC keepalive every few seconds: measured on a LAN call
+/// as a one-second "mixed" blip every ten seconds, a few dozen bytes. Media
+/// is hundreds of kilobytes a second, so anything under this is the
+/// heartbeat. The same floor applies to the direct side, where a probe is
+/// not a path either.
+const HEARTBEAT: u64 = 1024;
+
 /// Which path carried traffic between two samples of the counters.
 pub(super) fn classify(prev: &Counts, next: &Counts) -> Path {
-    match (next.direct > prev.direct, next.relay > prev.relay) {
+    let moved = |next: u64, prev: u64| next.saturating_sub(prev) > HEARTBEAT;
+    match (moved(next.direct, prev.direct), moved(next.relay, prev.relay)) {
         (true, false) => Path::Direct,
         (false, true) => Path::Relayed,
         (true, true) => Path::Mixed,
@@ -888,9 +899,13 @@ mod tests {
         assert_eq!(classify(&at(0, 0), &at(1200, 0)), Path::Direct);
         assert_eq!(classify(&at(0, 0), &at(0, 1200)), Path::Relayed);
         // Hole punching succeeds mid-second: both moved.
-        assert_eq!(classify(&at(0, 5000), &at(800, 6000)), Path::Mixed);
+        assert_eq!(classify(&at(0, 5000), &at(8000, 6500)), Path::Mixed);
         // ...and the second after, only direct does.
-        assert_eq!(classify(&at(800, 6000), &at(9000, 6000)), Path::Direct);
+        assert_eq!(classify(&at(8000, 6500), &at(90000, 6500)), Path::Direct);
+        // The relay keepalive beside a direct call is not a path.
+        assert_eq!(classify(&at(90000, 6500), &at(180000, 6560)), Path::Direct);
+        // Nor is a probe beside a relayed one.
+        assert_eq!(classify(&at(0, 6500), &at(60, 96500)), Path::Relayed);
     }
 
     #[test]
