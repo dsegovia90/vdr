@@ -108,15 +108,20 @@ async fn watch_path(endpoint: moq_tokio::iroh::Endpoint, metrics: Arc<Metrics>) 
         let next = read();
         let path = classify(&prev, &next);
         prev = next;
+        // A quiet second says nothing about the path, so the last answer
+        // stands: alone in a room nothing flows for minutes, and a word that
+        // blinks out is read as the connection dropping. The attempt's end
+        // clears it.
+        if path == Path::Unknown || path == shown {
+            continue;
+        }
+        shown = path;
         metrics.set_path(path);
-        if path != shown {
-            shown = path;
-            match path {
-                Path::Direct => tracing::info!("iroh path: direct"),
-                Path::Relayed => tracing::info!("iroh path: via n0 relay"),
-                Path::Mixed => tracing::info!("iroh path: mixed"),
-                Path::Unknown => tracing::info!("iroh path: idle"),
-            }
+        match path {
+            Path::Direct => tracing::info!("iroh path: direct"),
+            Path::Relayed => tracing::info!("iroh path: via n0 relay"),
+            Path::Mixed => tracing::info!("iroh path: mixed"),
+            Path::Unknown => {}
         }
     }
 }
