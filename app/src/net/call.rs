@@ -663,6 +663,12 @@ pub(super) fn spawn(
                 return;
             };
             runtime.block_on(async move {
+                // Every status passes through the sleep guard on its way out,
+                // the final one included, so the guard sees them in the order
+                // the interface does.
+                let (relay, statuses) = futures_channel::mpsc::unbounded();
+                tokio::spawn(crate::awake::follow(statuses, status));
+                let status = relay;
                 match run(decisions, feed, &status, participants, controls, metrics, local, share).await {
                     Ok(()) => {
                         tracing::info!("call ended");
