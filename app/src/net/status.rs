@@ -29,9 +29,10 @@ pub enum RemoteStatus {
         /// What was wrong with it.
         reason: String,
     },
-    /// Endpoint is up; waiting for the camera to produce a frame, because the
-    /// encoder cannot be built without one to size it from.
-    AwaitingCamera,
+    /// A destination is chosen and the call's own broadcasts are being set up,
+    /// before listening, dialing or joining. Brief: it no longer waits on the
+    /// camera, whose video joins the call whenever its first frame arrives.
+    Preparing,
     /// Listening for an incoming call. `me` is the key the peer needs.
     Listening {
         /// Our own endpoint id.
@@ -56,7 +57,7 @@ pub enum RemoteStatus {
         /// Which room, and on which relay.
         room: String,
     },
-    /// Connected, and the peer's video is arriving.
+    /// Connected: the peer's catalog has arrived (their video, if any, follows).
     Connected {
         /// The peer's endpoint id.
         ///
@@ -122,10 +123,9 @@ impl RemoteStatus {
     /// which needed a channel to tell the peer on, and there is one. The button
     /// says so rather than saying "cancel".
     ///
-    /// [`AwaitingCamera`](Self::AwaitingCamera) counts, for two reasons. It is
-    /// the state between choosing and listening — a second or two of camera wait
-    /// and encoder probe — and leaving it out made the controls vanish and come
-    /// back, which read as a flash. It is also **genuinely** cancellable: a
+    /// [`Preparing`](Self::Preparing) counts, for two reasons. It is the state
+    /// between choosing and listening, and leaving it out made the controls
+    /// vanish and come back, which read as a flash. It is also **genuinely** cancellable: a
     /// cancel sent during it waits in the decision channel and is taken by the
     /// `select!` as soon as that is reached, so the button is not a decoration.
     ///
@@ -135,7 +135,7 @@ impl RemoteStatus {
     pub fn is_cancellable(&self) -> bool {
         matches!(
             self,
-            Self::AwaitingCamera
+            Self::Preparing
                 | Self::Listening { .. }
                 | Self::Dialing { .. }
                 | Self::Joining { .. }
@@ -153,7 +153,7 @@ impl fmt::Display for RemoteStatus {
             Self::Binding => write!(f, "Starting the endpoint..."),
             Self::Idle { me } => write!(f, "Ready. Your key: {me}"),
             Self::BadKey { reason } => write!(f, "That is not a key or a room URL: {reason}"),
-            Self::AwaitingCamera => write!(f, "Waiting for the camera..."),
+            Self::Preparing => write!(f, "Starting the call..."),
             Self::Listening { me } => write!(f, "Waiting for a call. Your key: {me}"),
             Self::Dialing { peer } => write!(f, "Dialing {peer}..."),
             Self::Joining { room } => write!(f, "Joining {room}..."),

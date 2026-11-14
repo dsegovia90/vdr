@@ -541,6 +541,21 @@ pub(super) async fn video_track(
     config: &mut moq_video::encode::Config,
     priority: u8,
 ) -> Result<(moq_mux::catalog::Producer, moq_video::encode::Producer), String> {
+    let catalog = moq_mux::catalog::Producer::new(broadcast, Default::default())
+        .map_err(|error| format!("could not create a catalog: {error:#}"))?;
+    let producer = add_video(broadcast, &catalog, config, priority).await?;
+    Ok((catalog, producer))
+}
+
+/// [`video_track`] into a catalog that already exists, which may already be
+/// published: the camera's video joins its broadcast whenever the first frame
+/// arrives, after the microphone and possibly mid-call.
+async fn add_video(
+    broadcast: &moq_net::broadcast::Producer,
+    catalog: &moq_mux::catalog::Producer,
+    config: &mut moq_video::encode::Config,
+    priority: u8,
+) -> Result<moq_video::encode::Producer, String> {
     config.kind = encoder_kind();
     let rendition = match config.probe().await {
         Ok(rendition) => rendition,
@@ -554,14 +569,11 @@ pub(super) async fn video_track(
         }
         Err(error) => return Err(format!("could not probe the encoder: {error:#}")),
     };
-    let catalog = moq_mux::catalog::Producer::new(broadcast, Default::default())
-        .map_err(|error| format!("could not create a catalog: {error:#}"))?;
     let track = broadcast
         .create_track(TRACK, catalog.track_info(priority))
         .map_err(|error| format!("could not create a track: {error:#}"))?;
-    let producer = moq_video::encode::Producer::with_track(track, catalog.clone(), rendition)
-        .map_err(|error| format!("could not publish video: {error:#}"))?;
-    Ok((catalog, producer))
+    moq_video::encode::Producer::with_track(track, catalog.clone(), rendition)
+        .map_err(|error| format!("could not publish video: {error:#}"))
 }
 
 /// [`FRAMERATE`] as the encoder takes it: an exact fraction.
@@ -781,28 +793,17 @@ async fn run(
             continue;
         }
 
-        report(RemoteStatus::AwaitingCamera);
-        let Some(waiting) = parked.take() else {
+        report(RemoteStatus::Preparing);
+        // **The call does not wait for the camera.** Its video is added by the
+        // encode thread when the first frame arrives, which for someone whose
+        // camera is off may be mid-call or never; until then the broadcast
+        // carries the microphone alone.
+        let Some(feed) = parked.take() else {
             return Err("the camera feed is gone".to_string());
         };
-        let (mut feed, width, height) = tokio::task::spawn_blocking(move || {
-            let mut feed = waiting;
-
-            let first = feed.wait()?;
-            Some((feed, first.width, first.height))
-        })
-        .await
-        .map_err(|error| format!("the camera wait failed: {error}"))?
-        .ok_or_else(|| "the camera closed before a frame arrived".to_string())?;
-
-        // Encoded smaller than captured, when the camera insists on more than the
-    // link can carry. The bitrate follows from the size, so this is where it
-    // gets decided.
-    let (width, height, scale) = encode_size(width, height);
-    metrics.set_encode_size(width, height);
-    let mut config = moq_video::encode::Config::new(width, height, framerate());
-    let opening_bitrate = crate::camera::bitrate_for(width, height, FRAMERATE);
-    config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(opening_bitrate));
+    // The encoder's opening bitrate, set by the encode thread once a frame has
+    // sized it, and the rate loop's ceiling from then on.
+    let ceiling: adapt::Ceiling = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Filled in by the rate loop below, read by the encode loop. Stays empty
     // unless this attempt turns out to be one that can measure the link.
     let target: adapt::Target = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -815,8 +816,9 @@ async fn run(
         let mut broadcast = outbound
             .create_broadcast(camera_path(&me.to_string()))
             .map_err(|error| format!("could not create a broadcast: {error:#}"))?;
-        // Probed before anything is announced; see `video_track`.
-        let (catalog, mut producer) = video_track(&mut broadcast, &mut config, VIDEO_PRIORITY).await?;
+        // One catalog for the microphone now and the camera whenever it comes.
+        let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default())
+            .map_err(|error| format!("could not create a catalog: {error:#}"))?;
 
         // Announced beside the camera, and said before anything is shown: the
         // peer knows we are here whether or not a frame ever arrives.
@@ -847,7 +849,7 @@ async fn run(
 
         let engine = audio::open_playback(&controls).await;
         let mut aec_report = None;
-        match audio::publish(broadcast.clone(), catalog, engine.as_ref()) {
+        match audio::publish(broadcast.clone(), catalog.clone(), engine.as_ref()) {
             Ok((publication, driver, canceller)) => {
                 controls.attach(publication);
                 audio::drive(driver);
@@ -856,7 +858,8 @@ async fn run(
             }
             Err(error) => tracing::warn!("[audio] the microphone is not being published: {error}"),
         }
-        // The camera broadcast likewise, once its catalog and tracks exist.
+        // The camera broadcast likewise, once its catalog and the microphone's
+        // track exist. Its video track is not here yet; see the encode thread.
         broadcast
             .announce(moq_net::origin::Route::default())
             .map_err(|error| format!("could not announce our camera: {error:#}"))?;
@@ -1054,7 +1057,7 @@ async fn run(
             stats,
         } = peer_transport;
         let rate = bandwidth
-            .map(|bandwidth| adapt::spawn(bandwidth, opening_bitrate, target.clone(), metrics.clone()));
+            .map(|bandwidth| adapt::spawn(bandwidth, ceiling.clone(), target.clone(), metrics.clone()));
         let reporting = stats.map(|stats| {
             let metrics = metrics.clone();
             tokio::spawn(async move {
@@ -1119,15 +1122,24 @@ async fn run(
         // so the button waits on a frame.
         //
         // It owns the feed, the encoder and the producer while it runs and
-        // hands all three back on the way out, because the next attempt needs
-        // the feed and this one still has to flush.
+        // hands the feed and the producer back on the way out, because the
+        // next attempt needs the feed and this one still has to flush.
+        //
+        // **It is also where the video starts.** It waits for the camera's
+        // first frame, sizes the encoder from it, and only then adds the video
+        // track to the broadcast. A camera that is off holds this thread, not
+        // the call; a camera turned on mid-call starts the video then.
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut encoding = tokio::task::spawn_blocking({
             let metrics = metrics.clone();
             let stop = stop.clone();
             let target = target.clone();
+            let ceiling = ceiling.clone();
             let keyframe = keyframe.clone();
             let local = local.clone();
+            let broadcast = broadcast.clone();
+            let catalog = catalog.clone();
+            let runtime = tokio::runtime::Handle::current();
             // **The encoder is built here, on the thread that uses it.** It
             // is not `Send` (a hardware session belongs to the thread that
             // opened it), so it can neither be handed in nor handed back. For
@@ -1135,13 +1147,46 @@ async fn run(
             // producer go back: the leave sequence below needs the media
             // finished before it says goodbye.
             move || {
+                let mut feed = feed;
+                // Taken and dropped, not encoded, as before this waited
+                // outside: the tap keeps the last frame offered after the
+                // camera is switched off, and encoding that would send a still
+                // of someone who has turned their camera off.
+                let first = loop {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return (feed, None, Ok(()));
+                    }
+                    match feed.wait_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(Some(frame)) => break frame,
+                        Ok(None) => continue,
+                        // Every tap gone: the camera side is shutting down,
+                        // which ends the encode loop the same way.
+                        Err(_) => return (feed, None, Ok(())),
+                    }
+                };
+                tracing::info!("[video] first camera frame {}x{}; starting video", first.width, first.height);
+                // Encoded smaller than captured, when the camera insists on
+                // more than the link can carry. The bitrate follows from the
+                // size, so this is where it gets decided.
+                let (width, height, scale) = encode_size(first.width, first.height);
+                metrics.set_encode_size(width, height);
+                let mut config = moq_video::encode::Config::new(width, height, framerate());
+                let opening_bitrate = crate::camera::bitrate_for(width, height, FRAMERATE);
+                config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(opening_bitrate));
+                // A blocking thread is not inside the runtime, so it may block
+                // on it. The probe is one encode, as it was on the call task.
+                let mut producer = match runtime.block_on(add_video(&broadcast, &catalog, &mut config, VIDEO_PRIORITY)) {
+                    Ok(producer) => producer,
+                    Err(error) => return (feed, None, Err(error)),
+                };
                 let mut encoder = match moq_video::encode::Encoder::new(&config) {
                     Ok(encoder) => encoder,
                     Err(error) => {
                         let outcome = Err(format!("could not build an encoder: {error:#}"));
-                        return (feed, producer, outcome);
+                        return (feed, Some(producer), outcome);
                     }
                 };
+                ceiling.store(opening_bitrate, std::sync::atomic::Ordering::Relaxed);
                 tracing::info!(
                     "encoding {width}x{height} at the {} rung with {}",
                     crate::args::Args::get().quality,
@@ -1171,7 +1216,7 @@ async fn run(
                         producer.publish(&flushed).ok();
                     }
                 }
-                (feed, producer, outcome)
+                (feed, Some(producer), outcome)
             }
         });
 
@@ -1218,7 +1263,7 @@ async fn run(
         // itself, and the feed and producer are needed here. The thread has
         // flushed the encoder by the time it returns.
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (feed, mut producer) = match encoded {
+        let (feed, producer) = match encoded {
             Some((feed, producer, _)) => (feed, producer),
             None => match encoding.await {
                 Ok((feed, producer, _)) => (feed, producer),
@@ -1245,7 +1290,9 @@ async fn run(
         // finished re-announces it, which the peer reads as somebody leaving and
         // immediately rejoining; observed as a `left`/`joined` pair 53
         // microseconds apart before this was ordered properly.
-        producer.finish().ok();
+        if let Some(mut producer) = producer {
+            producer.finish().ok();
+        }
 
         // **Said, then shown.** The document is advisory -- it is what lets the
         // peer say "they hung up" rather than "they vanished" -- but `finish`
@@ -2060,26 +2107,50 @@ async fn watch(
             return;
         }
     };
-    let snapshot = match catalog.next().await {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) => {
-            tracing::warn!("the peer's catalog closed before a snapshot");
-            return;
+    // **Waits for a video rendition rather than reading one snapshot.** A
+    // peer whose camera is off publishes its microphone alone, and adds video
+    // when the camera produces its first frame -- possibly mid-call. The audio
+    // subscriber waits for its rendition the same way.
+    let mut reported = false;
+    let (name, config) = loop {
+        let snapshot = match catalog.next().await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                tracing::warn!("{peer}'s catalog closed before it offered video");
+                return;
+            }
+            Err(error) => {
+                tracing::error!("could not read {peer}'s catalog: {error:#}");
+                return;
+            }
+        };
+        // **The listening side can name its caller now.** iroh exposes no
+        // client identity to a server, so the transport genuinely cannot say
+        // who this is -- but the broadcast path can, and does. Said on their
+        // first catalog rather than their first video, which a peer with the
+        // camera off never sends.
+        let first = !reported;
+        if first {
+            reported = true;
+            if let Some(status) = &status {
+                let _ = status.unbounded_send(RemoteStatus::Connected {
+                    peer: Some(peer.clone()),
+                });
+            }
         }
-        Err(error) => {
-            tracing::error!("could not read the peer's catalog: {error:#}");
-            return;
+        match snapshot.video.renditions.iter().next() {
+            Some((name, config)) => break (name.clone(), config.clone()),
+            // Once: the catalog is rewritten often (audio's own updates), and
+            // each would otherwise say the same thing again.
+            None if first => tracing::info!("{peer} has no video yet; waiting for it"),
+            None => {}
         }
-    };
-    let Some((name, config)) = snapshot.video.renditions.iter().next() else {
-        tracing::warn!("the peer's catalog offers no video rendition");
-        return;
     };
 
     let mut consumer = match moq_video::decode::Consumer::new(
         &broadcast,
-        config,
-        name,
+        &config,
+        &name,
         // Default options: a zero `max_age`, so a stalled group is skipped as
         // soon as a newer one exists -- video's newest-wins posture.
         moq_video::decode::Options::default(),
@@ -2094,14 +2165,6 @@ async fn watch(
     };
     tracing::info!("decoding {peer}'s video with {}", consumer.name());
     metrics.set_decoder(consumer.name());
-    // **The listening side can name its caller now.** iroh exposes no client
-    // identity to a server, so the transport genuinely cannot say who this is --
-    // but the broadcast path can, and does.
-    if let Some(status) = &status {
-        let _ = status.unbounded_send(RemoteStatus::Connected {
-            peer: Some(peer.clone()),
-        });
-    }
 
     // The network half's own rate, independent of whether anything is painting.
     // `camera::paint::FrameRate` measures capture against the GPU; this measures

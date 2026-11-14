@@ -99,7 +99,7 @@ impl CameraChoice {
 pub fn use_camera_choice(slot: FrameSlot, tap: FrameTap) -> CameraChoice {
     let devices = use_shared_devices();
     let mut selected = use_signal::<Option<DeviceId>>(|| None);
-    let enabled = use_signal(|| true);
+    let enabled = use_signal(|| !Args::get().camera_off);
     let mut source = use_signal::<Option<CameraSource>>(|| None);
     let stream = use_camera_stream(slot, source, CONFIG, Some(tap));
 

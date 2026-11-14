@@ -21,6 +21,7 @@
 //! vdr --relay http://localhost:4443/room  # joins a room on a relay
 //! vdr --loopback                         # no network; the codec round trip
 //! vdr --camera facetime                   # picks a camera by name
+//! vdr --listen --camera-off               # starts with video off
 //! vdr --quality high                      # 720p rung; low | mid | high, mid by default
 //! vdr --encoder software                  # auto | hardware | software, auto by default
 //! vdr --ephemeral                         # a throwaway key and data folder
@@ -201,6 +202,10 @@ pub struct Args {
     pub peering: Peering,
     /// Case-insensitive substring of the camera to start on.
     pub camera: Option<String>,
+    /// Start with the camera switched off (`--camera-off`), as if the toggle
+    /// had been pressed before anything opened. The scriptable way to place a
+    /// call with no video on a machine that has a working camera.
+    pub camera_off: bool,
     /// Which rung the encoder runs at. Everyone defaults to the same one.
     pub quality: Quality,
     /// Hardware, software, or whichever this machine has (`--encoder`).
@@ -253,6 +258,7 @@ impl Args {
         let mut args = std::env::args().skip(1);
         let mut peering = Peering::Idle;
         let mut camera = None;
+        let mut camera_off = false;
         let mut quality = Quality::default();
         let mut encoder = EncoderChoice::default();
         let mut ephemeral = false;
@@ -285,6 +291,7 @@ impl Args {
                     Some(wanted) => camera = Some(wanted.to_lowercase()),
                     None => tracing::error!("--camera needs part of a device name"),
                 },
+                "--camera-off" => camera_off = true,
                 "--quality" => match args.next().as_deref().map(Quality::parse) {
                     Some(Some(chosen)) => quality = chosen,
                     Some(None) => tracing::error!("--quality is one of low, mid, high"),
@@ -317,6 +324,7 @@ impl Args {
         Self {
             peering,
             camera,
+            camera_off,
             quality,
             encoder,
             ephemeral,

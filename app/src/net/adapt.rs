@@ -40,7 +40,17 @@ const SAMPLE: Duration = Duration::from_millis(200);
 /// the previous one instead of queueing behind it.
 pub(super) type Target = Arc<AtomicU64>;
 
+/// The bitrate the encoder opened at, once there is one; zero until then.
+///
+/// Set by the encode thread, which builds the encoder only when the camera's
+/// first frame says what size it is -- possibly long after the call connected,
+/// or never, for someone whose camera is off.
+pub(super) type Ceiling = Arc<AtomicU64>;
+
 /// Watches the send-bandwidth estimate and publishes a bitrate to follow it.
+///
+/// The estimate is sampled and reported from the start; a target is only
+/// published once `ceiling` is set, since there is no encoder to steer before.
 ///
 /// Runs until aborted. Only the dialling side can do this today: the estimate
 /// hangs off the `Reconnect` a client gets back, and the listening side's
@@ -48,13 +58,12 @@ pub(super) type Target = Arc<AtomicU64>;
 /// opening rate.
 pub(super) fn spawn(
     bandwidth: moq_net::bandwidth::Consumer,
-    ceiling: u64,
+    ceiling: Ceiling,
     target: Target,
     metrics: Arc<super::Metrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let policy = moq_mux::rate::Policy::new(moq_net::bandwidth::Rate::from_bps(ceiling));
-        let mut control = moq_mux::rate::Control::new(policy);
+        let mut control = None;
         let mut ticker = tokio::time::interval(SAMPLE);
         // A missed tick should not be made up for by a burst of catch-up polls:
         // only the newest estimate means anything.
@@ -79,6 +88,18 @@ pub(super) fn spawn(
                 }
                 reported = Instant::now();
             }
+            if control.is_none() {
+                match ceiling.load(Ordering::Relaxed) {
+                    0 => continue,
+                    ceiling => {
+                        let policy = moq_mux::rate::Policy::new(moq_net::bandwidth::Rate::from_bps(ceiling));
+                        control = Some(moq_mux::rate::Control::new(policy));
+                    }
+                }
+            }
+            let Some(control) = control.as_mut() else {
+                continue;
+            };
             let Some(next) = control.update(estimate, Instant::now()).map(|rate| rate.as_bps()) else {
                 continue;
             };

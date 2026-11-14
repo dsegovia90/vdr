@@ -126,9 +126,22 @@ pub fn use_camera_stream(
                     let live = Arc::new(AtomicBool::new(true));
                     let pump = pump::spawn(camera, {
                         let live = Arc::clone(&live);
+                        // What the device delivers, said once per open. The
+                        // negotiation line above is only the request: the
+                        // macOS backend hands over BGRA whatever was asked,
+                        // and the device may override the size.
+                        let mut first = Some(label.clone());
                         move |frame| {
                             if !live.load(Ordering::Relaxed) {
                                 return;
+                            }
+                            if let Some(label) = first.take() {
+                                tracing::info!(
+                                    "{label}: first frame {}x{} {:?}",
+                                    frame.width,
+                                    frame.height,
+                                    frame.pixel_format
+                                );
                             }
                             // The one place every captured frame passes
                             // through, which is why the fan-out is here.

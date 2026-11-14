@@ -529,6 +529,29 @@ impl FrameFeed {
                 .unwrap_or_else(|e| e.into_inner());
         }
     }
+
+    /// [`take`](Self::take), but waiting up to `timeout` for a frame first.
+    ///
+    /// For a reader that must also notice being told to stop: a camera that is
+    /// switched off never publishes, so an unbounded [`wait`](Self::wait)
+    /// would hold its thread for as long as the camera stays off.
+    pub fn wait_timeout(&mut self, timeout: Duration) -> anyhow::Result<Option<Frame>> {
+        let pending = self.shared.lock();
+        let (mut pending, _) = self
+            .shared
+            .arrived
+            .wait_timeout_while(pending, timeout, |pending| {
+                pending.is_none() && self.shared.taps.load(Ordering::Acquire) != 0
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        match pending.take() {
+            Some(frame) => Ok(Some(frame)),
+            None if self.shared.taps.load(Ordering::Acquire) == 0 => {
+                Err(anyhow::anyhow!("capture tap closed"))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 impl Tapped {
@@ -772,5 +795,30 @@ mod tap_tests {
         });
         assert_eq!(feed.wait().expect("published late").width, 9);
         publisher.join().unwrap();
+    }
+
+    #[test]
+    fn wait_timeout_gives_up_without_a_frame() {
+        let (_tap, mut feed) = frame_tap();
+        assert!(matches!(feed.wait_timeout(Duration::from_millis(10)), Ok(None)));
+    }
+
+    #[test]
+    fn wait_timeout_wakes_on_a_later_publish() {
+        let (tap, mut feed) = frame_tap();
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            tap.publish(frame(9));
+        });
+        let frame = feed.wait_timeout(Duration::from_secs(5)).unwrap().expect("published late");
+        assert_eq!(frame.width, 9);
+        publisher.join().unwrap();
+    }
+
+    #[test]
+    fn wait_timeout_reports_a_dropped_tap() {
+        let (tap, mut feed) = frame_tap();
+        drop(tap);
+        assert!(feed.wait_timeout(Duration::from_secs(5)).is_err());
     }
 }
