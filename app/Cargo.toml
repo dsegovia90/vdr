@@ -122,6 +122,12 @@ wgpu = "30"
 # portal and PipeWire, is the `wayland-share` feature above, on in the Linux package.
 [target.'cfg(target_os = "linux")'.dependencies]
 moq-video = { version = "0.1.21", default-features = false, features = ["openh264", "vaapi", "nvidia", "capture"] }
+# Keeping the screen on during a call (`awake.rs`): the desktop portal's
+# Inhibit, and logind's where there is no portal. Both were already in the
+# lockfile (ashpd for Wayland screen share, zbus under it), so these add
+# features, not crates.
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "inhibit"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 # A patched moq-audio: exposes the echo canceller's own statistics (sonora's
 # ERLE, delay estimate, residual echo likelihood), which upstream keeps private, and carries the echo fix.

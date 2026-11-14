@@ -1,4 +1,5 @@
 mod args;
+mod awake;
 mod audio;
 mod camera;
 mod channel;
