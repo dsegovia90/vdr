@@ -248,3 +248,25 @@ pub fn CloseIcon() -> Element {
         }
     }
 }
+
+/// A pushpin: filled while a recent room is pinned.
+#[component]
+pub fn PinIcon(on: bool) -> Element {
+    rsx! {
+        svg {
+            // Needed: blitz hands the serialized subtree to usvg, which only
+            // accepts a root in the SVG namespace.
+            xmlns: "http://www.w3.org/2000/svg",
+            width: "16",
+            height: "16",
+            view_box: "0 0 24 24",
+            fill: if on { "currentColor" } else { "none" },
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M9 3h6l-1 6 4 4H6l4-4z" }
+            path { d: "M12 13v8" }
+        }
+    }
+}

@@ -6,6 +6,7 @@ mod channel;
 mod components;
 mod hotkeys;
 mod net;
+mod recent;
 mod settings;
 
 use dioxus_native::prelude::*;

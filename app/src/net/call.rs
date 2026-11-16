@@ -253,7 +253,7 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
 /// written anywhere a log or a screenshot might travel. Only our own lines are
 /// covered: moq-tokio logs the full URL at `info` itself, which the default
 /// `RUST_LOG=vdr=…` filter happens to hide.
-fn redacted(url: &url::Url) -> String {
+pub(crate) fn redacted(url: &url::Url) -> String {
     let mut clean = url.clone();
     if url.query_pairs().any(|(key, _)| key == "jwt") {
         let kept: Vec<(String, String)> = url
@@ -287,7 +287,7 @@ fn explain(error: String) -> String {
 ///
 /// The path *is* the room -- the relay roots each session at the path it
 /// connected with -- so two URLs differing only in host are two rooms.
-fn room_label(url: &url::Url) -> String {
+pub(super) fn room_label(url: &url::Url) -> String {
     let path = url.path().trim_matches('/');
     let host = url.host_str().unwrap_or("the relay");
     // An iroh relay's host is a 64-character key; the front is enough to tell

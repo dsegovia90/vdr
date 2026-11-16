@@ -42,10 +42,7 @@ pub fn ConnectRow(
         // Told apart by `://`, which no endpoint id contains, so a mistyped
         // URL gets the URL's complaint rather than the key's.
         if typed.contains("://") {
-            match crate::args::relay_url(&typed) {
-                Ok(url) => connect.call(Peering::Join(url)),
-                Err(reason) => status.set(RemoteStatus::BadKey { reason }),
-            }
+            join_room(&typed, connect, status);
             return;
         }
         match typed.parse::<EndpointId>() {
@@ -153,6 +150,17 @@ pub fn ConnectRow(
             }
             }
         }
+    }
+}
+
+/// Joins the room a URL names, or says why it is not one.
+///
+/// The field's Connect and a recent room's Join both come through here, so a
+/// remembered room fails, shows progress and cancels exactly as a pasted one.
+pub(super) fn join_room(text: &str, connect: Callback<Peering>, mut status: Signal<RemoteStatus>) {
+    match crate::args::relay_url(text) {
+        Ok(url) => connect.call(Peering::Join(url)),
+        Err(reason) => status.set(RemoteStatus::BadKey { reason }),
     }
 }
 
