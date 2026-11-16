@@ -62,6 +62,15 @@ Paste a room URL or a key into the field at the top of the window, or pass it
 on the command line (`--relay <url>`, `--dial <key>`, `--listen`; `--help`
 lists the rest).
 
+**Recent rooms.** Rooms you have joined are listed under the field while you
+are not in a call, newest first, with one-click *Join*. Pin one to keep it at
+the top; otherwise the ten most recent are kept. They are stored on your
+machine only, in `rooms.json` in the data folder, **including any access
+token in the room's link**, so that rejoining needs no pasting; the file is
+readable only by your user, and the token is never shown or logged. Remove an
+entry with its ×, or delete the file to forget them all. Direct calls by key
+are not remembered.
+
 ## In a call
 
 - **Subrooms** are how you step aside without leaving. Two people who want to

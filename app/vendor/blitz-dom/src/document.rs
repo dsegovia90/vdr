@@ -1790,6 +1790,14 @@ impl BaseDocument {
     /// timings); the pointer resting on a thumb, or dragging it, holds them
     /// visible.
     pub fn scrollbar_opacity(&self, node_id: NodeId) -> f32 {
+        // vid patch: thumbs stay visible. Upstream shows them only after a
+        // scroll and fades them out again, so a list that has never been
+        // scrolled gives no sign that it goes on. The caller paints a thumb
+        // only for a container whose content overflows, so this does not put
+        // one on everything.
+        if cfg!(feature = "scrollbars") {
+            return 1.0;
+        }
         let interacting = |scrollbar: &crate::node::ScrollbarRef| scrollbar.node_id == node_id;
         if self.hovered_scrollbar.as_ref().is_some_and(interacting)
             || self

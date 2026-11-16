@@ -27,6 +27,8 @@ pub fn ConnectRow(
     status: Signal<RemoteStatus>,
     /// Chooses who to talk to.
     connect: Callback<Peering>,
+    /// Rooms joined before: a pasted link is cleared once it is among them.
+    recent: Signal<crate::recent::RecentRooms>,
 ) -> Element {
     let mut draft = use_signal(String::new);
     let mut status = status;
@@ -42,10 +44,7 @@ pub fn ConnectRow(
         // Told apart by `://`, which no endpoint id contains, so a mistyped
         // URL gets the URL's complaint rather than the key's.
         if typed.contains("://") {
-            match crate::args::relay_url(&typed) {
-                Ok(url) => connect.call(Peering::Join(url)),
-                Err(reason) => status.set(RemoteStatus::BadKey { reason }),
-            }
+            join_room(&typed, connect, status);
             return;
         }
         match typed.parse::<EndpointId>() {
@@ -67,6 +66,26 @@ pub fn ConnectRow(
     use_effect(move || {
         if !status.read().is_waiting() {
             focus.typing_gone();
+        }
+    });
+
+    // **What was pasted is cleared once it has worked.** A room link can carry
+    // its access token, and left in the field it would be on screen again the
+    // moment the call ends, for anyone looking or sharing their screen. The
+    // room is in the recent list by then, without the token. Left alone on a
+    // failure, so a typo can be corrected rather than retyped, and left alone
+    // when the link has nothing after the `?` to hide.
+    // Keyed on the room being remembered rather than on being connected: a
+    // relay that refuses a link still reports connected for an instant.
+    use_effect(move || {
+        let list = recent.read();
+        let typed = draft.peek().trim().to_string();
+        let Ok(url) = crate::args::relay_url(&typed) else { return };
+        let key = crate::recent::identity(&url);
+        let remembered = list.rooms().iter().any(|room| room.key() == key);
+        drop(list);
+        if remembered && url.query().is_some() {
+            draft.set(String::new());
         }
     });
 
@@ -153,6 +172,17 @@ pub fn ConnectRow(
             }
             }
         }
+    }
+}
+
+/// Joins the room a URL names, or says why it is not one.
+///
+/// The field's Connect and a recent room's Join both come through here, so a
+/// remembered room fails, shows progress and cancels exactly as a pasted one.
+pub(super) fn join_room(text: &str, connect: Callback<Peering>, mut status: Signal<RemoteStatus>) {
+    match crate::args::relay_url(text) {
+        Ok(url) => connect.call(Peering::Join(url)),
+        Err(reason) => status.set(RemoteStatus::BadKey { reason }),
     }
 }
 

@@ -58,7 +58,7 @@ pub fn identity_path() -> Option<std::path::PathBuf> {
 /// written before it started checking was created 644. Tightened here rather
 /// than left to each tester to fix by hand; a missing file is the first launch
 /// and is created private by moq-tokio itself.
-fn private(path: &std::path::Path) {
+pub(crate) fn private(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
