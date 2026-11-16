@@ -32,9 +32,9 @@ env:
 jobs:
   version:
     name: tag matches Cargo.toml
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: compare
         run: |
           version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' app/Cargo.toml | head -1)
@@ -52,7 +52,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -62,17 +62,16 @@ jobs:
         with:
           workspaces: app
 
-      - uses: taiki-e/cache-cargo-install-action@v2
+      - uses: taiki-e/cache-cargo-install-action@v3
         with:
-          tool: dioxus-cli
-          version: ${{ env.DIOXUS_CLI_VERSION }}
+          tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
 
       # The same script as a local `just package-mac`: universal binary, ad hoc
       # signature, usage keys checked, zipped with the guide and licences.
       - name: package
         run: deploy/client/package-macos.sh "$LABEL"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vdr-macos-universal
           path: dist/vdr-macos-*.zip
@@ -86,7 +85,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       # Before dx is compiled, which links against some of them.
       - name: build dependencies
@@ -98,10 +97,9 @@ jobs:
         with:
           workspaces: app
 
-      - uses: taiki-e/cache-cargo-install-action@v2
+      - uses: taiki-e/cache-cargo-install-action@v3
         with:
-          tool: dioxus-cli
-          version: ${{ env.DIOXUS_CLI_VERSION }}
+          tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
 
       # The script the portable container build runs, here straight on the
       # runner: the same Ubuntu 22.04, PipeWire built from source for
@@ -109,7 +107,7 @@ jobs:
       - name: package
         run: SKIP_PACKAGES=1 deploy/client/build-linux.sh "$LABEL"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vdr-linux-x86_64
           path: dist/vdr-linux-*.tar.gz
@@ -120,11 +118,11 @@ jobs:
     name: GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [macos, linux]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
