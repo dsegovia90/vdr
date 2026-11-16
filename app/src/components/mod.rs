@@ -20,7 +20,7 @@ mod tile_menu;
 pub use bar::ControlBar;
 pub use button::{Button, Size, Tone};
 pub use device_menu::{DeviceMenu, DropdownOption, MenuSection, use_open_menu_provider};
-pub use icons::{CameraIcon, GearIcon, InfoIcon, KeyboardIcon, LeaveIcon, MicIcon, PersonIcon, ScreenIcon, SpeakerIcon};
+pub use icons::{CameraIcon, CloseIcon, GearIcon, InfoIcon, KeyboardIcon, LeaveIcon, MicIcon, PersonIcon, ScreenIcon, SpeakerIcon};
 pub use keys::{KeyFocus, SettingsPanel};
 pub use call_screen::CallScreen;
 pub use connect::ConnectRow;

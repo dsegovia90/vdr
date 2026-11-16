@@ -15,7 +15,7 @@ mod keyboard;
 use dioxus_native::prelude::*;
 
 use super::keys::{KeyFocus, SettingsPanel};
-use super::{InfoIcon, KeyboardIcon};
+use super::{CloseIcon, InfoIcon, KeyboardIcon};
 
 pub(super) use keyboard::record;
 
@@ -96,6 +96,14 @@ pub fn SettingsModal() -> Element {
                 }
                 div { class: "min-w-0 flex-1 overflow-y-auto px-8 py-6",
                     {current.body()}
+                }
+                // A way out that can be seen: Esc and the backdrop close it
+                // too, but neither says so. Over the pane's corner, after it
+                // so it is on top. A plain colour for the icon's sake.
+                button {
+                    class: "absolute right-3 top-3 flex h-8 w-8 cursor-pointer items-center justify-center rounded-md text-[rgb(163,163,163)] hover:bg-neutral-800",
+                    onclick: move |_| panel.close(focus),
+                    CloseIcon {}
                 }
             }
         }

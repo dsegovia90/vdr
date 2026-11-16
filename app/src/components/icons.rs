@@ -226,3 +226,25 @@ pub fn InfoIcon() -> Element {
         }
     }
 }
+
+/// A cross: closes the settings window.
+#[component]
+pub fn CloseIcon() -> Element {
+    rsx! {
+        svg {
+            // Needed: blitz hands the serialized subtree to usvg, which only
+            // accepts a root in the SVG namespace.
+            xmlns: "http://www.w3.org/2000/svg",
+            width: "16",
+            height: "16",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M18 6 6 18" }
+            path { d: "M6 6l12 12" }
+        }
+    }
+}
