@@ -97,3 +97,12 @@ used `use_wgpu` and `canvas { "src": id }`).
   the cost that matters. Frames reaching the encoder are downscaled by an integer
   factor first (`camera/frames.rs`, `encode_size`); capture itself is still
   negotiated against a fixed request in `camera/hooks/choice.rs`.
+- **Keys need something of ours focused.** Blitz sends a key press to the
+  focused element, or with none to `<html>`, above every handler we can add.
+  The call screen's root `div` holds focus for the shortcuts and takes it
+  back on blur (`components/keys.rs`). Move focus only from an event handler
+  or `onmounted`: from a spawned task or an effect, `MountedData::set_focus`
+  can run while Dioxus holds the document and panics ("RefCell already
+  borrowed"). What a key means is `hotkeys.rs`, which has no Dioxus in it.
+- **No tooltips.** Blitz ignores the `title` attribute (nothing in blitz-dom
+  or blitz-shell reads it), so a hint on hover has to be drawn by hand.

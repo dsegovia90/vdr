@@ -16,6 +16,8 @@
 //! conventional spot rather than one we invented. That crate itself is not used:
 //! it needs the `dioxus` umbrella and panics on filesystem errors.
 
+use std::collections::BTreeMap;
+
 use cameras::{Device, DeviceId};
 use serde::{Deserialize, Serialize};
 
@@ -81,7 +83,13 @@ fn private(path: &std::path::Path) {
 pub fn log_path() -> Option<std::path::PathBuf> {
     let dir = data_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("vdr.log"))
+    log_file()
+}
+
+/// Where [`log_path`] puts the log, without creating anything: for showing
+/// the path, not writing to it.
+pub fn log_file() -> Option<std::path::PathBuf> {
+    Some(data_dir()?.join("vdr.log"))
 }
 
 /// The app's data folder: identity, settings and logs.
@@ -145,6 +153,37 @@ pub struct Settings {
 
     /// Whether everyone outside our subroom is muted. `None` is unmuted.
     pub crosstalk_muted: Option<bool>,
+
+    /// Keyboard shortcuts the user changed: action id to chord, as
+    /// `"toggle_mic": "ctrl+alt+m"`, with `""` for one removed on purpose.
+    /// Changes only, so a better default later reaches everyone who never
+    /// touched it. Read through [`crate::hotkeys::Keymap::from_overrides`],
+    /// which skips what it does not understand rather than failing.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "lenient_hotkeys")]
+    pub hotkeys: BTreeMap<String, String>,
+}
+
+/// The `hotkeys` table, keeping what is text and dropping the rest with a log
+/// line. A hand edit that writes `"toggle_mic": 5` loses that one entry, not
+/// the camera, microphone and everything else in the file.
+fn lenient_hotkeys<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let serde_json::Value::Object(entries) = value else {
+        if !value.is_null() {
+            tracing::warn!("settings: hotkeys is not a table; ignoring it");
+        }
+        return Ok(BTreeMap::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|(id, chord)| match chord {
+            serde_json::Value::String(chord) => Some((id, chord)),
+            other => {
+                tracing::warn!("settings: ignoring hotkey {other} for {id}: not text");
+                None
+            }
+        })
+        .collect())
 }
 
 impl Settings {
@@ -516,6 +555,42 @@ mod tests {
         let settings = Settings {
             crosstalk_volume: Some(0.65),
             crosstalk_muted: Some(true),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialises");
+        let back: Settings = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(back, settings);
+    }
+
+    #[test]
+    fn a_file_written_before_hotkeys_existed_still_loads() {
+        let back: Settings = serde_json::from_str(
+            r#"{"camera":"abc","microphone":null,"output":null,"crosstalk_volume":0.5,"crosstalk_muted":false}"#,
+        )
+        .expect("an older file is valid");
+        assert_eq!(back.crosstalk_volume, Some(0.5));
+        assert!(back.hotkeys.is_empty(), "no changed shortcuts");
+    }
+
+    #[test]
+    fn a_malformed_hotkey_costs_only_itself() {
+        let back: Settings = serde_json::from_str(r#"{"camera":"abc","hotkeys":{"toggle_mic":5,"leave":"f5"}}"#)
+            .expect("still valid");
+        assert_eq!(back.camera.as_deref(), Some("abc"));
+        assert_eq!(back.hotkeys.len(), 1);
+        let back: Settings = serde_json::from_str(r#"{"camera":"abc","hotkeys":[1]}"#).expect("still valid");
+        assert_eq!(back.camera.as_deref(), Some("abc"));
+        assert!(back.hotkeys.is_empty());
+    }
+
+    #[test]
+    fn hotkeys_round_trip_and_are_left_out_when_unchanged() {
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("hotkeys"), "an older build never sees the field it does not need");
+        let settings = Settings {
+            hotkeys: [("toggle_mic".to_string(), "ctrl+alt+m".to_string()), ("leave".to_string(), String::new())]
+                .into_iter()
+                .collect(),
             ..Settings::default()
         };
         let json = serde_json::to_string(&settings).expect("serialises");

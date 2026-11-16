@@ -11,7 +11,7 @@
 use dioxus_native::prelude::*;
 use iroh::EndpointId;
 
-use super::{Button, Size, Tone};
+use super::{Button, KeyFocus, Size, Tone};
 use crate::args::Peering;
 use crate::net::RemoteStatus;
 
@@ -59,6 +59,17 @@ pub fn ConnectRow(
         }
     });
 
+    // **The field going away while it has the keyboard** sends no blur:
+    // blitz just drops the focus. Enter, which dials, gives the keyboard back
+    // itself; this catches anything else that ends the waiting, so shortcuts
+    // do not stay paused.
+    let focus = use_context::<KeyFocus>();
+    use_effect(move || {
+        if !status.read().is_waiting() {
+            focus.typing_gone();
+        }
+    });
+
     let waiting = status.read().is_waiting();
     let cancellable = status.read().is_cancellable();
     let connected = status.read().is_connected();
@@ -97,6 +108,13 @@ pub fn ConnectRow(
                     r#type: "text",
                     placeholder: "Paste the other person's key, or a relay room URL",
                     value: "{draft}",
+                    // Shortcuts pause while this has the keyboard: `m` here is
+                    // a letter of someone's key, not the microphone. Noted on
+                    // the press too, before blitz moves focus here, so the
+                    // page's root does not take it straight back.
+                    onmousedown: move |_| focus.set_typing(true),
+                    onfocus: move |_| focus.set_typing(true),
+                    onblur: move |_| focus.set_typing(false),
                     oninput: move |evt| {
                         // Clears a previous complaint as soon as the text
                         // changes, so the error belongs to what is on screen.
@@ -115,6 +133,11 @@ pub fn ConnectRow(
                         if is_enter {
                             dial.call(());
                             evt.prevent_default();
+                            // Dialled: this field is about to go, and with it
+                            // the focus. A key that did not parse leaves it.
+                            if !status.peek().is_waiting() {
+                                focus.set_typing(false);
+                            }
                         }
                     },
                 }
@@ -143,7 +166,7 @@ pub fn ConnectRow(
 ///
 /// Failing to copy is a log line: it is a convenience over text already on
 /// screen, and there is nothing useful to tell the user.
-fn copy_to_clipboard(text: &str) {
+pub(super) fn copy_to_clipboard(text: &str) {
     match arboard::Clipboard::new() {
         Ok(mut clipboard) => {
             if let Err(error) = clipboard.set_text(text.to_owned()) {
