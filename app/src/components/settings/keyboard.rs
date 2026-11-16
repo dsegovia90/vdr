@@ -77,7 +77,7 @@ pub fn KeyboardTab() -> Element {
         div { class: "flex flex-col",
             div { class: "text-lg font-semibold text-neutral-100", "Keyboard" }
             p { class: "mt-1 text-sm text-neutral-400",
-                "Shortcuts work while the vdr window is in front, and pause while you type in a text field. Click a key to change it."
+                "Shortcuts work while the vdr window is in front, and pause while you type in a text field. Click a key to change it: press the new key, Backspace to remove it, or Esc to cancel."
             }
             for section in Section::ALL {
                 Heading { text: section.title() }
