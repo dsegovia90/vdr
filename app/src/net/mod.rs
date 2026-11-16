@@ -41,6 +41,11 @@ use crate::camera::{frame_tap, FrameSlot, FrameTap};
 use crate::channel::use_channel;
 use crate::recent::RecentRooms;
 
+/// How long a room has to hold, with no drop, before it is remembered: long
+/// enough to outlast a relay turning the session away, short enough that a
+/// quick visit still counts.
+const SETTLED: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Somebody whose video we are showing, and the name that keys their tile.
 ///
 /// The id is their iroh endpoint id, read off the path they publish under. It
@@ -163,6 +168,27 @@ pub fn use_remote() -> Remote {
     // The room last asked for, until it is reached. Kept on this side so the
     // token never travels in a status, which is shown and compared.
     let mut chosen = use_signal(|| Option::<url::Url>::None);
+    // **Remembered once the room has held, not when it is first reached.** A
+    // relay that refuses a token still lets the session report connected for
+    // an instant before closing it, over and over as the session redials, so
+    // "reached the room" alone would remember a link that never worked. Each
+    // arrival starts a short wait on a thread of its own; any status that is
+    // not "in the room" in the meantime bumps the count, and the wait's
+    // message then finds it stale.
+    let mut arrival = use_signal(|| 0u64);
+    let settled = use_channel(move |waited_for: u64| {
+        if *arrival.peek() != waited_for {
+            return;
+        }
+        let pending = chosen.peek().clone();
+        if let Some(url) = pending {
+            // Cleared, so a reconnect later in the call does not record it
+            // again.
+            chosen.set(None);
+            tracing::info!("remembering {}", redacted(&url));
+            crate::recent::change(&mut recent, |list| list.joined(&url, crate::recent::now()));
+        }
+    });
     let mut arrivals = 0u64;
     let joined = use_channel(move |event: ParticipantEvent| match event {
         ParticipantEvent::Joined { id, slot, stats, feed } => {
@@ -192,16 +218,21 @@ pub fn use_remote() -> Remote {
         if let RemoteStatus::Idle { me: bound } = &next {
             me.set(Some(bound.clone()));
         }
-        // **Remembered on arrival, not on asking**, so a typo or a refused
-        // token never enters the list. The label check drops a late arrival
-        // from a room already cancelled in favour of another; clearing the
-        // choice means a reconnect does not record it again.
+        // The label check drops a late arrival from a room already cancelled
+        // in favour of another.
+        let count = *arrival.peek() + 1;
+        arrival.set(count);
         if let RemoteStatus::InRoom { room } = &next {
             let pending = chosen.peek().clone();
-            if let Some(url) = pending.filter(|url| call::room_label(url) == *room) {
-                chosen.set(None);
-                tracing::info!("remembering {}", redacted(&url));
-                crate::recent::change(&mut recent, |list| list.joined(&url, crate::recent::now()));
+            if pending.is_some_and(|url| call::room_label(&url) == *room) {
+                let settled = settled.clone();
+                let spawned = std::thread::Builder::new().name("room-settled".into()).spawn(move || {
+                    std::thread::sleep(SETTLED);
+                    let _ = settled.unbounded_send(count);
+                });
+                if let Err(error) = spawned {
+                    tracing::warn!("could not start the wait that remembers a room: {error}");
+                }
             }
         }
         status.set(next);
