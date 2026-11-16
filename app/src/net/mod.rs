@@ -33,11 +33,18 @@ use dioxus_native::prelude::*;
 pub use metrics::{Ask, Metrics, Path, PeerStats};
 pub use share::{ShareOption, ShareSource, ShareWish, available as share_available, lists as share_lists, sources as share_sources};
 pub use status::RemoteStatus;
+pub(crate) use call::redacted;
 
 use crate::args::{Args, Peering};
 use crate::audio::Controls;
 use crate::camera::{frame_tap, FrameSlot, FrameTap};
 use crate::channel::use_channel;
+use crate::recent::RecentRooms;
+
+/// How long a room has to hold, with no drop, before it is remembered: long
+/// enough to outlast a relay turning the session away, short enough that a
+/// quick visit still counts.
+const SETTLED: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Somebody whose video we are showing, and the name that keys their tile.
 ///
@@ -138,6 +145,9 @@ pub struct Remote {
     pub local: Arc<PeerStats>,
     /// What we want to share. The bar writes it; each call attempt serves it.
     pub share: ShareWish,
+    /// Rooms joined before, for the idle screen to offer again. Recorded here,
+    /// on arriving in the room, and changed by the list's own buttons.
+    pub recent: Signal<RecentRooms>,
 }
 
 /// Starts whichever remote path the command line asked for.
@@ -154,6 +164,31 @@ pub fn use_remote() -> Remote {
     let mut status = use_signal(|| RemoteStatus::Binding);
     let mut me = use_signal(|| Option::<String>::None);
     let mut participants = use_signal(Vec::<Participant>::new);
+    let mut recent = use_signal(RecentRooms::load);
+    // The room last asked for, until it is reached. Kept on this side so the
+    // token never travels in a status, which is shown and compared.
+    let mut chosen = use_signal(|| Option::<url::Url>::None);
+    // **Remembered once the room has held, not when it is first reached.** A
+    // relay that refuses a token still lets the session report connected for
+    // an instant before closing it, over and over as the session redials, so
+    // "reached the room" alone would remember a link that never worked. Each
+    // arrival starts a short wait on a thread of its own; any status that is
+    // not "in the room" in the meantime bumps the count, and the wait's
+    // message then finds it stale.
+    let mut arrival = use_signal(|| 0u64);
+    let settled = use_channel(move |waited_for: u64| {
+        if *arrival.peek() != waited_for {
+            return;
+        }
+        let pending = chosen.peek().clone();
+        if let Some(url) = pending {
+            // Cleared, so a reconnect later in the call does not record it
+            // again.
+            chosen.set(None);
+            tracing::info!("remembering {}", redacted(&url));
+            crate::recent::change(&mut recent, |list| list.joined(&url, crate::recent::now()));
+        }
+    });
     let mut arrivals = 0u64;
     let joined = use_channel(move |event: ParticipantEvent| match event {
         ParticipantEvent::Joined { id, slot, stats, feed } => {
@@ -182,6 +217,23 @@ pub fn use_remote() -> Remote {
         // be a second thing to keep in step.
         if let RemoteStatus::Idle { me: bound } = &next {
             me.set(Some(bound.clone()));
+        }
+        // The label check drops a late arrival from a room already cancelled
+        // in favour of another.
+        let count = *arrival.peek() + 1;
+        arrival.set(count);
+        if let RemoteStatus::InRoom { room } = &next {
+            let pending = chosen.peek().clone();
+            if pending.is_some_and(|url| call::room_label(&url) == *room) {
+                let settled = settled.clone();
+                let spawned = std::thread::Builder::new().name("room-settled".into()).spawn(move || {
+                    std::thread::sleep(SETTLED);
+                    let _ = settled.unbounded_send(count);
+                });
+                if let Err(error) = spawned {
+                    tracing::warn!("could not start the wait that remembers a room: {error}");
+                }
+            }
         }
         status.set(next);
     });
@@ -246,6 +298,9 @@ pub fn use_remote() -> Remote {
                 // UI. The CLI path is deliberately unchanged: it is how two
                 // instances get driven from a script.
                 if peering != Peering::Idle {
+                    if let Peering::Join(url) = &peering {
+                        chosen.set(Some(url.clone()));
+                    }
                     let _ = decide.unbounded_send(peering);
                 }
             }
@@ -254,6 +309,10 @@ pub fn use_remote() -> Remote {
         let connect = Callback::new({
             let decide = decide.clone();
             move |peering: Peering| {
+                chosen.set(match &peering {
+                    Peering::Join(url) => Some(url.clone()),
+                    _ => None,
+                });
                 // Failure means the call thread is gone, which the status line
                 // will already be saying.
                 let _ = decide.unbounded_send(peering);
@@ -262,6 +321,7 @@ pub fn use_remote() -> Remote {
         // Takes back a choice that has not become a call yet. Same channel, so
         // the call thread sees the two in the order they were pressed.
         let cancel = Callback::new(move |()| {
+            chosen.set(None);
             let _ = decide.unbounded_send(Peering::Idle);
         });
 
@@ -276,6 +336,7 @@ pub fn use_remote() -> Remote {
             metrics,
             local,
             share,
+            recent,
         }
     })
 }

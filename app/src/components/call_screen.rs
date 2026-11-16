@@ -15,7 +15,8 @@ use super::keys::{chord_of, use_keys_provider, use_settings_panel_provider};
 use super::microphone::set_mic;
 use super::tile::{UNDIMMED, dim_class};
 use super::{
-    ConnectRow, ControlBar, CrosstalkLevel, DropdownOption, Names, OwnShare, ParticipantTile, Rooms, SettingsModal,
+    ConnectRow, ControlBar, CrosstalkLevel, DropdownOption, Names, OwnShare, ParticipantTile, RecentRoomList, Rooms,
+    SettingsModal,
     ShareTile, layout, settings, share, use_crosstalk_provider, use_open_menu_provider, use_rooms_provider,
 };
 use crate::audio::use_shared_microphones;
@@ -343,6 +344,14 @@ pub fn CallScreen() -> Element {
         // grid and the bar below, nothing else.
         ConnectRow {
             me: remote.me,
+            status: remote.status,
+            connect: remote.connect,
+            recent: remote.recent,
+        }
+        // Only while idle too, and capped in height so the video keeps its
+        // share of the column.
+        RecentRoomList {
+            rooms: remote.recent,
             status: remote.status,
             connect: remote.connect,
         }

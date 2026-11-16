@@ -7,6 +7,7 @@ mod components;
 mod hotkeys;
 mod name;
 mod net;
+mod recent;
 mod settings;
 
 use dioxus_native::prelude::*;
