@@ -24,5 +24,7 @@ Four facts that break the build if you get them wrong:
    native`. `cargo run` comes up unstyled because `asset!` only resolves inside a dx
    bundle.
 
-The full picture — layout, the paint path, and notes on what this renderer does
-and does not support — is in **`app/README.md`**.
+The full guide for working in this repo, with or without a coding agent, is
+**`AGENTS.md` at the repository root**: how to run and test, the pins and why,
+the things that look like bugs and are not, and how to contribute. Notes on
+what this renderer does and does not support are in **`app/README.md`**.
