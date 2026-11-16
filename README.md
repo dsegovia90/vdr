@@ -81,6 +81,42 @@ lists the rest).
   the room, beside the sharer's camera.
 - **Mute and camera off** are in the bar and shown on your tile to the room.
 
+### Settings and keyboard shortcuts
+
+The gear at the right of the bar opens the settings (also Cmd+, on macOS,
+Ctrl+, elsewhere). Its *Keyboard* tab lists the shortcuts and changes them:
+click a key, then press the new one; Backspace removes it, Esc gives up. Its
+*About* tab shows the version and where the log is, which is what to send
+after a call that went wrong.
+
+| Action | macOS | Linux |
+|---|---|---|
+| Toggle microphone | `m` | `m` |
+| Toggle camera | `v` | `v` |
+| Share screen (stops a share, or opens the list) | `s` | `s` |
+| Leave or cancel the call | `cmd+shift+l` | `ctrl+shift+l` |
+| Open settings | `cmd+,` | `ctrl+,` |
+
+Shortcuts work while the vdr window is in front, and pause while you type in
+a text field or have the settings open. Esc closes the settings or an open
+menu, and cannot be rebound.
+
+Changed shortcuts are saved in `settings.json` in the data folder (shown in
+*About*) under `hotkeys`, by action, and only the ones you changed:
+
+```json
+"hotkeys": {
+  "toggle_mic": "ctrl+alt+m",
+  "share_screen": ""
+}
+```
+
+An empty string means no key. The actions are `toggle_mic`, `toggle_camera`,
+`share_screen`, `leave` and `open_settings`; a key is written in lowercase,
+modifiers first (`cmd`, `ctrl`, `alt`, `shift`) joined by `+`, with named
+keys such as `space`, `enter`, `left`, `f5` and `plus`. An entry that does
+not parse is ignored and that action keeps its default.
+
 ## Building and running
 
 The crate is in `app/`; `app/README.md` has the developer notes (styling, the
