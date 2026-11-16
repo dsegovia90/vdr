@@ -346,6 +346,7 @@ pub fn CallScreen() -> Element {
             me: remote.me,
             status: remote.status,
             connect: remote.connect,
+            recent: remote.recent,
         }
         // Only while idle too, and capped in height so the video keeps its
         // share of the column.

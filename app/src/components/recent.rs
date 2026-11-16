@@ -12,6 +12,9 @@ use crate::net::RemoteStatus;
 use crate::recent::{self, RecentRooms};
 
 /// One row's worth, read out of the list so no guard is held while rendering.
+/// How many rows the list's height shows whole.
+const VISIBLE: usize = 4;
+
 struct Row {
     key: String,
     name: String,
@@ -57,10 +60,18 @@ pub fn RecentRoomList(
     if rows.is_empty() {
         return rsx! {};
     }
+    let count = rows.len();
 
     rsx! {
         div { class: "flex max-h-40 w-full max-w-2xl shrink-0 flex-col gap-1",
-            span { class: "text-sm text-neutral-400", "Recent rooms" }
+            // **Says so when there is more than fits.** Nothing here draws a
+            // scrollbar, so a list cut off at the fourth row looked complete.
+            div { class: "flex flex-row items-baseline gap-2",
+                span { class: "text-sm text-neutral-400", "Recent rooms" }
+                if count > VISIBLE {
+                    span { class: "text-xs text-neutral-500", "{count} \u{b7} scroll for more" }
+                }
+            }
             div { class: "flex min-h-0 flex-col overflow-y-auto",
                 for row in rows {
                     div { key: "{row.key}", class: "flex flex-row items-center gap-3 rounded-md px-2 py-1 hover:bg-neutral-900",
