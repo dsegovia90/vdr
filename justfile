@@ -42,7 +42,7 @@ relay:
     cd ~/projects/demos/moq && cargo build --release --bin moq-relay
     cd ~/projects/demos/moq/demo/relay && RUST_LOG=info ../../target/release/moq-relay localhost.toml
 
-# Lints and unit tests.
+# Lints and unit tests. CI runs the same, with clippy warnings as errors.
 check:
     cd {{app}} && cargo clippy --all-targets && cargo test
 
@@ -53,6 +53,9 @@ tailwind:
 # Did a call meet the quality bar? Pass each participant's --stats file.
 report +files:
     cargo run --manifest-path {{app}}/Cargo.toml --release --bin call-report -- {{ files }}
+
+# Release packages are built by GitHub Actions (.github/workflows/release.yml)
+# from the same scripts; these recipes are for a local build.
 
 # Mac zip into dist/.
 package-mac:
@@ -86,6 +89,8 @@ package:
     exit $(( mac || linux ))
 
 alias binaries := package
+# Not GitHub CI (that is `just check`, with warnings as errors): an older name
+# for building both packages locally.
 alias ci := package
 
 # Follow this machine's app log (what testers send after a bad call).

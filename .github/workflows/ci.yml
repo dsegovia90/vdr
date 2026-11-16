@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# Actions are pinned to a commit, with the tag it was beside it: a tag can be
+# moved to different code, a commit cannot.
+permissions:
+  contents: read
+
+# A new push to the same branch or pull request makes the older run moot.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: clippy and tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.04: the same base, and glibc floor, as the Linux package.
+        os: [ubuntu-22.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      # Without `wayland-share` (off by default), so no PipeWire headers are
+      # needed here; the release build compiles that feature.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: ../deploy/client/linux-deps.sh
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: app
+
+      # `asset!` checks at compile time that assets/tailwind.css exists, and it
+      # is generated, not committed: dx makes it with this Tailwind version
+      # before every build. Made the same way here, so a stylesheet that
+      # fails to generate fails CI too.
+      - name: stylesheet
+        env:
+          TAILWIND_VERSION: v4.1.5
+        run: |
+          # Checked against a pinned digest: a binary swapped upstream fails
+          # here instead of running.
+          case "${{ runner.os }}" in
+            Linux) bin=tailwindcss-linux-x64 sum=9d258a7786c22f8572aea20ed35848f8cbef1d06277e4e6b97ad8561ffc21e07 ;;
+            macOS) bin=tailwindcss-macos-arm64 sum=8fda202174c214d720eafe49edbadafaed7cb9d01289d24462d92d2c2603787e ;;
+          esac
+          curl -sSfL -o "$RUNNER_TEMP/tailwindcss" \
+            "https://github.com/tailwindlabs/tailwindcss/releases/download/$TAILWIND_VERSION/$bin"
+          echo "$sum  $RUNNER_TEMP/tailwindcss" | shasum -a 256 -c -
+          chmod +x "$RUNNER_TEMP/tailwindcss"
+          "$RUNNER_TEMP/tailwindcss" --input tailwind.css --output assets/tailwind.css
+
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+  licences:
+    name: third-party licences
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+        with:
+          tool: cargo-about
+
+      # A crate under a licence not yet reviewed in about.toml fails here, and
+      # so does a dependency change that was not followed by `just notices`:
+      # the packages ship THIRD_PARTY_LICENSES as committed.
+      - name: generate and compare
+        run: |
+          cargo about generate --locked --fail --features wayland-share about.hbs -o "$RUNNER_TEMP/THIRD_PARTY_LICENSES"
+          diff -u ../THIRD_PARTY_LICENSES "$RUNNER_TEMP/THIRD_PARTY_LICENSES" \
+            || { echo "::error::THIRD_PARTY_LICENSES is out of date; run 'just notices' and commit it"; exit 1; }

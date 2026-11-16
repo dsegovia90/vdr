@@ -1,5 +1,7 @@
 # vdr
 
+[![CI](https://github.com/dsegovia90/vdr/actions/workflows/ci.yml/badge.svg)](https://github.com/dsegovia90/vdr/actions/workflows/ci.yml)
+
 A video room that a small team leaves open all day. Cameras stay on, the way
 desks in one office are in view of each other, so you can see whether someone
 is around, lean over and ask a thing, or step into a side room together for a
@@ -145,6 +147,40 @@ for a release bundle, `just loopback`, `just relay` for a local relay, and
 `just package-mac` for a zip of the macOS app. `deploy/client/JOINING.md` is the
 page for someone who was sent a build and a link.
 
+## Builds and releases
+
+Every pull request and every push to `master` runs CI
+(`.github/workflows/ci.yml`): `cargo clippy` with warnings as errors and
+`cargo test`, on Ubuntu 22.04 and macOS, and a check that
+`THIRD_PARTY_LICENSES` still matches `Cargo.lock` (`just notices` regenerates
+it).
+
+Releases are built by `.github/workflows/release.yml`, from the same scripts
+as a local package (`deploy/client/package-macos.sh` and
+`deploy/client/build-linux.sh`). To cut one:
+
+1. Set `version` in `app/Cargo.toml` to the new version, and merge that.
+2. Tag the merge commit and push the tag:
+   `git tag v0.2.0 && git push origin v0.2.0`.
+
+The workflow refuses a tag that does not match `app/Cargo.toml`, then builds
+`vdr-macos-universal-<tag>.zip` (Apple Silicon and Intel in one app) and
+`vdr-linux-x86_64-<tag>.tar.gz` (built on Ubuntu 22.04, so it runs on that
+and newer distributions) and attaches both to a GitHub Release with notes
+generated from the merged pull requests. Downloads are on the
+[Releases page](https://github.com/dsegovia90/vdr/releases).
+
+To get packages without a release, use *Run workflow* on the Release workflow
+in the Actions tab: both archives are attached to that run as artifacts. A pull
+request that changes the workflow or `deploy/client/` builds them the same way.
+
+The macOS app is signed ad hoc, not with an Apple Developer ID, so macOS will
+not open it with a double-click the first time: right-click `Vdr.app`, choose
+*Open*, then *Open* again. If macOS calls it "damaged", run
+`xattr -dr com.apple.quarantine /Applications/Vdr.app` once.
+`deploy/client/JOINING.md`, inside both archives, says the same for whoever
+receives a build.
+
 ## Platforms
 
 - **macOS** (Apple Silicon and Intel). The camera, microphone and
@@ -154,7 +190,8 @@ page for someone who was sent a build and a link.
   `deploy/client/build-linux.sh` on the machine itself, or
   `deploy/client/build-linux-portable.sh` in an Ubuntu 22.04 container with
   podman for a binary that runs on older distributions (`just package-linux`
-  runs that over ssh on `LINUX_HOST`). Runtime needs ALSA, PipeWire, and Vulkan.
+  runs that over ssh on `LINUX_HOST`). Release packages are built by CI; see
+  "Builds and releases" above. Runtime needs ALSA, PipeWire, and Vulkan.
   Screen sharing on Wayland goes through xdg-desktop-portal with your
   desktop's backend, and needs the `wayland-share` feature, which the package
   scripts turn on.
