@@ -147,6 +147,14 @@ for a release bundle, `just loopback`, `just relay` for a local relay, and
 `just package-mac` for a zip of the macOS app. `deploy/client/JOINING.md` is the
 page for someone who was sent a build and a link.
 
+## Contributing
+
+Changes come in as pull requests against `master`. [`AGENTS.md`](AGENTS.md) is
+the working guide to this codebase: how to run and test it, which dependency
+pins are load-bearing and why, and what a pull request should say. It is
+written so that a coding agent can be pointed at it, and it reads the same for
+a person.
+
 ## Builds and releases
 
 Every pull request and every push to `master` runs CI
