@@ -1,0 +1,141 @@
+name: Release
+
+# A `v*` tag builds both packages and publishes them as a GitHub Release.
+# "Run workflow" builds them as downloadable artifacts, without a Release, and
+# so does a pull request that changes the packaging, so a tag never meets an
+# untested build.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - deploy/client/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Only a pull request's run is superseded by a newer push; a tag's never is.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The dx version this repo is built with (see the root README).
+  DIOXUS_CLI_VERSION: 0.7.10
+  # Names the archives: the tag for a release, else empty, and the scripts
+  # fall back to the commit.
+  LABEL: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+
+jobs:
+  version:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: compare
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' app/Cargo.toml | head -1)
+          echo "app/Cargo.toml version: $version"
+          if [ -z "$LABEL" ]; then
+            echo "not a tag; nothing to compare"
+          elif [ "$LABEL" != "v$version" ]; then
+            echo "::error::tag $LABEL does not match app/Cargo.toml version $version"
+            exit 1
+          fi
+
+  macos:
+    name: macOS universal
+    needs: version
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      - uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: dioxus-cli
+          version: ${{ env.DIOXUS_CLI_VERSION }}
+
+      # The same script as a local `just package-mac`: universal binary, ad hoc
+      # signature, usage keys checked, zipped with the guide and licences.
+      - name: package
+        run: deploy/client/package-macos.sh "$LABEL"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vdr-macos-universal
+          path: dist/vdr-macos-*.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  linux:
+    name: Linux x86_64
+    needs: version
+    # The package's glibc floor: what it is built on is the oldest it runs on.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      # Before dx is compiled, which links against some of them.
+      - name: build dependencies
+        run: deploy/client/linux-deps.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      - uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: dioxus-cli
+          version: ${{ env.DIOXUS_CLI_VERSION }}
+
+      # The script the portable container build runs, here straight on the
+      # runner: the same Ubuntu 22.04, PipeWire built from source for
+      # `wayland-share`.
+      - name: package
+        run: SKIP_PACKAGES=1 deploy/client/build-linux.sh "$LABEL"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vdr-linux-x86_64
+          path: dist/vdr-linux-*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$LABEL" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "vdr $LABEL" \
+            --generate-notes \
+            --verify-tag
