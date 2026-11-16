@@ -13,6 +13,8 @@ on:
       - .github/workflows/release.yml
       - deploy/client/**
 
+# Actions are pinned to a commit, with the tag it was beside it: a tag can be
+# moved to different code, a commit cannot.
 permissions:
   contents: read
 
@@ -34,7 +36,9 @@ jobs:
     name: tag matches Cargo.toml
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - name: compare
         run: |
           version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' app/Cargo.toml | head -1)
@@ -52,17 +56,20 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: app
 
-      - uses: taiki-e/cache-cargo-install-action@v3
+      - uses: taiki-e/cache-cargo-install-action@9ee83daaa7b96a6fab930949ecf1122bba04a389 # v3
         with:
           tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
 
@@ -71,7 +78,7 @@ jobs:
       - name: package
         run: deploy/client/package-macos.sh "$LABEL"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: vdr-macos-universal
           path: dist/vdr-macos-*.zip
@@ -85,19 +92,23 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       # Before dx is compiled, which links against some of them.
       - name: build dependencies
         run: deploy/client/linux-deps.sh
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: app
 
-      - uses: taiki-e/cache-cargo-install-action@v3
+      - uses: taiki-e/cache-cargo-install-action@9ee83daaa7b96a6fab930949ecf1122bba04a389 # v3
         with:
           tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
 
@@ -107,7 +118,7 @@ jobs:
       - name: package
         run: SKIP_PACKAGES=1 deploy/client/build-linux.sh "$LABEL"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: vdr-linux-x86_64
           path: dist/vdr-linux-*.tar.gz
@@ -122,7 +133,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           merge-multiple: true
@@ -131,7 +142,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ls -l dist
+          # So a download can be checked against what this run built.
+          (cd dist && sha256sum vdr-* > SHA256SUMS && cat SHA256SUMS)
           gh release create "$LABEL" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "vdr $LABEL" \
