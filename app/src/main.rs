@@ -5,6 +5,7 @@ mod camera;
 mod channel;
 mod components;
 mod hotkeys;
+mod name;
 mod net;
 mod settings;
 

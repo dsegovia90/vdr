@@ -203,8 +203,13 @@ pub(super) fn press(share: &ShareWish, on: bool, mut menu: Signal<Option<String>
 
 #[derive(Clone, PartialEq, Props)]
 pub struct ShareTileProps {
-    /// The label's text, e.g. "3929461d · screen".
+    /// Names the stream in logs, e.g. "3929461d · screen", and is the
+    /// label's text unless `shown` says otherwise.
     pub label: String,
+    /// The label's text when it is not `label`: "Ada · screen" for a sharer
+    /// with a name. Kept apart so the log goes on naming them by id.
+    #[props(default)]
+    pub shown: Option<String>,
     /// The screen's frames: a peer's decoded, or our own capture's preview.
     pub slot: FrameSlot,
     /// Size and placement: `layout::TILE`, `SHARE` or `STRIP`.
@@ -246,7 +251,7 @@ pub fn ShareTile(props: ShareTileProps) -> Element {
                 }
             } else {
                 div { class: "absolute bottom-2 left-2 rounded-md bg-black/50 px-2 py-1",
-                    span { class: "whitespace-nowrap text-xs text-neutral-200", "{props.label}" }
+                    span { class: "whitespace-nowrap text-xs text-neutral-200", {props.shown.clone().unwrap_or_else(|| props.label.clone())} }
                 }
             }
             // Last, so it covers the rest; see `ParticipantTile`. Our own card

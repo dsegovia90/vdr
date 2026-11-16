@@ -85,16 +85,17 @@ pub fn LeaveIcon() -> Element {
     }
 }
 
-/// A head and shoulders: someone whose camera is off.
+/// A head and shoulders: someone whose camera is off, and the settings'
+/// Profile tab at the rail's 16 px.
 #[component]
-pub fn PersonIcon() -> Element {
+pub fn PersonIcon(#[props(default = 32)] size: u32) -> Element {
     rsx! {
         svg {
             // Needed: blitz hands the serialized subtree to usvg, which only
             // accepts a root in the SVG namespace.
             xmlns: "http://www.w3.org/2000/svg",
-            width: "32",
-            height: "32",
+            width: "{size}",
+            height: "{size}",
             view_box: "0 0 24 24",
             fill: "none",
             stroke: "currentColor",

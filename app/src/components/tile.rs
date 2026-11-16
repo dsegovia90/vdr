@@ -15,7 +15,7 @@ use dioxus_native::prelude::*;
 
 use super::device_menu::OpenMenu;
 use super::tile_menu::{TileMenu, menu_name};
-use super::{Invites, MicIcon, OwnShare, ParticipantVideo, PersonIcon, Rooms};
+use super::{Invites, MicIcon, Names, OwnShare, ParticipantVideo, PersonIcon, Rooms};
 use crate::audio::Crosstalk;
 use crate::camera::{FrameSlot, Mirror};
 use crate::channel::use_channel;
@@ -33,6 +33,9 @@ struct Reading {
     mic_on: bool,
     /// Their subroom. Not shown on the tile; passed on to the page's [`Rooms`].
     room: Option<String>,
+    /// What they call themselves, already cleaned. Shown in place of the
+    /// label on a peer's tile, and passed on to the page's [`Names`].
+    name: Option<String>,
     /// Who muted us. Our own tile only; empty on a peer's.
     muted_by: Option<String>,
     /// Who invites us, to which room. Our own tile only; passed on to the
@@ -52,6 +55,7 @@ impl Default for Reading {
             camera_on: true,
             mic_on: true,
             room: None,
+            name: None,
             muted_by: None,
             invites: BTreeMap::new(),
             sharing: false,
@@ -62,7 +66,8 @@ impl Default for Reading {
 
 #[derive(Clone, PartialEq, Props)]
 pub struct ParticipantTileProps {
-    /// Names the stream in logs, and is the label's text.
+    /// Names the stream in logs, and is the label's text unless they have
+    /// a name: their short id, or "You".
     pub label: String,
     /// Frames to render.
     pub slot: FrameSlot,
@@ -91,6 +96,7 @@ pub struct ParticipantTileProps {
 pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     let mut reading = use_signal(Reading::default);
     let Rooms(mut rooms) = use_context::<Rooms>();
+    let Names(mut names) = use_context::<Names>();
     let Invites(mut invites) = use_context::<Invites>();
     let OwnShare(mut own_share) = use_context::<OwnShare>();
     let OpenMenu(mut current) = use_context::<OpenMenu>();
@@ -116,9 +122,22 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
             let stale = written.borrow().as_ref().filter(|old| **old != key).cloned();
             if let Some(stale) = stale {
                 rooms.write().remove(&stale);
+                names.write().remove(&stale);
             }
             if rooms.peek().get(&key) != Some(&next.room) {
                 rooms.write().insert(key.clone(), next.room.clone());
+            }
+            // Peers only: ours is never shown by name on this screen, and
+            // "you" is what the lists say of us.
+            let name = if mine { None } else { next.name.clone() };
+            // Compared into a local first, so no read guard is held while
+            // the same signal is written.
+            let same = names.peek().get(&key) == name.as_ref();
+            if !same {
+                match name {
+                    Some(name) => names.write().insert(key.clone(), name),
+                    None => names.write().remove(&key),
+                };
             }
             written.replace(Some(key));
             if mine && *invites.peek() != next.invites {
@@ -139,6 +158,9 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
             if let Ok(mut map) = rooms.try_write() {
                 map.remove(&key);
             }
+            if let Ok(mut map) = names.try_write() {
+                map.remove(&key);
+            }
         }
     });
     use_hook({
@@ -154,6 +176,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                         camera_on: stats.camera_on(),
                         mic_on: stats.mic_on(),
                         room: stats.room(),
+                        name: stats.name(),
                         muted_by: stats.muted_by(),
                         invites: stats.invites(),
                         sharing: stats.sharing(),
@@ -193,7 +216,10 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     let muted_by = now
         .muted_by
         .as_ref()
-        .map(|by| format!("muted by {}", by.chars().take(8).collect::<String>()));
+        .map(|by| format!("muted by {}", Names::of(&names.read(), by)));
+    // **Their name if they have one, on a peer's tile only**: ours says
+    // "You" whatever we are called.
+    let shown = shown_label(mine, now.name.as_deref(), &props.label);
     let name = menu_name(&props.who);
     let open = !mine && current.read().as_deref() == Some(name.as_str());
     let our_room = rooms.read().get(&props.me).cloned().flatten();
@@ -241,7 +267,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                 div {
                     class: if now.talking { "h-2 w-2 shrink-0 rounded-full bg-emerald-400" } else { "h-2 w-2 shrink-0 rounded-full bg-neutral-500" },
                 }
-                span { class: text, "{props.label}{fps}" }
+                span { class: text, "{shown}{fps}" }
                 if let Some(muted_by) = muted_by {
                     span { class: "whitespace-nowrap text-xs text-red-300", "\u{b7} {muted_by}" }
                 }
@@ -261,6 +287,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
             if !mine {
                 TileMenu {
                     who: props.who.clone(),
+                    name: now.name.clone(),
                     their_room: now.room.clone(),
                     their_mic: now.mic_on,
                     our_room,
@@ -276,6 +303,15 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
             // still opens the menu.
             div { class: props.dim }
         }
+    }
+}
+
+/// A tile label's text: a peer's name when they have one, else `label` (their
+/// short id, or "You" on ours, which keeps it whatever we are called).
+fn shown_label(mine: bool, name: Option<&str>, label: &str) -> String {
+    match name {
+        Some(name) if !mine => name.to_string(),
+        _ => label.to_string(),
     }
 }
 
@@ -364,6 +400,14 @@ mod tests {
     #[test]
     fn the_default_volume_is_dimmed() {
         assert_eq!(darkness(dim_class(Crosstalk::default())), 65);
+    }
+
+    #[test]
+    fn a_peer_is_shown_by_name_and_we_are_you() {
+        assert_eq!(shown_label(false, Some("Ada"), "3929461d"), "Ada");
+        assert_eq!(shown_label(false, None, "3929461d"), "3929461d");
+        assert_eq!(shown_label(true, Some("Ada"), "You"), "You");
+        assert_eq!(shown_label(true, None, "You"), "You");
     }
 
     #[test]
