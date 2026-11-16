@@ -2,6 +2,7 @@
 # Builds vdr on Linux (Fedora or Debian/Ubuntu) and packs it for sending.
 #
 #   deploy/client/build-linux.sh            # writes dist/vdr-linux-<arch>-<commit>.tar.gz
+#   deploy/client/build-linux.sh v1.2.3     # writes dist/vdr-linux-<arch>-v1.2.3.tar.gz
 #
 # Run it on Linux: the app links the system's camera (V4L2), audio (ALSA) and
 # graphics (Vulkan, X11/Wayland) libraries, so it cannot be cross-built from a
@@ -11,40 +12,14 @@
 # UNVERIFIED: the package list is the set this kind of app usually needs, plus
 # what the first Linux build (2026-09-15) recorded. This blitz version
 # (v0.3.0-beta.4) has not been built on Linux yet. If a build step fails on a
-# missing library, add its -dev package here. First Fedora build (2026-11-05):
+# missing library, add its -dev package to linux-deps.sh. First Fedora build (2026-11-05):
 # fontconfig was the only one missing -- blitz uses it to find system fonts.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 
-# Root already (as in a container) needs no sudo, and may not have it.
-sudo=""
-[ "$(id -u)" -eq 0 ] || sudo="sudo"
-
 # System packages need root; set SKIP_PACKAGES=1 once they are installed.
-# PipeWire is for the `wayland-share` feature (Wayland screen sharing). Fedora's
-# is new enough; Debian/Ubuntu get meson and ninja to build it, see below.
-# Build headers only: Vulkan *drivers* are a runtime need, and asking for
-# Fedora's mesa-vulkan-drivers conflicts with RPM Fusion's freeworld build, which
-# provides the same thing.
-if [ -z "${SKIP_PACKAGES:-}" ]; then
-  if command -v dnf >/dev/null; then
-    $sudo dnf install -y \
-      gcc gcc-c++ pkgconf-pkg-config cmake clang git curl \
-      alsa-lib-devel systemd-devel libv4l-devel fontconfig-devel \
-      libX11-devel libXcursor-devel libXrandr-devel libXi-devel libxkbcommon-devel \
-      wayland-devel vulkan-loader-devel pipewire-devel \
-      openssl-devel
-  elif command -v apt-get >/dev/null; then
-    $sudo apt-get update
-    DEBIAN_FRONTEND=noninteractive $sudo apt-get install -y --no-install-recommends \
-      build-essential pkg-config cmake clang curl git \
-      libasound2-dev libudev-dev libv4l-dev libfontconfig1-dev \
-      libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxkbcommon-dev \
-      libwayland-dev libvulkan-dev meson ninja-build \
-      libssl-dev
-  fi
-fi
+[ -n "${SKIP_PACKAGES:-}" ] || "$root/deploy/client/linux-deps.sh"
 
 # Whether cargo *runs*, not whether it exists: rustup's launcher can be present
 # with no toolchain behind it (a cache that kept ~/.cargo but not ~/.rustup).
@@ -120,11 +95,12 @@ bin="$(find target/dx/vdr/release/linux -type f -name vdr -perm -u+x | head -1)"
 dir="$(dirname "$bin")"
 
 arch="$(uname -m)"
-# The commit names the package. VDR_COMMIT wins when set: a worktree copied to
-# another machine has a .git file pointing at a path that does not exist there,
-# so rev-parse would fail and stop the build.
-commit="${VDR_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
-out="$root/dist/vdr-linux-$arch-$commit.tar.gz"
+# The first argument names the package (a release passes its tag); without
+# one, the commit does. VDR_COMMIT wins over rev-parse when set: a worktree
+# copied to another machine has a .git file pointing at a path that does not
+# exist there, so rev-parse would fail and stop the build.
+label="${1:-${VDR_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)}}"
+out="$root/dist/vdr-linux-$arch-$label.tar.gz"
 mkdir -p "$root/dist"
 cp "$root/deploy/client/JOINING.md" "$dir/JOINING.md"
 cp "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$root/THIRD_PARTY_LICENSES" "$dir/"
