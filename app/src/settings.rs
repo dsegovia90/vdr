@@ -161,6 +161,26 @@ pub struct Settings {
     /// which skips what it does not understand rather than failing.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "lenient_hotkeys")]
     pub hotkeys: BTreeMap<String, String>,
+
+    /// What we call ourselves in a call, cleaned as it was saved. `None` is
+    /// no name, and the room sees our short id. Cleaned again wherever it is
+    /// read, so a hand edit cannot send what the field would not have let
+    /// through.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_name")]
+    pub name: Option<String>,
+}
+
+/// The `name` field, or no name when it is not text: a hand edit that writes
+/// `"name": 5` loses the name, not the rest of the file.
+fn lenient_name<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(name) => Ok(Some(name)),
+        serde_json::Value::Null => Ok(None),
+        other => {
+            tracing::warn!("settings: ignoring name {other}: not text");
+            Ok(None)
+        }
+    }
 }
 
 /// The `hotkeys` table, keeping what is text and dropping the rest with a log
@@ -570,6 +590,38 @@ mod tests {
         .expect("an older file is valid");
         assert_eq!(back.crosstalk_volume, Some(0.5));
         assert!(back.hotkeys.is_empty(), "no changed shortcuts");
+    }
+
+    #[test]
+    fn a_file_written_before_names_existed_still_loads() {
+        let back: Settings = serde_json::from_str(
+            r#"{"camera":"abc","microphone":null,"output":null,"crosstalk_volume":0.5,"hotkeys":{"leave":"f5"}}"#,
+        )
+        .expect("an older file is valid");
+        assert_eq!(back.camera.as_deref(), Some("abc"));
+        assert_eq!(back.name, None, "no name");
+    }
+
+    #[test]
+    fn a_name_round_trips_and_is_left_out_when_unset() {
+        let settings = Settings {
+            name: Some("Ada \u{1F600}".into()),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialises");
+        let back: Settings = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(back, settings);
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("name"), "{json}");
+    }
+
+    #[test]
+    fn a_malformed_name_costs_only_itself() {
+        for json in [r#"{"camera":"abc","name":5}"#, r#"{"camera":"abc","name":{"a":1}}"#, r#"{"camera":"abc","name":null}"#] {
+            let back: Settings = serde_json::from_str(json).expect("still valid");
+            assert_eq!(back.camera.as_deref(), Some("abc"), "{json}");
+            assert_eq!(back.name, None, "{json}");
+        }
     }
 
     #[test]

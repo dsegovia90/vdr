@@ -50,6 +50,21 @@ pub struct Rooms(pub Signal<BTreeMap<String, Option<String>>>);
 #[derive(Clone, Copy)]
 pub struct Invites(pub Signal<BTreeMap<String, Option<String>>>);
 
+/// What everyone else calls themselves, keyed by endpoint id; someone with no
+/// name has no entry. Written by each peer's tile, which already samples
+/// them, and read wherever a person is named off their own tile: invites,
+/// "muted by", the subroom lists, a share's label. The same half-second lag
+/// as [`Rooms`]. Shown only: everything else stays keyed on the id.
+#[derive(Clone, Copy)]
+pub struct Names(pub Signal<BTreeMap<String, String>>);
+
+impl Names {
+    /// What to call `id`: their name, or their short id without one.
+    pub fn of(names: &BTreeMap<String, String>, id: &str) -> String {
+        crate::name::label(names.get(id).map(String::as_str), id)
+    }
+}
+
 /// Whether we are sharing a screen, and why our last share failed. Written by
 /// our own tile, which already samples our entry, and read by the bar and the
 /// page; the same half-second lag as [`Rooms`], so a share the system ended
@@ -57,10 +72,11 @@ pub struct Invites(pub Signal<BTreeMap<String, Option<String>>>);
 #[derive(Clone, Copy)]
 pub struct OwnShare(pub Signal<(bool, Option<String>)>);
 
-/// Makes the shared [`Rooms`], [`Invites`] and [`OwnShare`] available to the
-/// tiles and the menus below.
+/// Makes the shared [`Rooms`], [`Names`], [`Invites`] and [`OwnShare`]
+/// available to the tiles and the menus below.
 pub fn use_rooms_provider() {
     use_context_provider(|| Rooms(Signal::new(BTreeMap::new())));
+    use_context_provider(|| Names(Signal::new(BTreeMap::new())));
     use_context_provider(|| Invites(Signal::new(BTreeMap::new())));
     use_context_provider(|| OwnShare(Signal::new((false, None))));
 }
@@ -116,6 +132,8 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
     let mut dragging = use_signal(|| false);
 
     let Invites(invites) = use_context::<Invites>();
+    let Names(names) = use_context::<Names>();
+    let names = names.read().clone();
     let map = rooms.read().clone();
     let mine = map.get(&props.me).cloned().flatten();
     // An invite to where we already are is hidden at once, ahead of the
@@ -210,7 +228,7 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
                                 let room = room.clone();
                                 move |_| join(room.clone())
                             },
-                            {invite_text(room, from)}
+                            {invite_text(room, &Names::of(&names, from))}
                         }
                     }
                     div { class: "px-2.5 pb-1 pt-1.5 text-xs text-neutral-500", "Subrooms" }
@@ -232,7 +250,7 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
                             },
                             // Both come off the wire, so both may be long.
                             span { class: "max-w-28 shrink-0 truncate", "{name}" }
-                            span { class: "min-w-0 truncate text-xs opacity-70", {who(members, &props.me)} }
+                            span { class: "min-w-0 truncate text-xs opacity-70", {who(members, &props.me, &names)} }
                         }
                     }
                     div {
@@ -329,18 +347,17 @@ pub fn SubroomMenu(props: SubroomMenuProps) -> Element {
     }
 }
 
-/// An invite's row: where to, and from whom by short id.
-fn invite_text(room: &Option<String>, from: &str) -> String {
+/// An invite's row: where to, and from whom, as [`Names::of`] calls them.
+fn invite_text(room: &Option<String>, by: &str) -> String {
     let to = room.as_deref().unwrap_or("main room");
-    let by: String = from.chars().take(8).collect();
     format!("Join {to} \u{b7} invited by {by}")
 }
 
-/// Who is in a subroom, for its row: short ids, and "you" for us.
-fn who(members: &[String], me: &str) -> String {
+/// Who is in a subroom, for its row: names or short ids, and "you" for us.
+fn who(members: &[String], me: &str, names: &BTreeMap<String, String>) -> String {
     members
         .iter()
-        .map(|id| if id == me { "you".to_string() } else { id.chars().take(8).collect() })
+        .map(|id| if id == me { "you".to_string() } else { Names::of(names, id) })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -469,6 +486,17 @@ mod tests {
             .iter()
             .map(|(id, room)| (id.to_string(), room.map(str::to_string)))
             .collect()
+    }
+
+    #[test]
+    fn members_are_named_where_they_have_names() {
+        let names: BTreeMap<String, String> = [("3929461daf6e".to_string(), "Ada".to_string())].into();
+        let members = ["3929461daf6e".to_string(), "573584f2aaaa".to_string(), "me".to_string()];
+        assert_eq!(who(&members, "me", &names), "Ada, 573584f2, you");
+        assert_eq!(
+            invite_text(&None, &Names::of(&names, "573584f2aaaa")),
+            "Join main room \u{b7} invited by 573584f2"
+        );
     }
 
     #[test]

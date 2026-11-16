@@ -57,6 +57,10 @@ pub(super) fn menu_name(who: &str) -> String {
 pub struct TileMenuProps {
     /// Whose tile this is, by endpoint id.
     pub who: String,
+    /// What they call themselves, if anything. With one, the menu also
+    /// shows their short id: a name is only a claim, and two people can
+    /// make the same one.
+    pub name: Option<String>,
     /// Their subroom, as their tile last sampled it.
     pub their_room: Option<String>,
     /// Whether their microphone is on.
@@ -112,6 +116,13 @@ pub fn TileMenu(props: TileMenuProps) -> Element {
             } else {
                 "hidden absolute bottom-10 left-2 z-10 w-48 rounded-lg border border-neutral-700 bg-neutral-900 p-1"
             },
+            if let Some(name) = props.name.as_ref() {
+                div { class: "flex flex-col px-2.5 pb-1.5 pt-1",
+                    span { class: "truncate text-sm text-neutral-100", "{name}" }
+                    span { class: "text-xs text-neutral-500", {crate::name::short(&props.who)} }
+                }
+                div { class: "my-1 h-px bg-neutral-800" }
+            }
             if offered.is_empty() {
                 div { class: "px-2.5 py-2 text-sm text-neutral-500", "Nothing to do" }
             }

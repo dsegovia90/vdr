@@ -321,6 +321,9 @@ pub struct PeerStats {
     /// The subroom they are in, as they say in their presence document, or
     /// `None` for the main room. For our own entry, the one we chose.
     room: std::sync::Mutex<Option<String>>,
+    /// What they call themselves, cleaned (`crate::name::clean`), or `None`.
+    /// For our own entry, the name we chose. Shown only; never a key.
+    name: std::sync::Mutex<Option<String>>,
     /// What we are asking of other peers, each with when we asked. Our own
     /// entry only; a peer's requests are acted on as they arrive, not kept.
     asks: std::sync::Mutex<Vec<(Request, Instant)>>,
@@ -513,6 +516,7 @@ impl Default for PeerStats {
             mic_on: AtomicBool::new(true),
             clock: std::sync::Mutex::new(None),
             room: std::sync::Mutex::new(None),
+            name: std::sync::Mutex::new(None),
             asks: std::sync::Mutex::new(Vec::new()),
             invites: std::sync::Mutex::new(BTreeMap::new()),
             muted_by: std::sync::Mutex::new(None),
@@ -586,6 +590,19 @@ impl PeerStats {
         };
         if changed {
             self.retain_asks(|request| request.kind != Ask::Invite);
+        }
+    }
+
+    /// What they call themselves, or `None` for no name.
+    pub fn name(&self) -> Option<String> {
+        self.name.lock().ok().and_then(|name| name.clone())
+    }
+
+    /// Records what they call themselves. Takes a name already cleaned: the
+    /// boundaries it crosses are where that happens, so it is visible there.
+    pub fn set_name(&self, name: Option<String>) {
+        if let Ok(mut slot) = self.name.lock() {
+            *slot = name;
         }
     }
 
