@@ -149,7 +149,10 @@ focus.
     speaker signal, so every call echoed) and exposes its statistics.
   - `moq-video`: its PipeWire capture dropped every DMA-BUF frame from
     Hyprland's portal.
-  - `blitz-dom`: hit-testing a node that was just removed panicked.
+  - `blitz-dom`: hit-testing a node that was just removed panicked. It also keeps
+    scrollbar thumbs visible wherever content overflows (blitz fades them out
+    until a scroll); the `scrollbars` feature on `dioxus-native` turns them on,
+    and a `scrollbar-color` with two colours paints the track.
 - **The moq stack is moq-video/moq-audio 0.1.21, moq-net 0.3, moq-tokio 0.19.**
   moq-video's `vaapi` and `nvidia` features are on for Linux only, `openh264`
   (the software fallback) everywhere. The video encoder is not `Send`: it is
@@ -272,6 +275,7 @@ focus.
 | `settings.rs` | what the app remembers between launches, the data folder, the log path |
 | `hotkeys.rs` | keyboard shortcuts as a pure table: actions, chords, the keymap. No UI in it |
 | `name.rs` | display names: cleaning, the short id, which label to show |
+| `recent.rs` | recent rooms: the list, pin/remove/cap, a room's identity, relative times, `rooms.json` (owner-only, holds room tokens: never display or log a stored link) |
 | `awake.rs` | keeps the machine awake during a call |
 | `channel.rs` | shared single-slot channel primitive |
 | `audio/` | `Controls` (mute, chosen devices, level), device enumeration, `catchup.rs` |
@@ -283,12 +287,12 @@ focus.
 | `net/share.rs` | screen sharing: capture and its own broadcast |
 | `net/loopback.rs` | the in-process H.264 round trip |
 | `net/runtime.rs` | the single tokio runtime |
-| `components/` | `call_screen.rs` (the page and its key handler), `layout.rs`, `tile.rs`, `tile_menu.rs`, `participant.rs`, `bar.rs`, `microphone.rs`, `share.rs`, `subroom.rs`, `device_menu.rs`, `connect.rs`, `keys.rs`, `icons.rs`, `button.rs`, `stats.rs` |
+| `components/` | `call_screen.rs` (the page and its key handler), `layout.rs`, `tile.rs`, `tile_menu.rs`, `participant.rs`, `bar.rs`, `microphone.rs`, `share.rs`, `subroom.rs`, `device_menu.rs`, `connect.rs`, `recent.rs` (the recent rooms list), `keys.rs`, `icons.rs`, `button.rs`, `stats.rs` |
 | `components/settings/` | the settings window: a `Tab` variant plus a component per tab (`profile.rs`, `keyboard.rs`, `about.rs`) |
 
 Frames never touch the DOM:
 `cameras::pump` → `FrameSlot` → `VideoPaintSource` → vello.
 
-`cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`,
+`cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`,
 `camera/paint/fit.rs`, `audio/catchup.rs`, `components/layout.rs`) are where
 logic that can be tested without a window belongs.
