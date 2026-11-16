@@ -31,5 +31,5 @@ pub use recent::RecentRoomList;
 pub use settings::SettingsModal;
 pub use stats::StatsRow;
 pub use share::{ShareControl, ShareTile};
-pub use subroom::{CrosstalkLevel, Invites, OwnShare, Rooms, SubroomMenu, use_crosstalk_provider, use_rooms_provider};
+pub use subroom::{CrosstalkLevel, Invites, Names, OwnShare, Rooms, SubroomMenu, use_crosstalk_provider, use_rooms_provider};
 pub use tile::ParticipantTile;

@@ -76,7 +76,7 @@ impl Participant {
     /// Enough of the id to tell two people apart in a log or a label, without
     /// carrying 64 hex characters around.
     pub fn short(&self) -> String {
-        self.id.chars().take(8).collect()
+        crate::name::short(&self.id)
     }
 }
 
@@ -220,6 +220,8 @@ pub fn use_remote() -> Remote {
         }
         let metrics = Arc::new(Metrics::default());
         let local = Arc::new(PeerStats::default());
+        // Our name, as last saved; the Profile tab changes it from here on.
+        local.set_name(saved.name.as_deref().and_then(crate::name::clean));
         let share = ShareWish::new();
         let (tap, feed) = frame_tap();
         // The decision, not the feed, is what gets deferred. The call thread

@@ -218,11 +218,16 @@ impl SettingsPanel {
 
     /// Closes it, abandoning any recording, and gives the keyboard back to
     /// the page.
+    ///
+    /// **Even from one of its text fields.** Hidden with the window, a field
+    /// that has the keyboard sends no blur, so `typing` would stay set and the
+    /// shortcuts paused until the next click; and `restore` declines while it
+    /// is set. So this clears it, which also restores.
     pub fn close(mut self, focus: KeyFocus) {
         self.open.set(false);
         self.recording.set(None);
         self.notice.set(None);
-        focus.restore();
+        focus.set_typing(false);
     }
 }
 

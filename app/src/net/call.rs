@@ -420,6 +420,12 @@ struct Presence {
     /// sharer's control broadcast goes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     sharing: bool,
+    /// What they call themselves. Absent is no name, so a document without
+    /// one is what a build without names sends, and such a build ignores the
+    /// field. **A claim, not an identity**: cleaned again on arrival, shown
+    /// only, and never a key -- everything stays keyed on the endpoint id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 impl Default for Presence {
@@ -432,6 +438,7 @@ impl Default for Presence {
             room: None,
             requests: Vec::new(),
             sharing: false,
+            name: None,
         }
     }
 }
@@ -447,6 +454,9 @@ impl Presence {
             room: local.room(),
             requests: local.requests(),
             sharing: local.sharing(),
+            // Cleaned on the way out as well as in: we send what we would
+            // accept, whatever wrote our entry.
+            name: local.name().as_deref().and_then(crate::name::clean),
         }
     }
 }
@@ -1777,7 +1787,7 @@ fn say(presence: &std::sync::Mutex<moq_json::snapshot::Producer<Presence>>, now:
     }
 }
 
-/// Re-announces our presence whenever our camera or microphone changes, and
+/// Re-announces our presence whenever our camera, microphone or name changes, and
 /// every [`CLOCK_EVERY`] regardless, so the clock pairing it carries stays fresh.
 ///
 /// **Polled, four times a second.** Two booleans flipped by a click do not earn
@@ -1794,16 +1804,18 @@ async fn announce(
         ticker.tick().await;
         local.expire_asks(ASK_FOR);
         let now = Presence::here(&local);
-        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing)
-            != (said.camera, said.mic, &said.room, &said.requests, said.sharing);
+        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name)
+            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name);
         if changed {
             let asking = match now.requests.len() {
                 0 => String::new(),
                 n => format!(", asking {n}"),
             };
             let sharing = if now.sharing { ", sharing" } else { "" };
+            // Whether, not what: the log keys people by id.
+            let named = if now.name.is_some() { ", named" } else { "" };
             tracing::info!(
-                "now camera {}, mic {}, room {}{asking}{sharing}",
+                "now camera {}, mic {}, room {}{asking}{sharing}{named}",
                 on_off(now.camera),
                 on_off(now.mic),
                 room_name(&now.room)
@@ -1957,6 +1969,7 @@ async fn listen(
                 room,
                 requests,
                 sharing,
+                name,
             })) => {
                 let room = subroom(room);
                 if let Some(clock) = clock {
@@ -1973,6 +1986,9 @@ async fn listen(
                 stats.set_camera(camera);
                 stats.set_mic(mic);
                 stats.set_sharing(sharing);
+                // Never trusted as sent: cleaned here whatever their build
+                // did, and shown only.
+                stats.set_name(name.as_deref().and_then(crate::name::clean));
                 // Read by their audio task on every frame, which is what sets
                 // how loud they are to us.
                 stats.set_room(room.clone());
@@ -2390,9 +2406,90 @@ mod presence_tests {
             room: None,
             requests: Vec::new(),
             sharing: false,
+            name: Some("Ada".to_string()),
         };
         let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
         assert_eq!(heard, said);
+    }
+
+    #[test]
+    fn a_name_survives_the_round_trip() {
+        let said = Presence {
+            name: Some("Ada \u{1F600}".to_string()),
+            ..Presence::default()
+        };
+        let json = serde_json::to_string(&said).unwrap();
+        assert!(json.contains(r#""name":"Ada"#), "{json}");
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard, said);
+    }
+
+    #[test]
+    fn no_name_is_said_without_a_name_key() {
+        // So an older peer receives exactly the bytes it did before names.
+        let json = serde_json::to_string(&Presence::default()).unwrap();
+        assert!(!json.contains("name"), "{json}");
+    }
+
+    #[test]
+    fn an_older_peer_has_no_name() {
+        let old: Presence = serde_json::from_str(r#"{"state":"here","mic":false,"room":"Attic"}"#).unwrap();
+        assert_eq!(old.name, None);
+        assert!(!old.mic);
+        assert_eq!(old.room.as_deref(), Some("Attic"));
+    }
+
+    /// `Presence` as a build from before names declared it, field for field.
+    #[derive(Debug, serde::Deserialize)]
+    struct Unnamed {
+        state: State,
+        #[serde(default = "super::on")]
+        camera: bool,
+        #[serde(default = "super::on")]
+        mic: bool,
+        #[serde(default)]
+        clock: Option<Clock>,
+        #[serde(default)]
+        room: Option<String>,
+        #[serde(default)]
+        requests: Vec<Request>,
+        #[serde(default)]
+        sharing: bool,
+    }
+
+    #[test]
+    fn an_older_peer_reads_a_named_document() {
+        // What reaches a build without names: the field is ignored, and the
+        // rest of the document still counts.
+        let said = Presence {
+            camera: false,
+            mic: false,
+            clock: Some(Clock { wall_us: 1, media_us: 2 }),
+            room: Some("Attic".to_string()),
+            requests: vec![request("x", Ask::Mute, 3)],
+            sharing: true,
+            name: Some("Ada".to_string()),
+            ..Presence::default()
+        };
+        let json = serde_json::to_string(&said).unwrap();
+        let heard: Unnamed = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard.state, State::Here);
+        assert!(!heard.camera && !heard.mic && heard.sharing);
+        assert_eq!(heard.clock, said.clock);
+        assert_eq!(heard.room.as_deref(), Some("Attic"));
+        assert_eq!(heard.requests, said.requests);
+    }
+
+    #[test]
+    fn a_hostile_name_is_cleaned_on_arrival() {
+        // What `listen` does with a name as it comes off the wire.
+        let json = format!(r#"{{"state":"here","name":"  \u202eEvil\n\n{}  "}}"#, "x".repeat(100));
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        let shown = heard.name.as_deref().and_then(crate::name::clean).unwrap();
+        assert!(shown.starts_with("Evil x"), "{shown}");
+        assert_eq!(shown.chars().count(), crate::name::MAX);
+        let blank: Presence = serde_json::from_str(r#"{"state":"here","name":" \t "}"#).unwrap();
+        assert_eq!(blank.name.as_deref().and_then(crate::name::clean), None);
     }
 }
 

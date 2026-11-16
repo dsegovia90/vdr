@@ -15,7 +15,8 @@ use super::keys::{chord_of, use_keys_provider, use_settings_panel_provider};
 use super::microphone::set_mic;
 use super::tile::{UNDIMMED, dim_class};
 use super::{
-    ConnectRow, ControlBar, CrosstalkLevel, DropdownOption, OwnShare, ParticipantTile, RecentRoomList, Rooms, SettingsModal,
+    ConnectRow, ControlBar, CrosstalkLevel, DropdownOption, Names, OwnShare, ParticipantTile, RecentRoomList, Rooms,
+    SettingsModal,
     ShareTile, layout, settings, share, use_crosstalk_provider, use_open_menu_provider, use_rooms_provider,
 };
 use crate::audio::use_shared_microphones;
@@ -64,6 +65,7 @@ pub fn CallScreen() -> Element {
     // tiles that dim to it. After `use_remote`, which loads the saved setting.
     use_crosstalk_provider(&remote.audio);
     let Rooms(rooms) = use_context::<Rooms>();
+    let Names(names) = use_context::<Names>();
     let CrosstalkLevel(crosstalk) = use_context::<CrosstalkLevel>();
     let camera = use_camera_choice(slot.clone(), remote.tap.clone());
 
@@ -188,6 +190,7 @@ pub fn CallScreen() -> Element {
     let tiles = cards.len();
 
     let rooms = rooms.read().clone();
+    let names = names.read().clone();
     let ours = rooms.get(&me).cloned().flatten();
     let dim = dim_class(crosstalk());
     let ids: Vec<&str> = cards
@@ -369,6 +372,13 @@ pub fn CallScreen() -> Element {
                         if let Some(participant) = item.peer {
                             ShareTile {
                                 label: format!("{} \u{b7} screen", participant.short()),
+                                // From their camera's tile, or straight from
+                                // their entry when they share without one.
+                                shown: names
+                                    .get(&participant.id)
+                                    .cloned()
+                                    .or_else(|| participant.stats.name())
+                                    .map(|name| format!("{name} \u{b7} screen")),
                                 slot: participant.slot.clone(),
                                 class: item.class,
                                 dim: item.dim,
@@ -448,7 +458,7 @@ pub fn CallScreen() -> Element {
             share: remote.share.clone(),
         }
         // Last, so it paints over everything, the video included.
-        SettingsModal {}
+        SettingsModal { local: remote.local.clone() }
         }
     }
 }

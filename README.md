@@ -84,10 +84,13 @@ are not remembered.
   still heard at the level you set there, from muted up to full, and it is
   remembered across launches. Tiles are grouped under their subroom's label
   and the ones outside yours are dimmed.
-- **Tile menu.** A person's name under their tile is a menu: join their
-  subroom, invite them to yours, or ask them to mute. An invite shows up in
-  the other person's subroom menu as a one-click *Join*; it never moves
-  anyone. A mute runs their own mute, so they see it and can unmute.
+- **Tile menu.** A person's name under their tile (or their short id, if
+  they have not set a name) is a menu: join their subroom, invite them to
+  yours, or ask them to mute. When they have a name, the menu also shows
+  their short id, so two people with the same name can be told apart. An
+  invite shows up in the other person's subroom menu as a one-click *Join*;
+  it never moves anyone. A mute runs their own mute, so they see it and can
+  unmute.
 - **Screen sharing.** Share from the bar; a shared screen is one more tile in
   the room, beside the sharer's camera.
 - **Mute and camera off** are in the bar and shown on your tile to the room.
@@ -95,10 +98,13 @@ are not remembered.
 ### Settings and keyboard shortcuts
 
 The gear at the right of the bar opens the settings (also Cmd+, on macOS,
-Ctrl+, elsewhere). Its *Keyboard* tab lists the shortcuts and changes them:
-click a key, then press the new one; Backspace removes it, Esc gives up. Its
-*About* tab shows the version and where the log is, which is what to send
-after a call that went wrong.
+Ctrl+, elsewhere). Its *Profile* tab sets your display name, shown under your
+video to everyone in the call in place of your short id; a change reaches a
+call you are already in. Names are not verified: anyone can choose any name,
+and two people can choose the same one. Its *Keyboard* tab lists the
+shortcuts and changes them: click a key, then press the new one; Backspace
+removes it, Esc gives up. Its *About* tab shows the version and where the log
+is, which is what to send after a call that went wrong.
 
 | Action | macOS | Linux |
 |---|---|---|

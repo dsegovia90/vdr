@@ -11,26 +11,32 @@
 
 mod about;
 mod keyboard;
+mod profile;
+
+use std::sync::Arc;
 
 use dioxus_native::prelude::*;
 
 use super::keys::{KeyFocus, SettingsPanel};
-use super::{CloseIcon, InfoIcon, KeyboardIcon};
+use super::{CloseIcon, InfoIcon, KeyboardIcon, PersonIcon};
+use crate::net::PeerStats;
 
 pub(super) use keyboard::record;
 
 /// One tab of the window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Tab {
+    Profile,
     Keyboard,
     About,
 }
 
 impl Tab {
-    const ALL: [Tab; 2] = [Tab::Keyboard, Tab::About];
+    const ALL: [Tab; 3] = [Tab::Profile, Tab::Keyboard, Tab::About];
 
     fn label(self) -> &'static str {
         match self {
+            Tab::Profile => "Profile",
             Tab::Keyboard => "Keyboard",
             Tab::About => "About",
         }
@@ -38,24 +44,28 @@ impl Tab {
 
     fn icon(self) -> Element {
         match self {
+            // The avatar's figure at the rail's size.
+            Tab::Profile => rsx! { PersonIcon { size: 16 } },
             Tab::Keyboard => rsx! { KeyboardIcon {} },
             Tab::About => rsx! { InfoIcon {} },
         }
     }
 
-    fn body(self) -> Element {
+    fn body(self, local: Arc<PeerStats>) -> Element {
         match self {
+            Tab::Profile => rsx! { profile::ProfileTab { local } },
             Tab::Keyboard => rsx! { keyboard::KeyboardTab {} },
             Tab::About => rsx! { about::AboutTab {} },
         }
     }
 }
 
+/// The window. `local` is our own entry, which the Profile tab names.
 #[component]
-pub fn SettingsModal() -> Element {
+pub fn SettingsModal(local: Arc<PeerStats>) -> Element {
     let panel = use_context::<SettingsPanel>();
     let focus = use_context::<KeyFocus>();
-    let mut tab = use_signal(|| Tab::Keyboard);
+    let mut tab = use_signal(|| Tab::Profile);
     let open = (panel.open)();
     let current = tab();
 
@@ -95,7 +105,7 @@ pub fn SettingsModal() -> Element {
                     }
                 }
                 div { class: "min-w-0 flex-1 overflow-y-auto px-8 py-6",
-                    {current.body()}
+                    {current.body(local.clone())}
                 }
                 // A way out that can be seen: Esc and the backdrop close it
                 // too, but neither says so. Over the pane's corner, after it
