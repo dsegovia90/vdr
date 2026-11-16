@@ -63,8 +63,9 @@ pub fn RecentRoomList(
             span { class: "text-sm text-neutral-400", "Recent rooms" }
             // The renderer paints a thumb while this overflows, which is what
             // says the list goes on. Padded on the right so the thumb, drawn
-            // over the content, does not sit on the remove buttons.
-            div { class: "flex min-h-0 flex-col overflow-y-auto pr-4 [scrollbar-color:rgb(115,115,115)_transparent]",
+            // over the content, does not sit on the remove buttons. The second colour is the track:
+            // the renderer paints one only when it is given a colour.
+            div { class: "flex min-h-0 flex-col overflow-y-auto pr-4 [scrollbar-color:rgb(115,115,115)_rgb(38,38,38)]",
                 for row in rows {
                     div { key: "{row.key}", class: "flex flex-row items-center gap-3 rounded-md px-2 py-1 hover:bg-neutral-900",
                         span { class: "min-w-0 truncate text-sm text-neutral-100", "{row.name}" }
