@@ -115,7 +115,10 @@ pub fn CallScreen() -> Element {
             }
             focus.key_pressed(matches!(event.key(), Key::Tab));
             let Some(chord) = chord_of(&event) else { return };
-            if let Some(action) = *panel.recording.peek() {
+            // Read into a local first: a borrow taken in the `if let` itself
+            // lasts for the whole block, and recording writes this signal.
+            let recording = *panel.recording.peek();
+            if let Some(action) = recording {
                 settings::record(panel, hotkeys, action, chord);
                 return;
             }
