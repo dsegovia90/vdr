@@ -109,8 +109,8 @@ pub fn ConnectRow(
                     placeholder: "Paste the other person's key, or a relay room URL",
                     value: "{draft}",
                     // Shortcuts pause while this has the keyboard: `m` here is
-                    // a letter of someone's key, not the microphone.
-                    // On the press, before blitz moves focus here, so the
+                    // a letter of someone's key, not the microphone. Noted on
+                    // the press too, before blitz moves focus here, so the
                     // page's root does not take it straight back.
                     onmousedown: move |_| focus.set_typing(true),
                     onfocus: move |_| focus.set_typing(true),
