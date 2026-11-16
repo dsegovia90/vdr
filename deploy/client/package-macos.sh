@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the macOS app and zips it for sending to someone.
 #
-#   deploy/client/package-macos.sh      # writes dist/vdr-macos-<arch>-<commit>.zip
+#   deploy/client/package-macos.sh          # writes dist/vdr-macos-<arch>-<commit>.zip
+#   deploy/client/package-macos.sh v1.2.3   # writes dist/vdr-macos-<arch>-v1.2.3.zip
 #
 # `dx build`, not `dx bundle`: `dx bundle` hands off to a bundler that writes
 # its own minimal Info.plist and drops the camera and microphone usage keys,
@@ -41,9 +42,10 @@ done
 
 arch="$(lipo -archs "$app/Contents/MacOS/vdr" | tr ' ' '+')"
 [ "$arch" = "x86_64+arm64" ] && arch=universal
-# The commit names the package; VDR_COMMIT wins when set (see build-linux.sh).
-commit="${VDR_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
-out="$root/dist/vdr-macos-$arch-$commit.zip"
+# The first argument names the package (a release passes its tag); without
+# one, the commit does, and VDR_COMMIT wins when set (see build-linux.sh).
+label="${1:-${VDR_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)}}"
+out="$root/dist/vdr-macos-$arch-$label.zip"
 mkdir -p "$root/dist"
 rm -f "$out"
 # The app and the guide together, so the one download is all anyone needs.
