@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+# A new push to the same branch or pull request makes the older run moot.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: clippy and tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.04: the same base, and glibc floor, as the Linux package.
+        os: [ubuntu-22.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+
+      # Without `wayland-share` (off by default), so no PipeWire headers are
+      # needed here; the release build compiles that feature.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: ../deploy/client/linux-deps.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+  licences:
+    name: third-party licences
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      # A crate under a licence not yet reviewed in about.toml fails here, and
+      # so does a dependency change that was not followed by `just notices`:
+      # the packages ship THIRD_PARTY_LICENSES as committed.
+      - name: generate and compare
+        run: |
+          cargo about generate --locked --fail --features wayland-share about.hbs -o "$RUNNER_TEMP/THIRD_PARTY_LICENSES"
+          diff -u ../THIRD_PARTY_LICENSES "$RUNNER_TEMP/THIRD_PARTY_LICENSES" \
+            || { echo "::error::THIRD_PARTY_LICENSES is out of date; run 'just notices' and commit it"; exit 1; }
