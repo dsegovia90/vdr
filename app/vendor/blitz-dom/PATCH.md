@@ -37,3 +37,16 @@ the same way. It is after `v0.3.0-beta.4` (2026-10-16), the newest
 release pins beta.4 or older. Drop this vendoring and the `[patch]` in
 `app/Cargo.toml` once dioxus-native takes a blitz-dom released after that
 commit.
+
+## Scrollbar thumbs stay visible
+
+`BaseDocument::scrollbar_opacity` returns 1.0 whenever the `scrollbars`
+feature is on. Upstream's overlay thumbs appear only once a container has been
+scrolled and fade out a moment later (Chromium's overlay timings), which
+leaves a list that has never been scrolled looking complete: the list of
+recent rooms cut off at its fourth row with nothing to say there were more.
+Painting is unchanged, so a thumb is still drawn only where content overflows.
+
+Not a bug upstream, so there is nothing to wait for; drop this if blitz grows a
+way to ask for persistent scrollbars (`scrollbar-gutter`, or an option).
+

@@ -43,7 +43,9 @@ cameras = "0.3.2"
 # pin is still load-bearing, because `hang 0.20` (via moq-mux/moq-video) and
 # `iroh 1.1` both pull `derive_more` in on their own. Verify with
 # `cargo tree -i derive_more` before concluding this pin is stale.
-dioxus-native = { git = "https://github.com/DioxusLabs/blitz", tag = "v0.3.0-beta.4", features = ["prelude", "tracing"] }
+# `scrollbars`: blitz paints a thumb on a container that scrolls. Off by
+# default upstream; without it nothing shows that a list goes on.
+dioxus-native = { git = "https://github.com/DioxusLabs/blitz", tag = "v0.3.0-beta.4", features = ["prelude", "tracing", "scrollbars"] }
 # Needed to name the `Widget` API types the video tiles implement (it replaced
 # `CustomPaintSource` in beta.4). Same tag as dioxus-native, or the two disagree.
 blitz-dom = { git = "https://github.com/DioxusLabs/blitz", tag = "v0.3.0-beta.4", default-features = false }
