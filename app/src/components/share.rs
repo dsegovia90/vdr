@@ -149,17 +149,10 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
                 onclick: {
                     let share = props.share.clone();
                     move |_| {
-                        if !on && share_lists() {
-                            // The ▾'s own list, opened from here: the menu is
-                            // the ▾'s, keyed by name, so this is all it takes.
-                            let next = if current.peek().as_deref() == Some(NAME) { None } else { Some(NAME.to_string()) };
-                            current.set(next);
-                            return;
+                        if let Some(next) = press(&share, on, current) {
+                            clicked.set(share.generation());
+                            wish.set(next);
                         }
-                        let next = if on { None } else { Some(ShareSource::Display(None)) };
-                        share.set(next.clone());
-                        clicked.set(share.generation());
-                        wish.set(next);
                     }
                 },
                 ScreenIcon { on }
@@ -190,6 +183,22 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
             }
         }
     }
+}
+
+/// What pressing Share does, for the button and the shortcut alike: stop a
+/// share that is on; otherwise open the list (toggling it), or where there is
+/// no list, start the system's picker. Returns the new wish when it set one.
+pub(super) fn press(share: &ShareWish, on: bool, mut menu: Signal<Option<String>>) -> Option<Option<ShareSource>> {
+    if !on && share_lists() {
+        // The ▾'s own list, opened from here: the menu is the ▾'s, keyed by
+        // name, so this is all it takes.
+        let next = if menu.peek().as_deref() == Some(NAME) { None } else { Some(NAME.to_string()) };
+        menu.set(next);
+        return None;
+    }
+    let next = if on { None } else { Some(ShareSource::Display(None)) };
+    share.set(next.clone());
+    Some(next)
 }
 
 #[derive(Clone, PartialEq, Props)]

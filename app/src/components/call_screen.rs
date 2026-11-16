@@ -1,18 +1,27 @@
 //! The call screen: who to call while idle, everyone's video, and the bar.
 //!
-//! Layout only. The camera's state lives in `camera::use_camera_choice`, the
-//! call's in `net::use_remote`, and the arrangement of the video in `layout`.
+//! Layout, and the keyboard shortcuts. The camera's state lives in
+//! `camera::use_camera_choice`, the call's in `net::use_remote`, the
+//! arrangement of the video in `layout`, and what a key means in `hotkeys`.
+//!
+//! **The page's root element is here**, not in `main`, because it is where
+//! keys arrive (see `keys`) and the actions they trigger need the call.
 
 use cameras::DeviceId;
 use dioxus_native::prelude::*;
 
+use super::device_menu::OpenMenu;
+use super::keys::{chord_of, use_keys_provider, use_settings_panel_provider};
+use super::microphone::set_mic;
 use super::tile::{UNDIMMED, dim_class};
 use super::{
-    ConnectRow, ControlBar, CrosstalkLevel, DropdownOption, OwnShare, ParticipantTile, Rooms, ShareTile, layout,
-    use_crosstalk_provider, use_open_menu_provider, use_rooms_provider,
+    ConnectRow, ControlBar, CrosstalkLevel, DropdownOption, OwnShare, ParticipantTile, Rooms, SettingsModal,
+    ShareTile, layout, settings, share, use_crosstalk_provider, use_open_menu_provider, use_rooms_provider,
 };
+use crate::audio::use_shared_microphones;
 use crate::camera::{FrameSlot, Mirror, use_camera_choice};
-use crate::net::{Feed, Participant, use_remote};
+use crate::hotkeys::Action;
+use crate::net::{Feed, Participant, share_available, use_remote};
 
 /// One child of the tile area, in order: a group's label, or a card with the
 /// line break after it. All in one keyed list, so someone changing subroom
@@ -40,6 +49,10 @@ pub fn CallScreen() -> Element {
     use_open_menu_provider();
     // Everyone's subroom, filled by the tiles and read by the subroom menu.
     use_rooms_provider();
+    let (focus, hotkeys) = use_keys_provider();
+    let panel = use_settings_panel_provider();
+    let OpenMenu(mut menu) = use_context::<OpenMenu>();
+    let microphones = use_shared_microphones();
 
     // Shared between the capture thread that fills it and the paint source that
     // drains it on the render thread.
@@ -53,6 +66,18 @@ pub fn CallScreen() -> Element {
     let Rooms(rooms) = use_context::<Rooms>();
     let CrosstalkLevel(crosstalk) = use_context::<CrosstalkLevel>();
     let camera = use_camera_choice(slot.clone(), remote.tap.clone());
+
+    // The camera button and its shortcut, one path: the room hears of it
+    // through our presence either way.
+    let toggle_camera = use_callback({
+        let local = remote.local.clone();
+        move |()| {
+            camera.toggle();
+            // Told to the room by the call's announcer, and shown on our own
+            // tile the same way others will see it.
+            local.set_camera(*camera.enabled.peek());
+        }
+    });
 
     let camera_options: Vec<DropdownOption> = camera
         .devices
@@ -72,6 +97,69 @@ pub fn CallScreen() -> Element {
         all.into_iter().partition(|participant| participant.feed == Feed::Camera);
     let OwnShare(own_share) = use_context::<OwnShare>();
     let (sharing, _) = own_share();
+
+    // **One key press, one action, by the bar's own code paths.** Esc and
+    // the shortcut recorder come first, since they work with the settings
+    // open; everything else waits while the settings are open or a text field
+    // has the keyboard. Held keys repeat, and a repeat is ignored, so holding
+    // `m` does not flap the microphone.
+    let on_key = {
+        let audio = remote.audio.clone();
+        let local = remote.local.clone();
+        let share = remote.share.clone();
+        let status = remote.status;
+        let cancel = remote.cancel;
+        move |event: KeyboardEvent| {
+            if event.is_auto_repeating() {
+                return;
+            }
+            focus.key_pressed(matches!(event.key(), Key::Tab));
+            let Some(chord) = chord_of(&event) else { return };
+            if let Some(action) = *panel.recording.peek() {
+                settings::record(panel, hotkeys, action, chord);
+                return;
+            }
+            if chord.is_escape() {
+                if *panel.open.peek() {
+                    panel.close(focus);
+                } else if menu.peek().is_some() {
+                    menu.set(None);
+                }
+                return;
+            }
+            if *focus.typing.peek() || *panel.open.peek() {
+                return;
+            }
+            let Some(action) = hotkeys.0.peek().lookup(chord) else { return };
+            tracing::debug!("shortcut {chord}: {}", action.id());
+            match action {
+                Action::ToggleMic => {
+                    // The button does nothing without a microphone either.
+                    if microphones.devices.peek().is_empty() {
+                        tracing::debug!("no microphone to toggle");
+                        return;
+                    }
+                    set_mic(&audio, &local, !audio.enabled());
+                }
+                Action::ToggleCamera => toggle_camera.call(()),
+                Action::ShareScreen => {
+                    let on = own_share.peek().0 || share.get().is_some();
+                    // Only where the Share button is shown: on a call, on a
+                    // build that can capture the screen. Stopping is always
+                    // allowed.
+                    if on || (status.peek().is_connected() && share_available()) {
+                        share::press(&share, on, menu);
+                    }
+                }
+                Action::Leave => {
+                    if status.peek().is_cancellable() {
+                        cancel.call(());
+                    }
+                }
+                Action::OpenSettings => panel.show(),
+            }
+        }
+    };
     // Our tile's `who`, and so our key among everyone's rooms.
     let me = remote.me.read().clone().unwrap_or_default();
 
@@ -224,6 +312,28 @@ pub fn CallScreen() -> Element {
     }
 
     rsx! {
+        // `h-screen`, not `h-full`: a percentage height on the root never
+        // resolves in blitz -- checked on both the old pin and beta.4 -- and
+        // without a definite height the video area cannot take what is left,
+        // so the bar floats mid-window. `overflow-hidden` because nothing here
+        // should ever scroll, and it stopped a one-pixel scrollbar flicker.
+        //
+        // Focusable from code only (`tabindex` -1), so it can hold the
+        // keyboard for the shortcuts; see `keys`. `outline-none`, or holding
+        // it would draw a ring round the whole window.
+        div {
+            class: "flex h-screen flex-col gap-4 overflow-hidden p-6 outline-none",
+            tabindex: "-1",
+            onmounted: move |event| focus.mounted(event.data()),
+            onkeydown: on_key,
+            // Blitz drops focus on a click anywhere it does not consider
+            // focusable, which is every button we have; the blur comes after
+            // it has.
+            onblur: move |_| focus.root_blurred(),
+            // For a click after focus went with no blur at all (a focused
+            // field removed): focused here, then cleared by the click, then
+            // restored by the blur above.
+            onclick: move |_| focus.restore(),
         // Only while there is no call: your key and who to call. A call is the
         // grid and the bar below, nothing else.
         ConnectRow {
@@ -318,15 +428,7 @@ pub fn CallScreen() -> Element {
             camera_on: (camera.enabled)(),
             cameras: camera_options,
             camera: camera.selected.read().as_ref().map(|id| id.0.clone()),
-            on_camera_toggle: {
-                let local = remote.local.clone();
-                move |_| {
-                    camera.toggle();
-                    // Told to the room by the call's announcer, and shown on
-                    // our own tile the same way others will see it.
-                    local.set_camera(*camera.enabled.peek());
-                }
-            },
+            on_camera_toggle: move |_| toggle_camera.call(()),
             on_camera_select: move |value: String| camera.choose(DeviceId(value)),
             on_camera_rescan: move |_| camera.devices.refresh.call(()),
             camera_problem: camera.problem(),
@@ -334,6 +436,9 @@ pub fn CallScreen() -> Element {
             metrics: remote.metrics.clone(),
             leave: remote.cancel,
             share: remote.share.clone(),
+        }
+        // Last, so it paints over everything, the video included.
+        SettingsModal {}
         }
     }
 }

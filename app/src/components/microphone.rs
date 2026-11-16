@@ -174,12 +174,7 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
                         }
                         let next = !*muted.peek();
                         muted.set(next);
-                        audio.set_enabled(!next);
-                        local.set_mic(!next);
-                        // Only our own unmute clears who muted us.
-                        if !next {
-                            local.set_muted_by(None);
-                        }
+                        set_mic(&audio, &local, !next);
                     }
                 },
                 MicIcon { off }
@@ -232,6 +227,17 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
                 span { class: "ml-1 text-xs text-red-400 whitespace-nowrap", "{problem}" }
             }
         }
+    }
+}
+
+/// Turns the microphone on or off, and tells the room: the button and the
+/// shortcut both come here, so a key press is announced exactly as a click is.
+pub(crate) fn set_mic(audio: &Controls, local: &PeerStats, on: bool) {
+    audio.set_enabled(on);
+    local.set_mic(on);
+    // Only our own unmute clears who muted us.
+    if on {
+        local.set_muted_by(None);
     }
 }
 

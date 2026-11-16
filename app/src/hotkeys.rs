@@ -349,33 +349,32 @@ impl Chord {
         self.key == Key::Named(Named::Escape) && self.mods == Mods::NONE
     }
 
-    /// What a key cap shows: `⌃⌥⇧⌘L` on macOS, in Apple's order, and
-    /// `Ctrl+Alt+Shift+Super+L` elsewhere.
-    pub fn label(&self, mac: bool) -> String {
-        let key = match self.key {
+    /// The keys to press, one per key cap: `⌃ ⌥ ⇧ ⌘ L` on macOS, in Apple's
+    /// order, and `Ctrl Alt Shift Super L` elsewhere.
+    pub fn caps(&self, mac: bool) -> Vec<String> {
+        let Mods { cmd, ctrl, alt, shift } = self.mods;
+        let names = if mac {
+            [(ctrl, "\u{2303}"), (alt, "\u{2325}"), (shift, "\u{21E7}"), (cmd, "\u{2318}")]
+        } else {
+            [(ctrl, "Ctrl"), (alt, "Alt"), (shift, "Shift"), (cmd, "Super")]
+        };
+        let mut caps: Vec<String> = names
+            .into_iter()
+            .filter(|(held, _)| *held)
+            .map(|(_, name)| name.to_string())
+            .collect();
+        caps.push(match self.key {
             Key::Char(c) => c.to_uppercase().collect(),
             Key::Named(named) => named.label().to_string(),
             Key::F(n) => format!("F{n}"),
-        };
-        let Mods { cmd, ctrl, alt, shift } = self.mods;
-        if mac {
-            let mut out = String::new();
-            for (held, symbol) in [(ctrl, "\u{2303}"), (alt, "\u{2325}"), (shift, "\u{21E7}"), (cmd, "\u{2318}")] {
-                if held {
-                    out.push_str(symbol);
-                }
-            }
-            out + &key
-        } else {
-            let mut parts: Vec<&str> = Vec::new();
-            for (held, name) in [(ctrl, "Ctrl"), (alt, "Alt"), (shift, "Shift"), (cmd, "Super")] {
-                if held {
-                    parts.push(name);
-                }
-            }
-            parts.push(&key);
-            parts.join("+")
-        }
+        });
+        caps
+    }
+
+    /// The chord in one piece, for running text: `⇧⌘L` on macOS,
+    /// `Ctrl+Shift+L` elsewhere.
+    pub fn label(&self, mac: bool) -> String {
+        self.caps(mac).join(if mac { "" } else { "+" })
     }
 }
 
@@ -602,6 +601,9 @@ mod tests {
         assert_eq!(chord("ctrl+shift+l").label(false), "Ctrl+Shift+L");
         assert_eq!(chord("ctrl+,").label(false), "Ctrl+,");
         assert_eq!(chord("space").label(true), "Space");
+        assert_eq!(chord("cmd+shift+l").caps(true), ["\u{21E7}", "\u{2318}", "L"]);
+        assert_eq!(chord("ctrl+shift+l").caps(false), ["Ctrl", "Shift", "L"]);
+        assert_eq!(chord("m").caps(true), ["M"]);
     }
 
     #[test]

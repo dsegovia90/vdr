@@ -1,6 +1,6 @@
 //! The bottom control bar: microphone, camera and screen sharing on the left,
-//! what the call is doing in the middle, and the subroom menu and Leave on the
-//! right.
+//! what the call is doing in the middle, and settings, the subroom menu and
+//! Leave on the right.
 //!
 //! **Small on purpose.** Everything here used to be full-width rows above and
 //! below the video, and in a default-size window they left four people 46
@@ -11,8 +11,8 @@ use std::sync::Arc;
 use dioxus_native::prelude::*;
 
 use super::{
-    CameraIcon, DeviceMenu, DropdownOption, LeaveIcon, MenuSection, MicControl, OwnShare, ShareControl, StatsRow,
-    SubroomMenu,
+    CameraIcon, DeviceMenu, DropdownOption, GearIcon, LeaveIcon, MenuSection, MicControl, OwnShare, SettingsPanel,
+    ShareControl, StatsRow, SubroomMenu,
 };
 use crate::audio::Controls;
 use crate::net::{Metrics, PeerStats, RemoteStatus, ShareWish, share_available};
@@ -51,6 +51,7 @@ pub struct ControlBarProps {
 #[component]
 pub fn ControlBar(props: ControlBarProps) -> Element {
     let status = props.status.read().clone();
+    let panel = use_context::<SettingsPanel>();
     let OwnShare(own_share) = use_context::<OwnShare>();
     let (_, share_problem) = own_share();
     let off = !props.camera_on;
@@ -105,6 +106,13 @@ pub fn ControlBar(props: ControlBarProps) -> Element {
                 }
                 span { class: status_class, "{status}" }
                 StatsRow { metrics: props.metrics.clone() }
+            }
+            // In every state, idle included: shortcuts can be changed before
+            // a call, and the About tab is where the log is.
+            button {
+                class: "flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-neutral-800 text-white hover:bg-neutral-700",
+                onclick: move |_| panel.show(),
+                GearIcon {}
             }
             // Only on a call: before one there is no room to divide.
             SubroomMenu {
