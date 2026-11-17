@@ -238,6 +238,22 @@ focus.
 - **Signals are `!Send`.** What a worker thread discovers reaches the interface
   as messages over the existing channel (`channel.rs`), never as shared
   signals.
+- **Any wake of the page repaints the whole window**, whether or not anything
+  changed: blitz asks for a redraw whenever the virtual DOM had work, with or
+  without mutations. So a polling thread sends a message only when its value
+  differs from the last one it sent (`components/microphone.rs` is the
+  pattern), and a value that never repeats exactly (an audio level) is reduced
+  to what is drawn (a bar width) before comparing. Measured on macOS: the app
+  idled at over half a core before this and at about 1% after.
+- **The video widget does not ask for continuous redraws.**
+  `VideoPaintSource::requires_redraw` is `false`; a `FrameSlot` watcher wakes
+  the tile when a frame is published or cleared (`components/participant.rs`).
+  Returning `true` there repaints at the display's refresh rate with no video
+  on screen.
+- **`overflow-y-auto` makes the other axis scroll too**, and scrollbar thumbs
+  are always visible here, so a pane a pixel too narrow for its content grows
+  a bar along the bottom. Add `overflow-x-hidden` to a pane that should only
+  scroll vertically.
 - **No tooltips**: blitz ignores `title`.
 
 ## Conventions
