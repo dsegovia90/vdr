@@ -105,7 +105,7 @@ pub fn SettingsModal(local: Arc<PeerStats>) -> Element {
                     }
                 }
                 // The same thumb and track as every scrolling list in the app.
-                div { class: "min-w-0 flex-1 overflow-y-auto px-8 py-6 [scrollbar-color:rgb(115,115,115)_rgb(38,38,38)]",
+                div { class: "min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-8 py-6 [scrollbar-color:rgb(115,115,115)_rgb(38,38,38)]",
                     {current.body(local.clone())}
                 }
                 // A way out that can be seen: Esc and the backdrop close it
