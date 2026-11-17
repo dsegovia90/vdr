@@ -254,13 +254,50 @@ pub struct FrameSlot {
     /// frame yet, keep showing the last one" apart from "the source went away,
     /// stop showing it" -- an empty slot alone cannot distinguish the two.
     cleared: Arc<AtomicU64>,
+    /// Whoever paints this slot, told when there is something new to paint.
+    /// Nothing redraws the window on a timer, so without this a frame would
+    /// sit in the slot unseen.
+    watchers: Arc<Mutex<Vec<(u64, Watcher)>>>,
 }
+
+/// Called from the capture or decode thread, so it must not block and must
+/// not touch the interface directly.
+pub type Watcher = Arc<dyn Fn() + Send + Sync>;
+
+/// Tells one [`FrameSlot::watch`] registration from another.
+static NEXT_WATCH: AtomicU64 = AtomicU64::new(0);
 
 impl FrameSlot {
     /// Replace the pending frame. Called from the capture thread.
     pub fn publish(&self, frame: Frame) {
         *self.lock() = Some(frame);
         self.published.fetch_add(1, Ordering::Relaxed);
+        self.notify();
+    }
+
+    /// Call `watcher` after every [`publish`](Self::publish) and
+    /// [`clear`](Self::clear). Returns the handle [`unwatch`](Self::unwatch)
+    /// takes.
+    pub fn watch(&self, watcher: Watcher) -> u64 {
+        let id = NEXT_WATCH.fetch_add(1, Ordering::Relaxed);
+        self.watchers().push((id, watcher));
+        id
+    }
+
+    pub fn unwatch(&self, id: u64) {
+        self.watchers().retain(|(watching, _)| *watching != id);
+    }
+
+    fn notify(&self) {
+        // Cloned out so a watcher never runs under the lock.
+        let watchers: Vec<Watcher> = self.watchers().iter().map(|(_, w)| w.clone()).collect();
+        for watcher in watchers {
+            watcher();
+        }
+    }
+
+    fn watchers(&self) -> std::sync::MutexGuard<'_, Vec<(u64, Watcher)>> {
+        self.watchers.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Take the pending frame, leaving the slot empty. Called from the renderer.
@@ -272,6 +309,7 @@ impl FrameSlot {
     pub fn clear(&self) {
         *self.lock() = None;
         self.cleared.fetch_add(1, Ordering::Relaxed);
+        self.notify();
     }
 
     /// How many times this slot has been cleared. Only changes are meaningful:
@@ -820,5 +858,49 @@ mod tap_tests {
         let (tap, mut feed) = frame_tap();
         drop(tap);
         assert!(feed.wait_timeout(Duration::from_secs(5)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn a_watcher_hears_every_change_until_it_stops_watching() {
+        let slot = FrameSlot::default();
+        let heard = Arc::new(AtomicUsize::new(0));
+        let watch = slot.watch({
+            let heard = heard.clone();
+            Arc::new(move || {
+                heard.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+
+        // A clone is the same slot, so a change through it is heard too.
+        slot.clear();
+        slot.clone().clear();
+        assert_eq!(heard.load(Ordering::Relaxed), 2);
+
+        slot.unwatch(watch);
+        slot.clear();
+        assert_eq!(heard.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn two_watchers_are_independent() {
+        let slot = FrameSlot::default();
+        let heard = Arc::new(AtomicUsize::new(0));
+        let count = |heard: &Arc<AtomicUsize>| -> Watcher {
+            let heard = heard.clone();
+            Arc::new(move || {
+                heard.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let first = slot.watch(count(&heard));
+        let _second = slot.watch(count(&heard));
+        slot.unwatch(first);
+        slot.clear();
+        assert_eq!(heard.load(Ordering::Relaxed), 1);
     }
 }

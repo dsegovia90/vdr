@@ -169,23 +169,31 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
             let Some(stats) = stats else { return };
             let spawned = std::thread::Builder::new()
                 .name("tile".into())
-                .spawn(move || loop {
-                    let next = Reading {
-                        fps: stats.video_fps(),
-                        talking: stats.talking(),
-                        camera_on: stats.camera_on(),
-                        mic_on: stats.mic_on(),
-                        room: stats.room(),
-                        name: stats.name(),
-                        muted_by: stats.muted_by(),
-                        invites: stats.invites(),
-                        sharing: stats.sharing(),
-                        share_problem: stats.share_problem(),
-                    };
-                    if tx.unbounded_send(next).is_err() {
-                        return;
+                .spawn(move || {
+                    let mut sent: Option<Reading> = None;
+                    loop {
+                        let next = Reading {
+                            fps: stats.video_fps(),
+                            talking: stats.talking(),
+                            camera_on: stats.camera_on(),
+                            mic_on: stats.mic_on(),
+                            room: stats.room(),
+                            name: stats.name(),
+                            muted_by: stats.muted_by(),
+                            invites: stats.invites(),
+                            sharing: stats.sharing(),
+                            share_problem: stats.share_problem(),
+                        };
+                        // Only a change is sent. Any message wakes the page, and blitz repaints
+                        // the whole window whenever the page wakes, changed or not.
+                        if sent.as_ref() != Some(&next) {
+                            if tx.unbounded_send(next.clone()).is_err() {
+                                return;
+                            }
+                            sent = Some(next);
+                        }
+                        std::thread::sleep(POLL);
                     }
-                    std::thread::sleep(POLL);
                 });
             if let Err(error) = spawned {
                 tracing::warn!("could not spawn a tile's stats thread: {error}");

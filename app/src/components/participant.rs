@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use dioxus_native::CustomWidgetAttr;
 use dioxus_native::prelude::*;
+use dioxus_native::winit::window::Window;
 
 use crate::camera::{use_pipeline_cache, Fit, FrameSlot, Mirror, VideoPaintSource};
 
@@ -43,6 +46,27 @@ pub fn ParticipantVideo(props: ParticipantVideoProps) -> Element {
         let fit = props.fit;
         move || CustomWidgetAttr::new(VideoPaintSource::new(label, slot, mirror, fit, cache))
     });
+
+    // **One repaint per frame, asked for here.** Blitz repaints only when the
+    // page changes, and a new video frame changes nothing it can see. So the
+    // slot wakes this component from the capture or decode thread (a
+    // scheduled update is only a message, it cannot block that thread), and
+    // the render that follows asks the window for a repaint from the UI
+    // thread. Asking the window directly from the other thread would wait on
+    // the UI thread, which can itself be waiting for that thread to stop.
+    let window = use_hook(try_consume_context::<Arc<dyn Window>>);
+    let update = use_hook(dioxus_core::schedule_update);
+    let watch = use_hook({
+        let slot = props.slot.clone();
+        move || slot.watch(update)
+    });
+    use_drop({
+        let slot = props.slot.clone();
+        move || slot.unwatch(watch)
+    });
+    if let Some(window) = &window {
+        window.request_redraw();
+    }
 
     rsx! {
         // **The video is taken out of layout, deliberately.** As an ordinary

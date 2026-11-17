@@ -119,13 +119,14 @@ impl Widget for VideoPaintSource {
         tracing::info!("[{}] paint source suspended", self.label);
     }
 
-    /// Always `true`: video needs a repaint every vsync, and nothing else would
-    /// ask for one. Blitz polls this only after a frame is drawn, so returning
-    /// `false` while idle would stop the loop with no way for a frame arriving
-    /// on the camera or decoder thread to restart it. The old `canvas` path
-    /// behaved the same way (a document with a canvas counted as animating).
+    /// `false`: a window showing video is not animating between frames.
+    /// Returning `true` made blitz repaint the whole window on every vsync,
+    /// 165 times a second on a fast display, whether or not anything had
+    /// changed and even with the camera off. Instead the component that owns
+    /// this widget watches the slot and asks for one repaint per frame that
+    /// arrives (`ParticipantVideo`).
     fn requires_redraw(&self) -> bool {
-        true
+        false
     }
 
     fn paint(

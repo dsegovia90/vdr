@@ -55,6 +55,7 @@ pub fn StatsRow(props: StatsProps) -> Element {
             let spawned = std::thread::Builder::new()
                 .name("stats".into())
                 .spawn(move || {
+                    let mut sent: Option<Sample> = None;
                     loop {
                         let next = Sample {
                             rtt: metrics.rtt(),
@@ -65,8 +66,13 @@ pub fn StatsRow(props: StatsProps) -> Element {
                             codecs: metrics.codecs(),
                             path: metrics.path(),
                         };
-                        if tx.unbounded_send(next).is_err() {
-                            return;
+                        // Only a change is sent. Any message wakes the page, and blitz repaints
+                        // the whole window whenever the page wakes, changed or not.
+                        if sent.as_ref() != Some(&next) {
+                            if tx.unbounded_send(next.clone()).is_err() {
+                                return;
+                            }
+                            sent = Some(next);
                         }
                         std::thread::sleep(POLL);
                     }

@@ -34,7 +34,9 @@ const POLL: Duration = Duration::from_millis(66);
 /// a message per buffer.
 #[derive(Clone, Copy, PartialEq, Default)]
 struct Meter {
-    level: f32,
+    /// The bar's width in percent, not the raw level: the level never
+    /// repeats exactly, and a width that has not changed is nothing to draw.
+    width: u32,
     status: MicStatus,
     /// Whether the mic is on, which a peer's mute request can change from
     /// outside this control; the button follows it.
@@ -117,15 +119,22 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
                     // Our own tile's talking dot, by the same rule as everyone
                     // else's, from the level we send (zero while muted).
                     let mut talking = Talking::every(POLL);
+                    let mut sent: Option<Meter> = None;
                     loop {
+                        let level = audio.level();
                         let next = Meter {
-                            level: audio.level(),
+                            width: (level.clamp(0.0, 1.0).sqrt() * 100.0).round() as u32,
                             status: audio.status(),
                             enabled: audio.enabled(),
                         };
-                        local.set_talking(talking.push(next.level));
-                        if tx.unbounded_send(next).is_err() {
-                            return;
+                        local.set_talking(talking.push(level));
+                        // Only a change is sent. Any message wakes the page, and blitz repaints
+                        // the whole window whenever the page wakes, changed or not.
+                        if sent != Some(next) {
+                            if tx.unbounded_send(next).is_err() {
+                                return;
+                            }
+                            sent = Some(next);
                         }
                         std::thread::sleep(POLL);
                     }
@@ -151,7 +160,7 @@ pub fn MicControl(props: MicrophoneProps) -> Element {
     let has_devices = !options.is_empty();
 
     let reading = meter();
-    let width = (reading.level.clamp(0.0, 1.0).sqrt() * 100.0).round() as u32;
+    let width = reading.width;
     let off = muted();
     // A problem with the device reads differently from choosing to mute: red
     // text beside the button, because the icon alone looks the same either way.
