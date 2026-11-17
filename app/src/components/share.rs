@@ -66,14 +66,23 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
         move || {
             let spawned = std::thread::Builder::new()
                 .name("share-wish".into())
-                .spawn(move || loop {
-                    // The generation first: the value read after it is at
-                    // least that new (see `ShareWish`).
-                    let generation = share.generation();
-                    if wishes.unbounded_send((generation, share.get())).is_err() {
-                        return;
+                .spawn(move || {
+                    let mut sent = None;
+                    loop {
+                        // The generation first: the value read after it is at
+                        // least that new (see `ShareWish`).
+                        let generation = share.generation();
+                        let next = (generation, share.get());
+                        // Only a change is sent. Any message wakes the page, and blitz repaints
+                        // the whole window whenever the page wakes, changed or not.
+                        if sent.as_ref() != Some(&next) {
+                            if wishes.unbounded_send(next.clone()).is_err() {
+                                return;
+                            }
+                            sent = Some(next);
+                        }
+                        std::thread::sleep(POLL);
                     }
-                    std::thread::sleep(POLL);
                 });
             if let Err(error) = spawned {
                 tracing::warn!("could not spawn the share button's thread: {error}");
