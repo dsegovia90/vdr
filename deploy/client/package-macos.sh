@@ -19,13 +19,21 @@ app="target/dx/vdr/release/macos/Vdr.app"
 # and each target keeps its own cargo output, so both binaries survive and
 # `lipo` joins them. Intel first, so the bundle dx leaves behind is the native
 # one, then the binary inside it is replaced with the joined one.
-rustup target add x86_64-apple-darwin >/dev/null
-dx build --renderer native --release --target x86_64-apple-darwin
-dx build --renderer native --release --target aarch64-apple-darwin
-lipo -create \
-  target/aarch64-apple-darwin/desktop-release/vdr \
-  target/x86_64-apple-darwin/desktop-release/vdr \
-  -output "$app/Contents/MacOS/vdr"
+#
+# VDR_MAC_PREBUILT=1 skips both builds: the release workflow makes them in two
+# jobs at once, since each is a full compile, and puts the results where the
+# builds below would have left them.
+intel="target/x86_64-apple-darwin/desktop-release/vdr"
+arm="target/aarch64-apple-darwin/desktop-release/vdr"
+if [ -z "${VDR_MAC_PREBUILT:-}" ]; then
+  rustup target add x86_64-apple-darwin >/dev/null
+  dx build --renderer native --release --target x86_64-apple-darwin
+  dx build --renderer native --release --target aarch64-apple-darwin
+fi
+for f in "$intel" "$arm" "$app/Contents/Info.plist"; do
+  [ -e "$f" ] || { echo "missing $f -- nothing to package" >&2; exit 1; }
+done
+lipo -create "$arm" "$intel" -output "$app/Contents/MacOS/vdr"
 # Licences inside the bundle, so they travel with the app on its own too.
 # Before signing: the signature seals Contents/Resources.
 for f in LICENSE-MIT LICENSE-APACHE THIRD_PARTY_LICENSES; do
