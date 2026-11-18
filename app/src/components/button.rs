@@ -51,6 +51,10 @@ impl Tone {
     }
 }
 
+/// A button that cannot be pressed right now, whatever its tone: dimmed, and
+/// no hover, so it does not invite a click that does nothing.
+const DISABLED: &str = "bg-neutral-800 text-neutral-500";
+
 impl Size {
     fn classes(self) -> &'static str {
         match self {
@@ -75,15 +79,24 @@ pub fn Button(
     /// Defaults to [`Size::Normal`].
     #[props(default)]
     size: Size,
+    /// Shown, but pressing it does nothing. Say why beside it: blitz shows
+    /// no tooltips.
+    #[props(default)]
+    disabled: bool,
     /// The label.
     children: Element,
 ) -> Element {
+    let look = if disabled { DISABLED } else { tone.classes() };
     rsx! {
         button {
             // `shrink-0` and `whitespace-nowrap` are not styling -- see the
             // module docs. Do not move them to a caller.
-            class: "shrink-0 whitespace-nowrap rounded-md {size.classes()} {tone.classes()}",
-            onclick: move |event| onclick.call(event),
+            class: "shrink-0 whitespace-nowrap rounded-md {size.classes()} {look}",
+            onclick: move |event| {
+                if !disabled {
+                    onclick.call(event);
+                }
+            },
             {children}
         }
     }

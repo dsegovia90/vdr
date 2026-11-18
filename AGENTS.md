@@ -167,6 +167,25 @@ focus.
   30's Metal backend applies no colour matching, so sRGB goes raw to the
   panel. The fix is merged upstream and waiting on a release. Do not
   compensate in our shader: it would double-correct once the fix ships.
+- **The updater's release interface** (`update/`). Installed copies look
+  for exactly `vdr-macos-universal-<tag>.zip`, `vdr-linux-x86_64-<tag>.tar.gz`,
+  `SHA256SUMS` (`sha256sum` format) and `SHA256SUMS.sig` (a raw 64-byte
+  ed25519 signature over the exact bytes of `SHA256SUMS`) on the latest
+  GitHub release. Renaming any of them, or changing the zip's `vdr/Vdr.app`
+  or the tarball's one-folder layout, strands every copy already installed
+  on the release it has. A release without the two signature files is
+  offered as a link only.
+- **The release public key in `update/verify.rs` never changes casually.**
+  Every installed copy trusts that key and no other; a release signed with a
+  new one is refused by all of them. Moving to a new key takes a release
+  signed with the old one that carries the new one.
+- **Testing the updater end to end** needs a build with
+  `VDR_UPDATE_TEST_PUBKEY=<64 hex>` set at compile time: only such a build
+  trusts that key instead, and only it reads `VDR_UPDATE_FEED` at runtime (a
+  URL answering with GitHub's latest-release JSON; its asset URLs may be
+  `http`). Release builds set neither. The installer refuses a copy under a
+  `target/` folder, an `--ephemeral` run and a translocated macOS app, so test
+  on a copy of the bundle moved elsewhere.
 - **The `wayland-share` feature is off by default** so that clippy and tests
   need no PipeWire headers; the Linux package turns it on.
 
@@ -293,6 +312,7 @@ focus.
 | `name.rs` | display names: cleaning, the short id, which label to show |
 | `recent.rs` | recent rooms: the list, pin/remove/cap, a room's identity, relative times, `rooms.json` (owner-only, holds room tokens: never display or log a stored link) |
 | `awake.rs` | keeps the machine awake during a call |
+| `update/` | checking for, verifying and installing a newer release: `release.rs` and `verify.rs` are pure, `fetch.rs` the network, `install.rs` the swap and restart |
 | `channel.rs` | shared single-slot channel primitive |
 | `audio/` | `Controls` (mute, chosen devices, level), device enumeration, `catchup.rs` |
 | `camera/hooks/` | chosen device, on/off, persistence, the stream and its watchdog |
@@ -304,11 +324,12 @@ focus.
 | `net/loopback.rs` | the in-process H.264 round trip |
 | `net/runtime.rs` | the single tokio runtime |
 | `components/` | `call_screen.rs` (the page and its key handler), `layout.rs`, `tile.rs`, `tile_menu.rs`, `participant.rs`, `bar.rs`, `microphone.rs`, `share.rs`, `subroom.rs`, `device_menu.rs`, `connect.rs`, `recent.rs` (the recent rooms list), `keys.rs`, `icons.rs`, `button.rs`, `stats.rs` |
-| `components/settings/` | the settings window: a `Tab` variant plus a component per tab (`profile.rs`, `keyboard.rs`, `about.rs`) |
+| `components/settings/` | the settings window: a `Tab` variant plus a component per tab (`profile.rs`, `keyboard.rs`, `updates.rs`, `about.rs`) |
 
 Frames never touch the DOM:
 `cameras::pump` → `FrameSlot` → `VideoPaintSource` → vello.
 
 `cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`,
-`camera/paint/fit.rs`, `audio/catchup.rs`, `components/layout.rs`) are where
+`camera/paint/fit.rs`, `audio/catchup.rs`, `components/layout.rs`,
+`update/release.rs`, `update/verify.rs`) are where
 logic that can be tested without a window belongs.

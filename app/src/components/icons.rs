@@ -228,6 +228,29 @@ pub fn InfoIcon() -> Element {
     }
 }
 
+/// An arrow into a tray: the settings' Updates tab.
+#[component]
+pub fn UpdateIcon() -> Element {
+    rsx! {
+        svg {
+            // Needed: blitz hands the serialized subtree to usvg, which only
+            // accepts a root in the SVG namespace.
+            xmlns: "http://www.w3.org/2000/svg",
+            width: "16",
+            height: "16",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }
+            path { d: "M7 10l5 5 5-5" }
+            path { d: "M12 15V3" }
+        }
+    }
+}
+
 /// A cross: closes the settings window.
 #[component]
 pub fn CloseIcon() -> Element {

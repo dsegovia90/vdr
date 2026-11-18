@@ -9,6 +9,7 @@ mod name;
 mod net;
 mod recent;
 mod settings;
+mod update;
 
 use dioxus_native::prelude::*;
 

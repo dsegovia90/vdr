@@ -168,6 +168,52 @@ pub struct Settings {
     /// through.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_name")]
     pub name: Option<String>,
+
+    /// Whether to look for a newer release on startup and once a day.
+    /// `None` is the default, which is yes ([`checks_updates`](Self::checks_updates)):
+    /// an `Option` so that a file from before this field, and `Default`, both
+    /// mean on. Only ever a check; installing always waits to be asked.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
+    pub check_updates: Option<bool>,
+
+    /// The newest release whose banner was dismissed, as `0.2.0`. The banner
+    /// stays away until a release newer than this; the dots on the settings
+    /// button and the Updates tab do not care. Read through
+    /// [`crate::update::banner`], which treats anything unparseable as none.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_text")]
+    pub dismissed_update: Option<String>,
+}
+
+impl Settings {
+    /// Whether the automatic update check is on.
+    pub fn checks_updates(&self) -> bool {
+        self.check_updates.unwrap_or(true)
+    }
+}
+
+/// A text field, or none when it is not text: a hand edit costs only it.
+fn lenient_text<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(text) => Ok(Some(text)),
+        serde_json::Value::Null => Ok(None),
+        other => {
+            tracing::warn!("settings: ignoring {other}: not text");
+            Ok(None)
+        }
+    }
+}
+
+/// An on/off field, or the default when it is not a boolean: a hand edit
+/// that writes `"check_updates": "no"` loses that choice, not the file.
+fn lenient_flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<bool>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(flag) => Ok(Some(flag)),
+        serde_json::Value::Null => Ok(None),
+        other => {
+            tracing::warn!("settings: ignoring {other}: not true or false");
+            Ok(None)
+        }
+    }
 }
 
 /// The `name` field, or no name when it is not text: a hand edit that writes
@@ -674,6 +720,45 @@ mod tests {
             .expect("an older file is valid");
         assert_eq!(back.microphone.as_deref(), Some("coreaudio:yeti"));
         assert_eq!(back.output, None);
+    }
+
+    #[test]
+    fn update_checks_are_on_unless_turned_off() {
+        assert!(Settings::default().checks_updates());
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","name":"Ada"}"#).expect("an older file is valid");
+        assert!(older.checks_updates(), "a file from before the setting means on");
+        let off: Settings = serde_json::from_str(r#"{"check_updates":false}"#).expect("valid");
+        assert!(!off.checks_updates());
+        let json = serde_json::to_string(&off).expect("serialises");
+        let back: Settings = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(back, off);
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("check_updates"), "left out until changed: {json}");
+    }
+
+    #[test]
+    fn a_dismissed_update_round_trips_and_older_files_load() {
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","check_updates":false}"#).expect("valid");
+        assert_eq!(older.dismissed_update, None);
+        let settings = Settings {
+            dismissed_update: Some("0.2.0".into()),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialises");
+        let back: Settings = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(back, settings);
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("dismissed_update"), "{json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","dismissed_update":5}"#).expect("still valid");
+        assert_eq!(bad.camera.as_deref(), Some("abc"));
+        assert_eq!(bad.dismissed_update, None);
+    }
+
+    #[test]
+    fn a_malformed_update_setting_costs_only_itself() {
+        let back: Settings = serde_json::from_str(r#"{"camera":"abc","check_updates":"no"}"#).expect("still valid");
+        assert_eq!(back.camera.as_deref(), Some("abc"));
+        assert!(back.checks_updates());
     }
 
     #[test]
