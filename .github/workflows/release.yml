@@ -30,6 +30,13 @@ env:
   # Names the archives: the tag for a release, else empty, and the scripts
   # fall back to the commit.
   LABEL: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+  # Public halves of the two release keys. Both are also what installed
+  # copies trust, so neither changes without a plan for those copies: the
+  # certificate the macOS app is signed with (its SHA-1), and the key the
+  # checksums are signed with (ed25519, hex; the same constant as in
+  # app/src/update).
+  SIGNING_CERT_SHA1: b939a06a0b214a2618022698cbd1cf949fd97fad
+  UPDATE_PUBLIC_KEY: 3037bc237610cf020580fdd0851508f79935c31056187e56167d70b3a5bfa191
 
 jobs:
   version:
@@ -73,8 +80,48 @@ jobs:
         with:
           tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
 
-      # The same script as a local `just package-mac`: universal binary, ad hoc
-      # signature, usage keys checked, zipped with the guide and licences.
+      # One certificate for every release, so macOS treats an update as the
+      # same app and keeps its camera, microphone and screen grants. It is
+      # self-signed: it proves "the same publisher as last time", not who that
+      # is. A run without the secret (a fork) signs ad hoc instead.
+      - name: signing certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$MACOS_CERT_P12" ]; then
+            if [ -n "$LABEL" ] && [ "$GITHUB_REPOSITORY" = "dsegovia90/vdr" ]; then
+              echo "::error::a release needs the signing certificate"
+              exit 1
+            fi
+            echo "::warning::no signing certificate here; the app is signed ad hoc"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          pass=$(openssl rand -hex 16)
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -p codesigning "$keychain" \
+            | awk '/^ *1\)/ {print $2}')
+          # A different certificate would cost every installed copy its grants.
+          if [ "$(printf '%s' "$identity" | tr 'A-F' 'a-f')" != "$SIGNING_CERT_SHA1" ]; then
+            echo "::error::the certificate in the secret is not the one releases are signed with"
+            exit 1
+          fi
+          echo "VDR_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "VDR_SIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      # The same script as a local `just package-mac`: universal binary,
+      # signed, usage keys checked, zipped with the guide and licences.
       - name: package
         run: deploy/client/package-macos.sh "$LABEL"
 
@@ -125,10 +172,62 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  # The checksums of both packages, signed. An installed app updates itself
+  # only from a package whose checksum is in a list signed by this key, so the
+  # key matters more than anything else here: lose it and no installed copy
+  # can ever be updated again; leak it and anyone who can also change a
+  # Release can ship code to them.
+  checksums:
+    name: signed checksums
+    needs: [macos, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: sign
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          (cd dist && sha256sum vdr-* > SHA256SUMS && cat SHA256SUMS)
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            if [ -n "$LABEL" ] && [ "$GITHUB_REPOSITORY" = "dsegovia90/vdr" ]; then
+              echo "::error::a release needs the update signing key"
+              exit 1
+            fi
+            echo "::warning::no update signing key here; the checksums are unsigned"
+            exit 0
+          fi
+          key="$RUNNER_TEMP/update.pem"
+          (umask 077 && printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key")
+          # The app carries the public half. A signature it cannot check is
+          # worse than none: every copy would refuse the update.
+          public=$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | xxd -p -c 64)
+          if [ "$public" != "$UPDATE_PUBLIC_KEY" ]; then
+            rm "$key"
+            echo "::error::the signing key in the secret does not match the public key in the app"
+            exit 1
+          fi
+          # Raw ed25519 over the file's bytes: 64 bytes, no container.
+          openssl pkeyutl -sign -rawin -inkey "$key" -in dist/SHA256SUMS -out dist/SHA256SUMS.sig
+          openssl pkey -in "$key" -pubout -out "$RUNNER_TEMP/update.pub"
+          rm "$key"
+          openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/update.pub" \
+            -in dist/SHA256SUMS -sigfile dist/SHA256SUMS.sig
+          [ "$(wc -c < dist/SHA256SUMS.sig)" -eq 64 ]
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: checksums
+          path: dist/SHA256SUMS*
+          if-no-files-found: error
+
   release:
     name: GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, linux]
+    needs: [macos, linux, checksums]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -142,8 +241,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # So a download can be checked against what this run built.
-          (cd dist && sha256sum vdr-* > SHA256SUMS && cat SHA256SUMS)
+          (cd dist && sha256sum --check SHA256SUMS && ls -l)
           gh release create "$LABEL" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "vdr $LABEL" \

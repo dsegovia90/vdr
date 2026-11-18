@@ -32,8 +32,23 @@ for f in LICENSE-MIT LICENSE-APACHE THIRD_PARTY_LICENSES; do
   cp "$root/$f" "$app/Contents/Resources/$f"
 done
 # Joining drops the linker's ad-hoc signature, and Apple Silicon will not run
-# an unsigned binary at all. Re-sign ad-hoc: the same as before, nothing more.
-codesign --force --sign - "$app"
+# an unsigned binary at all, so the bundle is signed again here.
+#
+# A release signs with one fixed certificate (VDR_SIGN_IDENTITY, its SHA-1, in
+# the keychain VDR_SIGN_KEYCHAIN). macOS ties the camera, microphone and screen
+# grants to the signature: ad hoc, that is the hash of this exact build, so
+# every new build is a stranger and is asked again; with a certificate it is
+# the bundle identifier plus the certificate, which an update keeps. Without
+# the variable (a local build) the signature is ad hoc, as before.
+if [ -n "${VDR_SIGN_IDENTITY:-}" ]; then
+  codesign --force --sign "$VDR_SIGN_IDENTITY" \
+    ${VDR_SIGN_KEYCHAIN:+--keychain "$VDR_SIGN_KEYCHAIN"} "$app"
+  codesign -d -r- "$app" 2>&1 | grep -q 'certificate leaf' \
+    || { echo "signed, but not by a certificate -- grants would not survive an update" >&2; exit 1; }
+else
+  codesign --force --sign - "$app"
+fi
+codesign --verify --deep --strict "$app"
 plist="$app/Contents/Info.plist"
 for key in NSCameraUsageDescription NSMicrophoneUsageDescription NSScreenCaptureUsageDescription; do
   /usr/libexec/PlistBuddy -c "Print :$key" "$plist" >/dev/null \
