@@ -31,7 +31,7 @@ use std::sync::Arc;
 use dioxus_native::prelude::*;
 
 pub use metrics::{Ask, Metrics, Path, PeerStats};
-pub use share::{ShareOption, ShareSource, ShareWish, available as share_available, lists as share_lists, sources as share_sources};
+pub use share::{ShareOption, ShareQuality, ShareSource, ShareWish, available as share_available, lists as share_lists, sources as share_sources};
 pub use status::RemoteStatus;
 pub(crate) use call::redacted;
 

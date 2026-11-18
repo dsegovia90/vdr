@@ -1,15 +1,15 @@
 //! Sharing a screen, as the page shows it: the bar's Share button with its ▾,
-//! and a shared screen's tile.
+//! the Sharpen button beside them while we share, and a shared screen's tile.
 
 use std::time::Duration;
 
 use dioxus_native::prelude::*;
 
 use super::device_menu::OpenMenu;
-use super::{DeviceMenu, DropdownOption, MenuSection, OwnShare, ParticipantVideo, ScreenIcon};
+use super::{Button, DeviceMenu, DropdownOption, MenuSection, OwnShare, ParticipantVideo, ScreenIcon, Tone};
 use crate::camera::{Fit, FrameSlot, Mirror};
 use crate::channel::use_channel;
-use crate::net::{ShareOption, ShareSource, ShareWish, share_lists, share_sources};
+use crate::net::{ShareOption, ShareQuality, ShareSource, ShareWish, share_lists, share_sources};
 
 /// This menu's name among the page's menus.
 const NAME: &str = "share";
@@ -28,7 +28,7 @@ pub struct ShareControlProps {
 }
 
 /// The Share button, and where the platform lists them, a ▾ of displays and
-/// windows.
+/// windows; while we share, the Sharpen button too.
 ///
 /// **The button never starts a share by itself.** Not sharing, it opens the
 /// list -- what "the main display" means is not obvious on a Mac with several,
@@ -36,11 +36,17 @@ pub struct ShareControlProps {
 /// list shares. Sharing, it stops. The ▾ opens the same list, to switch source.
 /// Where there is no list (Wayland, where the system's portal is the picker),
 /// the button starts the portal directly.
+///
+/// **Sharpen is beside the button, not in the ▾**, so it is there on Wayland,
+/// which has no ▾, and in sight while the share runs, which is when someone
+/// sees that text is soft. It upgrades the running share only; the share
+/// itself sets the quality back to Standard each time one starts.
 #[component]
 pub fn ShareControl(props: ShareControlProps) -> Element {
     let OwnShare(own) = use_context::<OwnShare>();
     let OpenMenu(mut current) = use_context::<OpenMenu>();
     let mut wish = use_signal(|| None::<ShareSource>);
+    let mut quality = use_signal(ShareQuality::default);
     // The wish's generation as of our own last click. A poll that read the
     // wish before the click must not undo what the click showed.
     let mut clicked = use_signal(|| 0u64);
@@ -56,9 +62,15 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
         }
     }));
 
-    let wishes = use_channel(move |(generation, next): (u64, Option<ShareSource>)| {
-        if generation >= *clicked.peek() && *wish.peek() != next {
+    let wishes = use_channel(move |(generation, next, chosen): (u64, Option<ShareSource>, ShareQuality)| {
+        if generation < *clicked.peek() {
+            return;
+        }
+        if *wish.peek() != next {
             wish.set(next);
+        }
+        if *quality.peek() != chosen {
+            quality.set(chosen);
         }
     });
     use_hook({
@@ -72,7 +84,7 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
                         // The generation first: the value read after it is at
                         // least that new (see `ShareWish`).
                         let generation = share.generation();
-                        let next = (generation, share.get());
+                        let next = (generation, share.get(), share.quality());
                         // Only a change is sent. Any message wakes the page, and blitz repaints
                         // the whole window whenever the page wakes, changed or not.
                         if sent.as_ref() != Some(&next) {
@@ -117,6 +129,7 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
     });
 
     let (sharing, _) = own();
+    let sharp = quality() == ShareQuality::Sharp;
     let wanted = wish();
     // On from the click, before the capture has opened, so the button answers
     // at once; and while the share runs.
@@ -188,6 +201,23 @@ pub fn ShareControl(props: ShareControlProps) -> Element {
                         },
                     ],
                     onrescan: move |_| list.call(()),
+                }
+            }
+            // Only while our share runs: before it there is nothing to
+            // sharpen, and a share always starts at Standard.
+            if sharing {
+                Button {
+                    tone: if sharp { Tone::Primary } else { Tone::Secondary },
+                    onclick: {
+                        let share = props.share.clone();
+                        move |_| {
+                            let next = if sharp { ShareQuality::Standard } else { ShareQuality::Sharp };
+                            share.set_quality(next);
+                            clicked.set(share.generation());
+                            quality.set(next);
+                        }
+                    },
+                    if sharp { "Sharp (more upload)" } else { "Sharpen (more upload)" }
                 }
             }
         }

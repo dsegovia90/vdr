@@ -92,7 +92,10 @@ are not remembered.
   it never moves anyone. A mute runs their own mute, so they see it and can
   unmute.
 - **Screen sharing.** Share from the bar; a shared screen is one more tile in
-  the room, beside the sharer's camera.
+  the room, beside the sharer's camera. While you share, *Sharpen* beside
+  the Share button lets a large screen (1080p and up) use up to 6 Mbps of
+  upload instead of 2.5, for crisper text; press it again to go back. Every
+  share starts without it.
 - **Mute and camera off** are in the bar and shown on your tile to the room.
 
 ### Settings and keyboard shortcuts

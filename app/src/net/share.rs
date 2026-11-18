@@ -62,10 +62,11 @@ impl ShareSource {
 /// A watch, not a queue: only the latest wish matters, and every attempt needs
 /// to read it.
 ///
-/// **Numbered.** Every change bumps a generation after the value is written, so
-/// a reader polling from another thread can tell a value read before a click
-/// from one read after it: read [`generation`](Self::generation) first, then
-/// [`get`](Self::get), and the value is at least that new.
+/// **Numbered.** Every change the bar makes, to the wish or to its quality,
+/// bumps a generation after the value is written, so a reader polling from
+/// another thread can tell a value read before a click from one read after
+/// it: read [`generation`](Self::generation) first, then [`get`](Self::get),
+/// and the value is at least that new.
 #[derive(Clone)]
 pub struct ShareWish {
     wish: Arc<watch::Sender<Option<ShareSource>>>,
@@ -73,6 +74,10 @@ pub struct ShareWish {
     /// What we are sharing, as our own share card shows it: frames from the
     /// capture, before encoding, scaled down. Cleared when a share ends.
     preview: FrameSlot,
+    /// How much upload the running share may spend. Read on every frame, so
+    /// the sharer's button reaches the share at once; set back to Standard
+    /// whenever a share starts (see [`next_turn`]).
+    quality: QualityChoice,
 }
 
 impl ShareWish {
@@ -81,7 +86,28 @@ impl ShareWish {
             wish: Arc::new(watch::Sender::new(None)),
             generation: Arc::default(),
             preview: FrameSlot::default(),
+            quality: QualityChoice::default(),
         }
+    }
+
+    /// The running share's quality, as last chosen.
+    pub fn quality(&self) -> ShareQuality {
+        self.quality.get()
+    }
+
+    /// Changes the running share's quality. It lasts only for that share: the
+    /// next one starts at Standard whatever this says.
+    ///
+    /// Numbered like a change of wish, so the button's poll can tell a value
+    /// read before the press from one read after it.
+    pub fn set_quality(&self, quality: ShareQuality) {
+        self.quality.set(quality);
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The choice itself, for a call attempt's shares to read.
+    pub(super) fn quality_choice(&self) -> QualityChoice {
+        self.quality.clone()
     }
 
     /// Our own share's preview frames, for its card.
@@ -252,8 +278,75 @@ const SHARE_BITS_PER_PIXEL: f64 = 0.1;
 /// The share's bitrate bounds. It does not follow the link: the rate loop owns
 /// one target for one encoder, and dividing an uplink between two belongs with
 /// simulcast. Lowering the ceiling is the cheap fix if it congests.
+///
+/// The ceiling bites above about 1.7 megapixels, so a 1080p or 1440p screen
+/// gets fewer bits per pixel than the floor above asks for. That is the
+/// default on purpose: a share that does not follow the link must not be the
+/// thing that saturates someone's uplink. [`SHARP_MAX_BPS`] lifts it, for
+/// one share at a time, when the sharer asks.
 const SHARE_MIN_BPS: u64 = 600_000;
 const SHARE_MAX_BPS: u64 = 2_500_000;
+
+/// The ceiling under [`ShareQuality::Sharp`]: high enough that the largest
+/// size we encode ([`MAX_SHARE`], 1440p at 15 fps, 5.5 Mbps) gets the full
+/// bits-per-pixel floor, with a little room.
+///
+/// **A deliberate act, per share.** Nothing lowers the rate when the link
+/// cannot carry it, so it is never the starting point and never carried over:
+/// the sharer turns it on while sharing, and every share begins at Standard.
+const SHARP_MAX_BPS: u64 = 6_000_000;
+
+/// How much upload a share may spend, as the sharer chose it.
+///
+/// Only the ceiling differs. Frame rate, bits per pixel, the size cap and the
+/// minimum are the same for both, so the two give identical rates for any
+/// screen small enough to sit under the lower ceiling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShareQuality {
+    /// Capped at [`SHARE_MAX_BPS`].
+    #[default]
+    Standard,
+    /// Capped at [`SHARP_MAX_BPS`].
+    Sharp,
+}
+
+impl ShareQuality {
+    /// Its name in the log.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Sharp => "sharp",
+        }
+    }
+
+    fn max_bps(self) -> u64 {
+        match self {
+            Self::Standard => SHARE_MAX_BPS,
+            Self::Sharp => SHARP_MAX_BPS,
+        }
+    }
+}
+
+/// The chosen [`ShareQuality`], shared between the bar that sets it and the
+/// share thread that reads it. An atomic rather than a watch: the share loop
+/// already wakes for every frame and only needs to look.
+#[derive(Clone, Default)]
+pub(super) struct QualityChoice(Arc<std::sync::atomic::AtomicBool>);
+
+impl QualityChoice {
+    fn get(&self) -> ShareQuality {
+        if self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            ShareQuality::Sharp
+        } else {
+            ShareQuality::Standard
+        }
+    }
+
+    fn set(&self, quality: ShareQuality) {
+        self.0
+            .store(quality == ShareQuality::Sharp, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// The largest size we encode. A 4K monitor would otherwise ask the software
 /// encoder for 8-megapixel frames.
@@ -277,6 +370,18 @@ const KEYFRAME_EVERY: Duration = Duration::from_secs(4);
 /// Each share's turn, so a share being replaced cannot write over the next
 /// (see `PeerStats::begin_share`). Never `0`, which is nobody's.
 static TURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Takes the next share's turn, and sets the quality back to Standard.
+///
+/// **The one place a share's quality is reset**, at the start of each share
+/// rather than the end of the last: a share can end many ways (a stop, a
+/// closed window, a failed set-up, a leave that does not wait for it), but
+/// every share starts here, after the share it replaces has finished, so a
+/// Sharp left over from it cannot reach the new one.
+fn next_turn(quality: &QualityChoice) -> u64 {
+    quality.set(ShareQuality::Standard);
+    TURNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
 
 /// The widest preview of our own share. The card it fills is a fraction of
 /// the window, and every preview frame is copied back to the CPU at its own
@@ -349,17 +454,22 @@ fn share_size(width: u32, height: u32) -> (u32, u32) {
 }
 
 /// The share's bitrate at a size: [`SHARE_BITS_PER_PIXEL`] at [`SHARE_FPS`],
-/// within the bounds.
-fn share_bitrate(width: u32, height: u32) -> u64 {
+/// within the bounds, the ceiling being `quality`'s.
+fn share_bitrate(width: u32, height: u32, quality: ShareQuality) -> u64 {
     let bits = width as f64 * height as f64 * SHARE_FPS as f64 * SHARE_BITS_PER_PIXEL;
-    (bits as u64).clamp(SHARE_MIN_BPS, SHARE_MAX_BPS)
+    (bits as u64).clamp(SHARE_MIN_BPS, quality.max_bps())
 }
 
-/// The encoder config for a share at `width` x `height`, keeping `kind` (the
-/// probe's choice) when given one.
-fn encoder_config(width: u32, height: u32, kind: Option<moq_video::encode::Kind>) -> moq_video::encode::Config {
+/// The encoder config for a share at `width` x `height` and `quality`, keeping
+/// `kind` (the probe's choice) when given one.
+fn encoder_config(
+    width: u32,
+    height: u32,
+    quality: ShareQuality,
+    kind: Option<moq_video::encode::Kind>,
+) -> moq_video::encode::Config {
     let mut config = moq_video::encode::Config::new(width, height, share_rate());
-    config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(share_bitrate(width, height)));
+    config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(share_bitrate(width, height, quality)));
     config.gop = moq_video::encode::Gop::keyframe_every(KEYFRAME_EVERY, share_rate());
     if let Some(kind) = kind {
         config.kind = kind;
@@ -394,6 +504,8 @@ pub(super) struct Call {
     pub keyframe: Arc<Keyframes>,
     /// Where our own card's preview goes.
     pub preview: FrameSlot,
+    /// The quality the sharer chose for the running share.
+    pub quality: QualityChoice,
 }
 
 /// One share in progress, from the serving task's side.
@@ -492,7 +604,7 @@ fn start(source: ShareSource, call: Call) -> Option<Running> {
     let (finished, done) = oneshot::channel();
     // Taken here, on the serving task, so turns begin in the order the person
     // asked for them, whatever order the threads run in.
-    let turn = TURNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let turn = next_turn(&call.quality);
     call.local.begin_share(turn);
     let spawned = std::thread::Builder::new().name("share".into()).spawn({
         let source = source.clone();
@@ -559,13 +671,15 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
         local,
         keyframe,
         preview: shown,
+        quality: chosen,
     } = call;
     let fail = |text: String| local.set_own_share_problem(turn, text);
     let Some(mut stream) = open(&source, &mut stop, &local, turn).await else {
         return;
     };
     let (width, height) = share_size(stream.width(), stream.height());
-    let mut config = encoder_config(width, height, None);
+    let quality = chosen.get();
+    let mut config = encoder_config(width, height, quality, None);
 
     let mut broadcast = match outbound.create_broadcast(screen_path(&me)) {
         Ok(broadcast) => broadcast,
@@ -620,9 +734,10 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
         local.set_own_sharing(turn, true);
     }
     tracing::info!(
-        "[share] sharing {} at {width}x{height}, {} kbps, with {}",
+        "[share] sharing {} at {width}x{height}, {} kbps ({}), with {}",
         stream.label(),
-        share_bitrate(width, height) / 1000,
+        share_bitrate(width, height, quality) / 1000,
+        quality.key(),
         encoder.name()
     );
 
@@ -635,6 +750,8 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
             local: &local,
             turn,
             preview: &shown,
+            chosen: &chosen,
+            quality,
         })
         .await
     };
@@ -672,6 +789,39 @@ struct Steering<'a> {
     local: &'a PeerStats,
     turn: u64,
     preview: &'a FrameSlot,
+    /// The person's choice of quality, which can change mid-share.
+    chosen: &'a QualityChoice,
+    /// The quality the encoder was opened at.
+    quality: ShareQuality,
+}
+
+/// Replaces the encoder with one for `width` x `height` at `quality`, on the
+/// same track, after flushing what the old one still holds.
+///
+/// **A new encoder, not `set_bitrate`.** Some backends refuse a rate above the
+/// one they opened at (see `adapt`), and Sharp is exactly that. A rebuild is
+/// what a resize already does, and the catalog follows the new parameter sets
+/// by itself. Its first picture is a keyframe.
+///
+/// On an error the old encoder is still in place, flushed and usable, and
+/// `config` is unchanged.
+fn rebuild(
+    encoder: &mut moq_video::encode::Encoder,
+    producer: &mut moq_video::encode::Producer,
+    config: &mut moq_video::encode::Config,
+    (width, height): (u32, u32),
+    quality: ShareQuality,
+) -> Result<(), String> {
+    if let Ok(flushed) = encoder.flush() {
+        if !flushed.is_empty() {
+            producer.publish(&flushed).ok();
+        }
+    }
+    let next = encoder_config(width, height, quality, Some(config.kind.clone()));
+    *encoder = moq_video::encode::Encoder::new(&next)
+        .map_err(|error| format!("could not rebuild the encoder: {error:#}"))?;
+    *config = next;
+    Ok(())
 }
 
 /// Reads, encodes and publishes until stopped or the source is gone.
@@ -692,6 +842,8 @@ async fn pump(
         local,
         turn,
         preview: shown,
+        chosen,
+        quality: mut using,
     } = steering;
     // **Our own clock**, not the capture's: a reopened capture restarts its
     // timeline, and the stream's timestamps must keep rising across that.
@@ -744,16 +896,7 @@ async fn pump(
                 last = None;
                 let (width, height) = share_size(stream.width(), stream.height());
                 if (width, height) != (config.width, config.height) {
-                    // A new size is a new encoder on the same track: the
-                    // catalog follows the new parameter sets by itself.
-                    if let Ok(flushed) = encoder.flush() {
-                        if !flushed.is_empty() {
-                            producer.publish(&flushed).ok();
-                        }
-                    }
-                    *config = encoder_config(width, height, Some(config.kind.clone()));
-                    *encoder = moq_video::encode::Encoder::new(config)
-                        .map_err(|error| format!("could not rebuild the encoder: {error:#}"))?;
+                    rebuild(encoder, producer, config, (width, height), using)?;
                     keyed = Instant::now();
                     tracing::info!("[share] source now {width}x{height}");
                 }
@@ -764,6 +907,27 @@ async fn pump(
                 return Ok(());
             }
         };
+        // A quality chosen mid-share applies from this frame. A failed rebuild
+        // keeps the old encoder and is not retried until the choice changes
+        // again.
+        let wanted = chosen.get();
+        if wanted != using {
+            let size = (config.width, config.height);
+            match rebuild(encoder, producer, config, size, wanted) {
+                Ok(()) => {
+                    keyed = Instant::now();
+                    tracing::info!(
+                        "[share] now {} kbps ({}) at {}x{}",
+                        share_bitrate(size.0, size.1, wanted) / 1000,
+                        wanted.key(),
+                        size.0,
+                        size.1
+                    );
+                }
+                Err(error) => tracing::warn!("[share] staying at {}: {error}", using.key()),
+            }
+            using = wanted;
+        }
         // Asked for on the frame about to be encoded, which this thread owns.
         let rejoined = keyframe.screen.swap(false, std::sync::atomic::Ordering::Relaxed);
         if rejoined || keyed.elapsed() >= KEYFRAME_EVERY {
@@ -847,10 +1011,69 @@ mod tests {
 
     #[test]
     fn the_bitrate_is_clamped_at_both_ends() {
-        assert_eq!(share_bitrate(1710, 1106), SHARE_MAX_BPS);
-        assert_eq!(share_bitrate(1280, 800), 1_536_000);
-        assert_eq!(share_bitrate(320, 200), SHARE_MIN_BPS);
-        assert_eq!(share_bitrate(7680, 4320), SHARE_MAX_BPS);
+        let standard = ShareQuality::Standard;
+        assert_eq!(share_bitrate(1710, 1106, standard), SHARE_MAX_BPS);
+        assert_eq!(share_bitrate(1280, 800, standard), 1_536_000);
+        assert_eq!(share_bitrate(320, 200, standard), SHARE_MIN_BPS);
+        assert_eq!(share_bitrate(7680, 4320, standard), SHARE_MAX_BPS);
+        assert_eq!(SHARE_MAX_BPS, 2_500_000, "Standard's ceiling is what it always was");
+    }
+
+    #[test]
+    fn standard_caps_1080p_and_1440p_at_its_ceiling() {
+        assert_eq!(share_bitrate(1920, 1080, ShareQuality::Standard), 2_500_000);
+        assert_eq!(share_bitrate(2560, 1440, ShareQuality::Standard), 2_500_000);
+    }
+
+    #[test]
+    fn sharp_gives_large_screens_the_full_bits_per_pixel() {
+        // 0.1 bits per pixel at 15 fps, unclamped.
+        assert_eq!(share_bitrate(1920, 1080, ShareQuality::Sharp), 3_110_400);
+        assert_eq!(share_bitrate(2560, 1440, ShareQuality::Sharp), 5_529_600);
+        // The largest size we encode fits under the ceiling...
+        let (w, h) = MAX_SHARE;
+        assert!(share_bitrate(w, h, ShareQuality::Sharp) < SHARP_MAX_BPS);
+        // ...which still holds for a size we never encode.
+        assert_eq!(share_bitrate(7680, 4320, ShareQuality::Sharp), SHARP_MAX_BPS);
+    }
+
+    #[test]
+    fn sharp_changes_nothing_under_the_standard_ceiling() {
+        for (w, h) in [(320, 200), (1280, 800), (1440, 900), (1600, 1000)] {
+            assert_eq!(
+                share_bitrate(w, h, ShareQuality::Sharp),
+                share_bitrate(w, h, ShareQuality::Standard),
+                "{w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_encoder_is_configured_at_the_chosen_quality() {
+        let rate = |quality| encoder_config(2560, 1440, quality, None).bitrate.map(|rate| rate.as_bps());
+        assert_eq!(rate(ShareQuality::Standard), Some(2_500_000));
+        assert_eq!(rate(ShareQuality::Sharp), Some(5_529_600));
+    }
+
+    #[test]
+    fn the_quality_is_standard_until_chosen() {
+        let wish = ShareWish::new();
+        assert_eq!(wish.quality(), ShareQuality::Standard);
+        wish.set_quality(ShareQuality::Sharp);
+        assert_eq!(wish.quality_choice().get(), ShareQuality::Sharp, "a share reads what the bar set");
+        wish.set_quality(ShareQuality::Standard);
+        assert_eq!(wish.quality(), ShareQuality::Standard);
+    }
+
+    #[test]
+    fn every_share_starts_at_standard() {
+        let wish = ShareWish::new();
+        wish.set_quality(ShareQuality::Sharp);
+        let first = next_turn(&wish.quality_choice());
+        assert_eq!(wish.quality(), ShareQuality::Standard, "a Sharp left from the last share is gone");
+        let second = next_turn(&wish.quality_choice());
+        assert!(second > first, "turns still advance");
+        assert_eq!(wish.quality(), ShareQuality::Standard);
     }
 
     #[test]
