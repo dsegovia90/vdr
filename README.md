@@ -191,7 +191,9 @@ To get packages without a release, use *Run workflow* on the Release workflow
 in the Actions tab: both archives are attached to that run as artifacts. A pull
 request that changes the workflow or `deploy/client/` builds them the same way.
 
-The macOS app is signed ad hoc, not with an Apple Developer ID, so macOS will
+The macOS app is signed with the project's own certificate, not with an Apple
+Developer ID. That keeps its camera, microphone and screen permissions across
+updates, but macOS still does not know the publisher, so it will
 not open it with a double-click the first time: right-click `Vdr.app`, choose
 *Open*, then *Open* again. If macOS calls it "damaged", run
 `xattr -dr com.apple.quarantine /Applications/Vdr.app` once.
