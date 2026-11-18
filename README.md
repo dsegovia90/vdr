@@ -103,8 +103,29 @@ video to everyone in the call in place of your short id; a change reaches a
 call you are already in. Names are not verified: anyone can choose any name,
 and two people can choose the same one. Its *Keyboard* tab lists the
 shortcuts and changes them: click a key, then press the new one; Backspace
-removes it, Esc gives up. Its *About* tab shows the version and where the log
-is, which is what to send after a call that went wrong.
+removes it, Esc gives up. Its *Updates* tab is described below. Its *About*
+tab shows the version and where the log is, which is what to send after a
+call that went wrong.
+
+### Updates
+
+Shortly after it starts, and once a day after that, vdr asks GitHub whether
+there is a newer release; a dot on the gear says when there is. That is all a
+check does. Nothing is downloaded until you press *Update and restart* in the
+*Updates* tab, which downloads the release, checks it, replaces the app and
+restarts it. It cannot be pressed during a call. *Check now* checks at once,
+and a switch turns the automatic check off.
+
+Releases are signed. Before anything is unpacked, vdr checks the release's
+signature against a key built into the app and the download's checksum
+against the signed list, and refuses a package that does not match.
+
+vdr replaces itself only where it was installed from a release: on macOS a
+`Vdr.app` you can write to (not one opened straight from Downloads or a disk
+image; move it to Applications first), on Linux the folder the tarball
+unpacked to. Anywhere else the tab says why and gives the release page, and
+on Linux it can still download and check the package for you to install by
+hand.
 
 | Action | macOS | Linux |
 |---|---|---|

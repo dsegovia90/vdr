@@ -212,6 +212,9 @@ pub fn use_remote() -> Remote {
     });
     // Status crosses from the call thread, which cannot touch a signal.
     let updates = use_channel(move |next: RemoteStatus| {
+        // Here, at the status's source, rather than from what the page
+        // renders: the updater's worker must not restart the app under a call.
+        crate::update::set_call_active(next.is_cancellable());
         // The key arrives inside a status rather than on its own channel: the
         // call thread already reports it that way, and a second channel would
         // be a second thing to keep in step.
@@ -298,6 +301,7 @@ pub fn use_remote() -> Remote {
                 // UI. The CLI path is deliberately unchanged: it is how two
                 // instances get driven from a script.
                 if peering != Peering::Idle {
+                    crate::update::set_call_active(true);
                     if let Peering::Join(url) = &peering {
                         chosen.set(Some(url.clone()));
                     }
@@ -309,6 +313,11 @@ pub fn use_remote() -> Remote {
         let connect = Callback::new({
             let decide = decide.clone();
             move |peering: Peering| {
+                // At once, before the call's first status arrives: an update
+                // must not restart the app in that gap.
+                if peering != Peering::Idle {
+                    crate::update::set_call_active(true);
+                }
                 chosen.set(match &peering {
                     Peering::Join(url) => Some(url.clone()),
                     _ => None,

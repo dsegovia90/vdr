@@ -12,7 +12,7 @@ use dioxus_native::prelude::*;
 
 use super::{
     CameraIcon, DeviceMenu, DropdownOption, GearIcon, LeaveIcon, MenuSection, MicControl, OwnShare, SettingsPanel,
-    ShareControl, StatsRow, SubroomMenu,
+    ShareControl, StatsRow, SubroomMenu, Updates,
 };
 use crate::audio::Controls;
 use crate::net::{Metrics, PeerStats, RemoteStatus, ShareWish, share_available};
@@ -54,6 +54,9 @@ pub fn ControlBar(props: ControlBarProps) -> Element {
     let panel = use_context::<SettingsPanel>();
     let OwnShare(own_share) = use_context::<OwnShare>();
     let (_, share_problem) = own_share();
+    // A memo, so download progress does not redraw the bar each percent.
+    let update_status = use_context::<Updates>().status;
+    let update_dot = use_memo(move || update_status.read().has_update());
     let off = !props.camera_on;
     // Only once something is under way: idle, there is nothing to leave, and
     // the connect row at the top is where the next step is.
@@ -110,9 +113,13 @@ pub fn ControlBar(props: ControlBarProps) -> Element {
             // In every state, idle included: shortcuts can be changed before
             // a call, and the About tab is where the log is.
             button {
-                class: "flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-neutral-800 text-white hover:bg-neutral-700",
+                class: "relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-neutral-800 text-white hover:bg-neutral-700",
                 onclick: move |_| panel.show(),
                 GearIcon {}
+                // A newer release: the Updates tab says what it is.
+                if update_dot() {
+                    span { class: "absolute right-0.5 top-0.5 h-2.5 w-2.5 rounded-full bg-blue-500" }
+                }
             }
             // Only on a call: before one there is no room to divide.
             SubroomMenu {

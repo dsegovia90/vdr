@@ -12,32 +12,36 @@
 mod about;
 mod keyboard;
 mod profile;
+mod updates;
 
 use std::sync::Arc;
 
 use dioxus_native::prelude::*;
 
 use super::keys::{KeyFocus, SettingsPanel};
-use super::{CloseIcon, InfoIcon, KeyboardIcon, PersonIcon};
+use super::{CloseIcon, InfoIcon, KeyboardIcon, PersonIcon, UpdateIcon};
 use crate::net::PeerStats;
 
 pub(super) use keyboard::record;
+pub(super) use updates::{Updates, use_updates_provider};
 
 /// One tab of the window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Tab {
     Profile,
     Keyboard,
+    Updates,
     About,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Profile, Tab::Keyboard, Tab::About];
+    const ALL: [Tab; 4] = [Tab::Profile, Tab::Keyboard, Tab::Updates, Tab::About];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Profile => "Profile",
             Tab::Keyboard => "Keyboard",
+            Tab::Updates => "Updates",
             Tab::About => "About",
         }
     }
@@ -47,6 +51,7 @@ impl Tab {
             // The avatar's figure at the rail's size.
             Tab::Profile => rsx! { PersonIcon { size: 16 } },
             Tab::Keyboard => rsx! { KeyboardIcon {} },
+            Tab::Updates => rsx! { UpdateIcon {} },
             Tab::About => rsx! { InfoIcon {} },
         }
     }
@@ -55,6 +60,7 @@ impl Tab {
         match self {
             Tab::Profile => rsx! { profile::ProfileTab { local } },
             Tab::Keyboard => rsx! { keyboard::KeyboardTab {} },
+            Tab::Updates => rsx! { updates::UpdatesTab {} },
             Tab::About => rsx! { about::AboutTab {} },
         }
     }

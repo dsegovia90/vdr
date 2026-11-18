@@ -17,7 +17,7 @@ use super::tile::{UNDIMMED, dim_class};
 use super::{
     ConnectRow, ControlBar, CrosstalkLevel, DropdownOption, Names, OwnShare, ParticipantTile, RecentRoomList, Rooms,
     SettingsModal,
-    ShareTile, layout, settings, share, use_crosstalk_provider, use_open_menu_provider, use_rooms_provider,
+    ShareTile, use_updates_provider, layout, settings, share, use_crosstalk_provider, use_open_menu_provider, use_rooms_provider,
 };
 use crate::audio::use_shared_microphones;
 use crate::camera::{FrameSlot, Mirror, use_camera_choice};
@@ -64,6 +64,9 @@ pub fn CallScreen() -> Element {
     // The out-of-room volume, shared by the subroom menu that sets it and the
     // tiles that dim to it. After `use_remote`, which loads the saved setting.
     use_crosstalk_provider(&remote.audio);
+    // The updater: its schedule starts here, and the settings button and the
+    // Updates tab read what it finds. It is told of calls by `net` itself.
+    use_updates_provider(remote.status);
     let Rooms(rooms) = use_context::<Rooms>();
     let Names(names) = use_context::<Names>();
     let CrosstalkLevel(crosstalk) = use_context::<CrosstalkLevel>();

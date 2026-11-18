@@ -112,6 +112,14 @@ moq-audio = { version = "0.1.21", default-features = false, features = ["capture
 # Was `moq-native`, renamed upstream. Its QUIC backend is now `noq`.
 moq-tokio = { version = "0.19.34", default-features = false, features = ["iroh", "noq", "aws-lc-rs"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
+# The updater (`update/`). All four were already compiled in, through iroh,
+# blitz-net and the moq stack, at these versions: declaring them adds no
+# package. No features of our own, so none is turned on that was not already;
+# reqwest's TLS backend is chosen in code (rustls), not by a feature here.
+reqwest = { version = "0.13", default-features = false }
+ed25519-dalek = { version = "3", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+semver = "1"
 url = "2"
 wgpu = "30"
 
