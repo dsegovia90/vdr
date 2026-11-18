@@ -110,8 +110,9 @@ call that went wrong.
 ### Updates
 
 Shortly after it starts, and once a day after that, vdr asks GitHub whether
-there is a newer release; a dot on the gear says when there is. That is all a
-check does. Nothing is downloaded until you press *Update and restart* in the
+there is a newer release. When there is, a dot shows on the gear and on the
+*Updates* tab, and a banner above the connect field says so outside a call
+(*Dismiss* hides it until a still newer release). That is all a check does. Nothing is downloaded until you press *Update and restart* in the
 *Updates* tab, which downloads the release, checks it, replaces the app and
 restarts it. It cannot be pressed during a call. *Check now* checks at once,
 and a switch turns the automatic check off.

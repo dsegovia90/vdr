@@ -29,7 +29,7 @@ pub use microphone::MicControl;
 pub use participant::ParticipantVideo;
 pub use recent::RecentRoomList;
 pub use settings::SettingsModal;
-use settings::{Updates, use_updates_provider};
+use settings::{UpdateBanner, Updates, use_updates_provider};
 pub use stats::StatsRow;
 pub use share::{ShareControl, ShareTile};
 pub use subroom::{CrosstalkLevel, Invites, Names, OwnShare, Rooms, SubroomMenu, use_crosstalk_provider, use_rooms_provider};

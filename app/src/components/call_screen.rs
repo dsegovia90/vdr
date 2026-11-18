@@ -17,7 +17,7 @@ use super::tile::{UNDIMMED, dim_class};
 use super::{
     ConnectRow, ControlBar, CrosstalkLevel, DropdownOption, Names, OwnShare, ParticipantTile, RecentRoomList, Rooms,
     SettingsModal,
-    ShareTile, use_updates_provider, layout, settings, share, use_crosstalk_provider, use_open_menu_provider, use_rooms_provider,
+    ShareTile, UpdateBanner, use_updates_provider, layout, settings, share, use_crosstalk_provider, use_open_menu_provider, use_rooms_provider,
 };
 use crate::audio::use_shared_microphones;
 use crate::camera::{FrameSlot, Mirror, use_camera_choice};
@@ -343,6 +343,8 @@ pub fn CallScreen() -> Element {
             // field removed): focused here, then cleared by the click, then
             // restored by the blur above.
             onclick: move |_| focus.restore(),
+        // Only outside a call, and until dismissed for that version.
+        UpdateBanner {}
         // Only while there is no call: your key and who to call. A call is the
         // grid and the bar below, nothing else.
         ConnectRow {

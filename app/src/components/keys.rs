@@ -25,6 +25,7 @@ use std::rc::Rc;
 
 use dioxus_native::prelude::*;
 
+use super::settings::Tab;
 use crate::hotkeys::{Action, Chord, Key as HotKey, Keymap, Mods, Named, Refusal};
 use crate::settings::Settings;
 
@@ -209,11 +210,22 @@ pub struct SettingsPanel {
     pub recording: Signal<Option<Action>>,
     /// A refused key, shown under the row it was meant for.
     pub notice: Signal<Option<(Action, String)>>,
+    /// The tab showing. Here rather than in the window, so something outside
+    /// it (the update banner) can open it on a given tab.
+    pub tab: Signal<Tab>,
 }
 
 impl SettingsPanel {
     pub fn show(mut self) {
         self.open.set(true);
+    }
+
+    /// Opens it on `tab`.
+    pub fn show_tab(mut self, tab: Tab) {
+        if *self.tab.peek() != tab {
+            self.tab.set(tab);
+        }
+        self.show();
     }
 
     /// Closes it, abandoning any recording, and gives the keyboard back to
@@ -237,5 +249,6 @@ pub fn use_settings_panel_provider() -> SettingsPanel {
         open: Signal::new(false),
         recording: Signal::new(None),
         notice: Signal::new(None),
+        tab: Signal::new(Tab::Profile),
     })
 }

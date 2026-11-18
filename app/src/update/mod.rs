@@ -29,6 +29,7 @@
 
 mod fetch;
 mod install;
+mod link;
 mod release;
 mod verify;
 
@@ -40,6 +41,7 @@ use std::time::{Duration, Instant};
 use futures_channel::mpsc::UnboundedSender;
 
 use install::Plan;
+pub use link::open_release_page;
 use release::{Platform, Release};
 
 /// Long enough after launch that the check does not compete with the
@@ -128,6 +130,26 @@ impl Status {
     pub fn has_update(&self) -> bool {
         self.offer.is_some() && !matches!(self.phase, Phase::Installed | Phase::Restarting)
     }
+}
+
+/// The version the idle-screen banner offers, if it should show at all.
+///
+/// Never during a call, by the same notion of a call the installer uses.
+/// `dismissed` is the newest version the person waved away: the banner comes
+/// back only for something newer than that. A dismissal that does not parse
+/// (a hand edit) counts as none, so it can only ever show the banner, never
+/// hide it for good.
+pub fn banner(status: &Status, dismissed: Option<&str>, in_call: bool) -> Option<String> {
+    if in_call || !status.has_update() {
+        return None;
+    }
+    let offer = status.offer.as_ref()?;
+    let offered = semver::Version::parse(&offer.version).ok()?;
+    let dismissed = dismissed.and_then(|text| semver::Version::parse(text).ok());
+    if dismissed.is_some_and(|dismissed| offered.cmp_precedence(&dismissed) != std::cmp::Ordering::Greater) {
+        return None;
+    }
+    Some(offer.version.clone())
 }
 
 /// The handle the interface keeps. Cheap to clone; every action runs on a
@@ -525,6 +547,31 @@ mod tests {
         assert!(status.has_update());
         status.phase = Phase::Installed;
         assert!(!status.has_update());
+    }
+
+    fn offering(version: &str) -> Status {
+        Status {
+            phase: Phase::Available,
+            offer: Some(Offer {
+                version: version.into(),
+                page: "https://github.com/dsegovia90/vdr/releases/tag/v0.2.0".into(),
+            }),
+            ability: Ability::Install,
+        }
+    }
+
+    #[test]
+    fn the_banner_shows_only_for_an_undismissed_update_outside_a_call() {
+        assert_eq!(banner(&Status::default(), None, false), None, "no update");
+        assert_eq!(banner(&offering("0.2.0"), None, false), Some("0.2.0".into()), "an update");
+        assert_eq!(banner(&offering("0.2.0"), Some("0.2.0"), false), None, "dismissed, same version");
+        assert_eq!(banner(&offering("0.2.0"), Some("0.1.5"), false), Some("0.2.0".into()), "dismissed an older one");
+        assert_eq!(banner(&offering("0.2.0"), Some("0.3.0"), false), None, "dismissed a newer one");
+        assert_eq!(banner(&offering("0.2.0"), None, true), None, "in a call");
+        assert_eq!(banner(&offering("0.2.0"), Some("garbage"), false), Some("0.2.0".into()), "bad dismissal is none");
+        let mut installed = offering("0.2.0");
+        installed.phase = Phase::Installed;
+        assert_eq!(banner(&installed, None, false), None, "already installed");
     }
 
     #[test]

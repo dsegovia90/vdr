@@ -23,11 +23,11 @@ use super::{CloseIcon, InfoIcon, KeyboardIcon, PersonIcon, UpdateIcon};
 use crate::net::PeerStats;
 
 pub(super) use keyboard::record;
-pub(super) use updates::{Updates, use_updates_provider};
+pub(super) use updates::{UpdateBanner, Updates, use_updates_provider};
 
 /// One tab of the window.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Tab {
+pub(crate) enum Tab {
     Profile,
     Keyboard,
     Updates,
@@ -71,7 +71,10 @@ impl Tab {
 pub fn SettingsModal(local: Arc<PeerStats>) -> Element {
     let panel = use_context::<SettingsPanel>();
     let focus = use_context::<KeyFocus>();
-    let mut tab = use_signal(|| Tab::Profile);
+    let SettingsPanel { mut tab, .. } = panel;
+    // A memo, so download progress does not redraw the rail each percent.
+    let update_status = use_context::<Updates>().status;
+    let update_dot = use_memo(move || update_status.read().has_update());
     let open = (panel.open)();
     let current = tab();
 
@@ -107,6 +110,10 @@ pub fn SettingsModal(local: Arc<PeerStats>) -> Element {
                             onclick: move |_| tab.set(item),
                             {item.icon()}
                             span { {item.label()} }
+                            // The gear's dot, on the tab it leads to.
+                            if item == Tab::Updates && update_dot() {
+                                span { class: "ml-auto h-2 w-2 shrink-0 rounded-full bg-blue-500" }
+                            }
                         }
                     }
                 }

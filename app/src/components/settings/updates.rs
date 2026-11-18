@@ -6,19 +6,21 @@
 //! dimmed during a call, and the updater checks again before it changes
 //! anything.
 //!
-//! **Links are shown, not opened**: blitz has no way to open one, and the
-//! app has no other, so the release page is its URL with a Copy button, as
-//! the repository is on the About tab.
+//! **The release notes are a link** the system's browser opens (see
+//! `update::link` for which URLs it will open). One it refuses, or an opener
+//! that will not start, falls back to the URL as text with a Copy button.
+//!
+//! The banner on the idle screen lives here too, since it is this state.
 
 use dioxus_native::prelude::*;
 
 use super::super::connect::copy_to_clipboard;
-use super::super::{Button, Size, Tone};
-use super::{Heading, Row};
+use super::super::{Button, SettingsPanel, Size, Tone};
+use super::{Heading, Row, Tab};
 use crate::channel::use_channel;
 use crate::net::RemoteStatus;
 use crate::settings::Settings;
-use crate::update::{Ability, Phase, Status, Updater, capitalised};
+use crate::update::{self, Ability, Phase, Status, Updater, capitalised};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -30,6 +32,8 @@ pub struct Updates {
     /// The call's status: no installing while it is under way.
     call: Signal<RemoteStatus>,
     auto: Signal<bool>,
+    /// The newest version whose banner was dismissed, as saved.
+    dismissed: Signal<Option<String>>,
     updater: Updater,
 }
 
@@ -37,11 +41,14 @@ pub struct Updates {
 pub fn use_updates_provider(call: Signal<RemoteStatus>) -> Updates {
     let mut status = use_signal(Status::default);
     let tx = use_channel(move |next: Status| status.set(next));
-    let auto = use_signal(|| Settings::load().checks_updates());
+    let saved = use_hook(Settings::load);
+    let auto = use_signal(|| saved.checks_updates());
+    let dismissed = use_signal(|| saved.dismissed_update.clone());
     use_context_provider(move || Updates {
         status,
         call,
         auto,
+        dismissed,
         updater: Updater::start(tx.clone(), *auto.peek()),
     })
 }
@@ -53,6 +60,7 @@ pub fn UpdatesTab() -> Element {
         call,
         mut auto,
         updater,
+        ..
     } = use_context::<Updates>();
     let now = status();
     let in_call = call.read().is_cancellable();
@@ -197,16 +205,7 @@ fn Offered(
                 }
             }
         }
-        Row {
-            title: "Release notes",
-            description: page.clone(),
-            first: false,
-            Button {
-                size: Size::Small,
-                onclick: move |_| copy_to_clipboard(&page),
-                "Copy"
-            }
-        }
+        ReleaseNotes { page }
     }
 }
 
@@ -228,6 +227,83 @@ fn Switch(on: bool, onclick: EventHandler<MouseEvent>) -> Element {
                 } else {
                     "absolute left-[2px] top-[2px] h-5 w-5 rounded-full bg-white"
                 },
+            }
+        }
+    }
+}
+
+/// The release page as a link, or, once opening it has failed, as text to
+/// copy. Failing is remembered for as long as the tab is mounted: a link that
+/// did nothing once will do nothing again.
+#[component]
+fn ReleaseNotes(page: String) -> Element {
+    let mut unopenable = use_signal(|| false);
+    if unopenable() {
+        return rsx! {
+            Row {
+                title: "Release notes",
+                description: page.clone(),
+                first: false,
+                Button {
+                    size: Size::Small,
+                    onclick: move |_| copy_to_clipboard(&page),
+                    "Copy"
+                }
+            }
+        };
+    }
+    rsx! {
+        div { class: "flex flex-row items-center gap-4 border-t border-neutral-800 py-3",
+            // A plain colour, and the underline, are what say "link" here:
+            // there is no tooltip to.
+            span {
+                class: "cursor-pointer text-sm text-[rgb(96,165,250)] underline hover:text-[rgb(147,197,253)]",
+                onclick: move |_| {
+                    if let Err(error) = update::open_release_page(&page) {
+                        tracing::warn!("update: could not open the release notes: {error}");
+                        unopenable.set(true);
+                    }
+                },
+                "Release notes"
+            }
+        }
+    }
+}
+
+/// "Version X is available" above the connect controls: outside a call
+/// only, until dismissed for that version. Update opens the Updates tab; it
+/// never installs from here.
+#[component]
+pub fn UpdateBanner() -> Element {
+    let Updates {
+        status,
+        call,
+        mut dismissed,
+        ..
+    } = use_context::<Updates>();
+    let panel = use_context::<SettingsPanel>();
+    // A memo over state that is already there: no messages of its own, and a
+    // change of percent mid-download does not redraw it.
+    let shown = use_memo(move || update::banner(&status.read(), dismissed.read().as_deref(), call.read().is_cancellable()));
+    let Some(version) = shown() else { return rsx! {} };
+    rsx! {
+        div { class: "flex shrink-0 flex-row items-center gap-3 rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2",
+            span { class: "h-2 w-2 shrink-0 rounded-full bg-blue-500" }
+            span { class: "min-w-0 flex-1 truncate text-sm text-neutral-200", "Version {version} is available" }
+            Button {
+                size: Size::Small,
+                tone: Tone::Primary,
+                onclick: move |_| panel.show_tab(Tab::Updates),
+                "Update"
+            }
+            Button {
+                size: Size::Small,
+                onclick: move |_| {
+                    let version = version.clone();
+                    dismissed.set(Some(version.clone()));
+                    Settings::update(move |settings| settings.dismissed_update = Some(version));
+                },
+                "Dismiss"
             }
         }
     }
