@@ -1093,6 +1093,7 @@ async fn run(
                 local: local.clone(),
                 keyframe: keyframe.clone(),
                 preview: share.preview(),
+                quality: share.quality_choice(),
             },
             share.clone(),
             share_quit,
