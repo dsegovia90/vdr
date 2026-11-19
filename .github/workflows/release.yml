@@ -57,11 +57,18 @@ jobs:
             exit 1
           fi
 
-  macos:
-    name: macOS universal
+  # One job per architecture, at the same time: each is a full compile of the
+  # app, and one after the other they were most of a release's wait.
+  macos-build:
+    name: macOS build (${{ matrix.target }})
     needs: version
     runs-on: macos-latest
     timeout-minutes: 120
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -70,15 +77,68 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: app
+          key: ${{ matrix.target }}
 
       - uses: taiki-e/cache-cargo-install-action@9ee83daaa7b96a6fab930949ecf1122bba04a389 # v3
         with:
           tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
+
+      - name: build
+        working-directory: app
+        run: dx build --renderer native --release --target "$TARGET"
+
+      # The binary from each, and the bundle (assets, Info.plist) from the
+      # Apple Silicon one. In a tar: an artifact on its own loses the
+      # executable bit and the bundle's links. Named so that the jobs below,
+      # which collect `vdr-*`, never mistake a half for a package.
+      - name: collect
+        run: |
+          mkdir out
+          cp "app/target/$TARGET/desktop-release/vdr" out/vdr
+          if [ "$TARGET" = aarch64-apple-darwin ]; then
+            cp -R app/target/dx/vdr/release/macos/Vdr.app out/Vdr.app
+          fi
+          tar -C out -cf "half-$TARGET.tar" .
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: half-${{ matrix.target }}
+          path: half-${{ matrix.target }}.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: macOS universal
+    needs: macos-build
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: half-*
+          path: halves
+          merge-multiple: true
+
+      # Where package-macos.sh's own builds would have left them.
+      - name: place the builds
+        run: |
+          for target in x86_64-apple-darwin aarch64-apple-darwin; do
+            mkdir -p "halves/$target" "app/target/$target/desktop-release"
+            tar -C "halves/$target" -xf "halves/half-$target.tar"
+            cp "halves/$target/vdr" "app/target/$target/desktop-release/vdr"
+          done
+          mkdir -p app/target/dx/vdr/release/macos
+          cp -R halves/aarch64-apple-darwin/Vdr.app app/target/dx/vdr/release/macos/Vdr.app
+          file app/target/*/desktop-release/vdr
 
       # One certificate for every release, so macOS treats an update as the
       # same app and keeps its camera, microphone and screen grants. It is
@@ -123,6 +183,8 @@ jobs:
       # The same script as a local `just package-mac`: universal binary,
       # signed, usage keys checked, zipped with the guide and licences.
       - name: package
+        env:
+          VDR_MAC_PREBUILT: 1
         run: deploy/client/package-macos.sh "$LABEL"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -184,6 +246,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
+          pattern: vdr-*
           path: dist
           merge-multiple: true
 
@@ -234,8 +297,14 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
+          pattern: vdr-*
           path: dist
           merge-multiple: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: checksums
+          path: dist
 
       - name: publish
         env:
