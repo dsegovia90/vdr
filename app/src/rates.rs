@@ -86,13 +86,13 @@ impl History {
 /// One second as one chart draws it, in kbps.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Point {
-    /// The bar.
+    /// What was sent, the filled line.
     pub sent: Option<u32>,
     /// The hard line, and part of the scale.
     pub cap: Option<u32>,
     pub target: Option<u32>,
-    /// Drawn where it fits, clipped to the top where it does not; never part
-    /// of the scale, or a generous link would flatten every bar.
+    /// Drawn only where it fits; never part of the scale, or a generous link
+    /// would flatten everything else.
     pub estimate: Option<u32>,
 }
 
@@ -156,20 +156,126 @@ pub fn top(points: &[Point]) -> u32 {
     with_headroom.div_ceil(step).max(1).saturating_mul(step)
 }
 
-/// How tall a bar of `kbps` is in a chart `px` high topped at `top`. Never
-/// taller than the chart.
-pub fn bar_px(kbps: u32, top: u32, px: u32) -> u32 {
-    if top == 0 {
-        return 0;
-    }
-    (kbps as u64 * px as u64 / top as u64).min(px as u64) as u32
+/// How many seconds the drawn "sent" line averages over.
+///
+/// An encoder meets its bitrate over a few seconds, not in each one: the
+/// second holding a keyframe is several times the ones between. Drawn raw,
+/// that is a comb that says nothing about the link and crosses the cap, which
+/// is itself an average, every other second.
+pub const SMOOTH: usize = 5;
+
+/// Each value averaged with up to `window - 1` known values before it. A gap
+/// stays a gap, and a value just after one averages only what it has.
+pub fn smoothed(values: &[Option<u32>], window: usize) -> Vec<Option<u32>> {
+    (0..values.len())
+        .map(|index| {
+            values[index]?;
+            let from = index.saturating_sub(window.saturating_sub(1));
+            let known: Vec<u64> = values[from..=index]
+                .iter()
+                .rev()
+                .map_while(|value| value.map(u64::from))
+                .collect();
+            Some((known.iter().sum::<u64>() / known.len() as u64) as u32)
+        })
+        .collect()
 }
 
-/// Where a line `thickness` px thick at `kbps` sits, as its distance from the
-/// bottom. A value above the top is clipped to it, line and all inside the
-/// chart.
-pub fn line_px(kbps: u32, top: u32, px: u32, thickness: u32) -> u32 {
-    bar_px(kbps, top, px).min(px.saturating_sub(thickness))
+/// A drawing surface `width` by `height`, with `top` kbps at its upper edge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Canvas {
+    pub width: f32,
+    pub height: f32,
+    pub top: u32,
+}
+
+impl Canvas {
+    /// Where slot `index` of `count` sits, left to right.
+    fn x(&self, index: usize, count: usize) -> f32 {
+        match count {
+            0 | 1 => self.width,
+            _ => self.width * index as f32 / (count - 1) as f32,
+        }
+    }
+
+    /// How far down `kbps` sits. Kept a pixel inside both edges, so a line at
+    /// zero or at the top is still wholly on the surface.
+    fn y(&self, kbps: u32) -> f32 {
+        let share = match self.top {
+            0 => 0.0,
+            top => (kbps as f32 / top as f32).min(1.0),
+        };
+        (self.height * (1.0 - share)).clamp(1.0, self.height - 1.0)
+    }
+
+    /// `values`, one per slot, as runs of neighbouring points: a gap ends a
+    /// run, so nothing is drawn across seconds that knew nothing.
+    pub fn runs(&self, values: &[Option<u32>]) -> Vec<Vec<(f32, f32)>> {
+        let mut runs = Vec::new();
+        let mut run = Vec::new();
+        for (index, value) in values.iter().enumerate() {
+            match value {
+                Some(kbps) => run.push((self.x(index, values.len()), self.y(*kbps))),
+                None if run.is_empty() => {}
+                None => runs.push(std::mem::take(&mut run)),
+            }
+        }
+        if !run.is_empty() {
+            runs.push(run);
+        }
+        runs
+    }
+}
+
+/// How wide a lone second is drawn, so one sample is a dash and not nothing.
+const LONE: f32 = 6.0;
+
+/// One run as path commands, starting with a move. Straight, or rounded
+/// through the midpoints: each point is a control point and the curve passes
+/// through the middles of the segments, so it never swings past the data.
+fn trace(run: &[(f32, f32)], smooth: bool) -> String {
+    use std::fmt::Write;
+    let mut d = String::new();
+    match run {
+        [] => {}
+        [(x, y)] => {
+            let _ = write!(d, "M{:.1},{y:.1} L{x:.1},{y:.1}", (x - LONE).max(0.0));
+        }
+        [(x, y), rest @ ..] => {
+            let _ = write!(d, "M{x:.1},{y:.1}");
+            if smooth {
+                for pair in rest.windows(2) {
+                    let ((cx, cy), (nx, ny)) = (pair[0], pair[1]);
+                    let _ = write!(d, " Q{cx:.1},{cy:.1} {:.1},{:.1}", (cx + nx) / 2.0, (cy + ny) / 2.0);
+                }
+            } else {
+                for (x, y) in &rest[..rest.len() - 1] {
+                    let _ = write!(d, " L{x:.1},{y:.1}");
+                }
+            }
+            let (x, y) = rest[rest.len() - 1];
+            let _ = write!(d, " L{x:.1},{y:.1}");
+        }
+    }
+    d
+}
+
+/// The runs as one path's `d`: a line, rounded or straight.
+pub fn line_d(runs: &[Vec<(f32, f32)>], smooth: bool) -> String {
+    runs.iter().map(|run| trace(run, smooth)).collect::<Vec<_>>().join(" ")
+}
+
+/// The runs as a filled shape's `d`: each rounded line closed down to the
+/// bottom edge at `height`.
+pub fn area_d(runs: &[Vec<(f32, f32)>], height: f32) -> String {
+    runs.iter()
+        .filter_map(|run| {
+            let (first, last) = (run.first()?, run.last()?);
+            let left = if run.len() == 1 { (first.0 - LONE).max(0.0) } else { first.0 };
+            Some(format!("{} L{:.1},{height:.1} L{left:.1},{height:.1} Z", trace(run, true), last.0))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -274,19 +380,48 @@ mod tests {
     }
 
     #[test]
-    fn heights_scale_and_stop_at_the_top() {
-        assert_eq!(bar_px(1500, 3000, 120), 60);
-        assert_eq!(bar_px(0, 3000, 120), 0);
-        assert_eq!(bar_px(3000, 3000, 120), 120);
-        assert_eq!(bar_px(9000, 3000, 120), 120);
-        assert_eq!(bar_px(100, 0, 120), 0, "no scale is no height, not a division by zero");
+    fn smoothing_averages_what_came_before_and_respects_gaps() {
+        let values = [Some(100), Some(300), None, Some(600), Some(0), Some(300)];
+        assert_eq!(
+            smoothed(&values, 3),
+            vec![Some(100), Some(200), None, Some(600), Some(300), Some(300)]
+        );
+        assert_eq!(smoothed(&[], 5), Vec::<Option<u32>>::new());
+        assert_eq!(smoothed(&[Some(7)], 0), vec![Some(7)], "a window of nothing is the value itself");
+    }
+
+    const CANVAS: Canvas = Canvas {
+        width: 600.0,
+        height: 120.0,
+        top: 3000,
+    };
+
+    #[test]
+    fn points_scale_and_stay_inside_the_surface() {
+        let runs = CANVAS.runs(&[Some(1500), Some(0), Some(3000), Some(50_000)]);
+        assert_eq!(runs, vec![vec![(0.0, 60.0), (200.0, 119.0), (400.0, 1.0), (600.0, 1.0)]]);
+        let none = Canvas { top: 0, ..CANVAS };
+        assert_eq!(none.runs(&[Some(100)]), vec![vec![(600.0, 119.0)]], "no scale is the floor, not a division by zero");
     }
 
     #[test]
-    fn a_line_above_the_top_stays_inside_the_chart() {
-        assert_eq!(line_px(1500, 3000, 120, 2), 60);
-        assert_eq!(line_px(3000, 3000, 120, 2), 118);
-        assert_eq!(line_px(50_000, 3000, 120, 2), 118);
-        assert_eq!(line_px(0, 3000, 120, 2), 0);
+    fn a_gap_splits_the_line() {
+        let runs = CANVAS.runs(&[None, Some(1500), Some(1500), None, None, Some(1500)]);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].len(), 2);
+        assert_eq!(runs[1], vec![(600.0, 60.0)]);
+    }
+
+    #[test]
+    fn paths_are_straight_or_rounded_and_a_lone_second_is_a_dash() {
+        let run = vec![(0.0, 60.0), (300.0, 20.0), (600.0, 60.0)];
+        assert_eq!(line_d(std::slice::from_ref(&run), false), "M0.0,60.0 L300.0,20.0 L600.0,60.0");
+        assert_eq!(line_d(std::slice::from_ref(&run), true), "M0.0,60.0 Q300.0,20.0 450.0,40.0 L600.0,60.0");
+        assert_eq!(line_d(&[vec![(600.0, 60.0)]], true), "M594.0,60.0 L600.0,60.0");
+        assert_eq!(line_d(&[], true), "");
+        assert_eq!(
+            area_d(&[run], 120.0),
+            "M0.0,60.0 Q300.0,20.0 450.0,40.0 L600.0,60.0 L600.0,120.0 L0.0,120.0 Z"
+        );
     }
 }
