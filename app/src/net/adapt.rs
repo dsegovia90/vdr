@@ -390,7 +390,7 @@ pub(super) fn spawn(follow: Follow) -> tokio::task::JoinHandle<()> {
             };
             let before = budget.0.state();
             if let Some(after) = budget.0.observe(sample, now) {
-                log_change(stream, before, after, sample, estimate_bps);
+                log_change(stream, before, after, sample, estimate_bps, follows);
             }
         }
     })
@@ -639,15 +639,38 @@ impl Drop for Summarise {
 /// The `info!` line for a change of state. Only changes are logged, so a
 /// stream that sits at the ceiling writes one line, and a log someone sends us
 /// says whether their rate was being held without needing `RUST_LOG`.
-fn log_change(stream: Stream, from: State, to: State, sample: Sample, estimate: Option<u64>) {
-    tracing::info!("{}", change_line(stream, from, to, sample, estimate));
+fn log_change(stream: Stream, from: State, to: State, sample: Sample, estimate: Option<u64>, slice: Option<u64>) {
+    tracing::info!("{}", change_line(stream, from, to, sample, estimate, slice));
 }
 
 /// [`log_change`]'s words, apart so they can be checked. For the share,
 /// `sample.estimate` is its slice and `estimate` the connection's.
-fn change_line(stream: Stream, from: State, to: State, sample: Sample, estimate: Option<u64>) -> String {
+///
+/// `slice` is what the stream follows. The camera's line names it only when
+/// the other streams took a real part of the link: "held at 400 (estimate
+/// 3000)" would otherwise read as a mistake, when it is the share being served
+/// first.
+fn change_line(
+    stream: Stream,
+    from: State,
+    to: State,
+    sample: Sample,
+    estimate: Option<u64>,
+    slice: Option<u64>,
+) -> String {
     let kbps = |bps: u64| bps / 1000;
     match (stream, to, sample.estimate) {
+        (Stream::Camera, State::Held, Some(estimate))
+            if slice.is_some_and(|slice| (slice as f64) < estimate as f64 * HELD_BELOW) =>
+        {
+            format!(
+                "[rate] held by the link: {} kbps of {} (slice {}, estimate {})",
+                kbps(sample.target),
+                kbps(sample.ceiling),
+                kbps(slice.unwrap_or(0)),
+                kbps(estimate)
+            )
+        }
         (Stream::Camera, State::Held, Some(estimate)) => format!(
             "[rate] held by the link: {} kbps of {} (estimate {})",
             kbps(sample.target),
@@ -1078,7 +1101,24 @@ mod tests {
         let held = at(CEILING, 900_000, Some(1_000_000));
         let at_ceiling = at(CEILING, CEILING, Some(5_000_000));
         let unknown = at(CEILING, 900_000, None);
-        let line = |stream, from, to, sample| change_line(stream, from, to, sample, Some(3_000_000));
+        let line = |stream, from, to, sample| change_line(stream, from, to, sample, Some(3_000_000), None);
+        // Squeezed by the streams served before it, the camera says so.
+        assert_eq!(
+            change_line(
+                Stream::Camera,
+                State::AtCeiling,
+                State::Held,
+                at(CEILING, 400_000, Some(3_000_000)),
+                Some(3_000_000),
+                Some(436_000)
+            ),
+            "[rate] held by the link: 400 kbps of 2500 (slice 436, estimate 3000)"
+        );
+        // With the link to itself (its slice is the estimate, less the microphone), as before.
+        assert_eq!(
+            change_line(Stream::Camera, State::AtCeiling, State::Held, held, Some(1_000_000), Some(960_000)),
+            "[rate] held by the link: 900 kbps of 2500 (estimate 1000)"
+        );
         // The camera's, byte for byte as before.
         assert_eq!(
             line(Stream::Camera, State::AtCeiling, State::Held, held),
