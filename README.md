@@ -106,9 +106,13 @@ video to everyone in the call in place of your short id; a change reaches a
 call you are already in. Names are not verified: anyone can choose any name,
 and two people can choose the same one. Its *Keyboard* tab lists the
 shortcuts and changes them: click a key, then press the new one; Backspace
-removes it, Esc gives up. Its *Updates* tab is described below. Its *About*
-tab shows the version and where the log is, which is what to send after a
-call that went wrong.
+removes it, Esc gives up. Its *Updates* tab is described below. Its
+*Network* tab charts the last minute of a call, a bar a second: what the
+camera and a screen share each sent against their caps, and everything sent
+against the link's estimate (video only; audio is not counted). Each stream
+has its own cap and nothing divides the link between them, so the last chart
+is where an overshoot shows. Its *About* tab shows the version and where the
+log is, which is what to send after a call that went wrong.
 
 ### Updates
 

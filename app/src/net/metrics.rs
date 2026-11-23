@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use crate::rates::{History, Second};
+
 /// The echo canceller's grade of itself, from sonora's statistics, in the
 /// units a person reads: dB and ms.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -165,6 +167,11 @@ pub struct Metrics {
     /// What each outgoing stream may send and what it did. See [`Sent`].
     camera: Sent,
     share: Sent,
+    /// The last minute of the above, for the Network tab. Behind a lock
+    /// rather than atomics because it is a list; taken once a second by the
+    /// meter and once a second by the tab while it is open, never on an
+    /// encode thread.
+    history: std::sync::Mutex<History>,
 }
 
 /// One outgoing stream's cap, and the bytes it actually handed the transport.
@@ -347,9 +354,29 @@ impl Metrics {
     }
 
     /// Turns the byte counts since the last call, `elapsed` ago, into rates.
+    ///
+    /// Also where the last minute is kept: this is the one place that already
+    /// runs once a second for the length of a call.
     pub(super) fn tick_sent(&self, elapsed: Duration) {
         self.camera.tick(elapsed);
         self.share.tick(elapsed);
+        let second = Second {
+            camera_sent: self.camera_sent_kbps(),
+            camera_cap: self.camera_cap_kbps(),
+            camera_target: self.send_kbps(),
+            share_sent: self.share_sent_kbps(),
+            share_cap: self.share_cap_kbps(),
+            estimate: self.estimate_kbps(),
+        };
+        if let Ok(mut history) = self.history.lock() {
+            history.push(second);
+        }
+    }
+
+    /// The last minute of what was sent, oldest first; empty outside a call,
+    /// and empty rather than a panic if the lock was poisoned.
+    pub fn last_minute(&self) -> Vec<Second> {
+        self.history.lock().map(|history| history.seconds()).unwrap_or_default()
     }
 
     /// Records a connection snapshot.
@@ -393,6 +420,9 @@ impl Metrics {
         self.set_path(Path::Unknown);
         self.camera.clear();
         self.share.clear();
+        if let Ok(mut history) = self.history.lock() {
+            history.clear();
+        }
         for field in [
             &self.rtt_ms,
             &self.loss_bp,
@@ -1267,8 +1297,15 @@ mod tests {
 
         // The share is its own stream.
         assert_eq!(metrics.share_sent_kbps(), None);
+
+        // Every tick since the cap was set is a second of history.
+        let minute = metrics.last_minute();
+        assert_eq!(minute.len(), 3);
+        assert_eq!(minute.iter().map(|s| s.camera_sent).collect::<Vec<_>>(), vec![None, Some(2000), Some(0)]);
+
         metrics.clear();
         assert_eq!((metrics.camera_cap_kbps(), metrics.camera_sent_kbps()), (None, None));
+        assert!(metrics.last_minute().is_empty());
     }
 
     #[test]

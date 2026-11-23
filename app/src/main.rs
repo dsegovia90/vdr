@@ -7,6 +7,7 @@ mod components;
 mod hotkeys;
 mod name;
 mod net;
+mod rates;
 mod recent;
 mod settings;
 mod update;
