@@ -100,11 +100,11 @@ impl Reporter {
                 },
             );
         }
-        self.cells.retain(|id, _| ids.iter().any(|kept| *kept == id));
+        self.cells.retain(|id, _| ids.contains(&id));
 
         self.ticks += 1;
         // The first tick reports, so a joiner is heard from at once.
-        if (self.ticks - 1) % TICKS_PER_REPORT != 0 {
+        if !(self.ticks - 1).is_multiple_of(TICKS_PER_REPORT) {
             return;
         }
         let average = |sent: &mut Vec<u32>| {

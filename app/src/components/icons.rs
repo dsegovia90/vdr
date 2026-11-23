@@ -228,6 +228,29 @@ pub fn InfoIcon() -> Element {
     }
 }
 
+/// A laboratory flask: the settings' Experimental tab.
+#[component]
+pub fn FlaskIcon() -> Element {
+    rsx! {
+        svg {
+            // Needed: blitz hands the serialized subtree to usvg, which only
+            // accepts a root in the SVG namespace.
+            xmlns: "http://www.w3.org/2000/svg",
+            width: "16",
+            height: "16",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M9 3h6" }
+            path { d: "M10 3v6l-5.5 9.5A2 2 0 0 0 6.2 21.5h11.6a2 2 0 0 0 1.7-3L14 9V3" }
+            path { d: "M7.5 15h9" }
+        }
+    }
+}
+
 /// Three bars of a chart: the settings' Network tab.
 #[component]
 pub fn ChartIcon() -> Element {

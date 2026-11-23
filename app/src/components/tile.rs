@@ -15,11 +15,12 @@ use dioxus_native::prelude::*;
 
 use super::device_menu::OpenMenu;
 use super::tile_menu::{TileMenu, menu_name};
-use super::{Invites, MicIcon, Names, OwnShare, ParticipantVideo, PersonIcon, Rooms};
+use super::{Invites, MicIcon, Names, OwnShare, ParticipantVideo, PersonIcon, Rooms, SignalBars};
 use crate::audio::Crosstalk;
 use crate::camera::{FrameSlot, Mirror};
 use crate::channel::use_channel;
 use crate::net::PeerStats;
+use crate::net::quality::{self, Quality};
 
 /// How often a tile re-reads its numbers. Matches the stats row.
 const POLL: Duration = Duration::from_millis(500);
@@ -45,6 +46,12 @@ struct Reading {
     /// passed on to the page's [`OwnShare`].
     sharing: bool,
     share_problem: Option<String>,
+    /// Their connection's quality as they report it, ours on our own tile.
+    /// `None` when they are not reporting or our experimental switch is off:
+    /// no mark at all, rather than an "unknown" one.
+    mark: Option<Quality>,
+    /// The tile menu's line about their connection. A peer's tile only.
+    connection: Option<String>,
 }
 
 impl Default for Reading {
@@ -60,6 +67,8 @@ impl Default for Reading {
             invites: BTreeMap::new(),
             sharing: false,
             share_problem: None,
+            mark: None,
+            connection: None,
         }
     }
 }
@@ -165,6 +174,9 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     });
     use_hook({
         let stats = props.stats.clone();
+        let local = props.local.clone();
+        // A peer's id never changes on its tile; ours has no menu line.
+        let peer = (!mine).then(|| props.who.clone());
         move || {
             let Some(stats) = stats else { return };
             let spawned = std::thread::Builder::new()
@@ -172,7 +184,21 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                 .spawn(move || {
                     let mut sent: Option<Reading> = None;
                     loop {
+                        // Off means neither publish nor show.
+                        let shown = local.experimental();
+                        let link = if shown { stats.link() } else { None };
+                        let connection = match (&peer, &link) {
+                            (Some(peer), Some(link)) => {
+                                quality::connection_line(Some(link), local.seen().get(peer))
+                            }
+                            _ => None,
+                        };
                         let next = Reading {
+                            // Only the state, which has hysteresis: the
+                            // figures move every report, and any change
+                            // sent here wakes the page.
+                            mark: link.as_ref().map(|link| link.q),
+                            connection,
                             fps: stats.video_fps(),
                             talking: stats.talking(),
                             camera_on: stats.camera_on(),
@@ -286,6 +312,9 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                         MicIcon { off: true }
                     }
                 }
+                if let Some(quality) = now.mark {
+                    SignalBars { quality }
+                }
                 if !mine {
                     span { class: "text-xs text-neutral-400", "\u{25BE}" }
                 }
@@ -298,6 +327,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                     name: now.name.clone(),
                     their_room: now.room.clone(),
                     their_mic: now.mic_on,
+                    connection: now.connection.clone(),
                     our_room,
                     local: props.local.clone(),
                     me: props.me.clone(),

@@ -372,10 +372,6 @@ pub struct Judge {
 }
 
 impl Judge {
-    pub fn shown(&self) -> Quality {
-        self.shown
-    }
-
     pub fn observe(&mut self, raw: Quality, now: Instant) -> Quality {
         match (raw.rank(), self.shown.rank()) {
             (Some(next), Some(shown)) if next < shown => {
@@ -534,7 +530,7 @@ pub fn chart_point(link: Option<&Link>) -> Point {
 pub fn loss_words(tenths: u32) -> String {
     let step = loss_step(tenths);
     let percent = |tenths: u32| {
-        if tenths % 10 == 0 { format!("{}", tenths / 10) } else { format!("{}.{}", tenths / 10, tenths % 10) }
+        if tenths.is_multiple_of(10) { format!("{}", tenths / 10) } else { format!("{}.{}", tenths / 10, tenths % 10) }
     };
     match LOSS_STEPS.iter().position(|value| *value == step) {
         Some(0) => "recent loss under 0.5%".to_string(),
