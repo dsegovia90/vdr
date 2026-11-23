@@ -7,12 +7,18 @@
 //! carry the stream shows up as video that lags and then jumps rather than as
 //! video that quietly got softer.
 //!
-//! Almost none of the policy is ours. `moq_video::encode::rate` decides what a
-//! bandwidth estimate should mean, and its defaults suit a call: target 90% of
-//! the estimate so audio and overhead have room, give bandwidth back the
-//! instant the pipe closes, take it back at 25% per second, and ignore moves
-//! under 5% so the encoder is not reconfigured at every twitch. What is here is
-//! the wiring and the cadence.
+//! Almost none of the policy is ours. `moq_mux::rate` decides what a bandwidth
+//! estimate should mean, and its behaviour suits a call: give bandwidth back
+//! the instant the pipe closes, take it back at 25% per second, and ignore
+//! moves under 5% so the encoder is not reconfigured at every twitch. What is
+//! here is the wiring and the cadence.
+//!
+//! **The camera aims at the whole connection's estimate, and nothing is held
+//! back for the other streams.** The policy expects an estimate that is this
+//! sender's alone; dividing one connection among its senders is
+//! `moq_net::bandwidth::Allocator`'s job, and we do not use one. So while a
+//! screen is shared, the camera and the share together can ask for more than
+//! the link carries, and the transport sheds the difference by priority.
 //!
 //! **The ceiling is the rate the encoder opened at.** Rate control can only
 //! take the target down: an optimistic estimate is not a reason to send more
@@ -52,10 +58,9 @@ pub(super) type Ceiling = Arc<AtomicU64>;
 /// The estimate is sampled and reported from the start; a target is only
 /// published once `ceiling` is set, since there is no encoder to steer before.
 ///
-/// Runs until aborted. Only the dialling side can do this today: the estimate
-/// hangs off the `Reconnect` a client gets back, and the listening side's
-/// `serve_both` hands out nothing equivalent, so a callee keeps sending at its
-/// opening rate.
+/// Runs until aborted. A dialling side reads the estimate off the `Reconnect`
+/// it gets back; a listening side has none until somebody calls, so
+/// [`forward`] feeds one of ours from the session.
 pub(super) fn spawn(
     bandwidth: moq_net::bandwidth::Consumer,
     ceiling: Ceiling,
