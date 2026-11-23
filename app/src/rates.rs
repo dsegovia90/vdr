@@ -30,6 +30,11 @@ pub struct Second {
     pub camera_target: Option<u32>,
     pub share_sent: Option<u32>,
     pub share_cap: Option<u32>,
+    /// What the rate loop asked the share's encoder for.
+    pub share_target: Option<u32>,
+    /// Each stream's slice of the link, as its rate loop follows it.
+    pub camera_slice: Option<u32>,
+    pub share_slice: Option<u32>,
     /// The transport's estimate for the whole connection.
     pub estimate: Option<u32>,
 }

@@ -74,7 +74,9 @@ impl Drop for Abort {
 struct Peer {
     /// Resolves when the connection ends, with why.
     closed: Pin<Box<dyn Future<Output = String> + Send>>,
-    /// The send-bitrate estimate, when this side can reach one.
+    /// The transport's own send-bitrate estimate, for a side that has one
+    /// lasting the whole attempt, to be mirrored into the call's budget. A
+    /// listener has none; its sessions feed the budget as they come.
     bandwidth: Option<moq_net::bandwidth::Consumer>,
     /// Connection figures, when this side has a handle that outlives a single
     /// session. The listening side reports its own from inside the accept loop
@@ -610,7 +612,7 @@ fn framerate() -> moq_video::Rate {
 
 /// Video's delivery priority: below audio (80) and the control documents
 /// ([`CONTROL_PRIORITY`]), as hang's own catalog ranks them.
-const VIDEO_PRIORITY: u8 = 60;
+pub(super) const VIDEO_PRIORITY: u8 = 60;
 
 /// How many decoded frames between rate reports in the log. Matches the paint
 /// path's cadence so the two logs are comparable.
@@ -828,12 +830,13 @@ async fn run(
         let Some(feed) = parked.take() else {
             return Err("the camera feed is gone".to_string());
         };
-    // The encoder's opening bitrate, set by the encode thread once a frame has
-    // sized it, and the rate loop's ceiling from then on.
-    let ceiling: adapt::Ceiling = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    // Filled in by the rate loop below, read by the encode loop. Stays empty
-    // unless this attempt turns out to be one that can measure the link.
-    let target: adapt::Target = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // The send budget for everything this attempt publishes, made before
+        // the microphone starts, since it reserves as it does. The estimate it
+        // divides is fed below, once the attempt knows which side it is; until
+        // then, and on a link that never reports one, every slice is "hold
+        // your rate", so each stream sends what it was configured for.
+        let estimate = moq_net::bandwidth::Producer::new();
+        let link = adapt::Link::new(&estimate);
     // Set when a session comes back, read by the encode loop. A subscriber that
     // rejoins mid-stream cannot decode until a keyframe arrives, and the encoder
     // already inserts one every two seconds -- so this only buys back that wait,
@@ -876,7 +879,7 @@ async fn run(
 
         let engine = audio::open_playback(&controls).await;
         let mut aec_report = None;
-        match audio::publish(broadcast.clone(), catalog.clone(), engine.as_ref()) {
+        match audio::publish(broadcast.clone(), catalog.clone(), engine.as_ref(), link.allocator.clone()) {
             Ok((publication, driver, canceller)) => {
                 controls.attach(publication);
                 audio::drive(driver);
@@ -976,12 +979,11 @@ async fn run(
                 // estimate lives. Without one, a callee sends at its opening
                 // rate for the whole call however bad the link gets.
                 //
-                // Persistent, and fed from whichever session is live. The
-                // dialling side gets this shape for free from `Reconnect`;
-                // here it is ours to keep, because an estimate has to exist
-                // before anyone has called.
-                let estimate = moq_net::bandwidth::Producer::new();
-                let bandwidth = Some(estimate.consume());
+                // The call's own estimate, fed from whichever session is live.
+                // The dialling side gets a persistent one from `Reconnect`;
+                // here the call's is the persistent one, because it has to
+                // exist before anyone has called.
+                let estimate = estimate.clone();
                 // The accept loop below is an `async move`, so it would take
                 // the shared handle with it and leave the next attempt without
                 // one.
@@ -1070,7 +1072,7 @@ async fn run(
                             }
                         }
                     }),
-                    bandwidth,
+                    bandwidth: None,
                     stats: None,
                 }
             }
@@ -1083,8 +1085,15 @@ async fn run(
             bandwidth,
             stats,
         } = peer_transport;
-        let rate = bandwidth
-            .map(|bandwidth| adapt::spawn(bandwidth, ceiling.clone(), target.clone(), metrics.clone()));
+        let mirroring = bandwidth.map(|source| Abort(tokio::spawn(adapt::mirror(source, estimate.clone()))));
+        let rate = adapt::spawn(adapt::Follow {
+            stream: adapt::Stream::Camera,
+            estimate: link.estimate.clone(),
+            lane: link.camera.clone(),
+            beside: None,
+            metrics: metrics.clone(),
+            shown: Box::new(|| true),
+        });
         let reporting = stats.map(|stats| {
             let metrics = metrics.clone();
             tokio::spawn(async move {
@@ -1113,6 +1122,7 @@ async fn run(
                 preview: share.preview(),
                 quality: share.quality_choice(),
                 metrics: metrics.clone(),
+                link: link.clone(),
             },
             share.clone(),
             share_quit,
@@ -1163,8 +1173,7 @@ async fn run(
         let mut encoding = tokio::task::spawn_blocking({
             let metrics = metrics.clone();
             let stop = stop.clone();
-            let target = target.clone();
-            let ceiling = ceiling.clone();
+            let link = link.clone();
             let keyframe = keyframe.clone();
             let local = local.clone();
             let broadcast = broadcast.clone();
@@ -1216,7 +1225,14 @@ async fn run(
                         return (feed, Some(producer), outcome);
                     }
                 };
-                ceiling.store(opening_bitrate, std::sync::atomic::Ordering::Relaxed);
+                // Held until the encode loop ends, which is the stream's life:
+                // dropping it hands the camera's room to the others. Reserved
+                // at the opening rate, the most this encoder ever sends.
+                let reservation = link
+                    .allocator
+                    .reserve(&producer.demand(), moq_net::bandwidth::Rate::from_bps(opening_bitrate));
+                link.camera.follow(reservation.consumer());
+                link.camera.set_ceiling(opening_bitrate);
                 // The target starts at the ceiling, and the rate loop only
                 // writes when it moves it, so without this a sender the link
                 // never holds back would show no rate all call.
@@ -1234,7 +1250,7 @@ async fn run(
                     &mut producer,
                     Steering {
                         scale,
-                        target: &target,
+                        lane: &link.camera,
                         keyframe: &keyframe.camera,
                         stop: &stop,
                         local: &local,
@@ -1252,6 +1268,7 @@ async fn run(
                         metrics.camera_sent(payload_bytes(&flushed));
                     }
                 }
+                drop(reservation);
                 (feed, Some(producer), outcome)
             }
         });
@@ -1363,9 +1380,8 @@ async fn run(
         tokio::time::sleep(GOODBYE_FLUSH).await;
         drop(transport);
         decode.abort();
-        if let Some(rate) = rate {
-            rate.abort();
-        }
+        rate.abort();
+        drop(mirroring);
         if let Some(reporting) = reporting {
             reporting.abort();
         }
@@ -1419,8 +1435,8 @@ async fn run(
 struct Steering<'a> {
     /// Integer downscale from capture to encode size.
     scale: usize,
-    /// A new bitrate, set by the rate loop.
-    target: &'a adapt::Target,
+    /// The camera's lane, where the rate loop leaves a new bitrate.
+    lane: &'a adapt::Lane,
     /// Set when a peer rejoins and needs a keyframe.
     keyframe: &'a std::sync::atomic::AtomicBool,
     /// Set when the attempt is over.
@@ -1444,7 +1460,7 @@ fn encode(
 ) -> Result<(), String> {
     let Steering {
         scale,
-        target,
+        lane,
         keyframe,
         stop,
         local,
@@ -1459,7 +1475,7 @@ fn encode(
         // Applied here because this thread owns the encoder. A rate arriving
         // mid-frame waits for the next one, which is well inside what the
         // control loop ramps over.
-        if let Some(bitrate) = adapt::take(target) {
+        if let Some(bitrate) = lane.take() {
             if let Err(error) = encoder.set_bitrate(moq_net::bandwidth::Rate::from_bps(bitrate)) {
                 tracing::warn!("could not move the encoder to {bitrate} bps: {error:#}");
             }
@@ -1931,6 +1947,9 @@ fn write_stats(
         "rtt_ms": metrics.rtt(), "loss_pct": metrics.loss(), "up_kbps": metrics.send_kbps(),
         "camera_cap_kbps": metrics.camera_cap_kbps(), "camera_sent_kbps": metrics.camera_sent_kbps(),
         "share_cap_kbps": metrics.share_cap_kbps(), "share_sent_kbps": metrics.share_sent_kbps(),
+        "estimate_kbps": metrics.estimate_kbps(),
+        "camera_slice_kbps": metrics.camera_slice_kbps(),
+        "share_slice_kbps": metrics.share_slice_kbps(), "share_target_kbps": metrics.share_target_kbps(),
         "aec_erle_db": aec.erle_db, "aec_erl_db": aec.erl_db,
         "aec_delay_ms": aec.delay_ms,
         "aec_reference_frames": aec.reference_frames, "aec_reference_rms": aec.reference_rms,

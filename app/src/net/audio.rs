@@ -113,9 +113,14 @@ pub(super) fn publish(
     broadcast: moq_net::broadcast::Producer,
     catalog: moq_mux::catalog::Producer,
     engine: Option<&playback::Engine>,
+    bandwidth: moq_net::bandwidth::Allocator,
 ) -> Result<(encode::Publication, encode::Driver, Option<moq_audio::aec::Control>), String> {
     // Opus at 20 ms, the system default input.
     let mut options = encode::PublicationOptions::default();
+    // The call's send budget. moq-audio reserves its bitrate against it, at
+    // audio's priority, and does not follow the slice back (read): what this
+    // buys is the video streams sizing themselves against what is left.
+    options.encode.bandwidth = bandwidth;
     // A clone handed back for `report_aec`: clones share one adaptive filter,
     // so this one sees what the microphone's does.
     let mut canceller = None;

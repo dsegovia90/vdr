@@ -99,7 +99,14 @@ async fn pump(
         moq_video::encode::Producer::with_track(track, catalog.clone(), rendition.clone())?;
 
     let engine = audio::open_playback(&controls).await;
-    match audio::publish(broadcast.clone(), catalog, engine.as_ref()) {
+    // Nothing to divide in-process: an unlimited allocator leaves the
+    // microphone at its configured rate.
+    match audio::publish(
+        broadcast.clone(),
+        catalog,
+        engine.as_ref(),
+        moq_net::bandwidth::Allocator::unlimited(),
+    ) {
         Ok((publication, driver, canceller)) => {
             controls.attach(publication);
             audio::drive(driver);

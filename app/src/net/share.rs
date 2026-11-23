@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{oneshot, watch};
 
+use super::adapt;
 use super::call::{Keyframes, SCREEN_PRIORITY, payload_bytes, screen_path, video_track};
 use crate::camera::{FrameSlot, from_decoded};
 use super::metrics::{Metrics, PeerStats};
@@ -275,25 +276,29 @@ const SHARE_FPS: u32 = 15;
 /// bits per frame is the only floor there is.
 const SHARE_BITS_PER_PIXEL: f64 = 0.1;
 
-/// The share's bitrate bounds. It does not follow the link: the rate loop owns
-/// one target for one encoder, and dividing an uplink between two belongs with
-/// simulcast. Lowering the ceiling is the cheap fix if it congests.
+/// The share's bitrate bounds.
+///
+/// The minimum is also the floor its rate loop holds it to when the link is
+/// short (`adapt`): below it text is unreadable, so a squeezed share gives up
+/// bitrate to here, at its usual frame rate, and no further.
 ///
 /// The ceiling bites above about 1.7 megapixels, so a 1080p or 1440p screen
 /// gets fewer bits per pixel than the floor above asks for. That is the
-/// default on purpose: a share that does not follow the link must not be the
-/// thing that saturates someone's uplink. [`SHARP_MAX_BPS`] lifts it, for
-/// one share at a time, when the sharer asks.
-const SHARE_MIN_BPS: u64 = 600_000;
+/// default on purpose: the rate loop only ever lowers a share from its
+/// ceiling, so the ceiling is what it sends on a link with room to spare, and
+/// a default share should not be the biggest thing on someone's uplink.
+/// [`SHARP_MAX_BPS`] lifts it, for one share at a time, when the sharer asks.
+pub(super) const SHARE_MIN_BPS: u64 = 600_000;
 const SHARE_MAX_BPS: u64 = 2_500_000;
 
 /// The ceiling under [`ShareQuality::Sharp`]: high enough that the largest
 /// size we encode ([`MAX_SHARE`], 1440p at 15 fps, 5.5 Mbps) gets the full
 /// bits-per-pixel floor, with a little room.
 ///
-/// **A deliberate act, per share.** Nothing lowers the rate when the link
-/// cannot carry it, so it is never the starting point and never carried over:
-/// the sharer turns it on while sharing, and every share begins at Standard.
+/// **A deliberate act, per share.** The rate loop lowers it when the link
+/// cannot carry it, but on a link that can it is more than twice Standard's
+/// upload, so it is never the starting point and never carried over: the
+/// sharer turns it on while sharing, and every share begins at Standard.
 const SHARP_MAX_BPS: u64 = 6_000_000;
 
 /// How much upload a share may spend, as the sharer chose it.
@@ -508,6 +513,8 @@ pub(super) struct Call {
     pub quality: QualityChoice,
     /// Where the share's cap and the bytes it sends are recorded.
     pub metrics: Arc<Metrics>,
+    /// The call's send budget, which the share reserves from and follows.
+    pub link: adapt::Link,
 }
 
 /// One share in progress, from the serving task's side.
@@ -675,6 +682,7 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
         preview: shown,
         quality: chosen,
         metrics,
+        link,
     } = call;
     let fail = |text: String| local.set_own_share_problem(turn, text);
     let Some(mut stream) = open(&source, &mut stop, &local, turn).await else {
@@ -749,10 +757,33 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
         encoder.name()
     );
 
+    // The share's claim on the link, at its cap, for as long as it runs:
+    // dropping it at the end hands the room back to the camera.
+    let cap = share_bitrate(width, height, quality);
+    let reservation = link.allocator.reserve(&producer.demand(), moq_net::bandwidth::Rate::from_bps(cap));
+    let lane = Arc::new(adapt::Lane::default());
+    lane.follow(reservation.consumer());
+    lane.set_ceiling(cap);
+    if local.share_is_current(turn) {
+        metrics.set_target_kbps(adapt::Stream::Share, (cap / 1000) as u32);
+    }
+
     let outcome = if going {
         Ok(())
     } else {
-        pump(&source, &mut stream, &mut encoder, &mut producer, &mut config, Steering {
+        // Aborted when the share ends, which writes its summary.
+        let rate = adapt::spawn(adapt::Follow {
+            stream: adapt::Stream::Share,
+            estimate: link.estimate.clone(),
+            lane: lane.clone(),
+            beside: Some(link.camera.clone()),
+            metrics: metrics.clone(),
+            shown: Box::new({
+                let local = local.clone();
+                move || local.share_is_current(turn)
+            }),
+        });
+        let outcome = pump(&source, &mut stream, &mut encoder, &mut producer, &mut config, Steering {
             keyframe: &keyframe,
             stop: &mut stop,
             local: &local,
@@ -761,8 +792,12 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
             chosen: &chosen,
             quality,
             metrics: &metrics,
+            lane: &lane,
+            reservation: &reservation,
         })
-        .await
+        .await;
+        rate.abort();
+        outcome
     };
     // Only the current share's: a replaced one finishing late must not blank
     // the next one's card.
@@ -787,8 +822,11 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
         }
     }
     producer.finish().ok();
+    drop(reservation);
     if local.share_is_current(turn) {
         metrics.set_share_cap_kbps(0);
+        metrics.set_target_kbps(adapt::Stream::Share, 0);
+        metrics.set_slice_kbps(adapt::Stream::Share, None);
     }
     local.set_own_sharing(turn, false);
     broadcast.close();
@@ -806,6 +844,10 @@ struct Steering<'a> {
     /// The quality the encoder was opened at.
     quality: ShareQuality,
     metrics: &'a Metrics,
+    /// Where the rate loop leaves a new bitrate, and learns of a new ceiling.
+    lane: &'a adapt::Lane,
+    /// The share's claim on the link, moved with its ceiling.
+    reservation: &'a moq_net::bandwidth::Reservation,
 }
 
 /// Replaces the encoder with one for `width` x `height` at `quality`, on the
@@ -838,6 +880,38 @@ fn rebuild(
     Ok(())
 }
 
+/// The bitrate the share's current encoder opened at.
+fn opened_at(config: &moq_video::encode::Config) -> u64 {
+    config.bitrate.map_or(0, |rate| rate.as_bps())
+}
+
+/// Tells the budget about an encoder rebuilt at `cap`: the reservation moves
+/// with it, the encoder goes back to where the link was holding it, if it
+/// was, and the rate loop learns the new ceiling, which starts it a new
+/// policy. Returns the rate the encoder is now at.
+fn retarget(
+    encoder: &mut moq_video::encode::Encoder,
+    lane: &adapt::Lane,
+    reservation: &moq_net::bandwidth::Reservation,
+    before: u64,
+    cap: u64,
+    metrics: Option<&Metrics>,
+) -> u64 {
+    reservation.update(moq_net::bandwidth::Rate::from_bps(cap));
+    let mut rate = cap;
+    if let Some(bitrate) = adapt::reapply(lane.current(), before, cap) {
+        match encoder.set_bitrate(moq_net::bandwidth::Rate::from_bps(bitrate)) {
+            Ok(()) => rate = bitrate,
+            Err(error) => tracing::warn!("[share] could not move the encoder to {bitrate} bps: {error:#}"),
+        }
+    }
+    if let Some(metrics) = metrics {
+        metrics.set_target_kbps(adapt::Stream::Share, (rate / 1000) as u32);
+    }
+    lane.set_ceiling(cap);
+    rate
+}
+
 /// Reads, encodes and publishes until stopped or the source is gone.
 ///
 /// `Ok` for an ending that is nobody's fault: a stop, or the source going away
@@ -859,7 +933,14 @@ async fn pump(
         chosen,
         quality: mut using,
         metrics,
+        lane,
+        reservation,
     } = steering;
+    let current = |local: &PeerStats| local.share_is_current(turn);
+    // The rate the encoder is at, so a target it is already at is not sent
+    // to it: on a link with no estimate the share is then never retuned at
+    // all, as before it had a rate loop.
+    let mut rate = opened_at(config);
     // **Our own clock**, not the capture's: a reopened capture restarts its
     // timeline, and the stream's timestamps must keep rising across that.
     let started = Instant::now();
@@ -911,11 +992,14 @@ async fn pump(
                 last = None;
                 let (width, height) = share_size(stream.width(), stream.height());
                 if (width, height) != (config.width, config.height) {
+                    let before = opened_at(config);
                     rebuild(encoder, producer, config, (width, height), using, metrics)?;
                     keyed = Instant::now();
                     // The rate follows the size, so a resize can move the cap.
-                    if local.share_is_current(turn) {
-                        metrics.set_share_cap_kbps((share_bitrate(width, height, using) / 1000) as u32);
+                    let cap = share_bitrate(width, height, using);
+                    rate = retarget(encoder, lane, reservation, before, cap, current(local).then_some(metrics));
+                    if current(local) {
+                        metrics.set_share_cap_kbps((cap / 1000) as u32);
                     }
                     tracing::info!("[share] source now {width}x{height}");
                 }
@@ -932,11 +1016,14 @@ async fn pump(
         let wanted = chosen.get();
         if wanted != using {
             let size = (config.width, config.height);
+            let before = opened_at(config);
             match rebuild(encoder, producer, config, size, wanted, metrics) {
                 Ok(()) => {
                     keyed = Instant::now();
-                    if local.share_is_current(turn) {
-                        metrics.set_share_cap_kbps((share_bitrate(size.0, size.1, wanted) / 1000) as u32);
+                    let cap = share_bitrate(size.0, size.1, wanted);
+                    rate = retarget(encoder, lane, reservation, before, cap, current(local).then_some(metrics));
+                    if current(local) {
+                        metrics.set_share_cap_kbps((cap / 1000) as u32);
                     }
                     tracing::info!(
                         "[share] now {} kbps ({}) at {}x{}",
@@ -949,6 +1036,18 @@ async fn pump(
                 Err(error) => tracing::warn!("[share] staying at {}: {error}", using.key()),
             }
             using = wanted;
+        }
+        // The link's word, applied on the frame about to be encoded, since this
+        // thread owns the encoder. Never above what the encoder opened at: a
+        // target worked out for the ceiling before a rebuild can land after
+        // it, and raising is the rebuild's job.
+        if let Some(bitrate) = lane.take().map(|bitrate| bitrate.min(opened_at(config))) {
+            if bitrate != rate {
+                match encoder.set_bitrate(moq_net::bandwidth::Rate::from_bps(bitrate)) {
+                    Ok(()) => rate = bitrate,
+                    Err(error) => tracing::warn!("[share] could not move the encoder to {bitrate} bps: {error:#}"),
+                }
+            }
         }
         // Asked for on the frame about to be encoded, which this thread owns.
         let rejoined = keyframe.screen.swap(false, std::sync::atomic::Ordering::Relaxed);
