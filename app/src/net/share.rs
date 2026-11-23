@@ -23,9 +23,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{oneshot, watch};
 
-use super::call::{Keyframes, SCREEN_PRIORITY, screen_path, video_track};
+use super::call::{Keyframes, SCREEN_PRIORITY, payload_bytes, screen_path, video_track};
 use crate::camera::{FrameSlot, from_decoded};
-use super::metrics::PeerStats;
+use super::metrics::{Metrics, PeerStats};
 use super::runtime::runtime;
 
 /// What to share. Ours, so the interface never names a moq type.
@@ -506,6 +506,8 @@ pub(super) struct Call {
     pub preview: FrameSlot,
     /// The quality the sharer chose for the running share.
     pub quality: QualityChoice,
+    /// Where the share's cap and the bytes it sends are recorded.
+    pub metrics: Arc<Metrics>,
 }
 
 /// One share in progress, from the serving task's side.
@@ -672,6 +674,7 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
         keyframe,
         preview: shown,
         quality: chosen,
+        metrics,
     } = call;
     let fail = |text: String| local.set_own_share_problem(turn, text);
     let Some(mut stream) = open(&source, &mut stop, &local, turn).await else {
@@ -732,6 +735,11 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
     let going = stopped(&mut stop);
     if !going {
         local.set_own_sharing(turn, true);
+        // Gated like `sharing`, and for the same reason: only the newest
+        // share's numbers mean anything.
+        if local.share_is_current(turn) {
+            metrics.set_share_cap_kbps((share_bitrate(width, height, quality) / 1000) as u32);
+        }
     }
     tracing::info!(
         "[share] sharing {} at {width}x{height}, {} kbps ({}), with {}",
@@ -752,6 +760,7 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
             preview: &shown,
             chosen: &chosen,
             quality,
+            metrics: &metrics,
         })
         .await
     };
@@ -773,11 +782,14 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
     // Media finished, then presence, then the broadcast, so the room hears
     // "stopped sharing" and loses the screen together.
     if let Ok(flushed) = encoder.flush() {
-        if !flushed.is_empty() {
-            producer.publish(&flushed).ok();
+        if !flushed.is_empty() && producer.publish(&flushed).is_ok() {
+            metrics.share_sent(payload_bytes(&flushed));
         }
     }
     producer.finish().ok();
+    if local.share_is_current(turn) {
+        metrics.set_share_cap_kbps(0);
+    }
     local.set_own_sharing(turn, false);
     broadcast.close();
 }
@@ -793,6 +805,7 @@ struct Steering<'a> {
     chosen: &'a QualityChoice,
     /// The quality the encoder was opened at.
     quality: ShareQuality,
+    metrics: &'a Metrics,
 }
 
 /// Replaces the encoder with one for `width` x `height` at `quality`, on the
@@ -811,10 +824,11 @@ fn rebuild(
     config: &mut moq_video::encode::Config,
     (width, height): (u32, u32),
     quality: ShareQuality,
+    metrics: &Metrics,
 ) -> Result<(), String> {
     if let Ok(flushed) = encoder.flush() {
-        if !flushed.is_empty() {
-            producer.publish(&flushed).ok();
+        if !flushed.is_empty() && producer.publish(&flushed).is_ok() {
+            metrics.share_sent(payload_bytes(&flushed));
         }
     }
     let next = encoder_config(width, height, quality, Some(config.kind.clone()));
@@ -844,6 +858,7 @@ async fn pump(
         preview: shown,
         chosen,
         quality: mut using,
+        metrics,
     } = steering;
     // **Our own clock**, not the capture's: a reopened capture restarts its
     // timeline, and the stream's timestamps must keep rising across that.
@@ -896,8 +911,12 @@ async fn pump(
                 last = None;
                 let (width, height) = share_size(stream.width(), stream.height());
                 if (width, height) != (config.width, config.height) {
-                    rebuild(encoder, producer, config, (width, height), using)?;
+                    rebuild(encoder, producer, config, (width, height), using, metrics)?;
                     keyed = Instant::now();
+                    // The rate follows the size, so a resize can move the cap.
+                    if local.share_is_current(turn) {
+                        metrics.set_share_cap_kbps((share_bitrate(width, height, using) / 1000) as u32);
+                    }
                     tracing::info!("[share] source now {width}x{height}");
                 }
                 continue;
@@ -913,9 +932,12 @@ async fn pump(
         let wanted = chosen.get();
         if wanted != using {
             let size = (config.width, config.height);
-            match rebuild(encoder, producer, config, size, wanted) {
+            match rebuild(encoder, producer, config, size, wanted, metrics) {
                 Ok(()) => {
                     keyed = Instant::now();
+                    if local.share_is_current(turn) {
+                        metrics.set_share_cap_kbps((share_bitrate(size.0, size.1, wanted) / 1000) as u32);
+                    }
                     tracing::info!(
                         "[share] now {} kbps ({}) at {}x{}",
                         share_bitrate(size.0, size.1, wanted) / 1000,
@@ -957,6 +979,7 @@ async fn pump(
             producer
                 .publish(&encoded)
                 .map_err(|error| format!("publish failed: {error:#}"))?;
+            metrics.share_sent(payload_bytes(&encoded));
         }
         // **After** the encode and publish, so the preview never delays what
         // the room sees. Fresh frames only: a still screen's re-send changes
