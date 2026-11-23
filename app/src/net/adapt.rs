@@ -293,6 +293,15 @@ impl std::fmt::Display for Summary {
                 lowest,
                 ceiling,
             } => {
+                // A stay of a second or two, or one where the estimate came and
+                // went at once: "0% of 0 s" would read as a measurement.
+                if observed < Duration::from_secs(1) {
+                    return write!(
+                        f,
+                        "[rate] this call: camera at {} kbps, too briefly to say whether the link held it",
+                        ceiling / 1000
+                    );
+                }
                 let share = if observed.is_zero() {
                     0.0
                 } else {
@@ -518,6 +527,20 @@ mod tests {
                 lowest: 900_000,
                 ceiling: CEILING,
             }
+        );
+    }
+
+    #[test]
+    fn a_stay_too_short_to_measure_says_so() {
+        let summary = Summary::Observed {
+            observed: Duration::from_millis(400),
+            held: Duration::ZERO,
+            lowest: 345_000,
+            ceiling: 345_000,
+        };
+        assert_eq!(
+            summary.to_string(),
+            "[rate] this call: camera at 345 kbps, too briefly to say whether the link held it"
         );
     }
 
