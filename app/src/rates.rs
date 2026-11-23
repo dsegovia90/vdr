@@ -102,9 +102,11 @@ pub struct Point {
     /// The hard line, and part of the scale.
     pub cap: Option<u32>,
     pub target: Option<u32>,
-    /// Drawn only where it fits; never part of the scale, or a generous link
-    /// would flatten everything else.
-    pub estimate: Option<u32>,
+    /// The dashed line: what the link allows this stream (its slice), or for
+    /// the total, the whole connection's estimate. Drawn only where it fits;
+    /// never part of the scale, or a generous link would flatten everything
+    /// else.
+    pub link: Option<u32>,
 }
 
 impl Point {
@@ -113,7 +115,7 @@ impl Point {
             sent: second.camera_sent,
             cap: second.camera_cap,
             target: second.camera_target,
-            estimate: second.estimate,
+            link: second.camera_slice,
         }
     }
 
@@ -121,8 +123,8 @@ impl Point {
         Self {
             sent: second.share_sent,
             cap: second.share_cap,
-            target: None,
-            estimate: None,
+            target: second.share_target,
+            link: second.share_slice,
         }
     }
 
@@ -133,7 +135,7 @@ impl Point {
             sent: second.total_sent(),
             cap: second.total_cap(),
             target: None,
-            estimate: second.estimate,
+            link: second.estimate,
         }
     }
 }
@@ -340,6 +342,21 @@ mod tests {
     }
 
     #[test]
+    fn each_stream_is_drawn_against_its_slice_and_the_total_against_the_link() {
+        let second = Second {
+            camera_target: Some(400),
+            camera_slice: Some(300),
+            share_target: Some(1800),
+            share_slice: Some(1700),
+            estimate: Some(2100),
+            ..Second::default()
+        };
+        assert_eq!((Point::camera(&second).target, Point::camera(&second).link), (Some(400), Some(300)));
+        assert_eq!((Point::share(&second).target, Point::share(&second).link), (Some(1800), Some(1700)));
+        assert_eq!((Point::total(&second).target, Point::total(&second).link), (None, Some(2100)));
+    }
+
+    #[test]
     fn slots_put_the_newest_at_the_right() {
         let point = |kbps| Point {
             sent: Some(kbps),
@@ -378,7 +395,7 @@ mod tests {
         let point = Point {
             sent: Some(900),
             cap: Some(1000),
-            estimate: Some(50_000),
+            link: Some(50_000),
             ..Point::default()
         };
         assert_eq!(top(&[point]), 1250);
