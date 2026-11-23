@@ -164,16 +164,22 @@ struct Marks {
 #[component]
 fn Chart(points: Vec<Point>, draw_cap: bool) -> Element {
     let top = rates::top(&points);
-    let has_target = points.iter().any(|point| point.target.is_some());
-    let has_estimate = points.iter().any(|point| point.estimate.is_some());
+    // A target sitting on the cap is the cap: drawn over it, it hid the cap
+    // line entirely for a camera the link never holds back, which is most.
+    let target_of = |point: &Point| point.target.filter(|target| point.cap != Some(*target));
+    // An estimate far above the scale is not drawn pinned to the top edge,
+    // where it reads as a value just over the scale; the numbers line says it.
+    let estimate_of = |point: &Point| point.estimate.filter(|estimate| *estimate <= top);
+    let has_target = points.iter().any(|point| target_of(point).is_some());
+    let has_estimate = points.iter().any(|point| estimate_of(point).is_some());
     let slots: Vec<Option<Marks>> = rates::slots(&points)
         .into_iter()
         .map(|slot| {
             slot.map(|point| Marks {
                 bar: point.sent.map(|kbps| rates::bar_px(kbps, top, CHART_PX)),
                 cap: point.cap.filter(|_| draw_cap).map(|kbps| rates::line_px(kbps, top, CHART_PX, CAP_PX)),
-                target: point.target.map(|kbps| rates::line_px(kbps, top, CHART_PX, TARGET_PX)),
-                estimate: point.estimate.map(|kbps| rates::line_px(kbps, top, CHART_PX, ESTIMATE_PX)),
+                target: target_of(&point).map(|kbps| rates::line_px(kbps, top, CHART_PX, TARGET_PX)),
+                estimate: estimate_of(&point).map(|kbps| rates::line_px(kbps, top, CHART_PX, ESTIMATE_PX)),
             })
         })
         .collect();
