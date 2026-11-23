@@ -464,7 +464,12 @@ pub fn CallScreen() -> Element {
             share: remote.share.clone(),
         }
         // Last, so it paints over everything, the video included.
-        SettingsModal { local: remote.local.clone(), metrics: remote.metrics.clone() }
+        SettingsModal {
+            local: remote.local.clone(),
+            metrics: remote.metrics.clone(),
+            participants: remote.participants,
+            me: remote.me.read().clone().unwrap_or_default(),
+        }
         }
     }
 }
