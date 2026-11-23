@@ -160,17 +160,22 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
 /// where it changed.
 #[component]
 fn Chart(points: Vec<Point>, draw_cap: bool) -> Element {
+    // Averaged before it is cut to the minute shown, over the few older
+    // seconds the history keeps for this, so the left edge is a full average
+    // like every other point.
+    let raw: Vec<Option<u32>> = points.iter().map(|point| point.sent).collect();
+    let points: Vec<Point> = points
+        .iter()
+        .zip(rates::smoothed(&raw, rates::SMOOTH))
+        .map(|(point, sent)| Point { sent, ..*point })
+        .collect();
     let slots = rates::slots(&points);
     let of = |pick: fn(&Point) -> Option<u32>| -> Vec<Option<u32>> {
         slots.iter().map(|slot| slot.as_ref().and_then(pick)).collect()
     };
-    let sent = rates::smoothed(&of(|point| point.sent), rates::SMOOTH);
+    let sent = of(|point| point.sent);
     // Scaled by what is drawn: the averaged line, not the raw spikes.
-    let scaled: Vec<Point> = slots
-        .iter()
-        .zip(&sent)
-        .filter_map(|(slot, sent)| slot.map(|point| Point { sent: *sent, ..point }))
-        .collect();
+    let scaled: Vec<Point> = slots.iter().flatten().copied().collect();
     let top = rates::top(&scaled);
     let canvas = rates::Canvas {
         width: WIDTH,
@@ -197,11 +202,18 @@ fn Chart(points: Vec<Point>, draw_cap: bool) -> Element {
     let half = HEIGHT / 2.0;
     let grid = format!("M0,{half} L{WIDTH},{half}");
 
-    let latest = Point {
-        sent: sent.last().copied().flatten(),
-        ..points.last().copied().unwrap_or_default()
+    // Which second the pointer is over, if any: its figures replace the
+    // latest second's in the line under the chart. No tooltip, because blitz
+    // has none.
+    let mut hovered = use_signal(|| None::<usize>);
+    let over = hovered();
+    let numbers = match over.and_then(|index| slots.get(index).copied().map(|slot| (index, slot))) {
+        Some((index, Some(point))) => numbers(&ago(index), point, draw_cap, top),
+        Some((index, None)) => format!("{}  \u{b7}  nothing sent yet", ago(index)),
+        None => numbers("now", points.last().copied().unwrap_or_default(), draw_cap, top),
     };
-    let numbers = numbers(latest, draw_cap, top);
+    let half_label = rate(top / 2);
+    let top_label = rate(top);
 
     rsx! {
         div { class: "relative h-[120px] w-full overflow-hidden rounded-md bg-neutral-950",
@@ -241,7 +253,37 @@ fn Chart(points: Vec<Point>, draw_cap: bool) -> Element {
                     }
                 }
             }
-            span { class: "absolute left-2 top-1 text-xs text-neutral-500", "{top} kbps" }
+            // The scale: the top edge and the line halfway.
+            span { class: "absolute left-2 top-1 text-xs text-neutral-500", "{top_label}" }
+            span { class: "absolute left-2 top-[62px] text-xs text-neutral-600", "{half_label}" }
+            // A column per second over everything else, to say which second
+            // the pointer is on without having to know the chart's width.
+            div {
+                class: "absolute inset-0 flex flex-row",
+                onmouseleave: move |_| {
+                    let was = *hovered.peek();
+                    if was.is_some() {
+                        hovered.set(None);
+                    }
+                },
+                for index in 0..rates::SECONDS {
+                    div {
+                        key: "{index}",
+                        class: "relative h-[120px] min-w-0 flex-1",
+                        // Written only on a change: a pointer moving inside
+                        // one column must not repaint the window each time.
+                        onmousemove: move |_| {
+                            let was = *hovered.peek();
+                            if was != Some(index) {
+                                hovered.set(Some(index));
+                            }
+                        },
+                        if over == Some(index) {
+                            div { class: "absolute bottom-0 left-0 top-0 w-px bg-neutral-400" }
+                        }
+                    }
+                }
+            }
         }
         div { class: "mt-2 flex flex-row flex-wrap items-center gap-4 text-xs text-neutral-400",
             div { class: "flex flex-row items-center gap-1.5",
@@ -274,24 +316,73 @@ fn Chart(points: Vec<Point>, draw_cap: bool) -> Element {
     }
 }
 
-/// The latest second in words, e.g. `sent 1840 kbps · cap 2500 · link 5200`.
-/// An estimate above the scale is not drawn, so here it says so.
-fn numbers(point: Point, with_cap: bool, top: u32) -> String {
-    let mut parts = Vec::new();
+/// A rate as a person reads it: `345 kbps`, `39.0 Mbps`.
+fn rate(kbps: u32) -> String {
+    match kbps {
+        0..10_000 => format!("{kbps} kbps"),
+        _ => format!("{:.1} Mbps", kbps as f64 / 1000.0),
+    }
+}
+
+/// How long ago the second in slot `index` was, the newest being the last.
+fn ago(index: usize) -> String {
+    match rates::SECONDS.saturating_sub(index + 1) {
+        0 => "now".to_string(),
+        seconds => format!("{seconds} s ago"),
+    }
+}
+
+/// One second in words, e.g. `now · sent 272 kbps · cap 345 kbps · link 39.0
+/// Mbps (off the chart)`. Every figure carries its unit, and only what the
+/// chart or its legend also shows is named: a target sitting on the cap is
+/// the cap. An estimate above the scale is not drawn, so here it says so.
+fn numbers(when: &str, point: Point, with_cap: bool, top: u32) -> String {
+    let mut parts = vec![when.to_string()];
     match point.sent {
-        Some(sent) => parts.push(format!("sent {sent} kbps")),
-        None => parts.push("sent ?".to_string()),
+        Some(sent) => parts.push(format!("sent {}", rate(sent))),
+        None => parts.push("nothing sent".to_string()),
     }
     if let (true, Some(cap)) = (with_cap, point.cap) {
-        parts.push(format!("cap {cap}"));
+        parts.push(format!("cap {}", rate(cap)));
     }
-    if let Some(target) = point.target {
-        parts.push(format!("target {target}"));
+    if let Some(target) = point.target.filter(|target| point.cap != Some(*target)) {
+        parts.push(format!("target {}", rate(target)));
     }
     match point.estimate {
-        Some(estimate) if estimate > top => parts.push(format!("link {estimate}, above the chart")),
-        Some(estimate) => parts.push(format!("link {estimate}")),
+        Some(estimate) if estimate > top => parts.push(format!("link estimate {} (off the chart)", rate(estimate))),
+        Some(estimate) => parts.push(format!("link estimate {}", rate(estimate))),
         None => {}
     }
     parts.join("  \u{b7}  ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_figure_carries_its_unit_and_a_target_on_the_cap_is_not_named() {
+        let point = Point {
+            sent: Some(272),
+            cap: Some(345),
+            target: Some(345),
+            estimate: Some(38_961),
+        };
+        assert_eq!(
+            numbers("now", point, true, 400),
+            "now  \u{b7}  sent 272 kbps  \u{b7}  cap 345 kbps  \u{b7}  link estimate 39.0 Mbps (off the chart)"
+        );
+        let held = Point { target: Some(300), estimate: Some(310), ..point };
+        assert_eq!(
+            numbers("12 s ago", held, true, 400),
+            "12 s ago  \u{b7}  sent 272 kbps  \u{b7}  cap 345 kbps  \u{b7}  target 300 kbps  \u{b7}  link estimate 310 kbps"
+        );
+    }
+
+    #[test]
+    fn the_newest_slot_is_now() {
+        assert_eq!(ago(rates::SECONDS - 1), "now");
+        assert_eq!(ago(rates::SECONDS - 13), "12 s ago");
+        assert_eq!(ago(0), "59 s ago");
+    }
 }

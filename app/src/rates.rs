@@ -11,8 +11,14 @@
 
 use std::collections::VecDeque;
 
-/// How many seconds the history keeps.
+/// How many seconds a chart shows.
 pub const SECONDS: usize = 60;
+
+/// How many the history keeps: the minute shown, and the few seconds before
+/// it that the oldest shown second is averaged with. Without them the left
+/// edge of a chart is one raw second, then an average of two, and so on, and
+/// it lurches every second as a different raw value scrolls into that place.
+const KEPT: usize = SECONDS + SMOOTH - 1;
 
 /// One second of the outgoing streams, in kbps. `None` is "not known", which
 /// is not the same as zero: a stalled encoder sends `Some(0)`.
@@ -51,7 +57,7 @@ fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     }
 }
 
-/// The last [`SECONDS`] seconds, oldest first.
+/// The last [`KEPT`] seconds, oldest first.
 #[derive(Debug, Default)]
 pub struct History {
     seconds: VecDeque<Second>,
@@ -67,7 +73,7 @@ impl History {
         if self.seconds.is_empty() && second.is_empty() {
             return;
         }
-        if self.seconds.len() == SECONDS {
+        if self.seconds.len() == KEPT {
             self.seconds.pop_front();
         }
         self.seconds.push_back(second);
@@ -291,15 +297,15 @@ mod tests {
     }
 
     #[test]
-    fn the_history_keeps_the_last_minute_oldest_first() {
+    fn the_history_keeps_the_minute_and_its_run_up_oldest_first() {
         let mut history = History::default();
-        for kbps in 0..(SECONDS as u32 + 5) {
+        for kbps in 0..(KEPT as u32 + 5) {
             history.push(sent(kbps));
         }
         let seconds = history.seconds();
-        assert_eq!(seconds.len(), SECONDS);
+        assert_eq!(seconds.len(), KEPT);
         assert_eq!(seconds[0].camera_sent, Some(5));
-        assert_eq!(seconds[SECONDS - 1].camera_sent, Some(SECONDS as u32 + 4));
+        assert_eq!(seconds[KEPT - 1].camera_sent, Some(KEPT as u32 + 4));
         history.clear();
         assert!(history.seconds().is_empty());
     }
@@ -388,6 +394,16 @@ mod tests {
         );
         assert_eq!(smoothed(&[], 5), Vec::<Option<u32>>::new());
         assert_eq!(smoothed(&[Some(7)], 0), vec![Some(7)], "a window of nothing is the value itself");
+    }
+
+    #[test]
+    fn the_oldest_second_shown_is_a_full_average() {
+        // A comb: 500, 100, 100, 100, 100, repeating. Its five-second average
+        // is 180 everywhere once there are five seconds behind a point.
+        let comb: Vec<Option<u32>> = (0..KEPT).map(|second| Some(if second % 5 == 0 { 500 } else { 100 })).collect();
+        let smooth = smoothed(&comb, SMOOTH);
+        let shown = &smooth[smooth.len() - SECONDS..];
+        assert!(shown.iter().all(|value| *value == Some(180)), "{shown:?}");
     }
 
     const CANVAS: Canvas = Canvas {
