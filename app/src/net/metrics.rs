@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use super::quality::{Link, Reports, Seen, StreamState};
 use crate::rates::{History, Second};
 
 /// The echo canceller's grade of itself, from sonora's statistics, in the
@@ -175,6 +176,15 @@ pub struct Metrics {
     /// What the share's rate loop asked its encoder for; zero while there is
     /// no share. The camera's is `send_kbps`.
     share_target_kbps: AtomicU32,
+    /// QUIC's running totals of packets lost and sent, for loss over the last
+    /// few seconds rather than since the connection opened. Zero sent is "not
+    /// known".
+    packets_lost: AtomicU64,
+    packets_sent: AtomicU64,
+    /// Each video stream's own rate-loop state, as a [`StreamState`]
+    /// discriminant; detail for the connection report.
+    camera_state: AtomicU8,
+    share_state: AtomicU8,
     /// The last minute of the above, for the Network tab. Behind a lock
     /// rather than atomics because it is a list; taken once a second by the
     /// meter and once a second by the tab while it is open, never on an
@@ -206,11 +216,19 @@ struct Sent {
     /// Set when the stream starts: the tick in progress began before it and
     /// would read short, so it is discarded rather than reported.
     fresh: AtomicBool,
+    /// Frames published since the last tick, and the rate over the last whole
+    /// tick ([`UNKNOWN`] before one), as for the bytes.
+    frames: AtomicU32,
+    fps: AtomicU32,
 }
 
 impl Sent {
     fn count(&self, bytes: usize) {
         self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn count_frames(&self, frames: usize) {
+        self.frames.fetch_add(frames as u32, Ordering::Relaxed);
     }
 
     /// Records a new cap; zero says the stream has ended.
@@ -219,12 +237,14 @@ impl Sent {
         if (was == 0) != (kbps == 0) {
             self.fresh.store(true, Ordering::Relaxed);
             self.kbps.store(UNKNOWN, Ordering::Relaxed);
+            self.fps.store(UNKNOWN, Ordering::Relaxed);
         }
     }
 
     /// Turns the bytes since the last tick, `elapsed` ago, into a rate.
     fn tick(&self, elapsed: Duration) {
         let bytes = self.bytes.swap(0, Ordering::Relaxed);
+        let frames = self.frames.swap(0, Ordering::Relaxed);
         if self.cap_kbps.load(Ordering::Relaxed) == 0 || self.fresh.swap(false, Ordering::Relaxed) {
             return;
         }
@@ -232,6 +252,19 @@ impl Sent {
         // Bits per millisecond is kilobits per second.
         let kbps = (bytes * 8 / ms).min(UNKNOWN as u64 - 1) as u32;
         self.kbps.store(kbps, Ordering::Relaxed);
+        let fps = (frames as u64 * 1000 + ms / 2) / ms;
+        self.fps.store(fps.min(UNKNOWN as u64 - 1) as u32, Ordering::Relaxed);
+    }
+
+    /// Frames a second over the last whole tick, as [`Sent::kbps`].
+    fn fps(&self) -> Option<u32> {
+        if self.cap_kbps.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        match self.fps.load(Ordering::Relaxed) {
+            UNKNOWN => None,
+            fps => Some(fps),
+        }
     }
 
     /// The rate over the last whole tick: `None` while there is no stream or
@@ -250,6 +283,8 @@ impl Sent {
         self.bytes.store(0, Ordering::Relaxed);
         self.cap_kbps.store(0, Ordering::Relaxed);
         self.kbps.store(UNKNOWN, Ordering::Relaxed);
+        self.frames.store(0, Ordering::Relaxed);
+        self.fps.store(UNKNOWN, Ordering::Relaxed);
         self.fresh.store(false, Ordering::Relaxed);
     }
 }
@@ -412,6 +447,52 @@ impl Metrics {
         self.share.count(bytes);
     }
 
+    /// Camera frames handed to the transport. Called per publish on the
+    /// encode thread.
+    pub(super) fn camera_frames(&self, frames: usize) {
+        self.camera.count_frames(frames);
+    }
+
+    /// The camera frame rate we sent over the last whole second; `None`
+    /// without an encoder.
+    pub fn camera_fps(&self) -> Option<u32> {
+        self.camera.fps()
+    }
+
+    /// QUIC's `(lost, sent)` packet totals for the connection, if it has
+    /// reported any.
+    pub fn packets(&self) -> Option<(u64, u64)> {
+        match self.packets_sent.load(Ordering::Relaxed) {
+            0 => None,
+            sent => Some((self.packets_lost.load(Ordering::Relaxed), sent)),
+        }
+    }
+
+    /// Records a stream's rate-loop state.
+    pub(super) fn set_stream_state(&self, stream: super::adapt::Stream, state: super::adapt::State) {
+        let value = match state {
+            super::adapt::State::Unknown => 0,
+            super::adapt::State::AtCeiling => 1,
+            super::adapt::State::Held => 2,
+        };
+        match stream {
+            super::adapt::Stream::Camera => self.camera_state.store(value, Ordering::Relaxed),
+            super::adapt::Stream::Share => self.share_state.store(value, Ordering::Relaxed),
+        }
+    }
+
+    /// The camera's rate-loop state; unknown without an encoder.
+    pub fn camera_state(&self) -> Option<StreamState> {
+        self.camera_cap_kbps()?;
+        Some(stream_state(self.camera_state.load(Ordering::Relaxed)))
+    }
+
+    /// The share's rate-loop state; `None` while not sharing.
+    pub fn share_state(&self) -> Option<StreamState> {
+        self.share_cap_kbps()?;
+        Some(stream_state(self.share_state.load(Ordering::Relaxed)))
+    }
+
     /// Turns the byte counts since the last call, `elapsed` ago, into rates.
     ///
     /// Also where the last minute is kept: this is the one place that already
@@ -453,6 +534,8 @@ impl Metrics {
             self.rtt_ms.store(rtt.as_millis() as u32, Ordering::Relaxed);
         }
         if let (Some(lost), Some(sent)) = (stats.packets_lost, stats.packets_sent) {
+            self.packets_lost.store(lost, Ordering::Relaxed);
+            self.packets_sent.store(sent, Ordering::Relaxed);
             if sent > 0 {
                 let bp = (lost as f64 / sent as f64 * 10_000.0).round() as u32;
                 self.loss_bp.store(bp, Ordering::Relaxed);
@@ -484,6 +567,10 @@ impl Metrics {
         self.share.clear();
         self.camera_slice.set(None);
         self.share_slice.set(None);
+        self.packets_lost.store(0, Ordering::Relaxed);
+        self.packets_sent.store(0, Ordering::Relaxed);
+        self.camera_state.store(0, Ordering::Relaxed);
+        self.share_state.store(0, Ordering::Relaxed);
         if let Ok(mut history) = self.history.lock() {
             history.clear();
         }
@@ -505,6 +592,14 @@ impl PartialEq for Metrics {
     /// Identity, never contents -- see `audio::Controls` for why.
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self, other)
+    }
+}
+
+fn stream_state(value: u8) -> StreamState {
+    match value {
+        1 => StreamState::Cap,
+        2 => StreamState::Held,
+        _ => StreamState::Unknown,
     }
 }
 
@@ -554,8 +649,25 @@ pub struct PeerStats {
     /// The peer whose request turned our microphone off. Our own entry only;
     /// cleared by our own unmute, nobody else's.
     muted_by: std::sync::Mutex<Option<String>>,
-    /// Delays of their frames this second, in ms, for the stats file.
+    /// Delays of their frames this second, in ms, and how late each was
+    /// against their earliest: drained once a second by [`PeerStats::roll`]
+    /// into the figures below, whether or not a stats file is being written.
     delays: std::sync::Mutex<Vec<u32>>,
+    lates: std::sync::Mutex<Vec<u32>>,
+    /// Last second's median and 95th-percentile delay, and median lateness.
+    delay_percentiles: std::sync::Mutex<(Option<u32>, Option<u32>)>,
+    late_median: AtomicU32,
+    /// Whether we tell the room how our connection is doing and show what
+    /// others tell us. Our own entry only; the Experimental tab sets it.
+    experimental: AtomicBool,
+    /// Their report on their own link, as cleaned on arrival; for our own
+    /// entry, the report we would send. `None` is not reporting.
+    link: std::sync::Mutex<Option<Link>>,
+    /// What they get from each other peer, keyed by endpoint id, as cleaned
+    /// on arrival; for our own entry, what we get.
+    seen: std::sync::Mutex<BTreeMap<String, Seen>>,
+    /// Their reports over the last couple of minutes, one per report time.
+    reports: std::sync::Mutex<Reports>,
     /// Audio frames decoded this second.
     audio_frames: AtomicU32,
     /// Gaps of more than [`AUDIO_GAP`] between their decoded audio frames, ever.
@@ -742,6 +854,13 @@ impl Default for PeerStats {
             invites: std::sync::Mutex::new(BTreeMap::new()),
             muted_by: std::sync::Mutex::new(None),
             delays: std::sync::Mutex::new(Vec::new()),
+            lates: std::sync::Mutex::new(Vec::new()),
+            delay_percentiles: std::sync::Mutex::new((None, None)),
+            late_median: AtomicU32::new(UNKNOWN),
+            experimental: AtomicBool::new(true),
+            link: std::sync::Mutex::new(None),
+            seen: std::sync::Mutex::new(BTreeMap::new()),
+            reports: std::sync::Mutex::new(Reports::default()),
             audio_frames: AtomicU32::new(0),
             audio_gaps: AtomicU32::new(0),
             audio_dry: AtomicU32::new(0),
@@ -995,19 +1114,104 @@ impl PeerStats {
     pub(super) fn frame_arrived(&self, media_us: u64) {
         let now = wall_us();
         if let Ok(mut late) = self.video_late.lock() {
-            self.video_late_ms.store(late.observe(media_us, now), Ordering::Relaxed);
+            let ms = late.observe(media_us, now);
+            self.video_late_ms.store(ms, Ordering::Relaxed);
+            push_bounded(&self.lates, ms);
         }
         let Some(delay) = self.clock().and_then(|clock| clock.delay_ms(media_us, now)) else {
             return;
         };
-        if let Ok(mut delays) = self.delays.lock() {
-            delays.push(delay);
-        }
+        push_bounded(&self.delays, delay);
     }
 
     /// This second's delays, emptied for the next.
-    pub(super) fn take_delays(&self) -> Vec<u32> {
+    #[cfg(test)]
+    fn take_delays(&self) -> Vec<u32> {
         self.delays.lock().map(|mut d| std::mem::take(&mut *d)).unwrap_or_default()
+    }
+
+    /// Turns this second's delays and lateness into their percentiles, and
+    /// empties them for the next. Called once a second for everyone in the
+    /// call; before, the delays were only drained while a stats file was
+    /// written, and grew for the length of every other call.
+    pub(super) fn roll(&self) {
+        let take = |list: &std::sync::Mutex<Vec<u32>>| list.lock().map(|mut d| std::mem::take(&mut *d)).unwrap_or_default();
+        let mut delays = take(&self.delays);
+        let mut lates = take(&self.lates);
+        delays.sort_unstable();
+        lates.sort_unstable();
+        if let Ok(mut slot) = self.delay_percentiles.lock() {
+            *slot = (percentile(&delays, 0.5), percentile(&delays, 0.95));
+        }
+        self.late_median
+            .store(percentile(&lates, 0.5).unwrap_or(UNKNOWN), Ordering::Relaxed);
+    }
+
+    /// Last second's median and 95th-percentile delay, by both wall clocks.
+    pub(super) fn delay_percentiles(&self) -> (Option<u32>, Option<u32>) {
+        self.delay_percentiles.lock().map(|slot| *slot).unwrap_or_default()
+    }
+
+    /// Last second's median lateness against their earliest frame.
+    pub(super) fn late_median(&self) -> Option<u32> {
+        match self.late_median.load(Ordering::Relaxed) {
+            UNKNOWN => None,
+            ms => Some(ms),
+        }
+    }
+
+    /// Whether the connection report is on. Meaningful on our own entry.
+    pub fn experimental(&self) -> bool {
+        self.experimental.load(Ordering::Relaxed)
+    }
+
+    pub fn set_experimental(&self, on: bool) {
+        self.experimental.store(on, Ordering::Relaxed);
+    }
+
+    /// Their report on their link, or ours on our own entry.
+    pub fn link(&self) -> Option<Link> {
+        self.link.lock().ok().and_then(|link| link.clone())
+    }
+
+    /// Records a report. Takes one already cleaned, as names do.
+    pub fn set_link(&self, link: Option<Link>) {
+        if let Ok(mut slot) = self.link.lock() {
+            *slot = link;
+        }
+    }
+
+    /// What they get from each other peer, or what we get on our own entry.
+    pub fn seen(&self) -> BTreeMap<String, Seen> {
+        self.seen.lock().map(|seen| seen.clone()).unwrap_or_default()
+    }
+
+    pub fn set_seen(&self, seen: BTreeMap<String, Seen>) {
+        if let Ok(mut slot) = self.seen.lock() {
+            *slot = seen;
+        }
+    }
+
+    /// Notes their report as it stands, as one point of their history.
+    pub(super) fn push_report(&self) {
+        let link = self.link();
+        if let Ok(mut reports) = self.reports.lock() {
+            reports.push(link);
+        }
+    }
+
+    /// Their reports, oldest first, a gap where there was none.
+    pub fn reports(&self) -> Vec<Option<Link>> {
+        self.reports.lock().map(|reports| reports.points()).unwrap_or_default()
+    }
+
+    /// Forgets our report and its history, for when a call ends.
+    pub(super) fn clear_report(&self) {
+        self.set_link(None);
+        self.set_seen(BTreeMap::new());
+        if let Ok(mut reports) = self.reports.lock() {
+            reports.clear();
+        }
     }
 
     /// One of their audio frames was decoded.
@@ -1074,6 +1278,24 @@ impl PeerStats {
         self.fps_tenths
             .store((fps * 10.0).round().max(0.0) as u32, Ordering::Relaxed);
     }
+}
+
+/// Most frames a second's list holds before it stops growing. Far above any
+/// frame rate, so it never trims a real second; it bounds a list nobody
+/// drains (a screen share's meter is no one's entry).
+const PER_SECOND: usize = 512;
+
+fn push_bounded(list: &std::sync::Mutex<Vec<u32>>, value: u32) {
+    if let Ok(mut list) = list.lock() {
+        if list.len() < PER_SECOND {
+            list.push(value);
+        }
+    }
+}
+
+/// The value at quantile `q` of a sorted list.
+fn percentile(sorted: &[u32], q: f64) -> Option<u32> {
+    (!sorted.is_empty()).then(|| sorted[((sorted.len() - 1) as f64 * q).round() as usize])
 }
 
 /// Counts decoded frames and publishes the rate once a second.
@@ -1412,6 +1634,51 @@ mod tests {
         assert_eq!(metrics.camera_slice_kbps(), None);
         metrics.set_share_cap_kbps(2500);
         assert_eq!((metrics.share_slice_kbps(), metrics.share_target_kbps()), (None, None));
+    }
+
+    #[test]
+    fn delays_drain_every_second_and_never_grow_without_bound() {
+        let stats = PeerStats::default();
+        stats.set_clock(Clock { wall_us: wall_us(), media_us: 0 });
+        for _ in 0..PER_SECOND + 100 {
+            stats.frame_arrived(0);
+        }
+        assert_eq!(stats.delays.lock().unwrap().len(), PER_SECOND);
+        stats.roll();
+        assert!(stats.delays.lock().unwrap().is_empty());
+        assert!(stats.delay_percentiles().0.is_some());
+        assert_eq!(stats.late_median(), Some(0));
+        // A second with no frames has no figures.
+        stats.roll();
+        assert_eq!(stats.delay_percentiles(), (None, None));
+        assert_eq!(stats.late_median(), None);
+    }
+
+    #[test]
+    fn the_frame_rate_sent_is_counted_like_the_bytes() {
+        let metrics = Metrics::default();
+        let second = Duration::from_secs(1);
+        assert_eq!(metrics.camera_fps(), None);
+        metrics.set_camera_cap_kbps(2500);
+        metrics.tick_sent(second);
+        for _ in 0..30 {
+            metrics.camera_frames(1);
+        }
+        metrics.tick_sent(second);
+        assert_eq!(metrics.camera_fps(), Some(30));
+        metrics.clear();
+        assert_eq!(metrics.camera_fps(), None);
+    }
+
+    #[test]
+    fn a_stream_state_needs_its_stream() {
+        use super::super::adapt::{State, Stream};
+        let metrics = Metrics::default();
+        metrics.set_stream_state(Stream::Camera, State::Held);
+        assert_eq!(metrics.camera_state(), None, "no encoder, no state");
+        metrics.set_camera_cap_kbps(2500);
+        assert_eq!(metrics.camera_state(), Some(StreamState::Held));
+        assert_eq!(metrics.share_state(), None);
     }
 
     #[test]

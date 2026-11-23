@@ -43,6 +43,7 @@ use super::{Feed, ParticipantEvent};
 use crate::args::Peering;
 use super::Metrics;
 use super::metrics::{Ask, Clock, Counts, FpsMeter, Path, PeerStats, Request, classify};
+use super::quality::{self, Link, Seen};
 use crate::audio::Controls;
 use crate::camera::{FrameFeed, FrameSlot, encode_size, from_decoded};
 
@@ -445,6 +446,22 @@ struct Presence {
     /// only, and never a key -- everything stays keyed on the endpoint id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    /// How their connection is doing, by their own account. Absent is not
+    /// reporting: an older build, or someone who turned the experimental
+    /// features off, so a document without it is byte-for-byte what a build
+    /// without reports sends. **Read leniently**: anything unreadable here is
+    /// "not reporting", never a failed document, because one parse error
+    /// ends listening to that peer.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "quality::lenient_link")]
+    link: Option<Link>,
+    /// What they get from each other peer, keyed by endpoint id. Absent when
+    /// empty, and read entry by entry as leniently as `link`.
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty",
+        deserialize_with = "quality::lenient_seen"
+    )]
+    seen: std::collections::BTreeMap<String, Seen>,
 }
 
 impl Default for Presence {
@@ -458,6 +475,8 @@ impl Default for Presence {
             requests: Vec::new(),
             sharing: false,
             name: None,
+            link: None,
+            seen: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -476,6 +495,15 @@ impl Presence {
             // Cleaned on the way out as well as in: we send what we would
             // accept, whatever wrote our entry.
             name: local.name().as_deref().and_then(crate::name::clean),
+            // **Off means neither publish nor show**: with the switch off
+            // neither field is said, and a report already out is withdrawn
+            // with the next document.
+            link: local.experimental().then(|| local.link()).flatten().map(Link::clean),
+            seen: if local.experimental() {
+                quality::clean_seen(local.seen(), "")
+            } else {
+                std::collections::BTreeMap::new()
+            },
         }
     }
 }
@@ -1395,6 +1423,8 @@ async fn run(
         // The mic button stays red if the mic is still off, which is honest
         // on its own.
         local.clear_asks();
+        // Our report was about a link that is gone.
+        local.clear_report();
         // Ends every share's turn, so the bar's "Screen recording is off"
         // does not outlive the call, and a straggling share thread can write
         // nothing into the next one.
@@ -1522,6 +1552,7 @@ fn encode(
                 .publish(&encoded)
                 .map_err(|error| format!("publish failed: {error:#}"))?;
             metrics.camera_sent(payload_bytes(&encoded));
+            metrics.camera_frames(encoded.len());
         }
     }
 }
@@ -1583,7 +1614,10 @@ async fn attend(
             .map_err(|error| tracing::warn!("cannot write stats to {}: {error}", path.display()))
             .ok()
     });
+    // Once a second for the whole call: the connection report, each peer's
+    // delays drained into figures, and the stats file when there is one.
     let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut reporter = super::report::Reporter::default();
     let mut announced = inbound.announced();
     // Dropping an entry aborts that participant's decoders, so leaving is the
     // same operation as the attempt ending.
@@ -1623,7 +1657,8 @@ async fn attend(
                 Some(update) => update,
                 None => break,
             },
-            _ = stats_tick.tick(), if stats_file.is_some() => {
+            _ = stats_tick.tick() => {
+                reporter.tick(std::time::Instant::now(), &metrics, &rooms.local, &people, &present, &me);
                 if let Some(file) = stats_file.as_mut() {
                     write_stats(file, &me, &people, &metrics);
                 }
@@ -1856,8 +1891,10 @@ async fn announce(
         ticker.tick().await;
         local.expire_asks(ASK_FOR);
         let now = Presence::here(&local);
-        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name)
-            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name);
+        // What a person did, for the log. The connection report changes with
+        // the link, and is only logged as it starts and stops.
+        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name, now.link.is_some())
+            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name, said.link.is_some());
         if changed {
             let asking = match now.requests.len() {
                 0 => String::new(),
@@ -1866,14 +1903,19 @@ async fn announce(
             let sharing = if now.sharing { ", sharing" } else { "" };
             // Whether, not what: the log keys people by id.
             let named = if now.name.is_some() { ", named" } else { "" };
+            let reporting = if now.link.is_some() { ", reporting the connection" } else { "" };
             tracing::info!(
-                "now camera {}, mic {}, room {}{asking}{sharing}{named}",
+                "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}",
                 on_off(now.camera),
                 on_off(now.mic),
                 room_name(&now.room)
             );
         }
-        if changed || said_at.elapsed() >= CLOCK_EVERY {
+        // The switch flipping goes out at once, either way (the report's
+        // presence is in `changed`); a report's new figures wait for the
+        // clock refresh, which is also when the reporter makes them.
+        let withdrawn = now.seen.is_empty() && !said.seen.is_empty();
+        if changed || withdrawn || said_at.elapsed() >= CLOCK_EVERY {
             say(&presence, now.clone());
             said = now;
             said_at = tokio::time::Instant::now();
@@ -1914,16 +1956,15 @@ fn write_stats(
     let t = super::metrics::wall_us() as f64 / 1e6;
     let mut lines = String::new();
     for (peer, stats) in people {
-        let mut delays = stats.take_delays();
-        delays.sort_unstable();
-        let pick = |q: f64| (!delays.is_empty()).then(|| delays[((delays.len() - 1) as f64 * q).round() as usize]);
+        // Drained into these once a second by the reporter, just before.
+        let (p50, p95) = stats.delay_percentiles();
         let (gaps, dry) = stats.audio_trouble();
         let sync = stats.audio_sync();
         let line = serde_json::json!({
             "t": t, "me": me, "peer": peer,
             "camera": stats.camera_on(), "mic": stats.mic_on(),
             "fps": stats.video_fps(),
-            "delay_p50_ms": pick(0.5), "delay_p95_ms": pick(0.95),
+            "delay_p50_ms": p50, "delay_p95_ms": p95,
             "audio_fps": stats.take_audio_frames(),
             "audio_gaps": gaps, "audio_dry": dry,
             "audio_buffered_ms": sync.map(|s| s.buffered_ms),
@@ -2027,6 +2068,8 @@ async fn listen(
                 requests,
                 sharing,
                 name,
+                link,
+                seen,
             })) => {
                 let room = subroom(room);
                 if let Some(clock) = clock {
@@ -2046,6 +2089,10 @@ async fn listen(
                 // Never trusted as sent: cleaned here whatever their build
                 // did, and shown only.
                 stats.set_name(name.as_deref().and_then(crate::name::clean));
+                // Cleaned again here, whatever their build did: a report is a
+                // claim like a name, and their own id has no place in it.
+                stats.set_link(link.map(Link::clean));
+                stats.set_seen(quality::clean_seen(seen, &id));
                 // Read by their audio task on every frame, which is what sets
                 // how loud they are to us.
                 stats.set_room(room.clone());
@@ -2330,8 +2377,9 @@ mod path_tests {
 
 #[cfg(test)]
 mod presence_tests {
-    use super::{Presence, State, asked_of, honour, subroom};
+    use super::{Link, Presence, Seen, State, asked_of, honour, quality, subroom};
     use crate::net::metrics::{Ask, Clock, Request};
+    use crate::net::quality::Quality;
 
     fn request(to: &str, kind: Ask, nonce: u64) -> Request {
         Request {
@@ -2464,6 +2512,8 @@ mod presence_tests {
             requests: Vec::new(),
             sharing: false,
             name: Some("Ada".to_string()),
+            link: None,
+            seen: Default::default(),
         };
         let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
         assert_eq!(heard, said);
@@ -2535,6 +2585,142 @@ mod presence_tests {
         assert_eq!(heard.clock, said.clock);
         assert_eq!(heard.room.as_deref(), Some("Attic"));
         assert_eq!(heard.requests, said.requests);
+    }
+
+    /// `Presence` as the build before connection reports declared it, field
+    /// for field, both ways.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Previous {
+        state: State,
+        #[serde(default = "super::on")]
+        camera: bool,
+        #[serde(default = "super::on")]
+        mic: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clock: Option<Clock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        room: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        requests: Vec<Request>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        sharing: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    }
+
+    fn id(c: char) -> String {
+        std::iter::repeat_n(c, 64).collect()
+    }
+
+    /// Our own entry with a report standing, as the reporter leaves it.
+    fn reporting(on: bool) -> crate::net::PeerStats {
+        let local = crate::net::PeerStats::default();
+        local.set_name(Some("Ada".into()));
+        local.set_mic(false);
+        local.set_link(Some(Link { q: Quality::Held, est: Some(2400), rtt: Some(40), fps: Some(30), ..Link::default() }));
+        let mut seen = std::collections::BTreeMap::new();
+        seen.insert(id('b'), Seen { q: Quality::Good, fps: Some(30), ..Seen::default() });
+        local.set_seen(seen);
+        local.set_experimental(on);
+        local
+    }
+
+    #[test]
+    fn switched_off_the_document_is_the_old_shape_byte_for_byte() {
+        let local = reporting(false);
+        let ours = serde_json::to_string(&Presence::here(&local)).unwrap();
+        let old = serde_json::to_string(&Previous {
+            state: State::Here,
+            camera: true,
+            mic: false,
+            clock: None,
+            room: None,
+            requests: Vec::new(),
+            sharing: false,
+            name: Some("Ada".into()),
+        })
+        .unwrap();
+        assert_eq!(ours, old);
+        assert!(!ours.contains("link") && !ours.contains("seen"), "{ours}");
+    }
+
+    #[test]
+    fn switched_on_the_report_is_said_and_survives_the_round_trip() {
+        let said = Presence::here(&reporting(true));
+        let json = serde_json::to_string(&said).unwrap();
+        assert!(json.contains(r#""link":{"q":"held","est":2400,"rtt":40,"fps":30}"#), "{json}");
+        assert!(json.contains(&format!(r#""seen":{{"{}":{{"q":"good","fps":30}}}}"#, id('b'))), "{json}");
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard, said);
+    }
+
+    #[test]
+    fn an_older_peer_is_not_reporting() {
+        let old: Presence = serde_json::from_str(r#"{"state":"here","name":"Ada"}"#).unwrap();
+        assert_eq!(old.link, None);
+        assert!(old.seen.is_empty());
+    }
+
+    #[test]
+    fn an_older_peer_reads_a_reporting_document() {
+        let json = serde_json::to_string(&Presence::here(&reporting(true))).unwrap();
+        let heard: Previous = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard.name.as_deref(), Some("Ada"));
+        assert!(!heard.mic && heard.camera);
+    }
+
+    #[test]
+    fn a_malformed_report_costs_only_itself() {
+        let json = format!(
+            r#"{{"state":"here","mic":false,"name":"Ada",
+                "link":{{"q":"good","est":"lots"}},
+                "seen":{{"{a}":{{"fps":"x"}},"{c}":{{"q":"poor","fps":12,"later":true}},"nope":{{}},"{upper}":{{}}}}}}"#,
+            a = id('a'),
+            c = id('c'),
+            upper = "F".repeat(64),
+        );
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert!(!heard.mic);
+        assert_eq!(heard.name.as_deref(), Some("Ada"));
+        assert_eq!(heard.link, None, "a bad figure is not reporting");
+        assert_eq!(heard.seen.keys().cloned().collect::<Vec<_>>(), vec![id('c')]);
+        assert_eq!(heard.seen[&id('c')].q, Quality::Poor);
+        // Wrong shapes altogether.
+        let heard: Presence = serde_json::from_str(r#"{"state":"here","link":5,"seen":[1,2],"camera":false}"#).unwrap();
+        assert_eq!((heard.link, heard.seen.len(), heard.camera), (None, 0, false));
+        let heard: Presence = serde_json::from_str(r#"{"state":"here","link":null}"#).unwrap();
+        assert_eq!(heard.link, None);
+    }
+
+    #[test]
+    fn a_report_from_a_later_build_reads_what_it_can() {
+        let heard: Presence =
+            serde_json::from_str(r#"{"state":"here","link":{"q":"superb","cam":"warp","path":"satellite","rtt":44,"jitter":3}}"#)
+                .unwrap();
+        let link = heard.link.unwrap();
+        assert_eq!(link.q, Quality::Unknown);
+        assert_eq!(link.cam, Some(quality::StreamState::Unknown));
+        assert_eq!(link.path, None, "an unknown path is dropped by cleaning");
+        assert_eq!(link.rtt, Some(40), "rounded on the way in");
+    }
+
+    #[test]
+    fn a_report_is_cleaned_on_arrival_and_on_the_way_out() {
+        let local = reporting(true);
+        local.set_link(Some(Link { est: Some(2_345), rtt: Some(3), ..Link::default() }));
+        let mut seen = std::collections::BTreeMap::new();
+        for n in 0..30u32 {
+            seen.insert(format!("{n:064x}"), Seen::default());
+        }
+        seen.insert("x".into(), Seen::default());
+        local.set_seen(seen.clone());
+        let said = Presence::here(&local);
+        let link = said.link.clone().unwrap();
+        assert_eq!((link.est, link.rtt), (Some(2_300), Some(10)));
+        assert_eq!(said.seen.len(), quality::SEEN_MAX);
+        // What `listen` does with a sender's own id in their map.
+        let theirs = quality::clean_seen(said.seen.clone(), &format!("{:064x}", 0));
+        assert!(!theirs.contains_key(&format!("{:064x}", 0)));
     }
 
     #[test]

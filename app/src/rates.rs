@@ -143,11 +143,19 @@ impl Point {
 /// `points` laid into [`SECONDS`] slots, newest at the right, empty slots on
 /// the left until the history is full. Keeps the time axis fixed, so a bar's
 /// position always means the same age.
-pub fn slots(points: &[Point]) -> Vec<Option<Point>> {
+pub fn slots<T: Clone>(points: &[T]) -> Vec<Option<T>> {
     let points = &points[points.len().saturating_sub(SECONDS)..];
     let mut slots = vec![None; SECONDS - points.len()];
-    slots.extend(points.iter().copied().map(Some));
+    slots.extend(points.iter().cloned().map(Some));
     slots
+}
+
+/// A rate as a person reads it: `345 kbps`, `39.0 Mbps`.
+pub fn kbps_words(kbps: u32) -> String {
+    match kbps {
+        0..10_000 => format!("{kbps} kbps"),
+        _ => format!("{:.1} Mbps", kbps as f64 / 1000.0),
+    }
 }
 
 /// The value at the top of a chart, in kbps: the larger of the highest cap

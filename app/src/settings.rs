@@ -182,12 +182,24 @@ pub struct Settings {
     /// [`crate::update::banner`], which treats anything unparseable as none.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_text")]
     pub dismissed_update: Option<String>,
+
+    /// Whether the experimental features are on: today, telling the room how
+    /// our connection is doing and showing what others tell. `None` is the
+    /// default, which is on ([`experimental_on`](Self::experimental_on)), as
+    /// for `check_updates`.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
+    pub experimental: Option<bool>,
 }
 
 impl Settings {
     /// Whether the automatic update check is on.
     pub fn checks_updates(&self) -> bool {
         self.check_updates.unwrap_or(true)
+    }
+
+    /// Whether the experimental features are on.
+    pub fn experimental_on(&self) -> bool {
+        self.experimental.unwrap_or(true)
     }
 }
 
@@ -759,6 +771,22 @@ mod tests {
         let back: Settings = serde_json::from_str(r#"{"camera":"abc","check_updates":"no"}"#).expect("still valid");
         assert_eq!(back.camera.as_deref(), Some("abc"));
         assert!(back.checks_updates());
+    }
+
+    #[test]
+    fn experimental_features_are_on_unless_turned_off_and_read_leniently() {
+        assert!(Settings::default().experimental_on());
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","check_updates":false}"#).expect("valid");
+        assert!(older.experimental_on(), "a file from before the setting means on");
+        let off: Settings = serde_json::from_str(r#"{"experimental":false}"#).expect("valid");
+        assert!(!off.experimental_on());
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&off).expect("serialises")).expect("deserialises");
+        assert_eq!(back, off);
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("experimental"), "left out until changed: {json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","experimental":"nope"}"#).expect("still valid");
+        assert_eq!(bad.camera.as_deref(), Some("abc"));
+        assert!(bad.experimental_on(), "a malformed flag costs only itself");
     }
 
     #[test]

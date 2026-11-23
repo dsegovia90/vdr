@@ -401,6 +401,9 @@ pub(super) fn spawn(follow: Follow) -> tokio::task::JoinHandle<()> {
             if let Some(after) = budget.0.observe(sample, now) {
                 log_change(stream, before, after, sample, estimate_bps, follows);
             }
+            if shown {
+                metrics.set_stream_state(stream, budget.0.state());
+            }
         }
     })
 }
