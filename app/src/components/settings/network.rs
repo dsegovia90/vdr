@@ -135,7 +135,15 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
         };
     }
 
+    // The whole link, in words: with only the camera sending no chart draws
+    // it, and it is the figure everything else on this tab is a part of.
+    let whole = match seconds.last().and_then(|second| second.estimate) {
+        Some(estimate) => format!("Link estimate now: {}", rate(estimate)),
+        None => "No link estimate from the transport: every stream holds its own cap.".to_string(),
+    };
+
     rsx! {
+        p { class: "mt-4 font-mono text-xs text-neutral-300", "{whole}" }
         Heading { text: "Camera" }
         if has_camera {
             Chart { points: camera, draw_cap: true, link: SLICE }
@@ -192,11 +200,17 @@ fn Chart(points: Vec<Point>, draw_cap: bool, link: &'static str) -> Element {
     let target = of(|point| point.target.filter(|target| point.cap != Some(*target)));
     // A value above the scale is not drawn pinned to the top edge, where it
     // reads as a value just over the scale; the numbers line says it.
+    //
+    // Nor is a slice sitting on the cap, for the same reason as the target: a
+    // stream is never granted more than it asked for, so on a link with room
+    // its slice *is* its cap and the two would draw as one striped line.
+    let caps = of(|point| point.cap);
     let dashed: Vec<Option<u32>> = of(|point| point.link)
         .into_iter()
-        .map(|value| value.filter(|value| *value <= top))
+        .zip(&caps)
+        .map(|(value, cap)| value.filter(|value| *value <= top && !(draw_cap && *cap == Some(*value))))
         .collect();
-    let cap = if draw_cap { of(|point| point.cap) } else { Vec::new() };
+    let cap = if draw_cap { caps } else { Vec::new() };
 
     let sent_runs = canvas.runs(&sent);
     let area = rates::area_d(&sent_runs, HEIGHT);
@@ -355,6 +369,8 @@ fn numbers(when: &str, point: Point, with_cap: bool, link: &str, top: u32) -> St
         parts.push(format!("target {}", rate(target)));
     }
     match point.link {
+        // Granted everything it asked for: the figure would only repeat the cap.
+        Some(value) if with_cap && point.cap == Some(value) => parts.push("the link has room for all of it".to_string()),
         Some(value) if value > top => parts.push(format!("{link} {} (off the chart)", rate(value))),
         Some(value) => parts.push(format!("{link} {}", rate(value))),
         None => {}
@@ -386,6 +402,20 @@ mod tests {
         assert_eq!(
             numbers("now", held, true, SLICE, 400),
             "now  \u{b7}  sent 272 kbps  \u{b7}  cap 345 kbps  \u{b7}  target 300 kbps  \u{b7}  slice of the link 310 kbps"
+        );
+    }
+
+    #[test]
+    fn a_slice_that_is_the_whole_cap_is_said_in_words() {
+        let point = Point {
+            sent: Some(299),
+            cap: Some(345),
+            target: Some(345),
+            link: Some(345),
+        };
+        assert_eq!(
+            numbers("now", point, true, SLICE, 400),
+            "now  \u{b7}  sent 299 kbps  \u{b7}  cap 345 kbps  \u{b7}  the link has room for all of it"
         );
     }
 
