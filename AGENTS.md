@@ -224,6 +224,11 @@ focus.
 - **Presence fields all have serde defaults**, so a peer on an older build
   ignores what it does not know and a newer one fills in what is missing. Keep
   that when adding a field, with a test both ways.
+- **The connection report (`link`, `seen` in presence) is behind the
+  Experimental switch, and off means neither publish nor show**: the fields
+  are absent, so the document is byte-for-byte an older build's, and no bars or
+  People section appear. Both fields are read leniently (`quality::lenient_*`),
+  because one parse error in a presence document ends listening to that peer.
 
 ## Layout, paint and input gotchas
 
@@ -311,6 +316,8 @@ focus.
 | `hotkeys.rs` | keyboard shortcuts as a pure table: actions, chords, the keymap. No UI in it |
 | `name.rs` | display names: cleaning, the short id, which label to show |
 | `rates.rs` | the last minute of what each outgoing stream sent, and the Network tab's chart scale |
+| `net/quality.rs` | the connection report's wire shape, rounding and cleaning, what good/held/poor mean, the grid's `blame`, a peer's report history |
+| `net/report.rs` | gathers our report from `Metrics` and each peer's entry, once a second from the attendance loop |
 | `recent.rs` | recent rooms: the list, pin/remove/cap, a room's identity, relative times, `rooms.json` (owner-only, holds room tokens: never display or log a stored link) |
 | `awake.rs` | keeps the machine awake during a call |
 | `update/` | checking for, verifying and installing a newer release: `release.rs` and `verify.rs` are pure, `fetch.rs` the network, `install.rs` the swap and restart |
@@ -324,13 +331,13 @@ focus.
 | `net/share.rs` | screen sharing: capture and its own broadcast |
 | `net/loopback.rs` | the in-process H.264 round trip |
 | `net/runtime.rs` | the single tokio runtime |
-| `components/` | `call_screen.rs` (the page and its key handler), `layout.rs`, `tile.rs`, `tile_menu.rs`, `participant.rs`, `bar.rs`, `microphone.rs`, `share.rs`, `subroom.rs`, `device_menu.rs`, `connect.rs`, `recent.rs` (the recent rooms list), `keys.rs`, `icons.rs`, `button.rs`, `stats.rs` |
-| `components/settings/` | the settings window: a `Tab` variant plus a component per tab (`profile.rs`, `keyboard.rs`, `updates.rs`, `network.rs`, `about.rs`) |
+| `components/` | `call_screen.rs` (the page and its key handler), `layout.rs`, `tile.rs`, `tile_menu.rs`, `participant.rs`, `bar.rs`, `microphone.rs`, `share.rs`, `subroom.rs`, `device_menu.rs`, `connect.rs`, `recent.rs` (the recent rooms list), `keys.rs`, `icons.rs`, `button.rs`, `stats.rs`, `signal.rs` (signal bars) |
+| `components/settings/` | the settings window: a `Tab` variant plus a component per tab (`profile.rs`, `keyboard.rs`, `updates.rs`, `network.rs`, `experimental.rs`, `about.rs`) |
 
 Frames never touch the DOM:
 `cameras::pump` → `FrameSlot` → `VideoPaintSource` → vello.
 
-`cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`, `rates.rs`,
+`cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`, `rates.rs`, `net/quality.rs`,
 `camera/paint/fit.rs`, `audio/catchup.rs`, `components/layout.rs`,
 `update/release.rs`, `update/verify.rs`) are where
 logic that can be tested without a window belongs.
