@@ -50,8 +50,6 @@ struct Reading {
     /// `None` when they are not reporting or our experimental switch is off:
     /// no mark at all, rather than an "unknown" one.
     mark: Option<Quality>,
-    /// The tile menu's line about their connection. A peer's tile only.
-    connection: Option<String>,
 }
 
 impl Default for Reading {
@@ -68,7 +66,6 @@ impl Default for Reading {
             sharing: false,
             share_problem: None,
             mark: None,
-            connection: None,
         }
     }
 }
@@ -175,8 +172,6 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     use_hook({
         let stats = props.stats.clone();
         let local = props.local.clone();
-        // A peer's id never changes on its tile; ours has no menu line.
-        let peer = (!mine).then(|| props.who.clone());
         move || {
             let Some(stats) = stats else { return };
             let spawned = std::thread::Builder::new()
@@ -187,18 +182,11 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                         // Off means neither publish nor show.
                         let shown = local.experimental();
                         let link = if shown { stats.link() } else { None };
-                        let connection = match (&peer, &link) {
-                            (Some(peer), Some(link)) => {
-                                quality::connection_line(Some(link), local.seen().get(peer))
-                            }
-                            _ => None,
-                        };
                         let next = Reading {
                             // Only the state, which has hysteresis: the
                             // figures move every report, and any change
                             // sent here wakes the page.
                             mark: link.as_ref().map(|link| link.q),
-                            connection,
                             fps: stats.video_fps(),
                             talking: stats.talking(),
                             camera_on: stats.camera_on(),
@@ -257,6 +245,13 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     let name = menu_name(&props.who);
     let open = !mine && current.read().as_deref() == Some(name.as_str());
     let our_room = rooms.read().get(&props.me).cloned().flatten();
+    // **Read as the menu renders, not sampled**: the figures move with every
+    // report, and sampling them would wake the page every couple of seconds
+    // for a line that is mostly hidden. Opening the menu renders it fresh.
+    let connection = match (&props.stats, open && props.local.experimental()) {
+        (Some(stats), true) => quality::connection_line(stats.link().as_ref(), props.local.seen().get(&props.who)),
+        _ => None,
+    };
     // **No z-index while closed**, so the dim layer still covers it; lifted
     // above its own click-away layer while open, so a second click closes it.
     let label = if mine {
@@ -327,7 +322,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                     name: now.name.clone(),
                     their_room: now.room.clone(),
                     their_mic: now.mic_on,
-                    connection: now.connection.clone(),
+                    connection,
                     our_room,
                     local: props.local.clone(),
                     me: props.me.clone(),
