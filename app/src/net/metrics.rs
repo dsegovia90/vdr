@@ -659,7 +659,7 @@ pub struct PeerStats {
     late_median: AtomicU32,
     /// Whether we tell the room how our connection is doing and show what
     /// others tell us. Our own entry only; the Experimental tab sets it.
-    experimental: AtomicBool,
+    connection_report: AtomicBool,
     /// Their report on their own link, as cleaned on arrival; for our own
     /// entry, the report we would send. `None` is not reporting.
     link: std::sync::Mutex<Option<Link>>,
@@ -857,7 +857,7 @@ impl Default for PeerStats {
             lates: std::sync::Mutex::new(Vec::new()),
             delay_percentiles: std::sync::Mutex::new((None, None)),
             late_median: AtomicU32::new(UNKNOWN),
-            experimental: AtomicBool::new(true),
+            connection_report: AtomicBool::new(true),
             link: std::sync::Mutex::new(None),
             seen: std::sync::Mutex::new(BTreeMap::new()),
             reports: std::sync::Mutex::new(Reports::default()),
@@ -1161,12 +1161,12 @@ impl PeerStats {
     }
 
     /// Whether the connection report is on. Meaningful on our own entry.
-    pub fn experimental(&self) -> bool {
-        self.experimental.load(Ordering::Relaxed)
+    pub fn connection_report(&self) -> bool {
+        self.connection_report.load(Ordering::Relaxed)
     }
 
-    pub fn set_experimental(&self, on: bool) {
-        self.experimental.store(on, Ordering::Relaxed);
+    pub fn set_connection_report(&self, on: bool) {
+        self.connection_report.store(on, Ordering::Relaxed);
     }
 
     /// Their report on their link, or ours on our own entry.

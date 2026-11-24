@@ -447,7 +447,7 @@ struct Presence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     /// How their connection is doing, by their own account. Absent is not
-    /// reporting: an older build, or someone who turned the experimental
+    /// reporting: an older build, or someone who turned the connection
     /// features off, so a document without it is byte-for-byte what a build
     /// without reports sends. **Read leniently**: anything unreadable here is
     /// "not reporting", never a failed document, because one parse error
@@ -498,8 +498,8 @@ impl Presence {
             // **Off means neither publish nor show**: with the switch off
             // neither field is said, and a report already out is withdrawn
             // with the next document.
-            link: local.experimental().then(|| local.link()).flatten().map(Link::clean),
-            seen: if local.experimental() {
+            link: local.connection_report().then(|| local.link()).flatten().map(Link::clean),
+            seen: if local.connection_report() {
                 quality::clean_seen(local.seen(), "")
             } else {
                 std::collections::BTreeMap::new()
@@ -2621,7 +2621,7 @@ mod presence_tests {
         let mut seen = std::collections::BTreeMap::new();
         seen.insert(id('b'), Seen { q: Quality::Good, fps: Some(30), ..Seen::default() });
         local.set_seen(seen);
-        local.set_experimental(on);
+        local.set_connection_report(on);
         local
     }
 

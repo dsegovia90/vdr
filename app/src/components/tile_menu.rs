@@ -66,7 +66,7 @@ pub struct TileMenuProps {
     /// Whether their microphone is on.
     pub their_mic: bool,
     /// Their connection in one line, when they report it and our
-    /// experimental switch is on. A line rather than a tooltip on the bars,
+    /// connection report is on. A line rather than a tooltip on the bars,
     /// since blitz has no tooltips.
     pub connection: Option<String>,
     /// Our subroom, from the page's [`Rooms`].

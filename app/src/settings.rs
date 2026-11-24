@@ -183,12 +183,12 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_text")]
     pub dismissed_update: Option<String>,
 
-    /// Whether the experimental features are on: today, telling the room how
+    /// Whether the connection report is on: telling the room how
     /// our connection is doing and showing what others tell. `None` is the
-    /// default, which is on ([`experimental_on`](Self::experimental_on)), as
+    /// default, which is on ([`connection_report_on`](Self::connection_report_on)), as
     /// for `check_updates`.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
-    pub experimental: Option<bool>,
+    pub connection_report: Option<bool>,
 }
 
 impl Settings {
@@ -197,9 +197,9 @@ impl Settings {
         self.check_updates.unwrap_or(true)
     }
 
-    /// Whether the experimental features are on.
-    pub fn experimental_on(&self) -> bool {
-        self.experimental.unwrap_or(true)
+    /// Whether the connection report is on.
+    pub fn connection_report_on(&self) -> bool {
+        self.connection_report.unwrap_or(true)
     }
 }
 
@@ -774,19 +774,19 @@ mod tests {
     }
 
     #[test]
-    fn experimental_features_are_on_unless_turned_off_and_read_leniently() {
-        assert!(Settings::default().experimental_on());
+    fn the_connection_report_is_on_unless_turned_off_and_read_leniently() {
+        assert!(Settings::default().connection_report_on());
         let older: Settings = serde_json::from_str(r#"{"camera":"abc","check_updates":false}"#).expect("valid");
-        assert!(older.experimental_on(), "a file from before the setting means on");
-        let off: Settings = serde_json::from_str(r#"{"experimental":false}"#).expect("valid");
-        assert!(!off.experimental_on());
+        assert!(older.connection_report_on(), "a file from before the setting means on");
+        let off: Settings = serde_json::from_str(r#"{"connection_report":false}"#).expect("valid");
+        assert!(!off.connection_report_on());
         let back: Settings = serde_json::from_str(&serde_json::to_string(&off).expect("serialises")).expect("deserialises");
         assert_eq!(back, off);
         let json = serde_json::to_string(&Settings::default()).expect("serialises");
-        assert!(!json.contains("experimental"), "left out until changed: {json}");
-        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","experimental":"nope"}"#).expect("still valid");
+        assert!(!json.contains("connection_report"), "left out until changed: {json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","connection_report":"nope"}"#).expect("still valid");
         assert_eq!(bad.camera.as_deref(), Some("abc"));
-        assert!(bad.experimental_on(), "a malformed flag costs only itself");
+        assert!(bad.connection_report_on(), "a malformed flag costs only itself");
     }
 
     #[test]

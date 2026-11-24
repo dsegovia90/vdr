@@ -1,9 +1,12 @@
-//! The Experimental tab: one switch for features still being tried out.
+//! The Experimental tab: a switch per feature still being tried out.
 //!
-//! On by default, for everyone; each person can turn it off for themselves.
-//! Today it covers one thing, the connection report: our presence tells the
-//! room how our link is doing and what we get from each person, and the tiles
-//! and the Network tab show what everyone else says.
+//! Each feature has its own switch and its own setting, named for what it
+//! does, so one can graduate or go away without touching the others. Each is
+//! on by default, for everyone; a person can turn one off for themselves.
+//!
+//! Today there is one, the connection report: our presence tells the room how
+//! our link is doing and what we get from each person, and the tiles and the
+//! Network tab show what everyone else says.
 //!
 //! **Off means neither publish nor show.** The flag lives on our own entry,
 //! where the presence announcer reads it four times a second (a report
@@ -21,9 +24,9 @@ use crate::settings::Settings;
 
 #[component]
 pub fn ExperimentalTab(local: Arc<PeerStats>) -> Element {
-    let mut on = use_signal({
+    let mut report = use_signal({
         let local = local.clone();
-        move || local.experimental()
+        move || local.connection_report()
     });
     rsx! {
         div { class: "flex flex-col",
@@ -33,17 +36,17 @@ pub fn ExperimentalTab(local: Arc<PeerStats>) -> Element {
             }
             div { class: "mt-6 flex flex-col",
                 Row {
-                    title: "Experimental features",
+                    title: "Connection report",
                     description: "Tells everyone in the call how your connection is doing and shows how theirs is, as bars on each video and in the Network tab. Turning it off stops telling the room about your connection and hides theirs.",
                     first: true,
                     Switch {
-                        on: on(),
+                        on: report(),
                         onclick: move |_| {
-                            let next = !*on.peek();
-                            on.set(next);
-                            local.set_experimental(next);
-                            tracing::info!("experimental features {}", if next { "on" } else { "off" });
-                            Settings::update(move |settings| settings.experimental = Some(next));
+                            let next = !*report.peek();
+                            report.set(next);
+                            local.set_connection_report(next);
+                            tracing::info!("connection report {}", if next { "on" } else { "off" });
+                            Settings::update(move |settings| settings.connection_report = Some(next));
                         },
                     }
                 }

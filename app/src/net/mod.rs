@@ -260,7 +260,7 @@ pub fn use_remote() -> Remote {
         local.set_name(saved.name.as_deref().and_then(crate::name::clean));
         // Whether we report our connection and show others'; the Experimental
         // tab changes it from here on, and the call reads it as it goes.
-        local.set_experimental(saved.experimental_on());
+        local.set_connection_report(saved.connection_report_on());
         let share = ShareWish::new();
         let (tap, feed) = frame_tap();
         // The decision, not the feed, is what gets deferred. The call thread

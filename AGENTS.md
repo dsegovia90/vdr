@@ -225,7 +225,7 @@ focus.
   ignores what it does not know and a newer one fills in what is missing. Keep
   that when adding a field, with a test both ways.
 - **The connection report (`link`, `seen` in presence) is behind the
-  Experimental switch, and off means neither publish nor show**: the fields
+  Experimental tab's switch for it, and off means neither publish nor show**: the fields
   are absent, so the document is byte-for-byte an older build's, and no bars or
   People section appear. Both fields are read leniently (`quality::lenient_*`),
   because one parse error in a presence document ends listening to that peer.

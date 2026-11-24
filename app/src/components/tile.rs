@@ -47,7 +47,7 @@ struct Reading {
     sharing: bool,
     share_problem: Option<String>,
     /// Their connection's quality as they report it, ours on our own tile.
-    /// `None` when they are not reporting or our experimental switch is off:
+    /// `None` when they are not reporting or our connection report is off:
     /// no mark at all, rather than an "unknown" one.
     mark: Option<Quality>,
 }
@@ -180,7 +180,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                     let mut sent: Option<Reading> = None;
                     loop {
                         // Off means neither publish nor show.
-                        let shown = local.experimental();
+                        let shown = local.connection_report();
                         let link = if shown { stats.link() } else { None };
                         let next = Reading {
                             // Only the state, which has hysteresis: the
@@ -248,7 +248,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     // **Read as the menu renders, not sampled**: the figures move with every
     // report, and sampling them would wake the page every couple of seconds
     // for a line that is mostly hidden. Opening the menu renders it fresh.
-    let connection = match (&props.stats, open && props.local.experimental()) {
+    let connection = match (&props.stats, open && props.local.connection_report()) {
         (Some(stats), true) => quality::connection_line(stats.link().as_ref(), props.local.seen().get(&props.who)),
         _ => None,
     };

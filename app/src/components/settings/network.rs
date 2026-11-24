@@ -27,7 +27,7 @@
 //! and it sends only when the minute changed. Any wake of the page repaints
 //! the whole window.
 //!
-//! **Under the charts, the people in the call** (only while the experimental
+//! **Under the charts, the people in the call** (only while the connection
 //! switch is on, and someone else is here): each person's own report on their
 //! connection, in figures and, for others, as a chart of the last couple of
 //! minutes built from their reports; then the grid of who gets what from
@@ -481,7 +481,7 @@ fn grid_of(people: &[Person]) -> Vec<Vec<Cell>> {
 /// The section's view, or `None` when it is not shown: the switch is off, or
 /// nobody else is here.
 fn gather(me: &str, local: &PeerStats, roster: &[(String, Arc<PeerStats>)]) -> Option<View> {
-    if !local.experimental() || roster.is_empty() {
+    if !local.connection_report() || roster.is_empty() {
         return None;
     }
     let mut people = vec![Person {
@@ -786,7 +786,7 @@ mod tests {
         let view = gather("a", &local, &roster).expect("on by default");
         assert_eq!(view.people.len(), 2);
         assert!(view.people[0].you);
-        local.set_experimental(false);
+        local.set_connection_report(false);
         assert!(gather("a", &local, &roster).is_none());
     }
 

@@ -114,7 +114,7 @@ the link's whole estimate (video only; audio is not counted). The lines are a
 five-second average. The estimate is divided between the microphone, the
 screen share and the camera, in that order, and each video stream follows its
 slice, so the last chart is where it shows whether everything together fit.
-Under the charts, while the experimental features are on and someone else is
+Under the charts, while the connection report is on and someone else is
 in the call, *People* lists everyone, you first, with what each says about
 their own connection: the link's estimate, round trip, recent loss, the frame
 rate they send, whether their camera and share are at their caps or held by
@@ -127,7 +127,7 @@ row's (frames a second, and how much later than its best the video arrives),
 coloured by quality; the diagonal is each person's own connection. A row
 mostly poor is marked "their upload?", a column mostly poor "their
 download?"; a single bad cell stays a single cell.
-Its *Experimental* tab has one switch, on by default: with it on, your
+Its *Experimental* tab has a switch per feature still being tried out. *Connection report*, on by default: with it on, your
 presence tells the room how your connection is doing and what you get from
 each person, and you see what they say. Each video's name label then carries
 signal bars: three green bars is good, two amber is held by the link (it
