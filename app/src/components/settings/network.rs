@@ -138,6 +138,13 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
     let share: Vec<Point> = seconds.iter().map(Point::share).collect();
     let total: Vec<Point> = seconds.iter().map(Point::total).collect();
 
+    // "Sent" counts what the encoder handed to the transport, and a stream
+    // nobody subscribed to goes no further: without these words the chart
+    // shows an upload that is not happening.
+    let unwatched = |alone: bool| if alone { UNWATCHED.to_string() } else { String::new() };
+    let camera_notes: Vec<String> = seconds.iter().map(|second| unwatched(second.camera_unwatched())).collect();
+    let share_notes: Vec<String> = seconds.iter().map(|second| unwatched(second.share_unwatched())).collect();
+
     let has_camera = camera.iter().any(|point| point.cap.is_some());
     // "Shared within the minute", not "sharing now": a share that just ended
     // keeps its chart, and the total, until its seconds have scrolled away.
@@ -162,13 +169,13 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
         p { class: "mt-4 font-mono text-xs text-neutral-300", "{whole}" }
         Heading { text: "Camera" }
         if has_camera {
-            Chart { points: camera, draw_cap: true, link: SLICE }
+            Chart { points: camera, draw_cap: true, link: SLICE, notes: camera_notes }
         } else {
             p { class: "text-sm text-neutral-300", "The camera is not sending." }
         }
         if has_share {
             Heading { text: "Screen share" }
-            Chart { points: share, draw_cap: true, link: SLICE }
+            Chart { points: share, draw_cap: true, link: SLICE, notes: share_notes }
             Heading { text: "Everything sent" }
             Chart { points: total, draw_cap: false, link: ESTIMATE }
             p { class: "mt-1 text-xs text-neutral-500", "Video only: audio is not included." }
@@ -176,6 +183,8 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
     }
 }
 
+/// Said after a second's figures when nobody was subscribed to the stream.
+const UNWATCHED: &str = "no one is watching: encoded, not uploaded";
 /// What a stream's dashed line is: its own slice of the link.
 const SLICE: &str = "slice of the link";
 /// What the total's dashed line is: the whole connection's estimate.

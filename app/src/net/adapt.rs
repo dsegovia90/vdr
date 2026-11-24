@@ -397,6 +397,9 @@ pub(super) fn spawn(follow: Follow) -> tokio::task::JoinHandle<()> {
                     Stream::Share => follows,
                 },
             };
+            if stream == Stream::Share && opened != 0 && follows.is_none() && estimate_bps.is_some() {
+                budget.0.unwatched();
+            }
             let before = budget.0.state();
             if let Some(after) = budget.0.observe(sample, now) {
                 log_change(stream, before, after, sample, estimate_bps, follows);
@@ -475,6 +478,9 @@ pub(super) struct Budget {
     /// The latest nonzero ceiling seen: once there was an encoder, the summary
     /// says so even if the estimate never came.
     ceiling: u64,
+    /// Whether the connection had an estimate at a moment this stream had no
+    /// slice of it: the link was there and nobody had asked for the stream.
+    unwatched: bool,
 }
 
 impl Budget {
@@ -535,10 +541,19 @@ impl Budget {
         changed.then_some(next)
     }
 
+    /// Notes that the stream was encoding with a link to send over and no
+    /// slice of it, which is nobody subscribed. Kept apart from the samples
+    /// because it is the summary's reason, not a state: without it a share
+    /// nobody watched ends by blaming the transport for a missing estimate.
+    pub(super) fn unwatched(&mut self) {
+        self.unwatched = true;
+    }
+
     /// What the stream's life amounted to, for one line at its end.
     pub(super) fn summary(&self) -> Summary {
         match (self.ceiling, self.lowest) {
             (0, _) => Summary::NoEncoder,
+            (ceiling, None) if self.unwatched => Summary::Unwatched { ceiling },
             (ceiling, None) => Summary::NoEstimate { ceiling },
             (ceiling, Some(lowest)) => Summary::Observed {
                 observed: self.observed,
@@ -558,6 +573,8 @@ pub(super) enum Summary {
     NoEncoder,
     /// An encoder, but never an estimate to hold it against.
     NoEstimate { ceiling: u64 },
+    /// An encoder and a link, but nobody ever subscribed to the stream.
+    Unwatched { ceiling: u64 },
     Observed {
         observed: Duration,
         held: Duration,
@@ -590,6 +607,11 @@ impl std::fmt::Display for Said {
             Summary::NoEstimate { ceiling } => write!(
                 f,
                 "[rate] {when}: {what} at {} kbps, but the transport gave no estimate, so whether the link held it is unknown",
+                ceiling / 1000
+            ),
+            Summary::Unwatched { ceiling } => write!(
+                f,
+                "[rate] {when}: {what} at {} kbps with nobody watching, so the link was never asked to carry it",
                 ceiling / 1000
             ),
             Summary::Observed {
@@ -709,7 +731,13 @@ fn change_line(
             format!("[rate] share back at the ceiling: {} kbps", kbps(sample.ceiling))
         }
         (Stream::Share, State::AtCeiling, _) => format!("[rate] share at the ceiling: {} kbps", kbps(sample.ceiling)),
-        // A share always has an encoder, so its unknown is a missing slice.
+        // A share always has an encoder, so its unknown is a missing slice;
+        // and a link with an estimate but no slice for it is nobody subscribed.
+        (Stream::Share, _, _) if estimate.is_some() => format!(
+            "[rate] nobody is watching the share; it stays at {} kbps of {}",
+            kbps(sample.target),
+            kbps(sample.ceiling)
+        ),
         (Stream::Share, _, _) => format!(
             "[rate] no slice from the transport; the share stays at {} kbps of {}",
             kbps(sample.target),
@@ -1106,6 +1134,13 @@ mod tests {
             Summary::NoEstimate { ceiling: CEILING }.of(Stream::Share).to_string(),
             "[rate] this share: screen at 2500 kbps, but the transport gave no estimate, so whether the link held it is unknown"
         );
+        let mut alone = Budget::new(Stream::Share);
+        alone.observe(at(CEILING, CEILING, None), start);
+        alone.unwatched();
+        assert_eq!(
+            alone.summary().of(Stream::Share).to_string(),
+            "[rate] this share: screen at 2500 kbps with nobody watching, so the link was never asked to carry it"
+        );
         assert_eq!(
             Summary::NoEncoder.of(Stream::Share).to_string(),
             "[rate] this share: the screen never encoded, so no rate to report"
@@ -1167,6 +1202,10 @@ mod tests {
         assert_eq!(line(Stream::Share, State::Unknown, State::AtCeiling, at_ceiling), "[rate] share at the ceiling: 2500 kbps");
         assert_eq!(
             line(Stream::Share, State::Held, State::Unknown, unknown),
+            "[rate] nobody is watching the share; it stays at 900 kbps of 2500"
+        );
+        assert_eq!(
+            change_line(Stream::Share, State::Held, State::Unknown, unknown, None, None),
             "[rate] no slice from the transport; the share stays at 900 kbps of 2500"
         );
     }
