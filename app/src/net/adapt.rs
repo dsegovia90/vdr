@@ -49,6 +49,13 @@ use moq_net::bandwidth::{Consumer, Rate};
 /// tick either way.
 const SAMPLE: Duration = Duration::from_millis(200);
 
+/// The least the camera is asked to encode at, however little of the link it
+/// is granted. About where a 640x360 picture of a person is still a person;
+/// seen on a throttled link, the tenth of its ceiling it used before (34 kbps)
+/// was reached whenever a share took the link. Costs the share this much at
+/// most, which it does not miss.
+const CAMERA_MIN_BPS: u64 = 120_000;
+
 /// Which outgoing stream a rate loop steers. It decides the stream's floor and
 /// the words its log lines use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,13 +68,15 @@ pub(super) enum Stream {
 impl Stream {
     /// The lowest rate the loop asks this stream's encoder for.
     ///
-    /// The camera's is the rate policy's own default, a tenth of the ceiling.
-    /// The share's is fixed: text below it is unreadable whatever the size of
+    /// The camera's is the rate policy's own default, a tenth of the ceiling,
+    /// but never under [`CAMERA_MIN_BPS`] (or the ceiling, for a camera that
+    /// opens below even that): a tenth of an ordinary camera's rate is a few
+    /// tens of kilobits, which is no longer a face. The share's is fixed: text below it is unreadable whatever the size of
     /// the screen, so a squeezed share gives up bitrate down to here and no
     /// further, at its usual frame rate.
     pub(super) fn floor(self, ceiling: u64) -> u64 {
         match self {
-            Stream::Camera => ceiling / 10,
+            Stream::Camera => (ceiling / 10).max(CAMERA_MIN_BPS).min(ceiling),
             Stream::Share => super::share::SHARE_MIN_BPS,
         }
     }
@@ -962,6 +971,16 @@ mod tests {
         // A camera with its floor or more needs nothing back.
         assert_eq!(share_budget(Some(2_000_000), Some(CAMERA_FLOOR), CAMERA_FLOOR), Some(2_000_000));
         assert_eq!(share_budget(Some(2_000_000), Some(5_000_000), CAMERA_FLOOR), Some(2_000_000));
+    }
+
+    #[test]
+    fn an_ordinary_camera_keeps_enough_for_a_face() {
+        assert_eq!(Stream::Camera.floor(345_600), CAMERA_MIN_BPS);
+        // A large camera's tenth is already more.
+        assert_eq!(Stream::Camera.floor(CEILING), CEILING / 10);
+        // One that opens under the minimum is never asked for more than it opened at.
+        assert_eq!(Stream::Camera.floor(43_000), 43_000);
+        assert_eq!(Stream::Camera.policy(345_600).min, Rate::from_bps(CAMERA_MIN_BPS));
     }
 
     #[test]
