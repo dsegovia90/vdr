@@ -2,9 +2,10 @@
 //!
 //! Everything here was already being computed and then thrown at the log, where
 //! it is no use to anyone who is not running the app from a terminal with
-//! `RUST_LOG` set. None of it costs a measurement of its own: the rates are
-//! counters the decode loops already keep, and the connection figures come from
-//! a struct QUIC maintains whether or not we read it.
+//! `RUST_LOG` set. Almost none of it costs a measurement of its own: the rates
+//! are counters the decode loops already keep, the connection figures come from
+//! a struct QUIC maintains whether or not we read it, and what each outgoing
+//! stream sends is one atomic add per encoded frame.
 //!
 //! Shared as atomics rather than messaged. Several threads write single numbers
 //! -- the call thread, the rate loop, both decode tasks -- and one reader
@@ -18,9 +19,11 @@
 //! rather than an absence of information.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
+
+use crate::rates::{History, Second};
 
 /// The echo canceller's grade of itself, from sonora's statistics, in the
 /// units a person reads: dB and ms.
@@ -161,6 +164,86 @@ pub struct Metrics {
     codecs: std::sync::Mutex<(Option<String>, Option<String>)>,
     /// A [`Path`], as its discriminant.
     path: AtomicU8,
+    /// What each outgoing stream may send and what it did. See [`Sent`].
+    camera: Sent,
+    share: Sent,
+    /// The last minute of the above, for the Network tab. Behind a lock
+    /// rather than atomics because it is a list; taken once a second by the
+    /// meter and once a second by the tab while it is open, never on an
+    /// encode thread.
+    history: std::sync::Mutex<History>,
+}
+
+/// One outgoing stream's cap, and the bytes it actually handed the transport.
+///
+/// **Bytes as encoded, not as sent on the wire.** Counted where the encoder's
+/// output is published, so it excludes QUIC and MoQ framing and retransmission,
+/// and includes anything the transport later drops from a congested queue. It
+/// answers "what did the encoder produce against its cap", which is the number
+/// a sender's own settings control.
+///
+/// The counter is bumped on the encode thread, once per published frame, so it
+/// is a single atomic add; a once-a-second tick ([`Metrics::tick_sent`]) turns
+/// it into a rate, the same split as `FpsMeter` and for the same reason: a
+/// stalled stream reads zero rather than its last healthy number.
+#[derive(Default)]
+struct Sent {
+    /// Bytes published since the last tick.
+    bytes: AtomicU64,
+    /// The rate over the last whole tick, or [`UNKNOWN`] before the first tick
+    /// since the stream got a cap.
+    kbps: AtomicU32,
+    /// What the encoder was configured for; zero while there is no stream.
+    cap_kbps: AtomicU32,
+    /// Set when the stream starts: the tick in progress began before it and
+    /// would read short, so it is discarded rather than reported.
+    fresh: AtomicBool,
+}
+
+impl Sent {
+    fn count(&self, bytes: usize) {
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Records a new cap; zero says the stream has ended.
+    fn set_cap(&self, kbps: u32) {
+        let was = self.cap_kbps.swap(kbps, Ordering::Relaxed);
+        if (was == 0) != (kbps == 0) {
+            self.fresh.store(true, Ordering::Relaxed);
+            self.kbps.store(UNKNOWN, Ordering::Relaxed);
+        }
+    }
+
+    /// Turns the bytes since the last tick, `elapsed` ago, into a rate.
+    fn tick(&self, elapsed: Duration) {
+        let bytes = self.bytes.swap(0, Ordering::Relaxed);
+        if self.cap_kbps.load(Ordering::Relaxed) == 0 || self.fresh.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let ms = elapsed.as_millis().max(1) as u64;
+        // Bits per millisecond is kilobits per second.
+        let kbps = (bytes * 8 / ms).min(UNKNOWN as u64 - 1) as u32;
+        self.kbps.store(kbps, Ordering::Relaxed);
+    }
+
+    /// The rate over the last whole tick: `None` while there is no stream or
+    /// before its first whole tick, and `Some(0)` for one sending nothing.
+    fn kbps(&self) -> Option<u32> {
+        if self.cap_kbps.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        match self.kbps.load(Ordering::Relaxed) {
+            UNKNOWN => None,
+            kbps => Some(kbps),
+        }
+    }
+
+    fn clear(&self) {
+        self.bytes.store(0, Ordering::Relaxed);
+        self.cap_kbps.store(0, Ordering::Relaxed);
+        self.kbps.store(UNKNOWN, Ordering::Relaxed);
+        self.fresh.store(false, Ordering::Relaxed);
+    }
 }
 
 impl Metrics {
@@ -174,7 +257,8 @@ impl Metrics {
         nonzero(&self.loss_bp).map(|bp| bp as f32 / 100.0)
     }
 
-    /// What we are currently encoding at.
+    /// The camera's target rate: what it opened at, until rate control moves
+    /// it. A target, not a measurement; see [`Metrics::camera_sent_kbps`].
     pub fn send_kbps(&self) -> Option<u32> {
         nonzero(&self.send_kbps)
     }
@@ -228,6 +312,73 @@ impl Metrics {
         self.estimate_kbps.store(kbps.unwrap_or(0), Ordering::Relaxed);
     }
 
+    /// The rate the camera's encoder opened at, which rate control never
+    /// exceeds; `None` until there is an encoder.
+    pub fn camera_cap_kbps(&self) -> Option<u32> {
+        nonzero(&self.camera.cap_kbps)
+    }
+
+    /// What the camera's encoder produced over the last whole second.
+    pub fn camera_sent_kbps(&self) -> Option<u32> {
+        self.camera.kbps()
+    }
+
+    /// The running screen share's configured rate; `None` while not sharing.
+    /// It is fixed per share (it does not follow the link), so it is the cap.
+    pub fn share_cap_kbps(&self) -> Option<u32> {
+        nonzero(&self.share.cap_kbps)
+    }
+
+    /// What the screen share's encoder produced over the last whole second.
+    pub fn share_sent_kbps(&self) -> Option<u32> {
+        self.share.kbps()
+    }
+
+    pub(super) fn set_camera_cap_kbps(&self, kbps: u32) {
+        self.camera.set_cap(kbps);
+    }
+
+    pub(super) fn set_share_cap_kbps(&self, kbps: u32) {
+        self.share.set_cap(kbps);
+    }
+
+    /// Bytes of camera video handed to the transport. Called per frame on the
+    /// encode thread.
+    pub(super) fn camera_sent(&self, bytes: usize) {
+        self.camera.count(bytes);
+    }
+
+    /// Bytes of screen video handed to the transport, likewise.
+    pub(super) fn share_sent(&self, bytes: usize) {
+        self.share.count(bytes);
+    }
+
+    /// Turns the byte counts since the last call, `elapsed` ago, into rates.
+    ///
+    /// Also where the last minute is kept: this is the one place that already
+    /// runs once a second for the length of a call.
+    pub(super) fn tick_sent(&self, elapsed: Duration) {
+        self.camera.tick(elapsed);
+        self.share.tick(elapsed);
+        let second = Second {
+            camera_sent: self.camera_sent_kbps(),
+            camera_cap: self.camera_cap_kbps(),
+            camera_target: self.send_kbps(),
+            share_sent: self.share_sent_kbps(),
+            share_cap: self.share_cap_kbps(),
+            estimate: self.estimate_kbps(),
+        };
+        if let Ok(mut history) = self.history.lock() {
+            history.push(second);
+        }
+    }
+
+    /// The last minute of what was sent, oldest first; empty outside a call,
+    /// and empty rather than a panic if the lock was poisoned.
+    pub fn last_minute(&self) -> Vec<Second> {
+        self.history.lock().map(|history| history.seconds()).unwrap_or_default()
+    }
+
     /// Records a connection snapshot.
     ///
     /// Loss is cumulative over the connection rather than recent, because that
@@ -267,6 +418,11 @@ impl Metrics {
             *codecs = (None, None);
         }
         self.set_path(Path::Unknown);
+        self.camera.clear();
+        self.share.clear();
+        if let Ok(mut history) = self.history.lock() {
+            history.clear();
+        }
         for field in [
             &self.rtt_ms,
             &self.loss_bp,
@@ -1111,6 +1267,61 @@ mod tests {
         stats.frame_arrived(123);
         assert_eq!(stats.video_late_ms(), Some(0));
         assert!(stats.take_delays().is_empty(), "still no delay without a clock");
+    }
+
+    #[test]
+    fn a_sent_rate_needs_a_stream_and_a_whole_second() {
+        let metrics = Metrics::default();
+        let second = Duration::from_secs(1);
+        // No camera encoder: bytes are no rate, and no cap is none.
+        metrics.camera_sent(10_000);
+        metrics.tick_sent(second);
+        assert_eq!((metrics.camera_cap_kbps(), metrics.camera_sent_kbps()), (None, None));
+
+        // The encoder opens mid-second: that second is partial, so unreported.
+        metrics.set_camera_cap_kbps(2500);
+        metrics.camera_sent(50_000);
+        metrics.tick_sent(second);
+        assert_eq!(metrics.camera_cap_kbps(), Some(2500));
+        assert_eq!(metrics.camera_sent_kbps(), None);
+
+        // A whole second of 250 kB is 2000 kbps.
+        metrics.camera_sent(200_000);
+        metrics.camera_sent(50_000);
+        metrics.tick_sent(second);
+        assert_eq!(metrics.camera_sent_kbps(), Some(2000));
+
+        // A stalled encoder reads zero, not its last rate.
+        metrics.tick_sent(second);
+        assert_eq!(metrics.camera_sent_kbps(), Some(0));
+
+        // The share is its own stream.
+        assert_eq!(metrics.share_sent_kbps(), None);
+
+        // Every tick since the cap was set is a second of history.
+        let minute = metrics.last_minute();
+        assert_eq!(minute.len(), 3);
+        assert_eq!(minute.iter().map(|s| s.camera_sent).collect::<Vec<_>>(), vec![None, Some(2000), Some(0)]);
+
+        metrics.clear();
+        assert_eq!((metrics.camera_cap_kbps(), metrics.camera_sent_kbps()), (None, None));
+        assert!(metrics.last_minute().is_empty());
+    }
+
+    #[test]
+    fn a_new_cap_on_a_running_share_keeps_its_rate() {
+        let metrics = Metrics::default();
+        let second = Duration::from_secs(1);
+        metrics.set_share_cap_kbps(2500);
+        metrics.tick_sent(second);
+        metrics.share_sent(125_000);
+        metrics.tick_sent(second);
+        assert_eq!(metrics.share_sent_kbps(), Some(1000));
+        // Sharp, mid-share: the stream did not restart.
+        metrics.set_share_cap_kbps(6000);
+        assert_eq!((metrics.share_cap_kbps(), metrics.share_sent_kbps()), (Some(6000), Some(1000)));
+        metrics.set_share_cap_kbps(0);
+        assert_eq!((metrics.share_cap_kbps(), metrics.share_sent_kbps()), (None, None));
     }
 
     #[test]

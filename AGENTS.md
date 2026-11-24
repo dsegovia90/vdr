@@ -310,6 +310,7 @@ focus.
 | `settings.rs` | what the app remembers between launches, the data folder, the log path |
 | `hotkeys.rs` | keyboard shortcuts as a pure table: actions, chords, the keymap. No UI in it |
 | `name.rs` | display names: cleaning, the short id, which label to show |
+| `rates.rs` | the last minute of what each outgoing stream sent, and the Network tab's chart scale |
 | `recent.rs` | recent rooms: the list, pin/remove/cap, a room's identity, relative times, `rooms.json` (owner-only, holds room tokens: never display or log a stored link) |
 | `awake.rs` | keeps the machine awake during a call |
 | `update/` | checking for, verifying and installing a newer release: `release.rs` and `verify.rs` are pure, `fetch.rs` the network, `install.rs` the swap and restart |
@@ -324,12 +325,12 @@ focus.
 | `net/loopback.rs` | the in-process H.264 round trip |
 | `net/runtime.rs` | the single tokio runtime |
 | `components/` | `call_screen.rs` (the page and its key handler), `layout.rs`, `tile.rs`, `tile_menu.rs`, `participant.rs`, `bar.rs`, `microphone.rs`, `share.rs`, `subroom.rs`, `device_menu.rs`, `connect.rs`, `recent.rs` (the recent rooms list), `keys.rs`, `icons.rs`, `button.rs`, `stats.rs` |
-| `components/settings/` | the settings window: a `Tab` variant plus a component per tab (`profile.rs`, `keyboard.rs`, `updates.rs`, `about.rs`) |
+| `components/settings/` | the settings window: a `Tab` variant plus a component per tab (`profile.rs`, `keyboard.rs`, `updates.rs`, `network.rs`, `about.rs`) |
 
 Frames never touch the DOM:
 `cameras::pump` → `FrameSlot` → `VideoPaintSource` → vello.
 
-`cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`,
+`cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`, `rates.rs`,
 `camera/paint/fit.rs`, `audio/catchup.rs`, `components/layout.rs`,
 `update/release.rs`, `update/verify.rs`) are where
 logic that can be tested without a window belongs.

@@ -126,6 +126,23 @@ async fn watch_path(endpoint: moq_tokio::iroh::Endpoint, metrics: Arc<Metrics>) 
     }
 }
 
+/// Turns what the encode loops count into a rate per stream, once a second,
+/// for as long as the attempt lasts.
+///
+/// Timed by the elapsed time actually measured rather than the nominal second,
+/// so a late tick does not read as a burst. Writes atomics only: nothing here
+/// wakes the page, which samples [`Metrics`] on its own schedule.
+async fn meter_sent(metrics: Arc<Metrics>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last = ticker.tick().await;
+    loop {
+        let now = ticker.tick().await;
+        metrics.tick_sent(now.duration_since(last));
+        last = now;
+    }
+}
+
 /// Everything [`connect`] needs, named rather than positional.
 struct Connect<'a> {
     config: &'a moq_tokio::client::Config,
@@ -1081,6 +1098,7 @@ async fn run(
             })
         });
         let pathing = over_iroh.then(|| Abort(tokio::spawn(watch_path(endpoint.clone(), metrics.clone()))));
+        let metering = Abort(tokio::spawn(meter_sent(metrics.clone())));
 
         // The person's wish to share a screen, served for this attempt. Its
         // own broadcast on the same outbound origin, so a share started now
@@ -1094,6 +1112,7 @@ async fn run(
                 keyframe: keyframe.clone(),
                 preview: share.preview(),
                 quality: share.quality_choice(),
+                metrics: metrics.clone(),
             },
             share.clone(),
             share_quit,
@@ -1198,6 +1217,11 @@ async fn run(
                     }
                 };
                 ceiling.store(opening_bitrate, std::sync::atomic::Ordering::Relaxed);
+                // The target starts at the ceiling, and the rate loop only
+                // writes when it moves it, so without this a sender the link
+                // never holds back would show no rate all call.
+                metrics.set_send_kbps((opening_bitrate / 1000) as u32);
+                metrics.set_camera_cap_kbps((opening_bitrate / 1000) as u32);
                 tracing::info!(
                     "encoding {width}x{height} at the {} rung with {}",
                     crate::args::Args::get().quality,
@@ -1214,6 +1238,7 @@ async fn run(
                         keyframe: &keyframe.camera,
                         stop: &stop,
                         local: &local,
+                        metrics: &metrics,
                     },
                 );
                 // A hardware encoder failing mid-call demotes the rest of this
@@ -1223,8 +1248,8 @@ async fn run(
                     HARDWARE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 if let Ok(flushed) = encoder.flush() {
-                    if !flushed.is_empty() {
-                        producer.publish(&flushed).ok();
+                    if !flushed.is_empty() && producer.publish(&flushed).is_ok() {
+                        metrics.camera_sent(payload_bytes(&flushed));
                     }
                 }
                 (feed, Some(producer), outcome)
@@ -1346,6 +1371,7 @@ async fn run(
         }
         // Before the clear, which resets the path, so nothing writes after it.
         drop(pathing);
+        drop(metering);
         metrics.clear();
         drop(aec_report);
         controls.detach();
@@ -1401,6 +1427,13 @@ struct Steering<'a> {
     stop: &'a std::sync::atomic::AtomicBool,
     /// Ourselves: the encode loop records our camera-to-wall-clock pairing.
     local: &'a PeerStats,
+    /// Where the bytes it publishes are counted.
+    metrics: &'a Metrics,
+}
+
+/// The bytes in a batch of encoded frames, as handed to the transport.
+pub(super) fn payload_bytes(encoded: &[moq_video::encode::Encoded]) -> usize {
+    encoded.iter().map(|frame| frame.payload.len()).sum()
 }
 
 fn encode(
@@ -1415,6 +1448,7 @@ fn encode(
         keyframe,
         stop,
         local,
+        metrics,
     } = steering;
     loop {
         // The only way out other than the camera going away. Checked per frame
@@ -1471,6 +1505,7 @@ fn encode(
             producer
                 .publish(&encoded)
                 .map_err(|error| format!("publish failed: {error:#}"))?;
+            metrics.camera_sent(payload_bytes(&encoded));
         }
     }
 }
@@ -1894,6 +1929,8 @@ fn write_stats(
     let link = serde_json::json!({
         "t": t, "me": me, "link": true,
         "rtt_ms": metrics.rtt(), "loss_pct": metrics.loss(), "up_kbps": metrics.send_kbps(),
+        "camera_cap_kbps": metrics.camera_cap_kbps(), "camera_sent_kbps": metrics.camera_sent_kbps(),
+        "share_cap_kbps": metrics.share_cap_kbps(), "share_sent_kbps": metrics.share_sent_kbps(),
         "aec_erle_db": aec.erle_db, "aec_erl_db": aec.erl_db,
         "aec_delay_ms": aec.delay_ms,
         "aec_reference_frames": aec.reference_frames, "aec_reference_rms": aec.reference_rms,
