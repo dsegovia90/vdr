@@ -679,6 +679,9 @@ pub struct PeerStats {
     /// Whether we host the rooms we join. Our own entry only; the
     /// Experimental tab sets it, and a join reads it as it starts.
     host_rooms: AtomicBool,
+    /// Whether each tile is marked with the way that person's video arrives.
+    /// Our own entry only; the Experimental tab sets it.
+    show_routes: AtomicBool,
     /// What we say about hosting this room, while we are serving it. Our own
     /// entry only; the presence announcer reads it. Carries the door.
     offer: std::sync::Mutex<Option<super::door::Offer>>,
@@ -890,6 +893,7 @@ impl Default for PeerStats {
             late_median: AtomicU32::new(UNKNOWN),
             connection_report: AtomicBool::new(true),
             host_rooms: AtomicBool::new(false),
+            show_routes: AtomicBool::new(false),
             offer: std::sync::Mutex::new(None),
             move_calls: AtomicBool::new(false),
             call_on: std::sync::Mutex::new(None),
@@ -1212,6 +1216,16 @@ impl PeerStats {
 
     pub fn set_host_rooms(&self, on: bool) {
         self.host_rooms.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether tiles show the way each video arrives. Meaningful on our own
+    /// entry.
+    pub fn show_routes(&self) -> bool {
+        self.show_routes.load(Ordering::Relaxed)
+    }
+
+    pub fn set_show_routes(&self, on: bool) {
+        self.show_routes.store(on, Ordering::Relaxed);
     }
 
     /// What we say about hosting the room we are in, while we serve it.

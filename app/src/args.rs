@@ -35,6 +35,7 @@
 //! vdr --move-calls                       # follow the call when someone moves it
 //! vdr --move-call relay                   # move the call as the join starts: relay or a host's id
 //! vdr --bounce 30                         # move it round the relay and the hosts every 30 s (10 at least)
+//! vdr --show-routes                       # mark each video with the way it arrives
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry is a second
@@ -268,6 +269,10 @@ pub struct Args {
     /// Move the call round the relay and every host this often
     /// (`--bounce <secs>`), so a scripted run can judge moves from logs.
     pub bounce: Option<std::time::Duration>,
+    /// Mark each video with the way it arrives, as the Experimental switch
+    /// does, without saving it (`--show-routes`). For looking at a scripted
+    /// run; the routes are logged whether or not this is on.
+    pub show_routes: bool,
 }
 
 impl Args {
@@ -307,6 +312,7 @@ impl Args {
         let mut move_calls = false;
         let mut move_call = None;
         let mut bounce = None;
+        let mut show_routes = false;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -378,6 +384,7 @@ impl Args {
                     move_calls = true;
                     bounce = Some(crate::net::moves::bounce_every(secs.and_then(Result::ok)));
                 }
+                "--show-routes" => show_routes = true,
                 // Read by `settings::data_dir` from the raw arguments, since
                 // the log opens before this parser runs; only skipped here.
                 "--profile" => {
@@ -409,6 +416,7 @@ impl Args {
             move_calls,
             move_call,
             bounce,
+            show_routes,
         }
     }
 }

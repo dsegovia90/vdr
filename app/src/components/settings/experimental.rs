@@ -53,6 +53,10 @@ pub fn ExperimentalTab(local: Arc<PeerStats>, me: String) -> Element {
         let local = local.clone();
         move || local.host_rooms()
     });
+    let mut routes = use_signal({
+        let local = local.clone();
+        move || local.show_routes()
+    });
     let hosts = local.clone();
     let mut moving = use_signal({
         let local = local.clone();
@@ -102,6 +106,7 @@ pub fn ExperimentalTab(local: Arc<PeerStats>, me: String) -> Element {
     };
     let movers = local.clone();
     let back = local.clone();
+    let marks = local.clone();
     rsx! {
         div { class: "flex flex-col",
             div { class: "text-lg font-semibold text-neutral-100", "Experimental" }
@@ -136,6 +141,21 @@ pub fn ExperimentalTab(local: Arc<PeerStats>, me: String) -> Element {
                             hosts.set_host_rooms(next);
                             tracing::info!("hosting rooms {}", if next { "on" } else { "off" });
                             Settings::update(move |settings| settings.host_rooms = Some(next));
+                        },
+                    }
+                }
+                Row {
+                    title: "Show the route on each video",
+                    first: false,
+                    description: "Marks each video with the way it reaches you: through the relay, through someone hosting the room, or directly, and marks whoever hosts. Your own says where your video goes. It shows the route announced as best; the video itself follows it within a moment. A debugging aid.",
+                    Switch {
+                        on: routes(),
+                        onclick: move |_| {
+                            let next = !*routes.peek();
+                            routes.set(next);
+                            marks.set_show_routes(next);
+                            tracing::info!("showing routes {}", if next { "on" } else { "off" });
+                            Settings::update(move |settings| settings.show_routes = Some(next));
                         },
                     }
                 }

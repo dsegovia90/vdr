@@ -327,6 +327,9 @@ pub fn use_remote() -> Remote {
         local.set_host_rooms(saved.hosts_rooms() || crate::args::Args::get().host_rooms);
         // Whether we follow moves of the call; the Experimental tab changes it.
         local.set_move_calls(saved.moves_calls() || crate::args::Args::get().move_calls);
+        // Whether tiles show the way each video arrives; the Experimental tab
+        // changes it from here on.
+        local.set_show_routes(saved.shows_routes() || crate::args::Args::get().show_routes);
         // The camera and microphone as launched. Our entry starts "on" for
         // both, and only a click changes it, so without this a camera started
         // off was announced as on, and so was a microphone that `--no-audio`

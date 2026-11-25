@@ -263,6 +263,11 @@ pub struct Settings {
     /// someone's computer.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
     pub move_calls: Option<bool>,
+    /// Whether each video is marked with the way it arrives (the relay, a
+    /// host, or directly) and whoever hosts. `None` is the default, which is
+    /// **off** ([`shows_routes`](Self::shows_routes)): it is a debugging aid.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
+    pub show_routes: Option<bool>,
 }
 
 impl Settings {
@@ -284,6 +289,11 @@ impl Settings {
     /// Whether we follow and make moves of the call.
     pub fn moves_calls(&self) -> bool {
         self.move_calls.unwrap_or(false)
+    }
+
+    /// Whether each video is marked with the way it arrives.
+    pub fn shows_routes(&self) -> bool {
+        self.show_routes.unwrap_or(false)
     }
 }
 
@@ -924,6 +934,22 @@ mod tests {
         let bad: Settings = serde_json::from_str(r#"{"camera":"abc","move_calls":7}"#).expect("still valid");
         assert_eq!(bad.camera.as_deref(), Some("abc"));
         assert!(!bad.moves_calls(), "a malformed flag costs only itself");
+    }
+
+    #[test]
+    fn showing_routes_is_off_unless_turned_on_and_read_leniently() {
+        assert!(!Settings::default().shows_routes());
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","host_rooms":true}"#).expect("valid");
+        assert!(!older.shows_routes(), "a file from before the setting means off");
+        let on: Settings = serde_json::from_str(r#"{"show_routes":true}"#).expect("valid");
+        assert!(on.shows_routes());
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&on).expect("serialises")).expect("deserialises");
+        assert_eq!(back, on);
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("show_routes"), "left out until changed: {json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","show_routes":"yes"}"#).expect("still valid");
+        assert_eq!(bad.camera.as_deref(), Some("abc"));
+        assert!(!bad.shows_routes(), "a malformed flag costs only itself");
     }
 
     #[test]
