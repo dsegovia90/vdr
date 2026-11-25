@@ -335,6 +335,36 @@ async fn a_lite05_route_outranks_a_lite06_one_of_the_same_length() {
     assert_eq!(route.cost.warm, 0, "{:?}", route.cost);
 }
 
+/// A moq-lite-06 link priced at zero beats a moq-lite-05 route of the same
+/// length: both are free to reach, but the older one's path is of unknown
+/// price and ranks last on that, where the newer one's is known to be free.
+/// This is what moving the call to a host rests on: a member dials the chosen
+/// host free, and everyone's media then flows through it rather than through
+/// the older relay.
+#[tokio::test]
+async fn a_free_lite06_route_beats_a_lite05_one_of_the_same_length() {
+    let older = Relay::start(&[lite("moq-lite-05")]).await;
+    let current = Relay::start(&[]).await;
+
+    let outbound = moq_tokio::origin::spawn();
+    let _publishing = publish(&outbound, true);
+    let publisher = client(&[]).with_publisher(&outbound);
+    let _p_older = established(publisher.clone().connect(older.url())).await;
+    let _p_current = established(publisher.with_cost(0).connect(current.url())).await;
+
+    let inbound = moq_tokio::origin::spawn();
+    let viewer = client(&[]).with_subscriber(inbound.clone());
+    let _v_older = established(viewer.clone().connect(older.url())).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _v_current = established(viewer.with_cost(0).connect(current.url())).await;
+
+    let mut announced = inbound.consume().announced();
+    let updates = settle(&mut announced, Duration::from_millis(800)).await;
+    let route = &updates.last().expect("announced").route;
+    assert_eq!(through(route), current.hop(), "{updates:?}");
+    assert_eq!(route.cost.warm, 0, "{:?}", route.cost);
+}
+
 /// What one session offers of ours: an origin of its own, sharing our
 /// publishing identity so every route to us still names one publisher, into
 /// which our broadcast is offered or from which it is withdrawn.
