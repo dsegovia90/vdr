@@ -660,6 +660,12 @@ pub struct PeerStats {
     /// Whether we tell the room how our connection is doing and show what
     /// others tell us. Our own entry only; the Experimental tab sets it.
     connection_report: AtomicBool,
+    /// Whether we host the rooms we join. Our own entry only; the
+    /// Experimental tab sets it, and a join reads it as it starts.
+    host_rooms: AtomicBool,
+    /// What we say about hosting this room, while we are serving it. Our own
+    /// entry only; the presence announcer reads it. Carries the door.
+    offer: std::sync::Mutex<Option<super::door::Offer>>,
     /// Their report on their own link, as cleaned on arrival; for our own
     /// entry, the report we would send. `None` is not reporting.
     link: std::sync::Mutex<Option<Link>>,
@@ -858,6 +864,8 @@ impl Default for PeerStats {
             delay_percentiles: std::sync::Mutex::new((None, None)),
             late_median: AtomicU32::new(UNKNOWN),
             connection_report: AtomicBool::new(true),
+            host_rooms: AtomicBool::new(false),
+            offer: std::sync::Mutex::new(None),
             link: std::sync::Mutex::new(None),
             seen: std::sync::Mutex::new(BTreeMap::new()),
             reports: std::sync::Mutex::new(Reports::default()),
@@ -1167,6 +1175,26 @@ impl PeerStats {
 
     pub fn set_connection_report(&self, on: bool) {
         self.connection_report.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether we host the rooms we join. Meaningful on our own entry.
+    pub fn host_rooms(&self) -> bool {
+        self.host_rooms.load(Ordering::Relaxed)
+    }
+
+    pub fn set_host_rooms(&self, on: bool) {
+        self.host_rooms.store(on, Ordering::Relaxed);
+    }
+
+    /// What we say about hosting the room we are in, while we serve it.
+    pub(super) fn offer(&self) -> Option<super::door::Offer> {
+        self.offer.lock().ok().and_then(|offer| offer.clone())
+    }
+
+    pub(super) fn set_offer(&self, offer: Option<super::door::Offer>) {
+        if let Ok(mut slot) = self.offer.lock() {
+            *slot = offer;
+        }
     }
 
     /// Their report on their link, or ours on our own entry.

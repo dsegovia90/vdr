@@ -189,6 +189,14 @@ pub struct Settings {
     /// for `check_updates`.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
     pub connection_report: Option<bool>,
+
+    /// Whether to host the rooms we join: accept their members directly as
+    /// well as through the relay, and say so in presence, so that the room
+    /// can still meet if its relay is down. `None` is the default, which is
+    /// **off** ([`hosts_rooms`](Self::hosts_rooms)): it lends our uplink to
+    /// other people's video, which nobody should find they had agreed to.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
+    pub host_rooms: Option<bool>,
 }
 
 impl Settings {
@@ -200,6 +208,11 @@ impl Settings {
     /// Whether the connection report is on.
     pub fn connection_report_on(&self) -> bool {
         self.connection_report.unwrap_or(true)
+    }
+
+    /// Whether we host the rooms we join.
+    pub fn hosts_rooms(&self) -> bool {
+        self.host_rooms.unwrap_or(false)
     }
 }
 
@@ -787,6 +800,22 @@ mod tests {
         let bad: Settings = serde_json::from_str(r#"{"camera":"abc","connection_report":"nope"}"#).expect("still valid");
         assert_eq!(bad.camera.as_deref(), Some("abc"));
         assert!(bad.connection_report_on(), "a malformed flag costs only itself");
+    }
+
+    #[test]
+    fn hosting_rooms_is_off_unless_turned_on_and_read_leniently() {
+        assert!(!Settings::default().hosts_rooms());
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","connection_report":false}"#).expect("valid");
+        assert!(!older.hosts_rooms(), "a file from before the setting means off");
+        let on: Settings = serde_json::from_str(r#"{"host_rooms":true}"#).expect("valid");
+        assert!(on.hosts_rooms());
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&on).expect("serialises")).expect("deserialises");
+        assert_eq!(back, on);
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("host_rooms"), "left out until changed: {json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","host_rooms":"yes"}"#).expect("still valid");
+        assert_eq!(bad.camera.as_deref(), Some("abc"));
+        assert!(!bad.hosts_rooms(), "a malformed flag costs only itself");
     }
 
     #[test]

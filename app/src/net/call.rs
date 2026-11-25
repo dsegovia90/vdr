@@ -284,7 +284,9 @@ struct Serve<'a> {
     /// The room and its door, when this side hosts one; `None` lets anyone in,
     /// as a 1:1 listener always has.
     door: Option<door::Hosting>,
-    estimates: Arc<adapt::Estimates>,
+    /// Where each session's bandwidth estimate goes, or `None` when the
+    /// guests' links must not steer what we send; see [`host_alongside`].
+    estimates: Option<Arc<adapt::Estimates>>,
     metrics: Arc<Metrics>,
 }
 
@@ -341,7 +343,7 @@ async fn serve(
 fn accept(
     mut server: moq_tokio::Listener,
     door: Option<door::Hosting>,
-    estimates: Arc<adapt::Estimates>,
+    estimates: Option<Arc<adapt::Estimates>>,
     metrics: Arc<Metrics>,
 ) -> (Abort, futures_channel::mpsc::UnboundedReceiver<bool>) {
     let (events, receiver) = futures_channel::mpsc::unbounded::<bool>();
@@ -368,9 +370,12 @@ fn accept(
             let metrics = metrics.clone();
             let events = events.clone();
             sessions.spawn(async move {
-                match request.ok().await {
-                    Ok(session) => adapt::forward(session, estimates, metrics).await,
-                    Err(error) => tracing::warn!("a session failed to start: {error:#}"),
+                match (request.ok().await, estimates) {
+                    (Ok(session), Some(estimates)) => adapt::forward(session, estimates, metrics).await,
+                    (Ok(session), None) => {
+                        let _ = session.closed().await;
+                    }
+                    (Err(error), _) => tracing::warn!("a session failed to start: {error:#}"),
                 }
                 let _ = events.unbounded_send(false);
             });
@@ -379,16 +384,18 @@ fn accept(
     (task, receiver)
 }
 
-/// Query parameters that carry a way in: a relay's token, a host's door.
-const SECRET_PARAMS: [&str; 2] = ["jwt", super::door::PARAM];
+/// Query parameters that carry a way in: a relay's token, a host's door, and
+/// the hosts an invite lists, each with its door.
+const SECRET_PARAMS: [&str; 3] = ["jwt", super::door::PARAM, super::door::HOST_PARAM];
 
 /// The URL with any token's value blanked, for logs and labels.
 ///
-/// **A room URL can carry its invitation** (`?jwt=…`, the relay's token, or
-/// `?door=…`, a hosted room's), and anyone holding it can join that room, so it
-/// must never be written anywhere a log or a screenshot might travel. Only our
-/// own lines are covered; moq-tokio 0.19's own connection lines print scheme,
-/// host and port only (read in its `connect.rs`, `Endpoint`).
+/// **A room URL can carry its invitation** (`?jwt=…`, the relay's token,
+/// `?door=…`, a hosted room's, or `?host=…`, the hosts an invite lists), and
+/// anyone holding it can join that room, so it must never be written anywhere
+/// a log or a screenshot might travel. Only our own lines are covered;
+/// moq-tokio 0.19's own connection lines print scheme, host and port only
+/// (read in its `connect.rs`, `Endpoint`).
 pub(crate) fn redacted(url: &url::Url) -> String {
     let mut clean = url.clone();
     let secret = |key: &str| SECRET_PARAMS.contains(&key);
@@ -582,6 +589,13 @@ struct Presence {
         deserialize_with = "quality::lenient_seen"
     )]
     seen: std::collections::BTreeMap<String, Seen>,
+    /// That they host this room, and how to come in: present only while they
+    /// serve it, so a document from someone not hosting is byte-for-byte what
+    /// a build without hosting sends, and such a build ignores the field.
+    /// **Read leniently**, as `link` is, and it carries a door: `Offer`'s
+    /// `Debug` leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "door::lenient_offer")]
+    host: Option<door::Offer>,
 }
 
 impl Default for Presence {
@@ -597,6 +611,7 @@ impl Default for Presence {
             name: None,
             link: None,
             seen: std::collections::BTreeMap::new(),
+            host: None,
         }
     }
 }
@@ -624,6 +639,8 @@ impl Presence {
             } else {
                 std::collections::BTreeMap::new()
             },
+            // Set only while we serve the room; cleaned on the way out too.
+            host: local.offer().and_then(door::Offer::clean),
         }
     }
 }
@@ -841,6 +858,8 @@ pub(super) fn spawn(
     metrics: Arc<Metrics>,
     local: Arc<PeerStats>,
     share: ShareWish,
+    doors: Arc<door::Doors>,
+    hosts: UnboundedSender<HostNews>,
 ) {
     let spawned = std::thread::Builder::new()
         .name("call".into())
@@ -858,7 +877,7 @@ pub(super) fn spawn(
                 let (relay, statuses) = futures_channel::mpsc::unbounded();
                 tokio::spawn(crate::awake::follow(statuses, status));
                 let status = relay;
-                match run(decisions, feed, &status, participants, controls, metrics, local, share).await {
+                match run(decisions, feed, &status, participants, controls, metrics, local, share, doors, hosts).await {
                     Ok(()) => {
                         tracing::info!("call ended");
                         let _ = status.unbounded_send(RemoteStatus::Ended);
@@ -891,6 +910,8 @@ async fn run(
     metrics: Arc<Metrics>,
     local: Arc<PeerStats>,
     share: ShareWish,
+    doors: Arc<door::Doors>,
+    hosts: UnboundedSender<HostNews>,
 ) -> Result<(), String> {
     let report = |next: RemoteStatus| {
         let _ = status.unbounded_send(next);
@@ -1068,10 +1089,29 @@ async fn run(
         // each other through it; and its own broadcasts sit beside theirs, as
         // a relay room's participants do. `attend` skips our own id, so
         // reading our own announcements back is harmless.
-        let inbound = match peering {
-            Peering::Host(_) => outbound.clone(),
-            _ => moq_tokio::origin::spawn(),
+        //
+        // **A join shares one too, but only when hosting is on as it
+        // starts**, so that the room's members reaching us directly and the
+        // relay room are one room: what they publish is offered on to the
+        // relay, and the relay's room is offered to them. The library keeps
+        // that from looping (a route is never offered back to the session it
+        // came in on), which this module's bridge tests show. With hosting off a
+        // join is wired exactly as it always was, two origins, until a change
+        // to everyone's has been tried by hand.
+        let host_rooms = local.host_rooms();
+        let shared = shares_origin(&peering, host_rooms);
+        let inbound = inbound_for(&outbound, shared);
+        // Where what we hear about hosts goes: only a join has a remembered
+        // room to keep them with.
+        let news = match &peering {
+            Peering::Join(url) => Some(RoomNews {
+                room: crate::recent::identity(url),
+                to: hosts.clone(),
+            }),
+            _ => None,
         };
+        // Serving the room's members beside the join, while hosting stays on.
+        let mut alongside: Option<Abort> = None;
 
         // Read before the match below takes `peering` apart. A hosted room is
         // a room: nobody leaving ends it, and the status line stays on it.
@@ -1111,7 +1151,7 @@ async fn run(
                 let room = room_label(url);
                 report(RemoteStatus::Joining { room: room.clone() });
                 tracing::info!("joining {room} at {}", redacted(url));
-                connect(Connect {
+                let joined = connect(Connect {
                     config: &client_config,
                     endpoint: &endpoint,
                     outbound: &outbound,
@@ -1121,7 +1161,20 @@ async fn run(
                     room: Some(room),
                     status: status.clone(),
                     keyframe: keyframe.clone(),
-                })?
+                })?;
+                if shared {
+                    alongside = host_alongside(Alongside {
+                        config: &client_config,
+                        endpoint: &endpoint,
+                        shared: outbound.clone(),
+                        url,
+                        doors: &doors,
+                        metrics: metrics.clone(),
+                        local: local.clone(),
+                    })
+                    .await;
+                }
+                joined
             }
             Peering::Listen => {
                 report(RemoteStatus::Listening { me: me.to_string() });
@@ -1141,7 +1194,7 @@ async fn run(
                     publisher: outbound.consume(),
                     subscriber: inbound.clone(),
                     door: None,
-                    estimates: adapt::Estimates::new(estimate.clone()),
+                    estimates: Some(adapt::Estimates::new(estimate.clone())),
                     metrics: metrics.clone(),
                 })
                 .await?;
@@ -1217,7 +1270,7 @@ async fn run(
                     publisher: outbound.consume(),
                     subscriber: inbound.clone(),
                     door: Some(hosting.clone()),
-                    estimates: adapt::Estimates::new(estimate.clone()),
+                    estimates: Some(adapt::Estimates::new(estimate.clone())),
                     metrics: metrics.clone(),
                 })
                 .await?;
@@ -1328,6 +1381,7 @@ async fn run(
                     local: local.clone(),
                     controls: controls.clone(),
                 },
+                news,
             },
             engine,
         ));
@@ -1558,6 +1612,11 @@ async fn run(
         // for something; short, because a leave should feel instant.
         tokio::time::sleep(GOODBYE_FLUSH).await;
         drop(transport);
+        // Ends every guest's session with the call, and with it what we say
+        // about hosting; the goodbye above still carried it, so nobody reads
+        // our leaving as having stopped.
+        drop(alongside);
+        local.set_offer(None);
         decode.abort();
         rate.abort();
         drop(mirroring);
@@ -1728,6 +1787,8 @@ struct Reports {
     /// Our own subroom and the volume for everyone outside it, which each
     /// peer's audio task reads on every frame.
     rooms: audio::Rooms,
+    /// Where hosts heard in this room are reported, on a join.
+    news: Option<RoomNews>,
 }
 
 /// Watches who is here, and gives each of them a tile and a decoder.
@@ -1754,6 +1815,7 @@ async fn attend(
         metrics,
         in_room,
         rooms,
+        news,
     } = reports;
     // The stats file, if asked for (`--stats`). A file that cannot be opened is
     // a line in the log, not a failed call.
@@ -1857,6 +1919,7 @@ async fn attend(
                             saying.clone(),
                             people.entry(id.to_string()).or_default().clone(),
                             asked.clone(),
+                            news.clone(),
                         ))),
                     );
                 }
@@ -2044,8 +2107,8 @@ async fn announce(
         let now = Presence::here(&local);
         // What a person did, for the log. The connection report changes with
         // the link, and is only logged as it starts and stops.
-        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name, now.link.is_some())
-            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name, said.link.is_some());
+        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name, now.link.is_some(), &now.host)
+            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name, said.link.is_some(), &said.host);
         if changed {
             let asking = match now.requests.len() {
                 0 => String::new(),
@@ -2055,8 +2118,10 @@ async fn announce(
             // Whether, not what: the log keys people by id.
             let named = if now.name.is_some() { ", named" } else { "" };
             let reporting = if now.link.is_some() { ", reporting the connection" } else { "" };
+            // Whether, never the door.
+            let hosting = if now.host.is_some() { ", hosting" } else { "" };
             tracing::info!(
-                "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}",
+                "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}{hosting}",
                 on_off(now.camera),
                 on_off(now.mic),
                 room_name(&now.room)
@@ -2178,7 +2243,11 @@ async fn listen(
     saying: UnboundedSender<String>,
     stats: Arc<PeerStats>,
     asked: Asked,
+    news: Option<RoomNews>,
 ) {
+    // The door they last said, while this reader has heard them hosting.
+    // What decides "they stopped": a document without one, after one with.
+    let mut offered: Option<String> = None;
     // Their invite lasts exactly as long as this reader: the leave aborts it
     // rather than letting it return, so a guard is what drops it.
     let _invited = Invited {
@@ -2221,6 +2290,7 @@ async fn listen(
                 name,
                 link,
                 seen,
+                host,
             })) => {
                 let room = subroom(room);
                 if let Some(clock) = clock {
@@ -2248,6 +2318,7 @@ async fn listen(
                 // how loud they are to us.
                 stats.set_room(room.clone());
                 asked.act(&id, &room, mic, &requests);
+                heard_hosting(&id, state, host, &mut offered, news.as_ref());
                 if state == State::Leaving {
                     // Reported, not acted on: whether the call is over is a
                     // question about everyone, and the loop that tracks
@@ -2263,6 +2334,192 @@ async fn listen(
             }
         }
     }
+}
+
+/// What the call tells the interface about the hosts of the room it joined,
+/// to keep with the room in `rooms.json`. Carries a door: no `Debug`.
+pub(crate) enum HostNews {
+    /// `id` says it hosts the room behind `door`; `told_by` is whose
+    /// presence said so, which today is always `id`'s own.
+    Heard {
+        room: String,
+        id: String,
+        door: String,
+        told_by: String,
+    },
+    /// `id` said it hosted the room and has now said it does not.
+    Stopped { room: String, id: String },
+}
+
+/// Where a presence reader reports the hosts it hears: the room's identity
+/// (`recent::identity`) and the interface's channel.
+#[derive(Clone)]
+struct RoomNews {
+    room: String,
+    to: UnboundedSender<HostNews>,
+}
+
+/// Acts on what one document says about hosting.
+///
+/// **Sent on a change only**: the first door heard from them, a new door, or
+/// the switch going off, because every message wakes the page. A document
+/// without one, from someone this reader heard hosting, is a host that has
+/// stopped, and the only thing that forgets it: leaving says nothing about
+/// whether they will host next time, and silence is what a host looks like on
+/// the day it is needed.
+fn heard_hosting(
+    id: &str,
+    state: State,
+    host: Option<door::Offer>,
+    offered: &mut Option<String>,
+    news: Option<&RoomNews>,
+) {
+    match host.and_then(door::Offer::clean) {
+        Some(offer) => {
+            if offered.as_deref() == Some(offer.door.as_str()) {
+                return;
+            }
+            tracing::info!("{id} hosts this room; keeping it with the room");
+            if let Some(news) = news {
+                let _ = news.to.unbounded_send(HostNews::Heard {
+                    room: news.room.clone(),
+                    id: id.to_string(),
+                    door: offer.door.clone(),
+                    told_by: id.to_string(),
+                });
+            }
+            *offered = Some(offer.door);
+        }
+        // The goodbye is not a change of mind, whatever it carries.
+        None if state == State::Leaving => {}
+        None => {
+            if offered.take().is_some() {
+                tracing::info!("{id} stopped hosting this room; forgetting it");
+                if let Some(news) = news {
+                    let _ = news.to.unbounded_send(HostNews::Stopped {
+                        room: news.room.clone(),
+                        id: id.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Whether an attempt's inbound is its outbound: always for a room hosted
+/// here, for a join only with hosting on as it starts, never otherwise.
+fn shares_origin(peering: &Peering, host_rooms: bool) -> bool {
+    match peering {
+        Peering::Host(_) => true,
+        Peering::Join(_) => host_rooms,
+        Peering::Dial(_) | Peering::Listen | Peering::Loopback | Peering::Idle => false,
+    }
+}
+
+/// The attempt's inbound origin: the outbound itself when shared, or one of
+/// its own.
+fn inbound_for(outbound: &moq_net::origin::Producer, shared: bool) -> moq_net::origin::Producer {
+    if shared { outbound.clone() } else { moq_tokio::origin::spawn() }
+}
+
+/// Everything [`host_alongside`] needs, named rather than positional.
+struct Alongside<'a> {
+    config: &'a moq_tokio::client::Config,
+    endpoint: &'a moq_tokio::iroh::Endpoint,
+    /// The one origin the join and its guests share.
+    shared: moq_net::origin::Producer,
+    /// The room on the relay; its path is the room we host.
+    url: &'a url::Url,
+    doors: &'a door::Doors,
+    metrics: Arc<Metrics>,
+    local: Arc<PeerStats>,
+}
+
+/// Serves the room's members directly beside a join, behind the room's door,
+/// and says so in presence, until hosting is switched off or the attempt
+/// ends. `None` when it cannot: logged, and the join goes on regardless.
+///
+/// **The guests' links do not steer what we send.** Our encoding follows the
+/// relay link's estimate, as a join's always has; feeding the guests'
+/// sessions into it too would give the estimate two writers and let their
+/// connection figures overwrite the relay's in the Network tab. Following
+/// whichever session carries the media is for when a join holds several.
+///
+/// Switching hosting off ends this at once and every guest's session with
+/// it; switching it on again takes effect from the next join, because the
+/// origins are wired as the attempt starts.
+async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
+    let Alongside {
+        config,
+        endpoint,
+        shared,
+        url,
+        doors,
+        metrics,
+        local,
+    } = args;
+    let room = url.path().trim_matches('/').to_string();
+    if room.is_empty() {
+        tracing::info!("not hosting: this room is the relay's root, which has no name a guest could ask for");
+        return None;
+    }
+    let Some(entry) = doors.get(&crate::recent::identity(url)) else {
+        tracing::warn!("not hosting: no door was issued for this room");
+        return None;
+    };
+    let hosting = door::Hosting::with_door(room, entry);
+    let served = serve(Serve {
+        config,
+        endpoint,
+        publisher: shared.consume(),
+        subscriber: shared.clone(),
+        door: Some(hosting.clone()),
+        estimates: None,
+        metrics,
+    })
+    .await;
+    let (accepting, mut events) = match served {
+        Ok(served) => served,
+        Err(error) => {
+            tracing::warn!("not hosting: {error}");
+            return None;
+        }
+    };
+    local.set_offer(Some(hosting.offer(shared.hop().id())));
+    tracing::info!("hosting this room for its members as well as joining it");
+    Some(Abort(tokio::spawn(async move {
+        let mut accepting = Some(accepting);
+        let mut live = 0usize;
+        // Polled as the presence announcer polls: a quarter of a second to
+        // notice a switch is not something anyone can see.
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => if !local.host_rooms() {
+                    tracing::info!("hosting switched off; turning {live} guests away");
+                    break;
+                },
+                event = events.next() => match event {
+                    Some(true) => {
+                        live += 1;
+                        tracing::info!("a guest came in directly; {live} connected");
+                    }
+                    Some(false) => {
+                        live = live.saturating_sub(1);
+                        tracing::info!("a direct guest's session ended; {live} connected");
+                    }
+                    None => {
+                        tracing::warn!("stopped hosting: the server ended");
+                        break;
+                    }
+                },
+            }
+        }
+        // The server and its sessions first, then the word: nobody should
+        // read the door after it stopped opening.
+        accepting.take();
+        local.set_offer(None);
+    })))
 }
 
 /// What a presence reader needs to act on requests addressed to us: who we
@@ -2528,7 +2785,8 @@ mod path_tests {
 
 #[cfg(test)]
 mod presence_tests {
-    use super::{Link, Presence, Seen, State, asked_of, honour, quality, subroom};
+    use super::{HostNews, Link, Presence, RoomNews, Seen, State, asked_of, door, heard_hosting, honour, inbound_for, quality, shares_origin, subroom};
+    use crate::args::Peering;
     use crate::net::metrics::{Ask, Clock, Request};
     use crate::net::quality::Quality;
 
@@ -2665,6 +2923,7 @@ mod presence_tests {
             name: Some("Ada".to_string()),
             link: None,
             seen: Default::default(),
+            host: None,
         };
         let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
         assert_eq!(heard, said);
@@ -2885,6 +3144,115 @@ mod presence_tests {
         let blank: Presence = serde_json::from_str(r#"{"state":"here","name":" \t "}"#).unwrap();
         assert_eq!(blank.name.as_deref().and_then(crate::name::clean), None);
     }
+
+    const DOOR: &str = "00112233445566778899aabbccddeeff";
+
+    /// Our own entry, serving a room behind `DOOR` with hop 7.
+    fn hosting(on: bool) -> crate::net::PeerStats {
+        let local = reporting(false);
+        if on {
+            local.set_offer(Some(door::Offer { door: DOOR.to_string(), hop: 7 }));
+        }
+        local
+    }
+
+    #[test]
+    fn not_hosting_the_document_is_the_old_shape_byte_for_byte() {
+        let ours = serde_json::to_string(&Presence::here(&hosting(false))).unwrap();
+        let old = serde_json::to_string(&Presence::here(&reporting(false))).unwrap();
+        assert_eq!(ours, old);
+        assert!(!ours.contains("host"), "{ours}");
+    }
+
+    #[test]
+    fn hosting_is_said_and_survives_the_round_trip() {
+        let said = Presence::here(&hosting(true));
+        let json = serde_json::to_string(&said).unwrap();
+        assert!(json.contains(&format!(r#""host":{{"door":"{DOOR}","hop":7}}"#)), "{json}");
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard, said);
+        assert!(!format!("{said:?}").contains(DOOR), "the door stays out of Debug");
+    }
+
+    #[test]
+    fn an_older_peer_reads_a_hosting_document_and_is_not_hosting() {
+        let json = serde_json::to_string(&Presence::here(&hosting(true))).unwrap();
+        let heard: Previous = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard.name.as_deref(), Some("Ada"));
+        let old: Presence = serde_json::from_str(r#"{"state":"here","name":"Ada"}"#).unwrap();
+        assert_eq!(old.host, None);
+    }
+
+    #[test]
+    fn a_malformed_host_costs_only_itself_and_a_bad_one_is_never_said() {
+        let heard: Presence = serde_json::from_str(r#"{"state":"here","name":"Ada","host":{"door":"x","hop":7}}"#).unwrap();
+        assert_eq!(heard.host, None);
+        assert_eq!(heard.name.as_deref(), Some("Ada"));
+        let local = reporting(false);
+        local.set_offer(Some(door::Offer { door: "not a door".to_string(), hop: 7 }));
+        assert_eq!(Presence::here(&local).host, None, "cleaned on the way out too");
+    }
+
+    #[test]
+    fn only_a_hosting_join_or_a_hosted_room_shares_one_origin() {
+        let url: url::Url = "https://relay.example.com/team".parse().unwrap();
+        let peer: iroh::EndpointId = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        for host_rooms in [false, true] {
+            assert!(shares_origin(&Peering::Host("team".into()), host_rooms));
+            assert_eq!(shares_origin(&Peering::Join(url.clone()), host_rooms), host_rooms);
+            for other in [Peering::Dial(peer), Peering::Listen, Peering::Loopback, Peering::Idle] {
+                assert!(!shares_origin(&other, host_rooms), "{other:?}");
+            }
+        }
+    }
+
+    /// With hosting off a join keeps two origins, as it always has: the
+    /// inbound is a separate origin, with a hop of its own.
+    #[tokio::test]
+    async fn an_unshared_inbound_is_an_origin_of_its_own() {
+        let outbound = moq_tokio::origin::spawn();
+        assert_ne!(inbound_for(&outbound, false).hop(), outbound.hop());
+        assert_eq!(inbound_for(&outbound, true).hop(), outbound.hop());
+    }
+
+    fn news() -> (RoomNews, futures_channel::mpsc::UnboundedReceiver<HostNews>) {
+        let (to, from) = futures_channel::mpsc::unbounded();
+        (RoomNews { room: "room".to_string(), to }, from)
+    }
+
+    fn offer(door: &str) -> Option<door::Offer> {
+        Some(door::Offer { door: door.to_string(), hop: 7 })
+    }
+
+    /// What reaches the interface, as `(heard, door)` or `(stopped, "")`.
+    fn drained(from: &mut futures_channel::mpsc::UnboundedReceiver<HostNews>) -> Vec<(&'static str, String)> {
+        std::iter::from_fn(|| from.try_recv().ok())
+            .map(|news| match news {
+                HostNews::Heard { door, .. } => ("heard", door),
+                HostNews::Stopped { .. } => ("stopped", String::new()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_host_is_reported_on_a_change_only_and_forgotten_only_when_it_stops() {
+        let (news, mut from) = news();
+        let other = "ffeeddccbbaa99887766554433221100";
+        let mut offered = None;
+        let mut say = |state, host| heard_hosting(&id('h'), state, host, &mut offered, Some(&news));
+        say(State::Here, None);
+        say(State::Here, offer(DOOR));
+        say(State::Here, offer(DOOR));
+        say(State::Here, offer(other));
+        say(State::Leaving, None);
+        say(State::Here, None);
+        say(State::Here, None);
+        say(State::Here, offer("junk"));
+        assert_eq!(
+            drained(&mut from),
+            [("heard", DOOR.to_string()), ("heard", other.to_string()), ("stopped", String::new())]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2908,6 +3276,15 @@ mod room_tests {
         assert!(shown.contains("door=redacted") && shown.contains("x=1"), "{shown}");
         let status = crate::net::RemoteStatus::InRoom { room: room_label(&url) }.to_string();
         assert!(!status.contains(door), "{status}");
+    }
+
+    #[test]
+    fn an_invites_hosts_never_reach_the_log() {
+        const DOOR: &str = "00112233445566778899aabbccddeeff";
+        let url: url::Url = format!("https://relay.example.com/team?jwt=t&host={}.{DOOR}", "a".repeat(64)).parse().unwrap();
+        let shown = redacted(&url);
+        assert!(!shown.contains(DOOR), "{shown}");
+        assert!(shown.contains("host=redacted"), "{shown}");
     }
 
     #[test]
@@ -2967,7 +3344,7 @@ mod served_tests {
         let server = config.init().unwrap().bind().await.unwrap();
         let port = server.local_addr().unwrap().port();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (task, _) = accept(server, door, estimates, Arc::new(Metrics::default()));
+        let (task, _) = accept(server, door, Some(estimates), Arc::new(Metrics::default()));
         (task, port)
     }
 
@@ -3072,6 +3449,127 @@ mod served_tests {
             assert_eq!(error.connect_error(), Some(moq_tokio::ConnectError::Unauthorized), "{target}: {error}");
             assert!(explain(format!("{error:#}")).starts_with("the room refused"), "{error:#}");
         }
+    }
+
+    /// A server on a local port whose sessions publish `publisher` and land
+    /// in `subscriber`, through [`accept`] with no door.
+    async fn serving(publisher: moq_net::origin::Consumer, subscriber: moq_net::origin::Producer) -> (Abort, u16) {
+        let mut config = moq_tokio::server::Config::default();
+        config.listen.bind = Some(moq_tokio::listen::Bind::Addr(([127, 0, 0, 1], 0).into()));
+        config.listen.tls.generate = vec!["localhost".to_string()];
+        config.publisher = Some(publisher);
+        config.subscriber = Some(subscriber);
+        let server = config.init().unwrap().bind().await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
+        let (task, _) = accept(server, None, Some(estimates), Arc::new(Metrics::default()));
+        (task, port)
+    }
+
+    /// A member hosting while in a relay room, as the app wires it: one
+    /// origin for its session to the relay, for its guests and for its own
+    /// camera.
+    struct Bridge {
+        _connection: moq_tokio::Connection,
+        _accepting: Abort,
+        port: u16,
+        _camera: moq_net::broadcast::Producer,
+    }
+
+    async fn bridge(relay: u16, id: &str) -> Bridge {
+        let shared = moq_tokio::origin::spawn();
+        let camera = shared.create_broadcast(camera_path(id)).unwrap();
+        camera.announce(moq_net::origin::Route::default()).unwrap();
+        let mut config = moq_tokio::client::Config::default();
+        config.connect.tls.insecure = Some(true);
+        let url: url::Url = format!("moqt://localhost:{relay}/room").parse().unwrap();
+        let connection = config
+            .init()
+            .unwrap()
+            .with_publisher(shared.consume())
+            .with_subscriber(shared.clone())
+            .with_reconnect(false)
+            .connect(url);
+        let (accepting, port) = serving(shared.consume(), shared).await;
+        Bridge {
+            _connection: connection,
+            _accepting: accepting,
+            port,
+            _camera: camera,
+        }
+    }
+
+    /// Waits for `path` to be announced in `origin`, or, with `active` false,
+    /// retracted from it.
+    async fn announced_in(origin: &moq_net::origin::Producer, path: &str, active: bool) {
+        let mut announced = origin.consume().announced();
+        let mut live = false;
+        tokio::time::timeout(WITHIN, async {
+            while let Some(update) = announced.next().await {
+                if update.prefix.as_str() == path {
+                    live = update.kind.is_active();
+                    if live == active {
+                        return;
+                    }
+                }
+            }
+            panic!("the announcements ended before {path}");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{path} never became {}", if active { "announced" } else { "retracted" }));
+    }
+
+    /// The bridge: a guest of the host and a member on the relay see each
+    /// other, through the host's one origin. And when the member leaves, they
+    /// are gone everywhere: a route the host had offered back to the relay
+    /// would keep them announced in a loop that never ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hosting_member_bridges_its_guests_and_the_relay_room() {
+        let relay = moq_tokio::origin::spawn();
+        let (_relaying, relay_port) = serving(relay.consume(), relay.clone()).await;
+        let host = bridge(relay_port, "h").await;
+        let guest_of_host = guest(host.port, "/room", "g");
+        let member = guest(relay_port, "/room", "c");
+        sees(&guest_of_host, "c").await;
+        sees(&guest_of_host, "h").await;
+        sees(&member, "g").await;
+        sees(&member, "h").await;
+
+        let route = relay.consume().routed(camera_path("c")).await.expect("the relay has c");
+        assert_eq!(route.hops.len(), 1, "c straight from c, not through the host: {:?}", route.hops);
+
+        drop(member);
+        announced_in(&relay, &camera_path("c"), false).await;
+        announced_in(&guest_of_host.inbound, &camera_path("c"), false).await;
+    }
+
+    /// What the relay is offered by a hosting member: its own camera and its
+    /// guests', and **nothing the relay itself sent**. The relay's session
+    /// with the host lands in an origin of its own here, so everything in it
+    /// is exactly what the host offered; the relay's one route for a member
+    /// is then that member's own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relay_is_offered_the_host_and_its_guests_and_no_reflection() {
+        let relay = moq_tokio::origin::spawn();
+        let (_members, members_port) = serving(relay.consume(), relay.clone()).await;
+        let from_host = moq_tokio::origin::spawn();
+        let (_for_host, host_port) = serving(relay.consume(), from_host.clone()).await;
+        let member = guest(members_port, "/room", "c");
+        let host = bridge(host_port, "h").await;
+        let guest_of_host = guest(host.port, "/room", "g");
+        // The host has the member, so it could reflect them if it were going to.
+        sees(&guest_of_host, "c").await;
+        announced_in(&from_host, &camera_path("h"), true).await;
+        announced_in(&from_host, &camera_path("g"), true).await;
+
+        let mut offered = from_host.consume().announced();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        while let Some(update) = offered.try_next() {
+            assert_ne!(update.prefix.as_str(), camera_path("c"), "the host offered the relay its own member back");
+        }
+        let route = relay.consume().routed(camera_path("c")).await.expect("the relay has c");
+        assert_eq!(route.hops.len(), 1, "{:?}", route.hops);
+        drop(member);
     }
 
     /// Weaker than it looks: over this socket, dropping the listener closes its

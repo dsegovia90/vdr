@@ -11,6 +11,13 @@
 //! records it on reaching the room, so a typo or a refused token never enters
 //! the list.
 //!
+//! **It also holds where else a room can meet.** A member who hosts the rooms
+//! they join says so in presence, with a door; everyone who hears it keeps
+//! that host with the room ([`Host`]), and a room joined with hosting on keeps
+//! its own door, so the invites members saved keep working across launches.
+//! These are secrets like the token, kept here for the day the relay is down,
+//! and never displayed or logged.
+//!
 //! Nothing here panics, for the reasons [`crate::settings`] gives: a missing or
 //! corrupt file is an empty list, and a failed write is a log line.
 
@@ -28,6 +35,131 @@ const FILE: &str = "rooms.json";
 /// dropped.
 pub const KEPT: usize = 10;
 
+/// How many hosts a room keeps, the most recently heard. Enough for a team
+/// in which several people opted in; a host is only worth keeping while it
+/// might still answer.
+pub const HOSTS_KEPT: usize = 8;
+
+/// How long a host is kept without being heard again: a month. Long enough
+/// to outlast a holiday, short enough that someone who stopped hosting long
+/// ago is not dialled for ever.
+pub const HOST_EXPIRES: u64 = 30 * 24 * 60 * 60;
+
+/// Somewhere else this room can meet: a member's app that hosts it.
+///
+/// **Kept when the host leaves or goes quiet.** Hosts exist for the day the
+/// relay is down, which is exactly when nobody can hear them, so silence
+/// cannot mean "forget". A host is forgotten when it says, live, that it has
+/// stopped hosting, when it has not been heard for [`HOST_EXPIRES`], or when
+/// newer hosts push it past [`HOSTS_KEPT`].
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct Host {
+    /// The host's endpoint id: what to dial.
+    id: String,
+    /// The door it said, presented when dialling it.
+    door: String,
+    /// Whose presence told us, or `None` when it came in an invite. Today a
+    /// host is only ever announced by itself, so this is its own id; kept so
+    /// that a host vouched for by someone else would need no new format.
+    #[serde(default)]
+    told_by: Option<String>,
+    /// When it was last heard, in seconds since the Unix epoch.
+    heard: u64,
+}
+
+/// By hand: the door must not reach a log through a stray `{:?}`.
+impl std::fmt::Debug for Host {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Host")
+            .field("id", &crate::name::short(&self.id))
+            .field("heard", &self.heard)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Host {
+    /// A host as heard in presence or read from an invite, or `None` when
+    /// the id or the door is not the shape they always have.
+    pub fn new(id: &str, door: &str, told_by: Option<&str>, heard: u64) -> Option<Self> {
+        let told_by = match told_by {
+            Some(by) if crate::net::quality::valid_id(by) => Some(by.to_string()),
+            Some(_) => return None,
+            None => None,
+        };
+        (crate::net::quality::valid_id(id) && crate::net::door::is_door(door)).then(|| Self {
+            id: id.to_string(),
+            door: door.to_string(),
+            told_by,
+            heard,
+        })
+    }
+
+    /// The host's endpoint id.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+}
+
+/// Reads one `host=` value of an invite.
+fn invited(value: &str, now: u64) -> Option<Host> {
+    let (id, door) = value.split_once('.')?;
+    Host::new(id, door, None, now)
+}
+
+/// Splits an invite into the link to dial and the hosts it lists.
+///
+/// **The hosts never go to the relay.** They ride in the link as repeated
+/// `host=<endpoint id>.<door>` parameters, which an older build passes to the
+/// relay untouched (a relay reads only `jwt`), but this one takes them out
+/// before dialling and before remembering the link. A malformed entry is
+/// dropped; the rest of the link is unaffected.
+pub fn split_invite(url: &url::Url, now: u64) -> (url::Url, Vec<Host>) {
+    let param = crate::net::door::HOST_PARAM;
+    if !url.query_pairs().any(|(key, _)| key == param) {
+        return (url.clone(), Vec::new());
+    }
+    let mut hosts = Vec::new();
+    let mut kept = Vec::new();
+    for (key, value) in url.query_pairs() {
+        if key == param {
+            match invited(&value, now) {
+                Some(host) if !hosts.iter().any(|known: &Host| known.id == host.id) => hosts.push(host),
+                Some(_) => {}
+                None => tracing::warn!("ignoring a host in this link that is not an id and a door"),
+            }
+        } else {
+            kept.push((key.into_owned(), value.into_owned()));
+        }
+    }
+    let mut clean = url.clone();
+    if kept.is_empty() {
+        clean.set_query(None);
+    } else {
+        clean.query_pairs_mut().clear().extend_pairs(kept);
+    }
+    (clean, hosts)
+}
+
+/// A room's own door, read from the file: anything that is not a door is
+/// none, costing only itself.
+fn lenient_door<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.as_str().filter(|door| crate::net::door::is_door(door)).map(str::to_string))
+}
+
+/// A room's hosts, read from the file one by one: an entry that does not
+/// read, or whose id or door is malformed, costs only itself.
+fn lenient_hosts<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Host>, D::Error> {
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    let serde_json::Value::Array(entries) = value else { return Ok(Vec::new()) };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value::<Host>(entry).ok())
+        .filter_map(|host| Host::new(&host.id, &host.door, host.told_by.as_deref(), host.heard))
+        .collect())
+}
+
 /// A room joined before.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Room {
@@ -38,6 +170,13 @@ pub struct Room {
     /// Kept whatever the cap, and listed first.
     #[serde(default)]
     pinned: bool,
+    /// Our own door for this room, made the first time we joined it with
+    /// hosting on. Absent for a room never hosted.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_door")]
+    door: Option<String>,
+    /// Where else it can meet, most recently heard first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_hosts")]
+    hosts: Vec<Host>,
 }
 
 /// By hand, so that a stray `{:?}` cannot write the token into a log.
@@ -47,6 +186,8 @@ impl std::fmt::Debug for Room {
             .field("link", &self.log_form())
             .field("last_joined", &self.last_joined)
             .field("pinned", &self.pinned)
+            .field("door", &self.door.is_some())
+            .field("hosts", &self.hosts)
             .finish()
     }
 }
@@ -100,6 +241,29 @@ impl Room {
     pub fn log_form(&self) -> String {
         self.url().map_or_else(|| "an unreadable link".to_string(), |url| crate::net::redacted(&url))
     }
+
+    /// Takes in a host heard now: a known one is refreshed, its door
+    /// replaced if it changed; then the list is kept to [`HOSTS_KEPT`], the
+    /// most recently heard.
+    fn heard(&mut self, host: Host) {
+        match self.hosts.iter_mut().find(|known| known.id == host.id) {
+            Some(known) => {
+                known.heard = known.heard.max(host.heard);
+                known.door = host.door;
+                if host.told_by.is_some() {
+                    known.told_by = host.told_by;
+                }
+            }
+            None => self.hosts.push(host),
+        }
+        self.hosts.sort_by_key(|host| std::cmp::Reverse(host.heard));
+        self.hosts.truncate(HOSTS_KEPT);
+    }
+
+    /// Drops hosts not heard for [`HOST_EXPIRES`].
+    fn expire(&mut self, now: u64) {
+        self.hosts.retain(|host| now.saturating_sub(host.heard) < HOST_EXPIRES);
+    }
 }
 
 /// A room's identity: scheme, relay host, port and path. Not the query, so a
@@ -128,13 +292,54 @@ impl RecentRooms {
     pub fn joined(&mut self, url: &url::Url, now: u64) {
         let key = identity(url);
         let pinned = self.rooms.iter().any(|room| room.pinned && room.key() == key);
+        // A rejoin keeps what the room has learned: its door and its hosts.
+        let kept = self.rooms.iter().find(|room| room.key() == key);
+        let door = kept.and_then(|room| room.door.clone());
+        let hosts = kept.map(|room| room.hosts.clone()).unwrap_or_default();
         self.rooms.retain(|room| room.key() != key);
         self.rooms.push(Room {
             link: url.to_string(),
             last_joined: now,
             pinned,
+            door,
+            hosts,
         });
         self.tidy();
+    }
+
+    /// The door of the room with this key, if it has one.
+    pub fn door_for(&self, key: &str) -> Option<String> {
+        self.rooms.iter().find(|room| room.key() == key).and_then(|room| room.door.clone())
+    }
+
+    /// Gives the room `door` unless it already has one: a door handed out is
+    /// never replaced, or every invite carrying it would stop working.
+    pub fn keep_door(&mut self, key: &str, door: &str) {
+        if !crate::net::door::is_door(door) {
+            return;
+        }
+        for room in self.rooms.iter_mut().filter(|room| room.key() == key && room.door.is_none()) {
+            room.door = Some(door.to_string());
+        }
+    }
+
+    /// Records a host heard for the room with this key. Returns whether the
+    /// room is in the list; one not remembered yet keeps nothing.
+    pub fn heard(&mut self, key: &str, host: Host, now: u64) -> bool {
+        let mut found = false;
+        for room in self.rooms.iter_mut().filter(|room| room.key() == key) {
+            room.heard(host.clone());
+            room.expire(now);
+            found = true;
+        }
+        found
+    }
+
+    /// Forgets a host that said it stopped hosting this room.
+    pub fn forget(&mut self, key: &str, id: &str) {
+        for room in self.rooms.iter_mut().filter(|room| room.key() == key) {
+            room.hosts.retain(|host| host.id != id);
+        }
     }
 
     pub fn set_pinned(&mut self, key: &str, pinned: bool) {
@@ -196,6 +401,10 @@ impl RecentRooms {
         list.rooms.retain(|room| room.url().is_some());
         if list.rooms.len() < before {
             tracing::warn!("ignoring {} remembered rooms whose link is not a relay url", before - list.rooms.len());
+        }
+        let now = now();
+        for room in &mut list.rooms {
+            room.expire(now);
         }
         list.tidy();
         list
@@ -477,6 +686,118 @@ mod tests {
             assert!(!shown.contains(TOKEN), "{shown} carries the token");
             assert!(!shown.contains("secret-payload"), "{shown} carries part of the token");
         }
+    }
+
+    const DOOR: &str = "00112233445566778899aabbccddeeff";
+    const OTHER_DOOR: &str = "ffeeddccbbaa99887766554433221100";
+
+    fn hex(c: char) -> String {
+        std::iter::repeat_n(c, 64).collect()
+    }
+
+    fn host(c: char, door: &str, heard: u64) -> Host {
+        Host::new(&hex(c), door, Some(&hex(c)), heard).expect("a well-formed host")
+    }
+
+    fn team() -> (RecentRooms, String) {
+        let mut list = RecentRooms::default();
+        list.joined(&url(&format!("https://relay.example.com/team?jwt={TOKEN}")), 1);
+        let key = list.rooms()[0].key();
+        (list, key)
+    }
+
+    #[test]
+    fn a_host_is_kept_with_its_room_refreshed_and_its_door_replaced() {
+        let (mut list, key) = team();
+        assert!(list.heard(&key, host('a', DOOR, 10), 10));
+        assert!(list.heard(&key, host('a', OTHER_DOOR, 20), 20));
+        let room = &list.rooms()[0];
+        assert_eq!(room.hosts.len(), 1);
+        assert_eq!(room.hosts[0].door, OTHER_DOOR);
+        assert_eq!(room.hosts[0].heard, 20);
+        assert!(!list.heard("https://relay.example.com:443/other", host('b', DOOR, 20), 20), "a room not remembered keeps nothing");
+    }
+
+    #[test]
+    fn hosts_are_capped_by_the_most_recently_heard_and_expire() {
+        let (mut list, key) = team();
+        let ids = "abcdef0123";
+        for (at, c) in ids.chars().enumerate() {
+            list.heard(&key, host(c, DOOR, 100 + at as u64), 100 + at as u64);
+        }
+        let kept: Vec<String> = list.rooms()[0].hosts.iter().map(|host| host.id[..1].to_string()).collect();
+        assert_eq!(kept, ["3", "2", "1", "0", "f", "e", "d", "c"], "the eight most recently heard");
+
+        let later = 109 + HOST_EXPIRES - 1;
+        list.heard(&key, host('9', DOOR, later), later);
+        let kept: Vec<String> = list.rooms()[0].hosts.iter().map(|host| host.id[..1].to_string()).collect();
+        assert_eq!(kept, ["9", "3"], "only the ones heard within the month");
+    }
+
+    #[test]
+    fn a_host_that_stops_is_forgotten_and_a_rejoin_keeps_the_rest() {
+        let (mut list, key) = team();
+        list.heard(&key, host('a', DOOR, 10), 10);
+        list.heard(&key, host('b', DOOR, 10), 10);
+        list.forget(&key, &hex('a'));
+        list.keep_door(&key, DOOR);
+        list.joined(&url("https://relay.example.com/team?jwt=fresh"), 50);
+        let room = &list.rooms()[0];
+        assert_eq!(room.hosts.len(), 1);
+        assert_eq!(room.hosts[0].id, hex('b'));
+        assert_eq!(room.door.as_deref(), Some(DOOR));
+    }
+
+    #[test]
+    fn a_door_handed_out_is_never_replaced() {
+        let (mut list, key) = team();
+        assert_eq!(list.door_for(&key), None);
+        list.keep_door(&key, "not a door");
+        assert_eq!(list.door_for(&key), None);
+        list.keep_door(&key, DOOR);
+        list.keep_door(&key, OTHER_DOOR);
+        assert_eq!(list.door_for(&key).as_deref(), Some(DOOR));
+    }
+
+    #[test]
+    fn a_link_with_only_hosts_loses_its_query_and_a_bad_host_costs_only_itself() {
+        let a = hex('a');
+        let text = format!("iroh://{b}/team?host={a}.{DOOR}&host=nonsense&host={a}.{OTHER_DOOR}&host={a}", b = hex('b'));
+        let (link, hosts) = split_invite(&url(&text), 0);
+        assert_eq!(link.as_str(), format!("iroh://{}/team", hex('b')));
+        assert_eq!(hosts.len(), 1, "one well-formed host, once");
+        assert_eq!(hosts[0].door, DOOR);
+        let plain = url("https://relay.example.com/team?jwt=x");
+        assert_eq!(split_invite(&plain, 0).0, plain);
+    }
+
+    #[test]
+    fn a_saved_room_keeps_its_hosts_and_door_and_bad_entries_cost_only_themselves() {
+        let path = temp("hosts");
+        let now = now();
+        let (mut list, key) = team();
+        list.keep_door(&key, DOOR);
+        list.heard(&key, host('b', OTHER_DOOR, now), now);
+        list.write_to(&path);
+        assert_eq!(RecentRooms::load_from(&path), list);
+
+        let b = hex('b');
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"rooms":[{{"link":"https://relay.example.com/team","last_joined":1,"door":42,
+                    "hosts":[{{"id":"{b}","door":"{DOOR}","heard":{now}}},{{"id":"short","door":"{DOOR}","heard":{now}}},
+                             {{"id":"{b}"}},7,{{"id":"{b}","door":"{DOOR}","heard":1}}]}},
+                   {{"link":"https://relay.example.com/other","last_joined":2,"hosts":"x"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let loaded = RecentRooms::load_from(&path);
+        assert_eq!(keys(&loaded), ["other", "team"]);
+        let team = &loaded.rooms()[1];
+        assert_eq!(team.door, None, "a door that is not one is none");
+        assert_eq!(team.hosts.len(), 1, "one good entry; the expired and malformed ones go");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
