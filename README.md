@@ -156,6 +156,11 @@ is not known yet. A person not reporting has none, and neither does a shared
 screen; the person's menu says it in a line. Turning the switch off stops
 telling the room about your connection and hides everyone else's. The
 thresholds are first guesses.
+*Move the call*, off by default, is a test instrument for rooms with hosts:
+with it on, a host's menu offers "Move the call here", and everyone else who
+has the switch on follows the move, sending their video through that host's
+computer until someone chooses "Back to automatic" in the same tab. People
+who cannot reach the host stay on the relay, and the host carries them across.
 Its *About* tab shows the version and where the
 log is, which is what to send after a call that went wrong.
 
@@ -227,6 +232,14 @@ microphone nor the speaker). For a test that must survive a restart, use
 `--profile <dir>` instead of `--ephemeral`: the instance keeps its own folder
 (settings, rooms, log and key) there, never the real one, and never updates
 itself.
+
+To test moving a call between the relay and a room's hosts from a script,
+start the instances with `--move-calls` (the *Move the call* switch, unsaved),
+and one of them with `--bounce <secs>`, which moves the call round the relay
+and each host it knows every so often (10 seconds at least, 30 if no number
+is given). `--move-call relay|<host id>` moves it once, as the join starts.
+Each move is logged, and each viewer logs `<id> left` and `<id> back after N
+ms` for a tile that went and came back.
 
 Run it with `dx`, not `cargo run`: the stylesheet only resolves inside a dx
 bundle, and `cargo run` comes up unstyled. `cargo clippy` and `cargo test` work
