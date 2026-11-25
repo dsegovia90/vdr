@@ -1025,15 +1025,27 @@ async fn run(
             .map_err(|error| format!("could not announce our presence: {error:#}"))?;
         let announcing = Abort(tokio::spawn(announce(presence.clone(), local.clone())));
 
-        let engine = audio::open_playback(&controls).await;
+        let no_audio = crate::args::Args::get().no_audio;
+        let engine = if no_audio {
+            tracing::info!("[audio] --no-audio: neither the microphone nor the speaker is opened");
+            None
+        } else {
+            audio::open_playback(&controls).await
+        };
         let mut aec_report = None;
-        match audio::publish(broadcast.clone(), catalog.clone(), engine.as_ref(), link.allocator.clone()) {
+        let published = if no_audio {
+            Err("--no-audio".to_string())
+        } else {
+            audio::publish(broadcast.clone(), catalog.clone(), engine.as_ref(), link.allocator.clone())
+        };
+        match published {
             Ok((publication, driver, canceller)) => {
                 controls.attach(publication);
                 audio::drive(driver);
                 aec_report = canceller
                     .map(|canceller| Abort(tokio::spawn(audio::report_aec(canceller, Some(metrics.clone())))));
             }
+            Err(_) if no_audio => {}
             Err(error) => tracing::warn!("[audio] the microphone is not being published: {error}"),
         }
         // The camera broadcast likewise, once its catalog and the microphone's
@@ -1995,7 +2007,7 @@ async fn attend(
             tasks.push(Abort(tokio::spawn(async move {
                 audio::subscribe(broadcast, peer, engine, stats, Some(rooms), None).await;
             })));
-        } else {
+        } else if !crate::args::Args::get().no_audio {
             tracing::warn!("[audio] {id} cannot be heard: there is no output device");
         }
         attending.insert(id.to_string(), tasks);

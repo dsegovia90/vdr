@@ -50,6 +50,10 @@ focus.
   opening the camera can change its format under another app that is using it.
 - **`--loopback` plays the microphone back through the speakers.** Do not use
   it unasked.
+- **`--no-audio`** opens neither the microphone nor the speaker. Use it for
+  every test instance unless audio is what you are testing, and always when
+  running several on one machine: each would otherwise take the microphone and
+  play the others through the speakers.
 - Do not send synthetic keystrokes or take screenshots of someone's screen
   without being asked. Build, run the unit tests, and hand the visual check to a
   person with a list of exactly what to look at.
@@ -314,7 +318,7 @@ focus.
 
 | Path | Role |
 |---|---|
-| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--host`, `--loopback`, `--camera`, `--camera-off`, `--ephemeral`, `--quality`, `--encoder`, …) |
+| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--host`, `--loopback`, `--camera`, `--camera-off`, `--no-audio`, `--ephemeral`, `--quality`, `--encoder`, …) |
 | `settings.rs` | what the app remembers between launches, the data folder, the log path |
 | `hotkeys.rs` | keyboard shortcuts as a pure table: actions, chords, the keymap. No UI in it |
 | `name.rs` | display names: cleaning, the short id, which label to show |

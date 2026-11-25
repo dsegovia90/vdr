@@ -30,6 +30,7 @@
 //! vdr --stats alice.jsonl                 # one line of measurements a second
 //! vdr --no-catchup                        # measure audio sync, never speed it up
 //! vdr --loopback --audio-stall 800        # hold audio back once, to make a backlog
+//! vdr --ephemeral --no-audio              # opens neither microphone nor speaker
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry is a second
@@ -244,6 +245,11 @@ pub struct Args {
     /// this long, so it queues and lands as a burst (`--audio-stall <ms>`).
     /// Reproduces a network stall's backlog on one machine.
     pub audio_stall: Option<std::time::Duration>,
+    /// Open neither the microphone nor the speaker (`--no-audio`). For running
+    /// several test instances on one machine without touching the audio of
+    /// the person at it: each would otherwise take the microphone and play
+    /// the others through the speakers.
+    pub no_audio: bool,
 }
 
 impl Args {
@@ -278,6 +284,7 @@ impl Args {
         let mut stats = None;
         let mut no_catchup = false;
         let mut audio_stall = None;
+        let mut no_audio = false;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -330,6 +337,7 @@ impl Args {
                     None => tracing::error!("--stats needs a file path"),
                 },
                 "--no-catchup" => no_catchup = true,
+                "--no-audio" => no_audio = true,
                 "--audio-stall" => match args.next().as_deref().map(str::parse::<u64>) {
                     Some(Ok(ms)) => audio_stall = Some(std::time::Duration::from_millis(ms)),
                     Some(Err(error)) => tracing::error!("--audio-stall is not a number: {error}"),
@@ -349,6 +357,7 @@ impl Args {
             stats,
             no_catchup,
             audio_stall,
+            no_audio,
         }
     }
 }

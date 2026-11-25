@@ -220,6 +220,11 @@ dx serve --renderer native                       # hot-reloading debug window
 dx serve --renderer native --args="--loopback"   # camera -> H.264 -> screen, no network
 ```
 
+To run several instances on one machine without touching its camera or audio,
+give each a throwaway identity and leave the devices closed:
+`vdr --ephemeral --camera-off --no-audio …` (`--no-audio` opens neither the
+microphone nor the speaker).
+
 Run it with `dx`, not `cargo run`: the stylesheet only resolves inside a dx
 bundle, and `cargo run` comes up unstyled. `cargo clippy` and `cargo test` work
 as usual. Measure anything performance-related on a release build: a debug
