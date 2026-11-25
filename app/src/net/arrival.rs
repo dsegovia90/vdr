@@ -25,7 +25,9 @@
 //! our guests' sessions (direct), another host's (via them), and **anything
 //! else is the far side of our own session, which is the relay**. That
 //! includes a host whose presence has not arrived yet, and a host on an older
-//! build that states no hop: both read as the relay.
+//! build that states no hop: both read as the relay. In a room hosted with
+//! `--host`, joined at `iroh://<host>/room`, that far side is the host
+//! itself, which states no hop there, so it is named from the address.
 //!
 //! **The nearest intermediary is named, and the one before it only when it is
 //! a known host**: `[.., host, relay]` reads "via relay, from that host". The
@@ -39,7 +41,7 @@
 //! within a moment (read in moq-net, not measured); a route that refused a
 //! request is the case where they could differ.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Through whom someone's broadcasts reach us.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +76,12 @@ pub(crate) struct Known<'a> {
     pub(crate) guests: &'a HashSet<u64>,
     /// Our own origin's hop.
     pub(crate) ours: u64,
+    /// The endpoint id on the far side of our session, when it is a person in
+    /// the room rather than a relay: a room hosted with `--host` is joined at
+    /// `iroh://<host>/room`, and that host states no hop.
+    pub(crate) far: Option<&'a str>,
+    /// Whose chain this is.
+    pub(crate) who: &'a str,
 }
 
 /// Reads a route's hop chain, oldest first. `None` for a chain that names us,
@@ -93,10 +101,43 @@ pub(crate) fn read(hops: &[u64], known: &Known<'_>) -> Option<Arrival> {
         .filter(|&&hop| known.theirs != Some(hop))
         .and_then(|hop| known.hosts.get(hop))
         .cloned();
-    Some(match known.hosts.get(&last) {
-        Some(id) => Arrival::Host { id: id.clone(), from },
-        None => Arrival::Relay { from },
+    Some(match (known.hosts.get(&last), known.far) {
+        (Some(id), _) => Arrival::Host { id: id.clone(), from },
+        (None, Some(far)) if far == known.who => Arrival::Direct,
+        (None, Some(far)) => Arrival::Host { id: far.to_string(), from },
+        (None, None) => Arrival::Relay { from },
     })
+}
+
+/// The hops our direct guests' sessions declared, while each session lives.
+///
+/// **Display only.** A hop is the guest's own claim, unauthenticated; it
+/// decides nothing but a word on a tile. Counted, because one guest can hold
+/// two sessions for a moment across a redial.
+#[derive(Default)]
+pub(crate) struct Guests(std::sync::Mutex<HashMap<u64, usize>>);
+
+impl Guests {
+    pub(crate) fn add(&self, hop: u64) {
+        if let Ok(mut hops) = self.0.lock() {
+            *hops.entry(hop).or_default() += 1;
+        }
+    }
+
+    pub(crate) fn remove(&self, hop: u64) {
+        if let Ok(mut hops) = self.0.lock() {
+            if let Some(count) = hops.get_mut(&hop) {
+                *count -= 1;
+                if *count == 0 {
+                    hops.remove(&hop);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn hops(&self) -> HashSet<u64> {
+        self.0.lock().map(|hops| hops.keys().copied().collect()).unwrap_or_default()
+    }
 }
 
 /// What a person's tile says about them: the way they reach us, or where we
@@ -151,14 +192,14 @@ mod tests {
     fn member(hops: &[u64], guests: &[u64]) -> Option<Arrival> {
         let hosts = hosts();
         let guests: HashSet<u64> = guests.iter().copied().collect();
-        read(hops, &Known { theirs: None, hosts: &hosts, guests: &guests, ours: US })
+        read(hops, &Known { theirs: None, hosts: &hosts, guests: &guests, ours: US, far: None, who: "m" })
     }
 
     /// Reads `hops` as the host `h`'s own broadcasts.
     fn of_host(hops: &[u64]) -> Option<Arrival> {
         let hosts = hosts();
         let guests = HashSet::new();
-        read(hops, &Known { theirs: Some(HOST), hosts: &hosts, guests: &guests, ours: US })
+        read(hops, &Known { theirs: Some(HOST), hosts: &hosts, guests: &guests, ours: US, far: None, who: "h" })
     }
 
     fn host(id: &str) -> Arrival {
@@ -213,6 +254,27 @@ mod tests {
         assert_eq!(member(&[MEMBER, 99], &[]), Some(RELAYED));
         assert_eq!(member(&[MEMBER, US, RELAY], &[]), None);
         assert_eq!(member(&[], &[]), None);
+    }
+
+    #[test]
+    fn in_a_room_hosted_with_host_the_far_side_is_that_host() {
+        let hosts = BTreeMap::new();
+        let guests = HashSet::new();
+        let at = |who| Known { theirs: None, hosts: &hosts, guests: &guests, ours: US, far: Some("x"), who };
+        assert_eq!(read(&[99], &at("x")), Some(Arrival::Direct), "the host's own");
+        assert_eq!(read(&[MEMBER, 99], &at("m")), Some(host("x")), "another guest's");
+    }
+
+    #[test]
+    fn a_guest_stays_known_until_its_last_session_ends() {
+        let guests = Guests::default();
+        guests.add(GATE);
+        guests.add(GATE);
+        guests.remove(GATE);
+        assert!(guests.hops().contains(&GATE));
+        guests.remove(GATE);
+        guests.remove(GATE);
+        assert!(guests.hops().is_empty());
     }
 
     #[test]

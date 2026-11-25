@@ -682,6 +682,17 @@ pub struct PeerStats {
     /// Whether each tile is marked with the way that person's video arrives.
     /// Our own entry only; the Experimental tab sets it.
     show_routes: AtomicBool,
+    /// Their origin's hop while they say they host, as cleaned on arrival;
+    /// zero when they do not. Names them in a route's hop chain.
+    host_hop: AtomicU64,
+    /// Whether any presence document of theirs has arrived, so a route is
+    /// not read before we could know they host.
+    heard: AtomicBool,
+    /// Through whom their broadcasts reach us, as last read; `None` before
+    /// the first reading and after they leave.
+    arrival: std::sync::Mutex<Option<super::arrival::Arrival>>,
+    /// Where our own broadcasts go. Our own entry only; `None` outside a room.
+    sending: std::sync::Mutex<Option<super::arrival::Sending>>,
     /// What we say about hosting this room, while we are serving it. Our own
     /// entry only; the presence announcer reads it. Carries the door.
     offer: std::sync::Mutex<Option<super::door::Offer>>,
@@ -894,6 +905,10 @@ impl Default for PeerStats {
             connection_report: AtomicBool::new(true),
             host_rooms: AtomicBool::new(false),
             show_routes: AtomicBool::new(false),
+            host_hop: AtomicU64::new(0),
+            heard: AtomicBool::new(false),
+            arrival: std::sync::Mutex::new(None),
+            sending: std::sync::Mutex::new(None),
             offer: std::sync::Mutex::new(None),
             move_calls: AtomicBool::new(false),
             call_on: std::sync::Mutex::new(None),
@@ -1226,6 +1241,54 @@ impl PeerStats {
 
     pub fn set_show_routes(&self, on: bool) {
         self.show_routes.store(on, Ordering::Relaxed);
+    }
+
+    /// Their origin's hop while they host, or `None`.
+    pub(super) fn host_hop(&self) -> Option<u64> {
+        match self.host_hop.load(Ordering::Relaxed) {
+            0 => None,
+            hop => Some(hop),
+        }
+    }
+
+    pub(super) fn set_host_hop(&self, hop: Option<u64>) {
+        self.host_hop.store(hop.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Whether they host the room, as they last said; for our own entry,
+    /// whether we serve it now.
+    pub fn hosting(&self) -> bool {
+        self.host_hop().is_some() || self.offer().is_some()
+    }
+
+    pub(super) fn heard(&self) -> bool {
+        self.heard.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set_heard(&self) {
+        self.heard.store(true, Ordering::Relaxed);
+    }
+
+    /// Through whom their broadcasts reach us.
+    pub fn arrival(&self) -> Option<super::arrival::Arrival> {
+        self.arrival.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub(super) fn set_arrival(&self, arrival: Option<super::arrival::Arrival>) {
+        if let Ok(mut slot) = self.arrival.lock() {
+            *slot = arrival;
+        }
+    }
+
+    /// Where our own broadcasts go. Meaningful on our own entry.
+    pub fn sending(&self) -> Option<super::arrival::Sending> {
+        self.sending.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub(super) fn set_sending(&self, sending: Option<super::arrival::Sending>) {
+        if let Ok(mut slot) = self.sending.lock() {
+            *slot = sending;
+        }
     }
 
     /// What we say about hosting the room we are in, while we serve it.

@@ -17,7 +17,7 @@
 //! loopback -- which is why the renderer needs to know nothing about either.
 
 mod adapt;
-mod arrival;
+pub(crate) mod arrival;
 mod audio;
 mod call;
 mod codec_check;

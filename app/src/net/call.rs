@@ -48,6 +48,7 @@ use moq_mux::catalog::Stream as _;
 mod sessions;
 
 use super::adapt;
+use super::arrival;
 use super::audio;
 use super::door;
 use super::runtime::runtime;
@@ -380,6 +381,9 @@ struct Serve<'a> {
     metrics: Arc<Metrics>,
     /// Where a host counts what it sends each guest; `None` for a listener.
     forwarded: Option<Arc<Forwarded>>,
+    /// Where each guest's session hop is kept while it lasts, so a route
+    /// straight from a guest reads as direct; `None` where nothing reads it.
+    guests: Option<Arc<arrival::Guests>>,
 }
 
 /// Starts accepting sessions on our endpoint, for as long as the returned
@@ -398,6 +402,7 @@ async fn serve(
         estimates,
         metrics,
         forwarded,
+        guests,
     } = args;
     let mut server_config = moq_tokio::server::Config::default();
     server_config.listen.bind = Some(moq_tokio::listen::Bind::Addr(
@@ -416,7 +421,7 @@ async fn serve(
         .bind()
         .await
         .map_err(|error| format!("could not listen: {error:#}"))?;
-    Ok(accept(server, door, estimates, metrics, forwarded))
+    Ok(accept(server, door, estimates, metrics, forwarded, guests))
 }
 
 /// The accept loop, apart from the server it runs on so it can be driven over
@@ -439,6 +444,7 @@ fn accept(
     estimates: Option<Arc<adapt::Estimates>>,
     metrics: Arc<Metrics>,
     forwarded: Option<Arc<Forwarded>>,
+    guests: Option<Arc<arrival::Guests>>,
 ) -> (Abort, futures_channel::mpsc::UnboundedReceiver<bool>) {
     let (events, receiver) = futures_channel::mpsc::unbounded::<bool>();
     let task = Abort(tokio::spawn(async move {
@@ -467,6 +473,11 @@ fn accept(
             let estimates = estimates.clone();
             let metrics = metrics.clone();
             let events = events.clone();
+            // The hop the guest declared, kept while its session lives.
+            let declared = guests.clone().zip(request.peer_hop().map(|hop| hop.id()).filter(|&hop| hop != 0));
+            if let Some((guests, hop)) = &declared {
+                guests.add(*hop);
+            }
             sessions.spawn(async move {
                 match (request.ok().await, estimates) {
                     (Ok(session), Some(estimates)) => adapt::forward(session, estimates, metrics).await,
@@ -474,6 +485,9 @@ fn accept(
                         let _ = session.closed().await;
                     }
                     (Err(error), _) => tracing::warn!("a session failed to start: {error:#}"),
+                }
+                if let Some((guests, hop)) = declared {
+                    guests.remove(hop);
                 }
                 let _ = events.unbounded_send(false);
             });
@@ -1252,6 +1266,22 @@ async fn run(
             Peering::Dial(_) | Peering::Listen | Peering::Host(_) => true,
             Peering::Loopback | Peering::Idle => false,
         };
+        // What reading each person's route needs beside the chain itself.
+        let routing = Routing {
+            guests: Arc::new(arrival::Guests::default()),
+            ours: outbound.hop().id(),
+            far: match &peering {
+                Peering::Join(url) if url.scheme() == "iroh" => url.host_str().map(str::to_string),
+                _ => None,
+            },
+        };
+        // Where our media goes, for our own tile. A join over several sessions
+        // says it as it moves (see `sessions`).
+        local.set_sending(match &peering {
+            Peering::Join(_) if !several => Some(arrival::Sending::Relay),
+            Peering::Host(_) => Some(arrival::Sending::Guests),
+            _ => None,
+        });
         let peer_transport: Peer = match peering {
             Peering::Dial(peer) => {
                 report(RemoteStatus::Dialing {
@@ -1309,6 +1339,7 @@ async fn run(
                         estimates: adapt::Estimates::new(guests),
                         local: local.clone(),
                         forwarded: forwarded.clone(),
+                        guests: routing.guests.clone(),
                     })
                     .await;
                 }
@@ -1363,6 +1394,7 @@ async fn run(
                     estimates: Some(adapt::Estimates::new(estimate.clone())),
                     metrics: metrics.clone(),
                     forwarded: None,
+                    guests: None,
                 })
                 .await?;
                 let status = status.clone();
@@ -1440,6 +1472,7 @@ async fn run(
                     estimates: Some(adapt::Estimates::new(estimate.clone())),
                     metrics: metrics.clone(),
                     forwarded: forwarded.clone(),
+                    guests: Some(routing.guests.clone()),
                 })
                 .await?;
                 if let Some(forwarded) = &forwarded {
@@ -1553,6 +1586,7 @@ async fn run(
                     controls: controls.clone(),
                 },
                 news,
+                routing,
             },
             engine,
         ));
@@ -1813,6 +1847,8 @@ async fn run(
         // The subroom was in a room that is gone now: the next call starts in
         // its main room, not in a name nobody else is using.
         local.set_room(None);
+        // Out of the room, our media goes nowhere.
+        local.set_sending(None);
         // Aborting the loop above stops the per-participant tasks with it, but
         // the tiles are the interface's and have to be taken down by name.
         let _ = participants.unbounded_send(ParticipantEvent::Cleared);
@@ -1960,6 +1996,19 @@ struct Reports {
     rooms: audio::Rooms,
     /// Where hosts heard in this room are reported, on a join.
     news: Option<RoomNews>,
+    /// What reading each person's route needs beside its chain.
+    routing: Routing,
+}
+
+/// What reading a route needs beside its hop chain (see `arrival`).
+struct Routing {
+    /// Our guests' session hops, while we host.
+    guests: Arc<arrival::Guests>,
+    /// Our own origin's hop.
+    ours: u64,
+    /// The endpoint id we joined at, over iroh: a person, when the room is
+    /// hosted with `--host`, or else a relay that is never in the room.
+    far: Option<String>,
 }
 
 /// Watches who is here, and gives each of them a tile and a decoder.
@@ -1987,6 +2036,7 @@ async fn attend(
         in_room,
         rooms,
         news,
+        routing,
     } = reports;
     // The stats file, if asked for (`--stats`). A file that cannot be opened is
     // a line in the log, not a failed call.
@@ -2037,6 +2087,12 @@ async fn attend(
         rooms: rooms.clone(),
         seen: Arc::default(),
     };
+    // Each person's route, as the hop chain of their control broadcast's
+    // announcement: everything of theirs is offered the same way, and this
+    // one is there whether or not a camera is. Read once a second rather than
+    // as it changes, so a host's presence has had time to name its hop.
+    let mut chains: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+    let mut routes: std::collections::HashMap<String, arrival::Arrival> = std::collections::HashMap::new();
 
     loop {
         let update = tokio::select! {
@@ -2046,6 +2102,7 @@ async fn attend(
             },
             _ = stats_tick.tick() => {
                 reporter.tick(std::time::Instant::now(), &metrics, &rooms.local, &people, &present, &me);
+                note_routes(&chains, &people, &mut routes, &routing, in_room);
                 if let Some(file) = stats_file.as_mut() {
                     write_stats(file, &me, &people, &metrics);
                 }
@@ -2073,6 +2130,21 @@ async fn attend(
             .or_else(|| participant_of(&path));
         if owner == Some(me.as_str()) {
             continue;
+        }
+        if let Some(id) = controller_of(&path) {
+            match update.kind {
+                moq_net::announce::Kind::Retracted => {
+                    chains.remove(id);
+                    if routes.remove(id).is_some() {
+                        if let Some(stats) = people.get(id) {
+                            stats.set_arrival(None);
+                        }
+                    }
+                }
+                _ => {
+                    chains.insert(id.to_string(), update.route.hops.as_slice().iter().map(|hop| hop.id()).collect());
+                }
+            }
         }
         // An announcement names a path; the broadcast is asked for by that path.
         // A re-priced route changes nothing we act on, and a retraction is the
@@ -2263,6 +2335,51 @@ async fn attend(
             tracing::warn!("[audio] {id} cannot be heard: there is no output device");
         }
         attending.insert(id.to_string(), tasks);
+    }
+}
+
+/// Reads each person's route from the chain last announced to us, and on a
+/// change sets it on their entry (which their tile polls) and logs it, so a
+/// scripted run can be judged from the log. Nobody is read before their
+/// presence has arrived: until then, a host would read as the relay.
+///
+/// Outside a room (a call dialled to one peer) there is nobody between.
+fn note_routes(
+    chains: &std::collections::HashMap<String, Vec<u64>>,
+    people: &std::collections::HashMap<String, Arc<PeerStats>>,
+    said: &mut std::collections::HashMap<String, arrival::Arrival>,
+    routing: &Routing,
+    in_room: bool,
+) {
+    let hosts: std::collections::BTreeMap<u64, String> = people
+        .iter()
+        .filter_map(|(id, stats)| stats.host_hop().map(|hop| (hop, id.clone())))
+        .collect();
+    let guests = routing.guests.hops();
+    let far = routing.far.as_deref().filter(|far| people.contains_key(*far));
+    for (id, hops) in chains {
+        let Some(stats) = people.get(id).filter(|stats| stats.heard()) else { continue };
+        let arrival = if in_room {
+            arrival::read(
+                hops,
+                &arrival::Known {
+                    theirs: stats.host_hop(),
+                    hosts: &hosts,
+                    guests: &guests,
+                    ours: routing.ours,
+                    far,
+                    who: id,
+                },
+            )
+        } else {
+            Some(arrival::Arrival::Direct)
+        };
+        let Some(arrival) = arrival else { continue };
+        if said.get(id) != Some(&arrival) {
+            tracing::info!("{id} now arrives {}", arrival::arrival_log(&arrival));
+            stats.set_arrival(Some(arrival.clone()));
+            said.insert(id.clone(), arrival);
+        }
     }
 }
 
@@ -2513,6 +2630,9 @@ async fn listen(
                 stats.set_room(room.clone());
                 asked.act(&id, &room, mic, &requests);
                 stats.set_hosts_room(host.is_some());
+                // Their hop names them in a route; the door stays here.
+                stats.set_host_hop(host.clone().and_then(door::Offer::clean).map(|offer| offer.hop));
+                stats.set_heard();
                 heard_hosting(&id, state, host, &mut offered, news.as_ref());
                 followed(&asked.rooms.local, moved);
                 if state == State::Leaving {
@@ -2649,6 +2769,8 @@ struct Alongside<'a> {
     estimates: Arc<adapt::Estimates>,
     local: Arc<PeerStats>,
     forwarded: Option<Arc<Forwarded>>,
+    /// Where our guests' session hops are kept, for reading routes.
+    guests: Arc<arrival::Guests>,
 }
 
 /// Serves the room's members directly beside a join, behind the room's door,
@@ -2675,6 +2797,7 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         estimates,
         local,
         forwarded,
+        guests,
     } = args;
     let room = url.path().trim_matches('/').to_string();
     if room.is_empty() {
@@ -2697,6 +2820,7 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         // link carrying our media; see the doc above.
         metrics: Arc::new(Metrics::default()),
         forwarded: forwarded.clone(),
+        guests: Some(guests),
     })
     .await;
     let (accepting, mut events) = match served {
@@ -3681,7 +3805,7 @@ mod served_tests {
         let server = config.init().unwrap().bind().await.unwrap();
         let port = server.local_addr().unwrap().port();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (task, _) = accept(server, door, Some(estimates), Arc::new(Metrics::default()), None);
+        let (task, _) = accept(server, door, Some(estimates), Arc::new(Metrics::default()), None, None);
         (task, port)
     }
 
@@ -3799,7 +3923,7 @@ mod served_tests {
         let server = config.init().unwrap().bind().await.unwrap();
         let port = server.local_addr().unwrap().port();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (task, _) = accept(server, None, Some(estimates), Arc::new(Metrics::default()), None);
+        let (task, _) = accept(server, None, Some(estimates), Arc::new(Metrics::default()), None, None);
         (task, port)
     }
 
@@ -3992,6 +4116,7 @@ mod served_tests {
             Some(estimates),
             Arc::new(Metrics::default()),
             Some(forwarded.clone()),
+            None,
         );
 
         let a = guest(port, &invited(&hosting), "a");
