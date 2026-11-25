@@ -2714,6 +2714,15 @@ async fn subscribe_presence(
     ))
 }
 
+/// Whether a catalog read ended because the transport under it did -- the
+/// session it came through closed, or its route went with a move or a relay
+/// going down -- rather than because what arrived could not be read. The
+/// first is a reader ending like any other in a call whose routes change,
+/// said where the reader ends; only the second is a fault of ours or theirs.
+pub(super) fn catalog_cut_off(error: &moq_mux::Error) -> bool {
+    matches!(error, moq_mux::Error::Moq(_) | moq_mux::Error::Json(moq_json::Error::Net(_)))
+}
+
 /// Takes in where someone says the call is, if we follow moves at all, and
 /// says so when it changes where we follow it to.
 fn followed(local: &PeerStats, moved: Option<super::moves::CallOn>) {
@@ -3058,6 +3067,10 @@ async fn watch(
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
                 tracing::warn!("{peer}'s catalog closed before it offered video");
+                return;
+            }
+            Err(error) if catalog_cut_off(&error) => {
+                tracing::warn!("{peer}'s catalog was cut off: {error:#}");
                 return;
             }
             Err(error) => {
@@ -3663,6 +3676,14 @@ mod presence_tests {
         assert_eq!(local.call_host(), Some(id('c')));
         local.set_move_calls(false);
         assert_eq!(local.call_host(), None, "off puts us back in the usual order");
+    }
+
+    #[test]
+    fn a_catalog_cut_off_by_its_transport_is_told_apart_from_one_that_does_not_read() {
+        assert!(super::catalog_cut_off(&moq_mux::Error::Moq(moq_net::Error::Cancel)));
+        assert!(super::catalog_cut_off(&moq_mux::Error::Json(moq_json::Error::Net(moq_net::Error::Dropped))));
+        assert!(!super::catalog_cut_off(&moq_mux::Error::Json(moq_json::Error::Json("expected value".into()))));
+        assert!(!super::catalog_cut_off(&moq_mux::Error::Json(moq_json::Error::MissingSnapshot)));
     }
 
     /// The wiring table: whether the origins are shared, and whether a join

@@ -295,6 +295,10 @@ pub(super) async fn subscribe(
                 tracing::warn!("[audio] {peer}'s catalog closed before it offered audio");
                 return;
             }
+            Err(error) if super::call::catalog_cut_off(&error) => {
+                tracing::warn!("[audio] {peer}'s catalog was cut off: {error:#}");
+                return;
+            }
             Err(error) => {
                 tracing::error!("[audio] could not read {peer}'s catalog: {error:#}");
                 return;
