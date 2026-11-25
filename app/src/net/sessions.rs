@@ -1442,19 +1442,58 @@ mod socket_tests {
         format!("moqt://localhost:{port}/team").parse().unwrap()
     }
 
-    /// A port nothing answers on: a relay that is down.
-    fn nowhere() -> url::Url {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        at(socket.local_addr().unwrap().port())
+    /// A local port held for a server that is down, or not up yet, that
+    /// refuses meanwhile as a port nothing listens on does.
+    ///
+    /// Bound and then dropped, the port is free for anything else in the
+    /// process to be given, and the tests run side by side: another test's
+    /// server or client could take it, and a member dialling "nothing" would
+    /// reach that. So the socket keeps it, connected to an address nothing
+    /// sends from: datagrams from anywhere else match no socket, and the
+    /// sender is refused at once, as it is by a port that is not bound.
+    struct Reserved(std::net::UdpSocket);
+
+    impl Reserved {
+        fn new() -> Reserved {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            // The discard port: nothing on this machine sends from it.
+            socket.connect("127.0.0.1:9").unwrap();
+            Reserved(socket)
+        }
+
+        fn port(&self) -> u16 {
+            self.0.local_addr().unwrap().port()
+        }
+
+        fn url(&self) -> url::Url {
+            at(self.port())
+        }
+
+        /// Lets the port go, for a server to bind it straight after.
+        fn release(self) -> u16 {
+            self.port()
+        }
     }
 
-    /// A client as the app's, minus iroh, giving up on a dead address soon
-    /// so a test of one does not wait out the app's whole budget.
+    /// How long a test client keeps trying a way in before giving up on it.
+    /// Well short of the app's own budget, so a test of a dead address does
+    /// not wait that out, but longer than a live one can take on a busy
+    /// machine, where a local handshake sometimes needs QUIC to send it again:
+    /// after a second, and again two seconds later, before any round trip has
+    /// been measured. With two runs of the tests at once, connections took
+    /// 1.27 s and 3.26 s (a quarter of a second of that is the dial trying
+    /// `[::1]` first); why the first answer goes missing was not found. At two
+    /// seconds such a session gave up, and a join rests a session that gave
+    /// up for longer than any test here waits.
+    const GIVE_UP: Duration = Duration::from_secs(5);
+
+    /// A client as the app's, minus iroh, giving up on a dead address after
+    /// [`GIVE_UP`].
     fn client() -> moq_tokio::Client {
         crypto();
         let mut config = moq_tokio::client::Config::default();
         config.connect.tls.insecure = Some(true);
-        config.connect.backoff.timeout = Duration::from_secs(2);
+        config.connect.backoff.timeout = GIVE_UP;
         // As a join's client pings: what the quiet limits are set against.
         config.quic.keep_alive = quiet::KEEP_ALIVE;
         config.init().unwrap()
@@ -1653,15 +1692,16 @@ mod socket_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_relay_that_is_down_at_join_does_not_hold_up_a_host() {
         let host = Meeting::start().await;
+        let down = Reserved::new();
         let started = Instant::now();
-        let mut m = member("m", vec![relay_at(nowhere()), host_at('a', host.url())]);
+        let mut m = member("m", vec![relay_at(down.url()), host_at('a', host.url())]);
         becomes(&host.origin, &camera_path("m"), true).await;
         assert_eq!(next_via(&mut m).await, Via { relay: false, hosts: 1, hosting: false });
         // The relay's moment to answer first, and no more: its own retries
         // would take the whole budget.
         assert!(started.elapsed() < Duration::from_secs(4), "it waited on the relay: {:?}", started.elapsed());
         // The relay gives up, and the call goes on through the host.
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep((started + GIVE_UP + Duration::from_secs(1)).saturating_duration_since(Instant::now())).await;
         assert!(m.ended.try_recv().is_err(), "the join ended with a host still up");
         assert!(heard_within(&host.origin, &camera_path("m"), Duration::from_millis(200)).await);
     }
@@ -1796,10 +1836,8 @@ mod socket_tests {
     /// host gets the member back directly.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_host_keeps_a_member_who_moves_up_to_the_relay_and_back() {
-        let port = {
-            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            socket.local_addr().unwrap().port()
-        };
+        let reserved = Reserved::new();
+        let port = reserved.port();
         // The host: one origin for its session to the relay and its guests.
         let shared = moq_tokio::origin::spawn();
         let host = Meeting::sharing(shared.clone()).await;
@@ -1810,12 +1848,17 @@ mod socket_tests {
         let _m = member_with("m", vec![relay_at(at(port)), host_at('h', host.url())], patient_client());
         becomes(&shared, &camera_path("m"), true).await;
 
-        let relay = Meeting::on(port, moq_tokio::origin::spawn()).await;
-        // Moved once the relay has m from m, not bridged through the host.
+        let relay = Meeting::on(reserved.release(), moq_tokio::origin::spawn()).await;
+        // Moved once the relay has m from m, not bridged through the host, and
+        // as m's carrier rather than its spare. m offers the spare on the relay
+        // as soon as the relay answers, two seconds before moving there, and
+        // until the host's own session reaches the relay the spare is the
+        // relay's only route to m. Taken for the move, it had the host checked
+        // below before m had moved at all.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(route) = route_within(&relay.origin, &camera_path("m")).await {
-                if !route.hops.as_slice().contains(&shared.hop()) {
+                if !route.hops.as_slice().contains(&shared.hop()) && route.cost.warm < SPARE_COST {
                     break;
                 }
             }
@@ -2155,8 +2198,10 @@ mod socket_tests {
         let (on_m, on_v) = (following(), following());
         on_m.move_call(Some(id('h')), "m");
         on_v.move_call(Some(id('h')), "v");
-        let mut m = member_as("m", vec![relay_at(relay.url()), host_at('h', nowhere())], client(), on_m);
-        let v = member_as("v", vec![relay_at(nowhere()), host_at('h', host.url())], client(), on_v);
+        let (unreachable, down) = (Reserved::new(), Reserved::new());
+        let dialled = Instant::now();
+        let mut m = member_as("m", vec![relay_at(relay.url()), host_at('h', unreachable.url())], client(), on_m);
+        let v = member_as("v", vec![relay_at(down.url()), host_at('h', host.url())], client(), on_v);
         // At the relay, v arrives bridged by the host, and m straight from m.
         routed_through(&relay.origin, &camera_path("v"), shared.hop(), "v never reached the relay through the host").await;
         becomes(&relay.origin, &camera_path("m"), true).await;
@@ -2165,7 +2210,7 @@ mod socket_tests {
         routed_through(&v.inbound, &camera_path("m"), host.origin.hop(), "v never had m through the host").await;
         // Past the time a lost session takes to give up: m stays, and so
         // does v's way to it.
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep((dialled + GIVE_UP + Duration::from_secs(1)).saturating_duration_since(Instant::now())).await;
         assert!(m.ended.try_recv().is_err(), "m's join ended with the relay up");
         assert!(route_within(&v.inbound, &camera_path("m")).await.is_some(), "v lost m");
     }
@@ -3016,10 +3061,23 @@ mod socket_tests {
     }
 
     /// A bad path to the relay, losing a third of its packets for five
-    /// seconds, is not a silent one: nothing is left.
+    /// seconds, is not a silent one while it carries a call: nothing is left.
+    ///
+    /// The host watches m through the relay, as a hosting member on a call
+    /// does. Without that its session to the relay carries only keep-alives
+    /// and their acknowledgements, a few packets a second, and QUIC sends a
+    /// lost one again on a doubling timer, so three seconds hold only about
+    /// five answers: at a third lost each way, all of them now and then are,
+    /// and that session really does hear nothing for its limit (measured:
+    /// 3.36 s, five answers in a row dropped). Leaving it then is the rule
+    /// doing what it says. A session carrying video hears dozens of packets
+    /// a second, and the same loss never silences it for a second.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_lossy_relay_path_is_not_left() {
         let mut r = behind().await;
+        let (_host_reading, _host_tiles, host_sees) = viewing_of(&id('c'), &r.host.origin, Some("m"));
+        host_sees.more(30, "the host saw no video from m").await;
+        routed_through(&r.host.origin, &camera_path("m"), r.relay.origin.hop(), "the host never had m through the relay").await;
         left_the_relay(&mut r.m);
         left_the_relay(&mut r.v);
         let (_watching, lost) = retractions(&r.relay.origin, &camera_path("m"));
