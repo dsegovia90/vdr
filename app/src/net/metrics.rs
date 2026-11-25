@@ -167,6 +167,14 @@ pub struct Metrics {
     /// What each outgoing stream may send and what it did. See [`Sent`].
     camera: Sent,
     share: Sent,
+    /// Each video stream's slice of the link, as its rate loop follows it: for
+    /// the share, after leaving room for the camera's floor. A starved stream's
+    /// slice is a real zero, hence [`Known`].
+    camera_slice: Known,
+    share_slice: Known,
+    /// What the share's rate loop asked its encoder for; zero while there is
+    /// no share. The camera's is `send_kbps`.
+    share_target_kbps: AtomicU32,
     /// The last minute of the above, for the Network tab. Behind a lock
     /// rather than atomics because it is a list; taken once a second by the
     /// meter and once a second by the tab while it is open, never on an
@@ -243,6 +251,21 @@ impl Sent {
         self.cap_kbps.store(0, Ordering::Relaxed);
         self.kbps.store(UNKNOWN, Ordering::Relaxed);
         self.fresh.store(false, Ordering::Relaxed);
+    }
+}
+
+/// A rate that may be zero, beside "not known": stored one up, so the
+/// atomic's default of zero is the unknown.
+#[derive(Default)]
+struct Known(AtomicU32);
+
+impl Known {
+    fn set(&self, kbps: Option<u32>) {
+        self.0.store(kbps.map_or(0, |kbps| kbps.saturating_add(1)), Ordering::Relaxed);
+    }
+
+    fn get(&self) -> Option<u32> {
+        self.0.load(Ordering::Relaxed).checked_sub(1)
     }
 }
 
@@ -323,8 +346,8 @@ impl Metrics {
         self.camera.kbps()
     }
 
-    /// The running screen share's configured rate; `None` while not sharing.
-    /// It is fixed per share (it does not follow the link), so it is the cap.
+    /// The rate the running screen share's encoder opened at, which its rate
+    /// loop never exceeds; `None` while not sharing.
     pub fn share_cap_kbps(&self) -> Option<u32> {
         nonzero(&self.share.cap_kbps)
     }
@@ -332,6 +355,42 @@ impl Metrics {
     /// What the screen share's encoder produced over the last whole second.
     pub fn share_sent_kbps(&self) -> Option<u32> {
         self.share.kbps()
+    }
+
+    /// The camera's slice of the link: `None` before it reserved one, while
+    /// nobody watches it, or with no estimate.
+    pub fn camera_slice_kbps(&self) -> Option<u32> {
+        self.camera_slice.get()
+    }
+
+    /// What the share's rate loop follows: its slice, less any room left for
+    /// the camera. `None` while not sharing, and as for the camera.
+    pub fn share_slice_kbps(&self) -> Option<u32> {
+        self.share_cap_kbps()?;
+        self.share_slice.get()
+    }
+
+    /// The share's target rate: what it opened at, until its rate loop moves
+    /// it. `None` while not sharing.
+    pub fn share_target_kbps(&self) -> Option<u32> {
+        self.share_cap_kbps()?;
+        nonzero(&self.share_target_kbps)
+    }
+
+    /// Records what a stream's rate loop follows.
+    pub(super) fn set_slice_kbps(&self, stream: super::adapt::Stream, kbps: Option<u32>) {
+        match stream {
+            super::adapt::Stream::Camera => self.camera_slice.set(kbps),
+            super::adapt::Stream::Share => self.share_slice.set(kbps),
+        }
+    }
+
+    /// Records the rate a stream's rate loop asked its encoder for.
+    pub(super) fn set_target_kbps(&self, stream: super::adapt::Stream, kbps: u32) {
+        match stream {
+            super::adapt::Stream::Camera => self.set_send_kbps(kbps),
+            super::adapt::Stream::Share => self.share_target_kbps.store(kbps, Ordering::Relaxed),
+        }
     }
 
     pub(super) fn set_camera_cap_kbps(&self, kbps: u32) {
@@ -366,6 +425,9 @@ impl Metrics {
             camera_target: self.send_kbps(),
             share_sent: self.share_sent_kbps(),
             share_cap: self.share_cap_kbps(),
+            share_target: self.share_target_kbps(),
+            camera_slice: self.camera_slice_kbps(),
+            share_slice: self.share_slice_kbps(),
             estimate: self.estimate_kbps(),
         };
         if let Ok(mut history) = self.history.lock() {
@@ -420,6 +482,8 @@ impl Metrics {
         self.set_path(Path::Unknown);
         self.camera.clear();
         self.share.clear();
+        self.camera_slice.set(None);
+        self.share_slice.set(None);
         if let Ok(mut history) = self.history.lock() {
             history.clear();
         }
@@ -428,6 +492,7 @@ impl Metrics {
             &self.loss_bp,
             &self.send_kbps,
             &self.estimate_kbps,
+            &self.share_target_kbps,
             &self.width,
             &self.height,
         ] {
@@ -1322,6 +1387,31 @@ mod tests {
         assert_eq!((metrics.share_cap_kbps(), metrics.share_sent_kbps()), (Some(6000), Some(1000)));
         metrics.set_share_cap_kbps(0);
         assert_eq!((metrics.share_cap_kbps(), metrics.share_sent_kbps()), (None, None));
+    }
+
+    #[test]
+    fn a_starved_slice_is_zero_not_unknown() {
+        use super::super::adapt::Stream;
+        let metrics = Metrics::default();
+        assert_eq!(metrics.camera_slice_kbps(), None);
+        metrics.set_slice_kbps(Stream::Camera, Some(0));
+        assert_eq!(metrics.camera_slice_kbps(), Some(0));
+        metrics.set_slice_kbps(Stream::Camera, None);
+        assert_eq!(metrics.camera_slice_kbps(), None);
+
+        // The share's figures mean nothing outside a share, whatever a loop
+        // stopping late wrote.
+        metrics.set_slice_kbps(Stream::Share, Some(900));
+        metrics.set_target_kbps(Stream::Share, 900);
+        assert_eq!((metrics.share_slice_kbps(), metrics.share_target_kbps()), (None, None));
+        metrics.set_share_cap_kbps(2500);
+        assert_eq!((metrics.share_slice_kbps(), metrics.share_target_kbps()), (Some(900), Some(900)));
+
+        metrics.set_slice_kbps(Stream::Camera, Some(300));
+        metrics.clear();
+        assert_eq!(metrics.camera_slice_kbps(), None);
+        metrics.set_share_cap_kbps(2500);
+        assert_eq!((metrics.share_slice_kbps(), metrics.share_target_kbps()), (None, None));
     }
 
     #[test]

@@ -1,21 +1,21 @@
 //! The Network tab: the last minute of what each outgoing stream sent, against
-//! its cap and the link's estimate.
+//! its cap and its slice of the link.
 //!
-//! **There is no shared budget to draw.** Each stream has its own cap, and the
-//! transport's estimate for the whole connection is the one number they all
-//! answer to. So each stream gets a chart against its own cap, and while a
-//! screen is shared a third adds them up against the estimate: that is the one
-//! where an overshoot shows, because nothing divides the link between them.
-//! With only the camera sending it would repeat the camera's chart, so it is
-//! not shown.
+//! **One budget, divided.** The transport's estimate for the whole connection
+//! is split among the microphone, the screen share and the camera, in that
+//! order (`net::adapt`), and each video stream's rate follows its own slice.
+//! So each stream gets a chart against its cap and its slice, and while a
+//! screen is shared a third adds them up against the whole estimate: that is
+//! where it shows whether everything together fit. With only the camera
+//! sending it would repeat the camera's chart, so it is not shown.
 //!
 //! **Drawn as one inline SVG per chart**, stretched to the pane's width: a
 //! filled, rounded line for what was sent and plain lines for the cap, the
-//! target and the estimate. Blitz hands the subtree to usvg and re-parses it
-//! when it changes, which the icons already rely on (the microphone gains a
-//! stroke when muted); here that happens once a second, only while the tab is
-//! open. No text inside the SVG, so no fonts are involved: the scale and the
-//! numbers are ordinary elements.
+//! target and the slice (or, for the total, the estimate). Blitz hands the
+//! subtree to usvg and re-parses it when it changes, which the icons already
+//! rely on (the microphone gains a stroke when muted); here that happens once
+//! a second, only while the tab is open. No text inside the SVG, so no fonts
+//! are involved: the scale and the numbers are ordinary elements.
 //!
 //! **The sent line is a few seconds' average, not each second.** An encoder
 //! meets its rate over seconds, so the raw figure is a comb of keyframe
@@ -52,7 +52,7 @@ const HEIGHT: f32 = 120.0;
 const SENT: &str = "rgb(59,130,246)";
 const CAP: &str = "rgb(239,68,68)";
 const TARGET: &str = "rgb(251,191,36)";
-const ESTIMATE: &str = "rgb(52,211,153)";
+const LINK: &str = "rgb(52,211,153)";
 const GRID: &str = "rgb(38,38,38)";
 
 #[component]
@@ -61,7 +61,7 @@ pub fn NetworkTab(metrics: Arc<Metrics>, open: bool) -> Element {
         div { class: "flex flex-col",
             div { class: "text-lg font-semibold text-neutral-100", "Network" }
             p { class: "mt-1 text-sm text-neutral-400",
-                "What your call sent over the last minute, newest at the right. Each stream has its own cap; nothing divides the link between them, so the link's estimate is the one number they share."
+                "What your call sent over the last minute, newest at the right. The link's estimate is divided between your microphone, your screen share and your camera, in that order; each video stream follows its slice, and never goes over its cap."
             }
             if open {
                 Charts { metrics }
@@ -135,31 +135,44 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
         };
     }
 
+    // The whole link, in words: with only the camera sending no chart draws
+    // it, and it is the figure everything else on this tab is a part of.
+    let whole = match seconds.last().and_then(|second| second.estimate) {
+        Some(estimate) => format!("Link estimate now: {}", rate(estimate)),
+        None => "No link estimate from the transport: every stream holds its own cap.".to_string(),
+    };
+
     rsx! {
+        p { class: "mt-4 font-mono text-xs text-neutral-300", "{whole}" }
         Heading { text: "Camera" }
         if has_camera {
-            Chart { points: camera, draw_cap: true }
+            Chart { points: camera, draw_cap: true, link: SLICE }
         } else {
             p { class: "text-sm text-neutral-300", "The camera is not sending." }
         }
         if has_share {
             Heading { text: "Screen share" }
-            Chart { points: share, draw_cap: true }
+            Chart { points: share, draw_cap: true, link: SLICE }
             Heading { text: "Everything sent" }
-            Chart { points: total, draw_cap: false }
+            Chart { points: total, draw_cap: false, link: ESTIMATE }
             p { class: "mt-1 text-xs text-neutral-500", "Video only: audio is not included." }
         }
     }
 }
 
+/// What a stream's dashed line is: its own slice of the link.
+const SLICE: &str = "slice of the link";
+/// What the total's dashed line is: the whole connection's estimate.
+const ESTIMATE: &str = "link estimate";
+
 /// One chart: what was sent as a filled line, with the cap, the target and
-/// the estimate over it.
+/// the dashed `link` line (named by `link`) over it.
 ///
 /// Every line follows its own value second by second, so a cap that changed
 /// mid-minute (Sharp turned on, the camera reopening at another size) shows
 /// where it changed.
 #[component]
-fn Chart(points: Vec<Point>, draw_cap: bool) -> Element {
+fn Chart(points: Vec<Point>, draw_cap: bool, link: &'static str) -> Element {
     // Averaged before it is cut to the minute shown, over the few older
     // seconds the history keeps for this, so the left edge is a full average
     // like every other point.
@@ -185,20 +198,26 @@ fn Chart(points: Vec<Point>, draw_cap: bool) -> Element {
     // A target sitting on the cap is the cap: drawn over it, it hid the cap
     // line entirely for a camera the link never holds back, which is most.
     let target = of(|point| point.target.filter(|target| point.cap != Some(*target)));
-    // An estimate above the scale is not drawn pinned to the top edge, where
-    // it reads as a value just over the scale; the numbers line says it.
-    let estimate: Vec<Option<u32>> = of(|point| point.estimate)
+    // A value above the scale is not drawn pinned to the top edge, where it
+    // reads as a value just over the scale; the numbers line says it.
+    //
+    // Nor is a slice sitting on the cap, for the same reason as the target: a
+    // stream is never granted more than it asked for, so on a link with room
+    // its slice *is* its cap and the two would draw as one striped line.
+    let caps = of(|point| point.cap);
+    let dashed: Vec<Option<u32>> = of(|point| point.link)
         .into_iter()
-        .map(|estimate| estimate.filter(|estimate| *estimate <= top))
+        .zip(&caps)
+        .map(|(value, cap)| value.filter(|value| *value <= top && !(draw_cap && *cap == Some(*value))))
         .collect();
-    let cap = if draw_cap { of(|point| point.cap) } else { Vec::new() };
+    let cap = if draw_cap { caps } else { Vec::new() };
 
     let sent_runs = canvas.runs(&sent);
     let area = rates::area_d(&sent_runs, HEIGHT);
     let line = rates::line_d(&sent_runs, true);
     let cap_line = rates::line_d(&canvas.runs(&cap), false);
     let target_line = rates::line_d(&canvas.runs(&target), false);
-    let estimate_line = rates::line_d(&canvas.runs(&estimate), false);
+    let link_line = rates::line_d(&canvas.runs(&dashed), false);
     let half = HEIGHT / 2.0;
     let grid = format!("M0,{half} L{WIDTH},{half}");
 
@@ -208,9 +227,9 @@ fn Chart(points: Vec<Point>, draw_cap: bool) -> Element {
     let mut hovered = use_signal(|| None::<usize>);
     let over = hovered();
     let numbers = match over.and_then(|index| slots.get(index).copied().map(|slot| (index, slot))) {
-        Some((index, Some(point))) => numbers(&ago(index), point, draw_cap, top),
+        Some((index, Some(point))) => numbers(&ago(index), point, draw_cap, link, top),
         Some((index, None)) => format!("{}  \u{b7}  nothing sent yet", ago(index)),
-        None => numbers("now", points.last().copied().unwrap_or_default(), draw_cap, top),
+        None => numbers("now", points.last().copied().unwrap_or_default(), draw_cap, link, top),
     };
     let half_label = rate(top / 2);
     let top_label = rate(top);
@@ -244,10 +263,10 @@ fn Chart(points: Vec<Point>, draw_cap: bool) -> Element {
                 if !cap_line.is_empty() {
                     path { d: "{cap_line}", stroke: CAP, stroke_width: "2" }
                 }
-                if !estimate_line.is_empty() {
+                if !link_line.is_empty() {
                     path {
-                        d: "{estimate_line}",
-                        stroke: ESTIMATE,
+                        d: "{link_line}",
+                        stroke: LINK,
                         stroke_width: "2",
                         stroke_dasharray: "10 8",
                     }
@@ -302,13 +321,13 @@ fn Chart(points: Vec<Point>, draw_cap: bool) -> Element {
                     span { "target" }
                 }
             }
-            if !estimate_line.is_empty() {
+            if !link_line.is_empty() {
                 div { class: "flex flex-row items-center gap-1.5",
                     div { class: "flex shrink-0 flex-row gap-[2px]",
                         div { class: "h-[2px] w-[6px] bg-emerald-400" }
                         div { class: "h-[2px] w-[6px] bg-emerald-400" }
                     }
-                    span { "link estimate" }
+                    span { "{link}" }
                 }
             }
         }
@@ -332,11 +351,12 @@ fn ago(index: usize) -> String {
     }
 }
 
-/// One second in words, e.g. `now · sent 272 kbps · cap 345 kbps · link 39.0
-/// Mbps (off the chart)`. Every figure carries its unit, and only what the
-/// chart or its legend also shows is named: a target sitting on the cap is
-/// the cap. An estimate above the scale is not drawn, so here it says so.
-fn numbers(when: &str, point: Point, with_cap: bool, top: u32) -> String {
+/// One second in words, e.g. `now · sent 272 kbps · cap 345 kbps · link
+/// estimate 39.0 Mbps (off the chart)`, the dashed line named as `link` says.
+/// Every figure carries its unit, and only what the chart or its legend also
+/// shows is named: a target sitting on the cap is the cap. A dashed value above
+/// the scale is not drawn, so here it says so.
+fn numbers(when: &str, point: Point, with_cap: bool, link: &str, top: u32) -> String {
     let mut parts = vec![when.to_string()];
     match point.sent {
         Some(sent) => parts.push(format!("sent {}", rate(sent))),
@@ -348,9 +368,11 @@ fn numbers(when: &str, point: Point, with_cap: bool, top: u32) -> String {
     if let Some(target) = point.target.filter(|target| point.cap != Some(*target)) {
         parts.push(format!("target {}", rate(target)));
     }
-    match point.estimate {
-        Some(estimate) if estimate > top => parts.push(format!("link estimate {} (off the chart)", rate(estimate))),
-        Some(estimate) => parts.push(format!("link estimate {}", rate(estimate))),
+    match point.link {
+        // Granted everything it asked for: the figure would only repeat the cap.
+        Some(value) if with_cap && point.cap == Some(value) => parts.push("the link has room for all of it".to_string()),
+        Some(value) if value > top => parts.push(format!("{link} {} (off the chart)", rate(value))),
+        Some(value) => parts.push(format!("{link} {}", rate(value))),
         None => {}
     }
     parts.join("  \u{b7}  ")
@@ -366,16 +388,34 @@ mod tests {
             sent: Some(272),
             cap: Some(345),
             target: Some(345),
-            estimate: Some(38_961),
+            link: Some(38_961),
         };
         assert_eq!(
-            numbers("now", point, true, 400),
+            numbers("now", point, true, ESTIMATE, 400),
             "now  \u{b7}  sent 272 kbps  \u{b7}  cap 345 kbps  \u{b7}  link estimate 39.0 Mbps (off the chart)"
         );
-        let held = Point { target: Some(300), estimate: Some(310), ..point };
+        let held = Point { target: Some(300), link: Some(310), ..point };
         assert_eq!(
-            numbers("12 s ago", held, true, 400),
+            numbers("12 s ago", held, true, ESTIMATE, 400),
             "12 s ago  \u{b7}  sent 272 kbps  \u{b7}  cap 345 kbps  \u{b7}  target 300 kbps  \u{b7}  link estimate 310 kbps"
+        );
+        assert_eq!(
+            numbers("now", held, true, SLICE, 400),
+            "now  \u{b7}  sent 272 kbps  \u{b7}  cap 345 kbps  \u{b7}  target 300 kbps  \u{b7}  slice of the link 310 kbps"
+        );
+    }
+
+    #[test]
+    fn a_slice_that_is_the_whole_cap_is_said_in_words() {
+        let point = Point {
+            sent: Some(299),
+            cap: Some(345),
+            target: Some(345),
+            link: Some(345),
+        };
+        assert_eq!(
+            numbers("now", point, true, SLICE, 400),
+            "now  \u{b7}  sent 299 kbps  \u{b7}  cap 345 kbps  \u{b7}  the link has room for all of it"
         );
     }
 
