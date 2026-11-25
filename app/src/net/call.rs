@@ -19,6 +19,10 @@
 //! [`super::door`]); and it is a room, not a call with one peer. Its guests
 //! join it as they would a relay's room, which is why they need nothing new.
 //!
+//! **A join with somewhere else to meet holds several sessions**: the relay
+//! and the room's hosts together, through [`sessions`]. A join with no hosts
+//! and hosting off is the one session through [`connect`] it always was.
+//!
 //! Every arm converges on [`Peer`], so the claim above is structural rather
 //! than a description: anything per-connection is reached the same way
 //! whichever side established it.
@@ -39,6 +43,9 @@ use std::sync::Arc;
 use futures_channel::mpsc::UnboundedSender;
 use futures_util::StreamExt as _;
 use moq_mux::catalog::Stream as _;
+
+#[path = "sessions.rs"]
+mod sessions;
 
 use super::adapt;
 use super::audio;
@@ -250,7 +257,7 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
                             tracing::info!("joined {label}");
                         }
                         let next = match &room {
-                            Some(room) => Some(RemoteStatus::InRoom { room: room.clone() }),
+                            Some(room) => Some(RemoteStatus::InRoom { room: room.clone(), via: None }),
                             None if connected => Some(RemoteStatus::Connected {
                                 peer: Some(label.clone()),
                             }),
@@ -484,11 +491,17 @@ pub(crate) fn redacted(url: &url::Url) -> String {
 /// reaches us is then the bare word (seen in this module's local-socket test).
 /// What reaches us at the end is transport text; this says what to do.
 fn explain(error: String) -> String {
-    if error.contains("reason=unauthorized") || error.trim() == "unauthorized" || error == TURNED_AWAY {
+    if is_refusal(&error) {
         "the room refused this link: its token or door is missing, expired, or for another room".to_string()
     } else {
         error
     }
+}
+
+/// Whether a call's final error is a refusal: a token or a door not taken,
+/// which no amount of redialling changes.
+fn is_refusal(error: &str) -> bool {
+    error.contains("reason=unauthorized") || error.trim() == "unauthorized" || error == TURNED_AWAY
 }
 
 /// How a room reads in the status line: its path, and the relay it is on.
@@ -1162,6 +1175,15 @@ async fn run(
         let host_rooms = local.host_rooms();
         let shared = shares_origin(&peering, host_rooms);
         let inbound = inbound_for(&outbound, shared);
+        // Where else the room can meet, as the interface put it with the
+        // decision. A join with somewhere else to go, or one we host, holds
+        // several sessions (see `sessions`); any other is the one session it
+        // always was.
+        let known = match &peering {
+            Peering::Join(url) => doors.hosts(&crate::recent::identity(url)),
+            _ => Vec::new(),
+        };
+        let several = dials_several(&peering, host_rooms, !known.is_empty());
         // Where what we hear about hosts goes: only a join has a remembered
         // room to keep them with.
         let news = match &peering {
@@ -1181,7 +1203,7 @@ async fn run(
         // over plain QUIC, and the endpoint's counters would only ever say
         // "nothing moved".
         let over_iroh = match &peering {
-            Peering::Join(url) => url.scheme() == "iroh",
+            Peering::Join(url) => url.scheme() == "iroh" || several,
             Peering::Dial(_) | Peering::Listen | Peering::Host(_) => true,
             Peering::Loopback | Peering::Idle => false,
         };
@@ -1208,11 +1230,11 @@ async fn run(
                     keyframe: keyframe.clone(),
                 })?
             }
-            Peering::Join(ref url) => {
+            Peering::Join(ref url) if !several => {
                 let room = room_label(url);
                 report(RemoteStatus::Joining { room: room.clone() });
                 tracing::info!("joining {room} at {}", redacted(url));
-                let joined = connect(Connect {
+                connect(Connect {
                     config: &client_config,
                     endpoint: &endpoint,
                     outbound: &outbound,
@@ -1222,7 +1244,16 @@ async fn run(
                     room: Some(room),
                     status: status.clone(),
                     keyframe: keyframe.clone(),
-                })?;
+                })?
+            }
+            Peering::Join(ref url) => {
+                let room = room_label(url);
+                report(RemoteStatus::Joining { room: room.clone() });
+                tracing::info!("joining {room} at {}", redacted(url));
+                // Serving first, so its guests' links are there to fall back
+                // on, and so a relay that is down cannot hold it up.
+                let guests = moq_net::bandwidth::Producer::new();
+                let guests_link = guests.consume();
                 if shared {
                     alongside = host_alongside(Alongside {
                         config: &client_config,
@@ -1230,12 +1261,31 @@ async fn run(
                         shared: outbound.clone(),
                         url,
                         doors: &doors,
-                        metrics: metrics.clone(),
+                        estimates: adapt::Estimates::new(guests),
                         local: local.clone(),
                     })
                     .await;
                 }
-                joined
+                let client = client_config
+                    .clone()
+                    .init()
+                    .map_err(|error| format!("could not build a client: {error:#}"))?
+                    .with_iroh(endpoint.clone());
+                sessions::join(sessions::Join {
+                    client,
+                    me: me.to_string(),
+                    targets: sessions::targets(url, &known, &me.to_string(), alongside.is_some()),
+                    outbound: outbound.clone(),
+                    inbound: inbound.clone(),
+                    hosting: shared,
+                    estimate: estimate.clone(),
+                    guests: alongside.is_some().then_some(guests_link),
+                    metrics: metrics.clone(),
+                    local: local.clone(),
+                    status: status.clone(),
+                    keyframe: keyframe.clone(),
+                    room,
+                })
             }
             Peering::Listen => {
                 report(RemoteStatus::Listening { me: me.to_string() });
@@ -1344,7 +1394,7 @@ async fn run(
                     hosting.invite(&me.to_string())
                 );
                 tracing::info!("hosting {}; the invite went to stdout, not to this log", hosting.room());
-                report(RemoteStatus::InRoom { room });
+                report(RemoteStatus::InRoom { room, via: None });
                 Peer {
                     // Guests coming and going is the room's ordinary life,
                     // not the call's: it ends only when we stop serving.
@@ -2467,6 +2517,13 @@ fn heard_hosting(
     }
 }
 
+/// Whether a join holds several sessions: when the room has hosts to dial
+/// beside its relay, or when we host it. Never anything else, and never a
+/// join with neither, which stays the one session it always was.
+fn dials_several(peering: &Peering, host_rooms: bool, has_hosts: bool) -> bool {
+    matches!(peering, Peering::Join(_)) && (host_rooms || has_hosts)
+}
+
 /// Whether an attempt's inbound is its outbound: always for a room hosted
 /// here, for a join only with hosting on as it starts, never otherwise.
 fn shares_origin(peering: &Peering, host_rooms: bool) -> bool {
@@ -2492,7 +2549,9 @@ struct Alongside<'a> {
     /// The room on the relay; its path is the room we host.
     url: &'a url::Url,
     doors: &'a door::Doors,
-    metrics: Arc<Metrics>,
+    /// Where the guests' links are gathered, for when nothing else carries
+    /// our media.
+    estimates: Arc<adapt::Estimates>,
     local: Arc<PeerStats>,
 }
 
@@ -2500,11 +2559,12 @@ struct Alongside<'a> {
 /// and says so in presence, until hosting is switched off or the attempt
 /// ends. `None` when it cannot: logged, and the join goes on regardless.
 ///
-/// **The guests' links do not steer what we send.** Our encoding follows the
-/// relay link's estimate, as a join's always has; feeding the guests'
-/// sessions into it too would give the estimate two writers and let their
-/// connection figures overwrite the relay's in the Network tab. Following
-/// whichever session carries the media is for when a join holds several.
+/// **The guests' links steer what we send only when nothing else carries
+/// it.** They are gathered apart from the call's estimate, and the join
+/// follows the session carrying our media; only a host with no outgoing
+/// session left follows its guests instead (see `sessions`). Their
+/// connection figures never reach the Network tab, so that it always shows
+/// one link.
 ///
 /// Switching hosting off ends this at once and every guest's session with
 /// it; switching it on again takes effect from the next join, because the
@@ -2516,7 +2576,7 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         shared,
         url,
         doors,
-        metrics,
+        estimates,
         local,
     } = args;
     let room = url.path().trim_matches('/').to_string();
@@ -2535,8 +2595,10 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         publisher: shared.consume(),
         subscriber: shared.clone(),
         door: Some(hosting.clone()),
-        estimates: None,
-        metrics,
+        estimates: Some(estimates),
+        // The guests' figures stay out of the Network tab, which shows the
+        // link carrying our media; see the doc above.
+        metrics: Arc::new(Metrics::default()),
     })
     .await;
     let (accepting, mut events) = match served {
@@ -2846,7 +2908,7 @@ mod path_tests {
 
 #[cfg(test)]
 mod presence_tests {
-    use super::{HostNews, Link, Presence, RoomNews, Seen, State, asked_of, door, heard_hosting, honour, inbound_for, quality, shares_origin, subroom};
+    use super::{HostNews, Link, Presence, RoomNews, Seen, State, asked_of, dials_several, door, heard_hosting, honour, inbound_for, quality, shares_origin, subroom};
     use crate::args::Peering;
     use crate::net::metrics::{Ask, Clock, Request};
     use crate::net::quality::Quality;
@@ -3254,6 +3316,9 @@ mod presence_tests {
         assert_eq!(Presence::here(&local).host, None, "cleaned on the way out too");
     }
 
+    /// The wiring table: whether the origins are shared, and whether a join
+    /// holds several sessions. A join with no hosts and hosting off is the
+    /// one session over two origins it always was.
     #[test]
     fn only_a_hosting_join_or_a_hosted_room_shares_one_origin() {
         let url: url::Url = "https://relay.example.com/team".parse().unwrap();
@@ -3263,6 +3328,16 @@ mod presence_tests {
             assert_eq!(shares_origin(&Peering::Join(url.clone()), host_rooms), host_rooms);
             for other in [Peering::Dial(peer), Peering::Listen, Peering::Loopback, Peering::Idle] {
                 assert!(!shares_origin(&other, host_rooms), "{other:?}");
+            }
+        }
+        let join = Peering::Join(url);
+        assert!(!dials_several(&join, false, false), "no hosts, not hosting: as before");
+        assert!(dials_several(&join, false, true), "a room with hosts");
+        assert!(dials_several(&join, true, false), "a room we host");
+        assert!(dials_several(&join, true, true));
+        for other in [Peering::Host("team".into()), Peering::Dial(peer), Peering::Listen, Peering::Loopback, Peering::Idle] {
+            for (host_rooms, has_hosts) in [(false, false), (true, true)] {
+                assert!(!dials_several(&other, host_rooms, has_hosts), "{other:?}");
             }
         }
     }
@@ -3368,7 +3443,7 @@ mod room_tests {
         let shown = redacted(&url);
         assert!(!shown.contains(door), "{shown}");
         assert!(shown.contains("door=redacted") && shown.contains("x=1"), "{shown}");
-        let status = crate::net::RemoteStatus::InRoom { room: room_label(&url) }.to_string();
+        let status = crate::net::RemoteStatus::InRoom { room: room_label(&url), via: None }.to_string();
         assert!(!status.contains(door), "{status}");
     }
 

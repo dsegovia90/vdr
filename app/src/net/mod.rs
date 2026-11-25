@@ -287,7 +287,7 @@ pub fn use_remote() -> Remote {
         // in favour of another.
         let count = *arrival.peek() + 1;
         arrival.set(count);
-        if let RemoteStatus::InRoom { room } = &next {
+        if let RemoteStatus::InRoom { room, .. } = &next {
             let pending = chosen.peek().clone();
             if pending.is_some_and(|url| call::room_label(&url) == *room) {
                 let settled = settled.clone();
@@ -342,6 +342,19 @@ pub fn use_remote() -> Remote {
                 let Peering::Join(url) = peering else { return peering };
                 let (url, invited) = crate::recent::split_invite(&url, crate::recent::now());
                 let key = crate::recent::identity(&url);
+                // Where else the room can meet, for the join to dial beside the
+                // relay: what the room has heard, then what the invite lists,
+                // each host once.
+                let mut hosts: Vec<door::Known> = Vec::new();
+                for host in recent.peek().hosts_for(&key, crate::recent::now()).iter().chain(&invited) {
+                    if !hosts.iter().any(|known| known.id == host.id()) {
+                        hosts.push(door::Known {
+                            id: host.id().to_string(),
+                            door: host.door().to_string(),
+                        });
+                    }
+                }
+                doors.set_hosts(key.clone(), hosts);
                 {
                     let mut waiting = waiting.borrow_mut();
                     // A new decision: what an earlier attempt left is stale.

@@ -99,6 +99,11 @@ impl Host {
         &self.id
     }
 
+    /// The door to present when dialling it.
+    pub fn door(&self) -> &str {
+        &self.door
+    }
+
 
     /// As an invite carries it.
     fn param(&self) -> String {
@@ -332,6 +337,18 @@ impl RecentRooms {
             hosts,
         });
         self.tidy();
+    }
+
+    /// The hosts the room with this key keeps, leaving out any not heard
+    /// for [`HOST_EXPIRES`] by `now`: what a join dials beside the relay.
+    pub fn hosts_for(&self, key: &str, now: u64) -> Vec<Host> {
+        self.rooms
+            .iter()
+            .filter(|room| room.key() == key)
+            .flat_map(|room| room.hosts.iter())
+            .filter(|host| now.saturating_sub(host.heard) < HOST_EXPIRES)
+            .cloned()
+            .collect()
     }
 
     /// The door of the room with this key, if it has one.
@@ -743,6 +760,17 @@ mod tests {
         assert_eq!(room.hosts[0].door, OTHER_DOOR);
         assert_eq!(room.hosts[0].heard, 20);
         assert!(!list.heard("https://relay.example.com:443/other", host('b', DOOR, 20), 20), "a room not remembered keeps nothing");
+    }
+
+    #[test]
+    fn a_join_reads_the_rooms_hosts_heard_within_the_month_and_no_others() {
+        let (mut list, key) = team();
+        list.heard(&key, host('a', DOOR, 10), 10);
+        list.heard(&key, host('b', OTHER_DOOR, 20), 20);
+        let ids = |hosts: Vec<Host>| hosts.iter().map(|host| (host.id()[..1].to_string(), host.door().to_string())).collect::<Vec<_>>();
+        assert_eq!(ids(list.hosts_for(&key, 30)), [("b".to_string(), OTHER_DOOR.to_string()), ("a".to_string(), DOOR.to_string())]);
+        assert_eq!(ids(list.hosts_for(&key, 15 + HOST_EXPIRES)), [("b".to_string(), OTHER_DOOR.to_string())]);
+        assert!(list.hosts_for("https://relay.example.com:443/other", 30).is_empty());
     }
 
     #[test]
