@@ -423,6 +423,37 @@ mod tests {
         assert_eq!(quiet.quiet(ms(start, 2900)), None, "the host waits its extra second");
     }
 
+    /// Our own pass stalling is not the relay going quiet. Nothing is
+    /// sampled for four seconds while our guests' sessions, timed by their
+    /// own samplers, are heard throughout; the relay heard things meanwhile
+    /// too, and the first pass after the stall sees its count moved. It is
+    /// heard at that pass, however long the gap since the last one.
+    #[test]
+    fn a_late_pass_is_not_silence() {
+        let start = Instant::now();
+        let mut quiet = Quiet::default();
+        let limit = QUIET_QUIC + HOSTING_EXTRA;
+        for at in (0..=1000).step_by(250) {
+            quiet.observe(0, Some(at + 1), limit, true, ms(start, at));
+        }
+        for at in (0..=5000).step_by(250) {
+            quiet.heard(1, Some(ms(start, at)), QUIET_IROH);
+        }
+        // The pass after the stall: samples first, then asks, as the join does.
+        quiet.observe(0, Some(9_999), limit, true, ms(start, 5000));
+        assert_eq!(quiet.quiet(ms(start, 5000)), None, "heard during the stall");
+        // And a relay that truly heard nothing across the same stall is quiet.
+        let mut silent = Quiet::default();
+        for at in (0..=1000).step_by(250) {
+            silent.observe(0, Some(at + 1), limit, true, ms(start, at));
+        }
+        for at in (0..=5000).step_by(250) {
+            silent.heard(1, Some(ms(start, at)), QUIET_IROH);
+        }
+        silent.observe(0, Some(1001), limit, true, ms(start, 5000));
+        assert_eq!(silent.quiet(ms(start, 5000)).map(|verdict| verdict.quiet), Some(0));
+    }
+
     #[test]
     fn a_session_only_heard_as_evidence_is_never_found_quiet() {
         let start = Instant::now();
