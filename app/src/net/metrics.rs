@@ -1257,6 +1257,11 @@ impl PeerStats {
         }
     }
 
+    /// Whether they say they host the room.
+    pub fn hosts_room(&self) -> bool {
+        self.hosts_room.load(Ordering::Relaxed)
+    }
+
     pub(super) fn set_hosts_room(&self, on: bool) {
         self.hosts_room.store(on, Ordering::Relaxed);
     }

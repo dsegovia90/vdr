@@ -252,6 +252,12 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
         (Some(stats), true) => quality::connection_line(stats.link().as_ref(), props.local.seen().get(&props.who)),
         _ => None,
     };
+    // Read the same way, as the menu opens: whether they host, and whether
+    // the call is on them already.
+    let move_here = open
+        && props.local.move_calls()
+        && props.stats.as_ref().is_some_and(|stats| stats.hosts_room())
+        && props.local.call_host().as_deref() != Some(props.who.as_str());
     // **No z-index while closed**, so the dim layer still covers it; lifted
     // above its own click-away layer while open, so a second click closes it.
     let label = if mine {
@@ -323,6 +329,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                     their_room: now.room.clone(),
                     their_mic: now.mic_on,
                     connection,
+                    move_here,
                     our_room,
                     local: props.local.clone(),
                     me: props.me.clone(),

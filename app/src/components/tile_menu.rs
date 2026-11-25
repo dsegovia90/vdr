@@ -1,5 +1,6 @@
 //! The menu under a peer's tile label: join their subroom, invite them to
-//! ours, mute their microphone.
+//! ours, mute their microphone, and, with moving the call switched on in
+//! Experimental, move the call to them when they host the room.
 //!
 //! Joining is local and instant: subrooms are open, so it only sets our own
 //! room. Inviting and muting are requests said in our presence document and
@@ -27,11 +28,15 @@ pub(super) enum Item {
     Invite,
     /// Ask their client to turn their microphone off.
     Mute,
+    /// Move the call to them, a host: said in our presence, followed by
+    /// everyone who has moving the call switched on.
+    MoveHere,
 }
 
-/// What applies, given their room, ours, and whether their mic is on.
-/// Inapplicable items are left out rather than greyed.
-pub(super) fn items(theirs: Option<&str>, ours: Option<&str>, their_mic: bool) -> Vec<Item> {
+/// What applies, given their room, ours, whether their mic is on, and
+/// whether the call can be moved to them. Inapplicable items are left out
+/// rather than greyed.
+pub(super) fn items(theirs: Option<&str>, ours: Option<&str>, their_mic: bool, move_here: bool) -> Vec<Item> {
     let mut items = Vec::new();
     if let Some(room) = theirs {
         if Some(room) != ours {
@@ -43,6 +48,9 @@ pub(super) fn items(theirs: Option<&str>, ours: Option<&str>, their_mic: bool) -
     }
     if their_mic {
         items.push(Item::Mute);
+    }
+    if move_here {
+        items.push(Item::MoveHere);
     }
     items
 }
@@ -69,6 +77,9 @@ pub struct TileMenuProps {
     /// connection report is on. A line rather than a tooltip on the bars,
     /// since blitz has no tooltips.
     pub connection: Option<String>,
+    /// Whether the call can be moved to them: they host the room, we follow
+    /// moves, and it is not on them already.
+    pub move_here: bool,
     /// Our subroom, from the page's [`Rooms`].
     pub our_room: Option<String>,
     /// Ourselves: where requests are recorded, and our room is set.
@@ -97,7 +108,7 @@ pub fn TileMenu(props: TileMenuProps) -> Element {
         }
     });
 
-    let offered = items(props.their_room.as_deref(), props.our_room.as_deref(), props.their_mic);
+    let offered = items(props.their_room.as_deref(), props.our_room.as_deref(), props.their_mic, props.move_here);
     let invite_to = match props.our_room.as_deref() {
         Some(_) => "Invite to my subroom",
         None => "Invite to main room",
@@ -157,6 +168,7 @@ pub fn TileMenu(props: TileMenuProps) -> Element {
                                     local.ask(&who, Ask::Mute);
                                     tracing::info!("asked {who}: {:?}", Ask::Mute);
                                 }
+                                Item::MoveHere => local.move_call(Some(who.clone()), &me),
                             }
                             current.set(None);
                         }
@@ -165,6 +177,7 @@ pub fn TileMenu(props: TileMenuProps) -> Element {
                         Item::Join(room) => rsx! { "Join {room}" },
                         Item::Invite => rsx! { "{invite_to}" },
                         Item::Mute => rsx! { "Mute their mic" },
+                        Item::MoveHere => rsx! { "Move the call here" },
                     }
                 }
             }
@@ -178,32 +191,38 @@ mod tests {
 
     #[test]
     fn same_room_with_their_mic_on_offers_mute() {
-        assert_eq!(items(None, None, true), vec![Item::Mute]);
-        assert_eq!(items(Some("Attic"), Some("Attic"), true), vec![Item::Mute]);
+        assert_eq!(items(None, None, true, false), vec![Item::Mute]);
+        assert_eq!(items(Some("Attic"), Some("Attic"), true, false), vec![Item::Mute]);
     }
 
     #[test]
     fn same_room_with_their_mic_off_offers_nothing() {
-        assert_eq!(items(Some("Attic"), Some("Attic"), false), vec![]);
+        assert_eq!(items(Some("Attic"), Some("Attic"), false, false), vec![]);
     }
 
     #[test]
     fn they_in_a_subroom_we_in_main() {
         assert_eq!(
-            items(Some("Kitchen"), None, true),
+            items(Some("Kitchen"), None, true, false),
             vec![Item::Join("Kitchen".into()), Item::Invite, Item::Mute]
         );
     }
 
     #[test]
     fn we_in_a_subroom_they_in_main() {
-        assert_eq!(items(None, Some("Kitchen"), true), vec![Item::Invite, Item::Mute]);
+        assert_eq!(items(None, Some("Kitchen"), true, false), vec![Item::Invite, Item::Mute]);
+    }
+
+    #[test]
+    fn a_host_offers_moving_the_call_last() {
+        assert_eq!(items(None, None, false, true), vec![Item::MoveHere]);
+        assert_eq!(items(None, None, true, true), vec![Item::Mute, Item::MoveHere]);
     }
 
     #[test]
     fn two_different_subrooms() {
         assert_eq!(
-            items(Some("Attic"), Some("Loft"), false),
+            items(Some("Attic"), Some("Loft"), false, false),
             vec![Item::Join("Attic".into()), Item::Invite]
         );
     }

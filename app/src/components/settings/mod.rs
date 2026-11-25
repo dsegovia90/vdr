@@ -73,7 +73,7 @@ impl Tab {
             Tab::Keyboard => rsx! { keyboard::KeyboardTab {} },
             Tab::Updates => rsx! { updates::UpdatesTab {} },
             Tab::Network => rsx! { network::NetworkTab { metrics, local, participants, me, open } },
-            Tab::Experimental => rsx! { experimental::ExperimentalTab { local } },
+            Tab::Experimental => rsx! { experimental::ExperimentalTab { local, me } },
             Tab::About => rsx! { about::AboutTab {} },
         }
     }
