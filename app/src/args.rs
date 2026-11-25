@@ -32,6 +32,9 @@
 //! vdr --loopback --audio-stall 800        # hold audio back once, to make a backlog
 //! vdr --ephemeral --no-audio              # opens neither microphone nor speaker
 //! vdr --profile /tmp/vdr-a                # a test instance's own lasting folder and key
+//! vdr --move-calls                       # follow the call when someone moves it
+//! vdr --move-call relay                   # move the call as the join starts: relay or a host's id
+//! vdr --bounce 30                         # move it round the relay and the hosts every 30 s (10 at least)
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry is a second
@@ -256,6 +259,15 @@ pub struct Args {
     /// from empty settings and nobody is there to click the switch, so a
     /// scripted test has no other way to be a host.
     pub host_rooms: bool,
+    /// Follow and say where the call is moved, as the Experimental switch
+    /// does, without saving it (`--move-calls`; implied by the two below).
+    pub move_calls: bool,
+    /// Move the call as a join starts (`--move-call relay|<host id>`):
+    /// `Some(None)` is the relay.
+    pub move_call: Option<Option<String>>,
+    /// Move the call round the relay and every host this often
+    /// (`--bounce <secs>`), so a scripted run can judge moves from logs.
+    pub bounce: Option<std::time::Duration>,
 }
 
 impl Args {
@@ -292,6 +304,9 @@ impl Args {
         let mut audio_stall = None;
         let mut no_audio = false;
         let mut host_rooms = false;
+        let mut move_calls = false;
+        let mut move_call = None;
+        let mut bounce = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -346,6 +361,23 @@ impl Args {
                 "--no-catchup" => no_catchup = true,
                 "--no-audio" => no_audio = true,
                 "--host-rooms" => host_rooms = true,
+                "--move-calls" => move_calls = true,
+                "--move-call" => match args.next().as_deref().map(crate::net::moves::parse_target) {
+                    Some(Ok(to)) => {
+                        move_calls = true;
+                        move_call = Some(to);
+                    }
+                    Some(Err(error)) => tracing::error!("--move-call {error}"),
+                    None => tracing::error!("--move-call needs relay or a host's endpoint id"),
+                },
+                "--bounce" => {
+                    let secs = args.next().as_deref().map(str::parse::<u64>);
+                    if !matches!(secs, Some(Ok(_))) {
+                        tracing::error!("--bounce needs a number of seconds; bouncing every {}s", crate::net::moves::BOUNCE_DEFAULT.as_secs());
+                    }
+                    move_calls = true;
+                    bounce = Some(crate::net::moves::bounce_every(secs.and_then(Result::ok)));
+                }
                 // Read by `settings::data_dir` from the raw arguments, since
                 // the log opens before this parser runs; only skipped here.
                 "--profile" => {
@@ -374,6 +406,9 @@ impl Args {
             audio_stall,
             no_audio,
             host_rooms,
+            move_calls,
+            move_call,
+            bounce,
         }
     }
 }

@@ -670,6 +670,13 @@ struct Presence {
     /// `Debug` leaves it out.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "door::lenient_offer")]
     host: Option<door::Offer>,
+    /// Where they follow the call to, while they have moving the call
+    /// switched on: absent otherwise, so a document without it is
+    /// byte-for-byte what a build without moves sends, and such a build
+    /// ignores the field. **Read leniently** (`moves::lenient`): a bad value
+    /// costs only itself.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "super::moves::lenient")]
+    moved: Option<super::moves::CallOn>,
 }
 
 impl Default for Presence {
@@ -686,6 +693,7 @@ impl Default for Presence {
             link: None,
             seen: std::collections::BTreeMap::new(),
             host: None,
+            moved: None,
         }
     }
 }
@@ -715,6 +723,9 @@ impl Presence {
             },
             // Set only while we serve the room; cleaned on the way out too.
             host: local.offer().and_then(door::Offer::clean),
+            // The winner we follow, repeated, so a choice outlives whoever
+            // made it. Cleaned on the way out too.
+            moved: local.followed_move().and_then(super::moves::CallOn::clean),
         }
     }
 }
@@ -1173,6 +1184,8 @@ async fn run(
         // join is wired exactly as it always was, two origins, until a change
         // to everyone's has been tried by hand.
         let host_rooms = local.host_rooms();
+        // Where the last call was moved says nothing about this one.
+        local.forget_moves();
         let shared = shares_origin(&peering, host_rooms);
         let inbound = inbound_for(&outbound, shared);
         // Where else the room can meet, as the interface put it with the
@@ -1271,6 +1284,10 @@ async fn run(
                     .init()
                     .map_err(|error| format!("could not build a client: {error:#}"))?
                     .with_iroh(endpoint.clone());
+                // A scripted run's choice, said as the join starts.
+                if let Some(to) = crate::args::Args::get().move_call.clone() {
+                    local.move_call(to, &me.to_string());
+                }
                 sessions::join(sessions::Join {
                     client,
                     me: me.to_string(),
@@ -1285,6 +1302,7 @@ async fn run(
                     status: status.clone(),
                     keyframe: keyframe.clone(),
                     room,
+                    bounce: crate::args::Args::get().bounce,
                 })
             }
             Peering::Listen => {
@@ -1947,6 +1965,9 @@ async fn attend(
     // same operation as the attempt ending.
     let mut attending: std::collections::HashMap<String, Vec<Abort>> =
         std::collections::HashMap::new();
+    // When each person's camera last went, so its return can say how long
+    // their tile was gone: what a move of the call is judged by from logs.
+    let mut gone: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
     // **Cloned per participant, never taken.** Clones of an engine share its
     // device and its mix, so each peer becomes one more sink in the same output
     // -- and the echo canceller, built from this engine, subtracts that whole
@@ -2150,6 +2171,7 @@ async fn attend(
 
         let Some(broadcast) = broadcast else {
             tracing::info!("{id} left");
+            gone.insert(id.to_string(), std::time::Instant::now());
             attending.remove(id);
             // Forgotten once all of their broadcasts are gone, so a rejoin
             // with the same key starts from "on" rather than their last word.
@@ -2164,6 +2186,9 @@ async fn attend(
         };
 
         tracing::info!("{id} joined");
+        if let Some(left) = gone.remove(id) {
+            tracing::info!("{id} back after {} ms", left.elapsed().as_millis());
+        }
         let slot = FrameSlot::default();
         let stats = people.entry(id.to_string()).or_default().clone();
         let _ = participants.unbounded_send(ParticipantEvent::Joined {
@@ -2413,6 +2438,7 @@ async fn listen(
                 link,
                 seen,
                 host,
+                moved,
             })) => {
                 let room = subroom(room);
                 if let Some(clock) = clock {
@@ -2440,7 +2466,9 @@ async fn listen(
                 // how loud they are to us.
                 stats.set_room(room.clone());
                 asked.act(&id, &room, mic, &requests);
+                stats.set_hosts_room(host.is_some());
                 heard_hosting(&id, state, host, &mut offered, news.as_ref());
+                followed(&asked.rooms.local, moved);
                 if state == State::Leaving {
                     // Reported, not acted on: whether the call is over is a
                     // question about everyone, and the loop that tracks
@@ -2455,6 +2483,16 @@ async fn listen(
                 return;
             }
         }
+    }
+}
+
+/// Takes in where someone says the call is, if we follow moves at all, and
+/// says so when it changes where we follow it to.
+fn followed(local: &PeerStats, moved: Option<super::moves::CallOn>) {
+    let Some(moved) = moved.filter(|_| local.move_calls()) else { return };
+    let (to, by) = (moved.to.clone(), moved.by.clone());
+    if local.hear_move(moved) {
+        tracing::info!("the call moves to {} (said by {by})", super::moves::describe(to.as_deref()));
     }
 }
 
@@ -2919,7 +2957,7 @@ mod path_tests {
 
 #[cfg(test)]
 mod presence_tests {
-    use super::{HostNews, Link, Presence, RoomNews, Seen, State, asked_of, dials_several, door, heard_hosting, honour, inbound_for, quality, shares_origin, subroom};
+    use super::{HostNews, Link, Presence, RoomNews, Seen, State, asked_of, dials_several, door, followed, heard_hosting, honour, inbound_for, quality, shares_origin, subroom};
     use crate::args::Peering;
     use crate::net::metrics::{Ask, Clock, Request};
     use crate::net::quality::Quality;
@@ -3058,6 +3096,7 @@ mod presence_tests {
             link: None,
             seen: Default::default(),
             host: None,
+            moved: None,
         };
         let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
         assert_eq!(heard, said);
@@ -3325,6 +3364,64 @@ mod presence_tests {
         let local = reporting(false);
         local.set_offer(Some(door::Offer { door: "not a door".to_string(), hop: 7 }));
         assert_eq!(Presence::here(&local).host, None, "cleaned on the way out too");
+    }
+
+    /// Our entry following a move of the call to host `h`, with the switch
+    /// as given.
+    fn following(on: bool) -> crate::net::PeerStats {
+        let local = reporting(false);
+        local.set_move_calls(true);
+        local.move_call(Some(id('c')), &id('a'));
+        local.set_move_calls(on);
+        local
+    }
+
+    #[test]
+    fn a_move_is_said_only_while_we_follow_moves_and_survives_the_round_trip() {
+        let off = serde_json::to_string(&Presence::here(&following(false))).unwrap();
+        assert_eq!(off, serde_json::to_string(&Presence::here(&reporting(false))).unwrap(), "the old shape");
+        assert!(!off.contains("moved"), "{off}");
+        let said = Presence::here(&following(true));
+        let json = serde_json::to_string(&said).unwrap();
+        assert!(json.contains(&format!(r#""moved":{{"to":"{}","n":1,"by":"{}"}}"#, id('c'), id('a'))), "{json}");
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard, said);
+    }
+
+    #[test]
+    fn an_older_peer_reads_a_moved_document_and_we_read_theirs() {
+        let json = serde_json::to_string(&Presence::here(&following(true))).unwrap();
+        let heard: Previous = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard.name.as_deref(), Some("Ada"));
+        let old: Presence = serde_json::from_str(r#"{"state":"here","name":"Ada"}"#).unwrap();
+        assert_eq!(old.moved, None);
+    }
+
+    #[test]
+    fn a_malformed_move_costs_only_itself() {
+        for bad in [
+            r#""moved":"relay""#.to_string(),
+            r#""moved":{"to":"x","n":1,"by":"y"}"#.to_string(),
+            format!(r#""moved":{{"n":-1,"by":"{}"}}"#, id('a')),
+            format!(r#""moved":{{"n":9007199254740993,"by":"{}"}}"#, id('a')),
+        ] {
+            let heard: Presence = serde_json::from_str(&format!(r#"{{"state":"here","name":"Ada",{bad}}}"#)).unwrap();
+            assert_eq!(heard.moved, None, "{bad}");
+            assert_eq!(heard.name.as_deref(), Some("Ada"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_heard_move_is_followed_only_with_the_switch_on() {
+        let theirs = super::super::moves::CallOn { to: Some(id('c')), n: 3, by: id('b') };
+        let local = reporting(false);
+        followed(&local, Some(theirs.clone()));
+        local.set_move_calls(true);
+        assert_eq!(local.call_host(), None, "heard while off, so not taken in");
+        followed(&local, Some(theirs));
+        assert_eq!(local.call_host(), Some(id('c')));
+        local.set_move_calls(false);
+        assert_eq!(local.call_host(), None, "off puts us back in the usual order");
     }
 
     /// The wiring table: whether the origins are shared, and whether a join

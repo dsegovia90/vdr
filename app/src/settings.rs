@@ -256,6 +256,13 @@ pub struct Settings {
     /// other people's video, which nobody should find they had agreed to.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
     pub host_rooms: Option<bool>,
+
+    /// Whether to follow, and be able to make, moves of the call to a host:
+    /// an experiment. `None` is the default, which is **off**
+    /// ([`moves_calls`](Self::moves_calls)): a move sends media through
+    /// someone's computer.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
+    pub move_calls: Option<bool>,
 }
 
 impl Settings {
@@ -272,6 +279,11 @@ impl Settings {
     /// Whether we host the rooms we join.
     pub fn hosts_rooms(&self) -> bool {
         self.host_rooms.unwrap_or(false)
+    }
+
+    /// Whether we follow and make moves of the call.
+    pub fn moves_calls(&self) -> bool {
+        self.move_calls.unwrap_or(false)
     }
 }
 
@@ -898,6 +910,20 @@ mod tests {
         let bad: Settings = serde_json::from_str(r#"{"camera":"abc","host_rooms":"yes"}"#).expect("still valid");
         assert_eq!(bad.camera.as_deref(), Some("abc"));
         assert!(!bad.hosts_rooms(), "a malformed flag costs only itself");
+    }
+
+    #[test]
+    fn moving_calls_is_off_unless_turned_on_and_read_leniently() {
+        assert!(!Settings::default().moves_calls());
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","host_rooms":true}"#).expect("valid");
+        assert!(!older.moves_calls(), "a file from before the setting means off");
+        let on: Settings = serde_json::from_str(r#"{"move_calls":true}"#).expect("valid");
+        assert!(on.moves_calls());
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("move_calls"), "left out until changed: {json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","move_calls":7}"#).expect("still valid");
+        assert_eq!(bad.camera.as_deref(), Some("abc"));
+        assert!(!bad.moves_calls(), "a malformed flag costs only itself");
     }
 
     #[test]

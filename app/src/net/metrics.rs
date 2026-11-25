@@ -666,6 +666,15 @@ pub struct PeerStats {
     /// What we say about hosting this room, while we are serving it. Our own
     /// entry only; the presence announcer reads it. Carries the door.
     offer: std::sync::Mutex<Option<super::door::Offer>>,
+    /// Whether we follow and say where the call is moved. Our own entry
+    /// only; the Experimental tab sets it.
+    move_calls: AtomicBool,
+    /// Where the call is, as the winning choice we heard or made; repeated
+    /// in our presence while `move_calls` is on. Our own entry only.
+    call_on: std::sync::Mutex<Option<super::moves::CallOn>>,
+    /// Whether they say they host the room, from their presence; what puts
+    /// "Move the call here" on their tile.
+    hosts_room: AtomicBool,
     /// Their report on their own link, as cleaned on arrival; for our own
     /// entry, the report we would send. `None` is not reporting.
     link: std::sync::Mutex<Option<Link>>,
@@ -866,6 +875,9 @@ impl Default for PeerStats {
             connection_report: AtomicBool::new(true),
             host_rooms: AtomicBool::new(false),
             offer: std::sync::Mutex::new(None),
+            move_calls: AtomicBool::new(false),
+            call_on: std::sync::Mutex::new(None),
+            hosts_room: AtomicBool::new(false),
             link: std::sync::Mutex::new(None),
             seen: std::sync::Mutex::new(BTreeMap::new()),
             reports: std::sync::Mutex::new(Reports::default()),
@@ -1195,6 +1207,58 @@ impl PeerStats {
         if let Ok(mut slot) = self.offer.lock() {
             *slot = offer;
         }
+    }
+
+    /// Whether we follow and say where the call is moved. Meaningful on our
+    /// own entry.
+    pub fn move_calls(&self) -> bool {
+        self.move_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn set_move_calls(&self, on: bool) {
+        self.move_calls.store(on, Ordering::Relaxed);
+    }
+
+    /// Where the call is, as we follow it: the host's endpoint id, `None`
+    /// for the relay. `None` too while the switch is off, so turning it off
+    /// puts our media back in the automatic order at once.
+    pub fn call_host(&self) -> Option<String> {
+        self.followed_move().and_then(|on| on.to)
+    }
+
+    /// The choice we follow, while the switch is on.
+    pub(crate) fn followed_move(&self) -> Option<super::moves::CallOn> {
+        if !self.move_calls() {
+            return None;
+        }
+        self.call_on.lock().ok().and_then(|on| on.clone())
+    }
+
+    /// Takes in a choice someone said; true when it is now the one we follow.
+    pub(crate) fn hear_move(&self, heard: super::moves::CallOn) -> bool {
+        self.call_on.lock().is_ok_and(|mut on| super::moves::hear(&mut on, heard))
+    }
+
+    /// Moves the call to `to` (`None` is the relay), as `me`, winning over
+    /// whatever we follow now.
+    pub fn move_call(&self, to: Option<String>, me: &str) {
+        if let Ok(mut on) = self.call_on.lock() {
+            let mine = super::moves::choose(on.as_ref(), to, me);
+            tracing::info!("moving the call to {}", super::moves::describe(mine.to.as_deref()));
+            *on = Some(mine);
+        }
+    }
+
+    /// Forgets where the last call was, so a new one starts in the automatic
+    /// order rather than repeating an old room's choice.
+    pub(super) fn forget_moves(&self) {
+        if let Ok(mut on) = self.call_on.lock() {
+            *on = None;
+        }
+    }
+
+    pub(super) fn set_hosts_room(&self, on: bool) {
+        self.hosts_room.store(on, Ordering::Relaxed);
     }
 
     /// Their report on their link, or ours on our own entry.

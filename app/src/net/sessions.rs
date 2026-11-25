@@ -54,6 +54,22 @@
 //! this handles; telling a bridged host from a cut-off one needs more than
 //! what a session can see, and belongs with promotion policy.
 //!
+//! **The call can be moved to a host, as an experiment** (`super::super::moves`
+//! says how the room agrees where). Following a move does two things here.
+//! The chosen host goes first in the order our media is offered in, so our
+//! offer moves there the way it moves anywhere, and falls back to the usual
+//! order when we cannot reach it, the host bridging us in from the relay. And
+//! our link to that host is dialled again, free instead of [`HOST_COST`],
+//! because moving offers alone would not move the media: the host bridges
+//! everything to the relay, and the relay's routes would still win at every
+//! viewer, so the media would go through the host and then the relay anyway.
+//! A free modern link beats a moq-lite-05 relay's (`routes.rs` pins it). A
+//! link's price is fixed for the life of its session, hence the redial; the
+//! old session is kept a moment, as an old offer is. **Known limit: links
+//! between hosts are not re-priced**, only links from the members who dial
+//! the chosen host, so a second host still reaches the room through the relay
+//! while it is up.
+//!
 //! **The estimate follows the session carrying our media**, as do the
 //! connection figures in the Network tab and in the report we send: that link
 //! is what our encoding has to fit. A host with no outgoing session left falls
@@ -85,6 +101,10 @@ pub(super) const REST: Duration = Duration::from_secs(15);
 /// the new one to be announced, after which the viewer's subscription moves
 /// across rather than ending.
 const MOVE_OVERLAP: Duration = Duration::from_secs(1);
+
+/// What pulling through the host the call has been moved to costs: nothing,
+/// so its routes beat the relay's.
+const CHOSEN_COST: u64 = 0;
 
 /// How often the set looks at its timers and at whether we still host.
 const TICK: Duration = Duration::from_millis(250);
@@ -168,17 +188,33 @@ impl State {
 /// Without it the first session up wins, which on a quick link to a host is
 /// the host, and our media would go through it for two seconds before moving
 /// back: a move at the start of every join, for nothing.
-pub(super) fn pick(states: &[State], current: Option<usize>, now: Instant, started: Instant) -> Option<usize> {
+///
+/// `preferred`, the host the call has been moved to, goes first in the order
+/// and the rest keep theirs; when it is not live the order is the usual one.
+pub(super) fn pick(
+    states: &[State],
+    current: Option<usize>,
+    now: Instant,
+    started: Instant,
+    preferred: Option<usize>,
+) -> Option<usize> {
     if states.first() == Some(&State::Dialing) && now.duration_since(started) < HOLD {
         return None;
     }
+    let preferred = preferred.filter(|&at| at < states.len());
+    let order: Vec<usize> = preferred
+        .into_iter()
+        .chain((0..states.len()).filter(|&at| Some(at) != preferred))
+        .collect();
     if let Some(current) = current.filter(|&at| states.get(at).is_some_and(|state| state.live())) {
-        let held = states[..current]
+        let rank = order.iter().position(|&at| at == current).unwrap_or(order.len());
+        let held = order[..rank]
             .iter()
-            .position(|state| matches!(state, State::Live(since) if now.duration_since(*since) >= HOLD));
+            .copied()
+            .find(|&at| matches!(states[at], State::Live(since) if now.duration_since(since) >= HOLD));
         return Some(held.unwrap_or(current));
     }
-    states.iter().position(|state| state.live())
+    order.into_iter().find(|&at| states[at].live())
 }
 
 /// What the status line says about where we are.
@@ -329,6 +365,9 @@ pub(super) struct Join {
     pub(super) keyframe: Arc<Keyframes>,
     /// The room as the status line names it.
     pub(super) room: String,
+    /// Move the call round the relay and every host this often
+    /// (`--bounce`), to test moving it.
+    pub(super) bounce: Option<Duration>,
 }
 
 /// One session of the set.
@@ -339,6 +378,8 @@ struct Member {
     error: Option<String>,
     /// Ever up, so a return reads as one.
     joined: bool,
+    /// Dialled again at a new price while up, so its answer is not a return.
+    redialled: bool,
     session: Option<Session>,
 }
 
@@ -373,15 +414,16 @@ pub(super) fn join(args: Join) -> Peer {
         status,
         keyframe,
         room,
+        bounce,
     } = args;
     let (events, mut heard) = futures_channel::mpsc::unbounded::<(usize, Event)>();
     let dial = {
         let inbound = inbound.clone();
         let outbound = outbound.clone();
-        move |index: usize, member: &Member| -> Session {
+        move |index: usize, member: &Member, chosen: bool| -> Session {
             let mut client = client.clone();
             if member.target.host.is_some() {
-                client = client.with_cost(HOST_COST);
+                client = client.with_cost(if chosen { CHOSEN_COST } else { HOST_COST });
             }
             let client = match &member.gate {
                 Some(gate) => client.with_publisher(&gate.origin),
@@ -436,13 +478,21 @@ pub(super) fn join(args: Join) -> Peer {
             state: State::Dialing,
             error: None,
             joined: false,
+            redialled: false,
             session: None,
         })
         .collect();
     let hosts = members.len() - 1;
     tracing::info!("dialling the relay and {hosts} saved hosts");
+    // Where the call is said to be as we join, so its host is dialled at its
+    // price from the start rather than dialled twice.
+    let mut chosen = chosen_member(&members, &local);
     for (index, member) in members.iter_mut().enumerate() {
-        member.session = Some(dial(index, member));
+        member.session = Some(dial(index, member, chosen == Some(index)));
+    }
+    let stops: Vec<Option<String>> = members.iter().map(|member| member.target.host.clone()).collect();
+    if let Some(every) = bounce {
+        tracing::info!("bouncing every {}s between the relay and {hosts} hosts", every.as_secs());
     }
     let path = members[0].target.url.path().trim_matches('/').to_string();
     let relay_label = redacted(&members[0].target.url);
@@ -457,6 +507,7 @@ pub(super) fn join(args: Join) -> Peer {
             let mut on_guests = false;
             let mut said: Option<Via> = None;
             let mut down_said = false;
+            let mut next_bounce = bounce.map(|every| started + every);
             let mut ticker = tokio::time::interval(TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -473,6 +524,9 @@ pub(super) fn join(args: Join) -> Peer {
                             Some(id) => format!("host {id}"),
                         };
                         match event {
+                            Event::Live if std::mem::take(&mut member.redialled) && member.state.live() => {
+                                tracing::info!("{} answered at its new price", name(member));
+                            }
                             Event::Live => {
                                 match (&member.target.host, member.joined) {
                                     (None, false) => tracing::info!("joined {relay_label}"),
@@ -529,7 +583,7 @@ pub(super) fn join(args: Join) -> Peer {
                     if let State::Resting(until) = member.state {
                         if going && now >= until {
                             member.state = State::Dialing;
-                            member.session = Some(dial(index, member));
+                            member.session = Some(dial(index, member, chosen == Some(index)));
                         }
                     }
                 }
@@ -538,7 +592,53 @@ pub(super) fn join(args: Join) -> Peer {
                 // Until the relay has answered or failed once, a host with
                 // nobody else up is still joining, not cut off.
                 let relay_tried = states.first().is_some_and(|state| *state != State::Dialing);
-                let next = pick(&states, carrier, now, started);
+                // A bounce moves the call on, for everyone following moves;
+                // what follows below applies it here like any other move.
+                if next_bounce.is_some_and(|due| now >= due) {
+                    if local.move_calls() {
+                        let on = local.call_host();
+                        local.move_call(super::super::moves::next_stop(&stops, on.as_deref()), &me);
+                    }
+                    next_bounce = bounce.map(|every| now + every);
+                }
+
+                // The call moved: the host it left is dialled again at the
+                // usual price and the one it went to free. A session that is
+                // not up keeps none to replace; its next dial reads the price.
+                let now_chosen = chosen_member(&members, &local);
+                if now_chosen != chosen {
+                    for index in [chosen, now_chosen].into_iter().flatten() {
+                        let free = now_chosen == Some(index);
+                        let member = &mut members[index];
+                        if member.session.is_none() {
+                            continue;
+                        }
+                        let id = member.target.host.clone().unwrap_or_default();
+                        if free {
+                            tracing::info!("the call is on host {id}; dialling it again, free");
+                        } else {
+                            tracing::info!("the call left host {id}; dialling it again at the usual price");
+                        }
+                        let fresh = dial(index, member, free);
+                        member.redialled = member.state.live();
+                        if let Some(old) = member.session.replace(fresh) {
+                            // Kept a moment, as an old offer is, so what is
+                            // pulled through it moves to the new session.
+                            tokio::spawn(async move {
+                                tokio::time::sleep(MOVE_OVERLAP).await;
+                                drop(old);
+                            });
+                        }
+                        if carrier == Some(index) {
+                            if let Some(session) = &member.session {
+                                _following = Some(follow(session, &estimate, &metrics));
+                            }
+                        }
+                    }
+                    chosen = now_chosen;
+                }
+
+                let next = pick(&states, carrier, now, started, chosen);
                 if next.is_some() && next != carrier {
                     let index = next.unwrap_or_default();
                     let member = &members[index];
@@ -593,6 +693,13 @@ pub(super) fn join(args: Join) -> Peer {
         bandwidth: None,
         stats: None,
     }
+}
+
+/// Which session goes to the host the call has been moved to, if we follow
+/// moves and hold one to it.
+fn chosen_member(members: &[Member], local: &PeerStats) -> Option<usize> {
+    let host = local.call_host()?;
+    members.iter().position(|member| member.target.host.as_deref() == Some(host.as_str()))
 }
 
 /// Follows one session: its estimate into the call's, its figures into the
@@ -688,7 +795,7 @@ mod tests {
         let start = Instant::now();
         let at = |ms: u64| start + Duration::from_millis(ms);
         use State::*;
-        let pick = |states: &[State], current, now| pick(states, current, now, start);
+        let pick = |states: &[State], current, now| pick(states, current, now, start, None);
         assert_eq!(pick(&[Dialing, Dialing], None, at(0)), None);
         assert_eq!(pick(&[Dialing, Live(at(0))], None, at(500)), None, "the relay gets a moment to answer");
         assert_eq!(pick(&[Dialing, Live(at(0))], None, at(2000)), Some(1), "then a host while the relay still dials");
@@ -698,6 +805,27 @@ mod tests {
         assert_eq!(pick(&[Redialling, Live(at(0)), Live(at(0))], Some(0), at(3000)), Some(1), "down at once");
         assert_eq!(pick(&[Live(at(0)), Live(at(0))], None, at(0)), Some(0), "the first choice needs no hold");
         assert_eq!(pick(&[Refused, Resting(at(0)), Live(at(0))], Some(1), at(0)), Some(2));
+    }
+
+    #[test]
+    fn the_host_the_call_moved_to_goes_first_and_the_rest_keep_their_order() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        use State::*;
+        let pick = |states: &[State], current, now, preferred| pick(states, current, now, start, preferred);
+        let all = [Live(at(0)), Live(at(0)), Live(at(0))];
+        assert_eq!(pick(&all, Some(0), at(5000), Some(2)), Some(2), "held, so at once");
+        assert_eq!(pick(&all, None, at(5000), Some(1)), Some(1));
+        assert_eq!(pick(&all, Some(2), at(5000), None), Some(0), "back to the usual order");
+        assert_eq!(
+            pick(&[Live(at(0)), Live(at(0)), Live(at(4000))], Some(0), at(5000), Some(2)),
+            Some(0),
+            "not until it has held"
+        );
+        assert_eq!(pick(&[Live(at(0)), Live(at(0)), Resting(at(0))], Some(2), at(5000), Some(2)), Some(0), "unreachable: the usual order");
+        assert_eq!(pick(&[Redialling, Live(at(0)), Resting(at(0))], None, at(5000), Some(2)), Some(1));
+        assert_eq!(pick(&[Live(at(0)), Live(at(0))], Some(1), at(5000), Some(1)), Some(1), "stays on it");
+        assert_eq!(pick(&all, Some(1), at(5000), Some(9)), Some(0), "a host we do not hold is no preference");
     }
 
     #[test]
@@ -761,8 +889,21 @@ mod socket_tests {
         /// On a given port, so a relay can come up where members are already
         /// dialling it.
         async fn on(port: u16, origin: moq_net::origin::Producer) -> Meeting {
+            Self::speaking(port, origin, Vec::new()).await
+        }
+
+        /// A relay that speaks no later than moq-lite-05, as the production
+        /// one does: its routes carry no price.
+        async fn older() -> Meeting {
+            let versions = vec!["moq-lite-05".parse().expect("a version this moq-net knows")];
+            Self::speaking(0, moq_tokio::origin::spawn(), versions).await
+        }
+
+        /// `versions` empty speaks every version, as a default server does.
+        async fn speaking(port: u16, origin: moq_net::origin::Producer, versions: Vec<moq_net::Version>) -> Meeting {
             crypto();
             let mut config = moq_tokio::server::Config::default();
+            config.listen.version = versions;
             config.listen.bind = Some(moq_tokio::listen::Bind::Addr(([127, 0, 0, 1], port).into()));
             config.listen.tls.generate = vec!["localhost".to_string()];
             config.publisher = Some(origin.consume());
@@ -851,6 +992,12 @@ mod socket_tests {
     }
 
     fn member_with(me: &str, targets: Vec<Target>, client: moq_tokio::Client) -> Member {
+        member_as(me, targets, client, Arc::new(PeerStats::default()))
+    }
+
+    /// A member whose own entry is `local`, where moves of the call are
+    /// switched on and made.
+    fn member_as(me: &str, targets: Vec<Target>, client: moq_tokio::Client, local: Arc<PeerStats>) -> Member {
         let outbound = moq_tokio::origin::spawn();
         let camera = outbound.create_broadcast(camera_path(me)).unwrap();
         let mut track = camera.create_track("video", None).unwrap();
@@ -875,10 +1022,11 @@ mod socket_tests {
             estimate: moq_net::bandwidth::Producer::new(),
             guests: None,
             metrics: Arc::new(Metrics::default()),
-            local: Arc::new(PeerStats::default()),
+            local,
             status,
             keyframe: Arc::new(Keyframes::default()),
             room: "room team".to_string(),
+            bounce: None,
         });
         let (end, ended) = tokio::sync::oneshot::channel();
         let joined = Abort(tokio::spawn(async move {
@@ -1124,5 +1272,95 @@ mod socket_tests {
             assert!(Instant::now() < deadline, "the host never had m back directly");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Our own entry with moves of the call switched on.
+    fn following() -> Arc<PeerStats> {
+        let local = Arc::new(PeerStats::default());
+        local.set_move_calls(true);
+        local
+    }
+
+    /// Waits until `origin`'s best route to `path` arrives through `through`.
+    async fn routed_through(origin: &moq_net::origin::Producer, path: &str, through: moq_net::Hop, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(route) = route_within(origin, path).await {
+                if route.hops.as_slice().last() == Some(&through) {
+                    return;
+                }
+            }
+            assert!(Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A host bridging to a relay that speaks moq-lite-05, as the production
+    /// one does, with a member and a viewer dialling both. Moving the call to
+    /// the host moves the media too: the viewer gets the member, and the
+    /// host's own camera, through the host rather than through the relay,
+    /// which every route the host bridges would otherwise still prefer. And
+    /// back again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_moved_to_a_host_goes_through_it_and_back() {
+        let relay = Meeting::older().await;
+        let shared = moq_tokio::origin::spawn();
+        let camera = shared.create_broadcast(camera_path("h")).unwrap();
+        camera.announce(moq_net::origin::Route::default()).unwrap();
+        let _to_relay = client()
+            .with_publisher(shared.consume())
+            .with_subscriber(shared.clone())
+            .connect(relay.url());
+        let host = Meeting::sharing(shared).await;
+        let host_hop = host.origin.hop();
+        let relay_hop = relay.origin.hop();
+
+        let (on_m, on_v) = (following(), following());
+        let _m = member_as("m", vec![relay_at(relay.url()), host_at('h', host.url())], client(), on_m.clone());
+        let v = member_as("v", vec![relay_at(relay.url()), host_at('h', host.url())], client(), on_v.clone());
+        routed_through(&v.inbound, &camera_path("m"), relay_hop, "m never arrived through the relay").await;
+        routed_through(&v.inbound, &camera_path("h"), relay_hop, "h never arrived through the relay").await;
+
+        on_m.move_call(Some(id('h')), "m");
+        on_v.move_call(Some(id('h')), "v");
+        routed_through(&v.inbound, &camera_path("m"), host_hop, "m never came through the host").await;
+        routed_through(&v.inbound, &camera_path("h"), host_hop, "h's own camera never came straight from it").await;
+
+        on_m.move_call(None, "m");
+        on_v.move_call(None, "v");
+        routed_through(&v.inbound, &camera_path("m"), relay_hop, "m never went back to the relay").await;
+        routed_through(&v.inbound, &camera_path("h"), relay_hop, "h never went back to the relay").await;
+        drop(camera);
+    }
+
+    /// Someone who cannot reach the host the call moved to stays in the
+    /// usual order, offering on the relay, and the host bridges them to
+    /// whoever reaches only the host.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_who_cannot_reach_the_chosen_host_is_bridged_in() {
+        let relay = Meeting::older().await;
+        let shared = moq_tokio::origin::spawn();
+        let _to_relay = client()
+            .with_publisher(shared.consume())
+            .with_subscriber(shared.clone())
+            .connect(relay.url());
+        let host = Meeting::sharing(shared.clone()).await;
+
+        let (on_m, on_v) = (following(), following());
+        on_m.move_call(Some(id('h')), "m");
+        on_v.move_call(Some(id('h')), "v");
+        let mut m = member_as("m", vec![relay_at(relay.url()), host_at('h', nowhere())], client(), on_m);
+        let v = member_as("v", vec![relay_at(nowhere()), host_at('h', host.url())], client(), on_v);
+        // At the relay, v arrives bridged by the host, and m straight from m.
+        routed_through(&relay.origin, &camera_path("v"), shared.hop(), "v never reached the relay through the host").await;
+        becomes(&relay.origin, &camera_path("m"), true).await;
+        let route = route_within(&relay.origin, &camera_path("m")).await.expect("m on the relay");
+        assert!(!route.hops.as_slice().contains(&shared.hop()), "m went through the host: {route:?}");
+        routed_through(&v.inbound, &camera_path("m"), host.origin.hop(), "v never had m through the host").await;
+        // Past the time a lost session takes to give up: m stays, and so
+        // does v's way to it.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(m.ended.try_recv().is_err(), "m's join ended with the relay up");
+        assert!(route_within(&v.inbound, &camera_path("m")).await.is_some(), "v lost m");
     }
 }
