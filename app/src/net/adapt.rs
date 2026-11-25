@@ -746,42 +746,139 @@ fn change_line(
     }
 }
 
-/// Mirrors a session's send-bandwidth estimate into the call's own producer,
-/// until the session closes.
+/// The call's one estimate, fed by every session an accepting side holds.
 ///
-/// A listener has no persistent estimate -- it has a session, and only once
-/// somebody has called -- so the call's estimate is fed from whichever session
-/// is live. Clears the estimate on close rather than leaving the last value
-/// standing: a stale number is worse than none, since the rate policy
-/// deliberately holds its target when the estimate goes away and would
-/// otherwise hold one measured against a connection that no longer exists.
-pub(super) async fn forward(
-    session: moq_net::Session,
+/// **The slowest live link sets it.** We encode once and send that one
+/// encoding to everyone, so a rate one guest's link cannot carry would be
+/// dropped for that guest whatever the others could take. That costs everyone
+/// quality for one poor link; it is a first choice, and sending each viewer a
+/// rendition of their own is separate work.
+///
+/// **One slot per session, rather than every session writing the estimate.**
+/// When each wrote it, the last writer won, and any session closing cleared
+/// it for the others -- including the old session of a peer who had already
+/// redialled, which left the new one's call holding its target blind.
+///
+/// The connection figures (rtt, loss) follow the same session, so what the
+/// Network tab shows is the link that is holding the call back.
+pub(super) struct Estimates {
     estimate: moq_net::bandwidth::Producer,
-    metrics: Arc<super::Metrics>,
-) {
+    live: Mutex<Live>,
+}
+
+#[derive(Default)]
+struct Live {
+    next: u64,
+    rates: std::collections::BTreeMap<u64, Option<Rate>>,
+}
+
+impl Estimates {
+    pub(super) fn new(estimate: moq_net::bandwidth::Producer) -> Arc<Self> {
+        Arc::new(Self {
+            estimate,
+            live: Mutex::new(Live::default()),
+        })
+    }
+
+    /// A slot for one session, given back when the slot is dropped -- which
+    /// is also what happens when its task is aborted, so an attempt ending
+    /// cannot leave a dead session's number standing.
+    pub(super) fn join(self: &Arc<Self>) -> Slot {
+        let Ok(mut live) = self.live.lock() else {
+            return Slot { estimates: self.clone(), id: None };
+        };
+        let id = live.next;
+        live.next += 1;
+        live.rates.insert(id, None);
+        Slot { estimates: self.clone(), id: Some(id) }
+    }
+
+    /// Records one session's rate and republishes the slowest. Returns whether
+    /// this session is the one setting the pace.
+    fn set(&self, id: u64, rate: Option<Rate>) -> bool {
+        let Ok(mut live) = self.live.lock() else { return false };
+        if let Some(slot) = live.rates.get_mut(&id) {
+            *slot = rate;
+        }
+        let pace = slowest(&live.rates);
+        // Written under the lock, so two sessions cannot publish out of order.
+        let _ = self.estimate.set(pace.and_then(|(_, rate)| rate));
+        pace.is_some_and(|(pacer, _)| pacer == id)
+    }
+
+    fn leave(&self, id: u64) {
+        let Ok(mut live) = self.live.lock() else { return };
+        live.rates.remove(&id);
+        let _ = self.estimate.set(slowest(&live.rates).and_then(|(_, rate)| rate));
+    }
+}
+
+/// One session's place in [`Estimates`].
+pub(super) struct Slot {
+    estimates: Arc<Estimates>,
+    /// `None` only when the lock was poisoned, which costs this session its say.
+    id: Option<u64>,
+}
+
+impl Slot {
+    /// See [`Estimates::set`].
+    pub(super) fn set(&self, rate: Option<Rate>) -> bool {
+        self.id.is_some_and(|id| self.estimates.set(id, rate))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            self.estimates.leave(id);
+        }
+    }
+}
+
+/// Which session sets the pace, and at what: the lowest known rate, the
+/// earliest session on a tie. A session that has no estimate yet sets nothing
+/// while another has one; when none has, the earliest is the pacer with no
+/// rate, so the figures still come from somewhere. `None` with no sessions.
+pub(super) fn slowest(rates: &std::collections::BTreeMap<u64, Option<Rate>>) -> Option<(u64, Option<Rate>)> {
+    let known = rates
+        .iter()
+        .filter_map(|(id, rate)| rate.map(|rate| (rate, *id)))
+        .min()
+        .map(|(rate, id)| (id, Some(rate)));
+    known.or_else(|| rates.keys().next().map(|id| (*id, None)))
+}
+
+/// Feeds one session's send-bandwidth estimate into the call's, until the
+/// session closes.
+///
+/// A listener has no persistent estimate -- it has sessions, and only once
+/// somebody has called -- so the call's estimate is fed from the live ones
+/// (see [`Estimates`]). Leaving clears this session's share rather than leaving
+/// the last value standing: a stale number is worse than none, since the rate
+/// policy deliberately holds its target when the estimate goes away and would
+/// otherwise hold one measured against a connection that no longer exists.
+pub(super) async fn forward(session: moq_net::Session, estimates: Arc<Estimates>, metrics: Arc<super::Metrics>) {
     let source = session.send_bandwidth();
     if source.is_none() {
         tracing::debug!("[rate] this session reports no bandwidth estimate");
     }
+    let slot = estimates.join();
     let mut ticker = tokio::time::interval(SAMPLE);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             error = session.closed() => {
-                tracing::debug!("[rate] session closed, dropping the estimate: {error}");
+                tracing::debug!("[rate] session closed, dropping its estimate: {error}");
                 break;
             }
             _ = ticker.tick() => {
-                if let Some(source) = source.as_ref() {
-                    let _ = estimate.set(source.peek());
+                if slot.set(source.as_ref().and_then(|source| source.peek())) {
+                    metrics.set_connection(&session.stats());
                 }
-                metrics.set_connection(&session.stats());
             }
         }
     }
-    let _ = estimate.set(None);
 }
 
 /// Copies a dialling side's estimate into the call's own producer, for as long
@@ -1262,6 +1359,46 @@ mod tests {
         drop(share_sub);
         assert_eq!(share_lane.slice(), None);
         assert_eq!(link.camera.slice(), Some(1_936_000));
+    }
+
+    fn kbps(kbps: u64) -> Option<Rate> {
+        Some(Rate::from_kbps(kbps))
+    }
+
+    #[test]
+    fn the_slowest_known_link_sets_the_pace() {
+        let rates = std::collections::BTreeMap::from([(0, kbps(900)), (1, kbps(400)), (2, None)]);
+        assert_eq!(slowest(&rates), Some((1, kbps(400))));
+        // A tie goes to the earliest session, so the pacer does not flap.
+        let rates = std::collections::BTreeMap::from([(3, kbps(400)), (1, kbps(400))]);
+        assert_eq!(slowest(&rates), Some((1, kbps(400))));
+    }
+
+    #[test]
+    fn with_nothing_known_the_earliest_session_paces_at_no_rate() {
+        let rates = std::collections::BTreeMap::from([(4, None), (2, None)]);
+        assert_eq!(slowest(&rates), Some((2, None)));
+        assert_eq!(slowest(&std::collections::BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn one_session_leaving_does_not_clear_the_others() {
+        let estimate = moq_net::bandwidth::Producer::new();
+        let seen = estimate.consume();
+        let estimates = Estimates::new(estimate);
+        let first = estimates.join();
+        let second = estimates.join();
+        assert!(first.set(kbps(300)));
+        assert_eq!(seen.peek(), kbps(300));
+        assert!(!second.set(kbps(800)), "the faster link does not pace");
+        assert!(first.set(kbps(300)), "the slower one does");
+
+        // What a peer redialling looks like: the old session's close used to
+        // clear the estimate under the new one.
+        drop(first);
+        assert_eq!(seen.peek(), kbps(800));
+        drop(second);
+        assert_eq!(seen.peek(), None, "no sessions, no estimate");
     }
 
     impl Sample {

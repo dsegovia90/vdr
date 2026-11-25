@@ -266,6 +266,97 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
     })
 }
 
+/// Everything [`serve`] needs, named rather than positional.
+struct Serve<'a> {
+    config: &'a moq_tokio::client::Config,
+    endpoint: &'a moq_tokio::iroh::Endpoint,
+    /// What every accepted session is offered.
+    publisher: moq_net::origin::Consumer,
+    /// Where every accepted session's broadcasts land.
+    subscriber: moq_net::origin::Producer,
+    estimates: Arc<adapt::Estimates>,
+    metrics: Arc<Metrics>,
+}
+
+/// Starts accepting sessions on our endpoint, for as long as the returned
+/// task lives. Each message on the receiver is `true` for a session that
+/// began and `false` for one that ended; the channel closing says the server
+/// did.
+async fn serve(
+    args: Serve<'_>,
+) -> Result<(Abort, futures_channel::mpsc::UnboundedReceiver<bool>), String> {
+    let Serve {
+        config,
+        endpoint,
+        publisher,
+        subscriber,
+        estimates,
+        metrics,
+    } = args;
+    let mut server_config = moq_tokio::server::Config::default();
+    server_config.listen.bind = Some(moq_tokio::listen::Bind::Addr(
+        std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+    ));
+    server_config.listen.tls.generate = vec!["localhost".to_string()];
+    server_config.quic = config.quic.clone();
+    server_config.iroh = Some(endpoint.clone());
+    // The origins stay on the server rather than moving to each request:
+    // `accept` attaches them.
+    server_config.publisher = Some(publisher);
+    server_config.subscriber = Some(subscriber);
+    let server = server_config
+        .init()
+        .map_err(|error| format!("could not build a server: {error:#}"))?
+        .bind()
+        .await
+        .map_err(|error| format!("could not listen: {error:#}"))?;
+    Ok(accept(server, estimates, metrics))
+}
+
+/// The accept loop, apart from the server it runs on so it can be driven over
+/// a plain local socket as well as iroh.
+///
+/// **Our own accept loop, rather than `serve_both`.** That convenience method
+/// is exactly this loop, plus a private helper that does `request.ok()` and
+/// waits -- but it never hands the session back, and the session is where a
+/// bandwidth estimate lives. Without one, a callee sends at its opening rate
+/// for the whole call however bad the link gets.
+///
+/// **The sessions belong to this task.** They used to be spawned loose, so
+/// aborting the loop at the end of an attempt stopped new sessions and left
+/// the accepted ones running: a listener that hung up stayed connected
+/// underneath, serving its origins to whoever was still on the line. Held in a
+/// `JoinSet` here, they end with the loop, and with the call.
+fn accept(
+    mut server: moq_tokio::Listener,
+    estimates: Arc<adapt::Estimates>,
+    metrics: Arc<Metrics>,
+) -> (Abort, futures_channel::mpsc::UnboundedReceiver<bool>) {
+    let (events, receiver) = futures_channel::mpsc::unbounded::<bool>();
+    let task = Abort(tokio::spawn(async move {
+        let mut sessions = tokio::task::JoinSet::new();
+        // `accept` alone is awaited, never raced: handshakes in flight are
+        // parked on the server, and a loop that dropped its accept to do
+        // something else could lose exactly the reconnection being waited
+        // for. Finished sessions are reaped as each new one arrives instead.
+        while let Some(request) = server.accept().await {
+            while sessions.try_join_next().is_some() {}
+            let _ = events.unbounded_send(true);
+            let estimates = estimates.clone();
+            let metrics = metrics.clone();
+            let events = events.clone();
+            sessions.spawn(async move {
+                match request.ok().await {
+                    Ok(session) => adapt::forward(session, estimates, metrics).await,
+                    Err(error) => tracing::warn!("a session failed to start: {error:#}"),
+                }
+                let _ = events.unbounded_send(false);
+            });
+        }
+    }));
+    (task, receiver)
+}
+
 /// The URL with any token's value blanked, for logs and labels.
 ///
 /// **A room URL can carry its invitation** (`?jwt=…`, the relay's token), and
@@ -983,66 +1074,27 @@ async fn run(
             }
             Peering::Listen => {
                 report(RemoteStatus::Listening { me: me.to_string() });
-                let mut server_config = moq_tokio::server::Config::default();
-                server_config.listen.bind = Some(moq_tokio::listen::Bind::Addr(
-                    std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
-                ));
-                server_config.listen.tls.generate = vec!["localhost".to_string()];
-                server_config.quic = client_config.quic.clone();
-                server_config.iroh = Some(endpoint.clone());
-                // The origins stay on the server rather than moving to each
-                // request: `accept` attaches them.
-                server_config.publisher = Some(outbound.consume());
-                server_config.subscriber = Some(inbound.clone());
-                let mut server = server_config
-                    .init()
-                    .map_err(|error| format!("could not build a server: {error:#}"))?
-                    .bind()
-                    .await
-                    .map_err(|error| format!("could not listen: {error:#}"))?;
-                // **Our own accept loop, rather than `serve_both`.** That
-                // convenience method is exactly this loop, plus a private
-                // helper that does `request.ok()` and waits -- but it never
-                // hands the session back, and the session is where a bandwidth
-                // estimate lives. Without one, a callee sends at its opening
-                // rate for the whole call however bad the link gets.
+                // The call's own estimate, fed from the live sessions. The
+                // dialling side gets a persistent one from `Reconnect`; here
+                // the call's is the persistent one, because it has to exist
+                // before anyone has called.
                 //
-                // The call's own estimate, fed from whichever session is live.
-                // The dialling side gets a persistent one from `Reconnect`;
-                // here the call's is the persistent one, because it has to
-                // exist before anyone has called.
-                let estimate = estimate.clone();
-                // The accept loop below is an `async move`, so it would take
-                // the shared handle with it and leave the next attempt without
-                // one.
-                let metrics = metrics.clone();
-                let status = status.clone();
-                let keyframe = keyframe.clone();
                 // **Accepting is its own task, not a branch below.** A listener
                 // has to watch two things at once -- new sessions and the ones
                 // it has -- and `accept` parks half-finished handshakes on the
                 // server itself, so dropping it mid-poll to take the other
                 // branch could lose exactly the reconnection being waited for.
-                // `true` says a session began, `false` that one ended; the
-                // channel closing says the server did.
-                let (sessions, mut events) = futures_channel::mpsc::unbounded::<bool>();
-                let accepting = Abort(tokio::spawn(async move {
-                    while let Some(request) = server.accept().await {
-                        let _ = sessions.unbounded_send(true);
-                        let estimate = estimate.clone();
-                        let metrics = metrics.clone();
-                        let sessions = sessions.clone();
-                        tokio::spawn(async move {
-                            match request.ok().await {
-                                Ok(session) => adapt::forward(session, estimate, metrics).await,
-                                Err(error) => {
-                                    tracing::warn!("a session failed to start: {error:#}")
-                                }
-                            }
-                            let _ = sessions.unbounded_send(false);
-                        });
-                    }
-                }));
+                let (accepting, mut events) = serve(Serve {
+                    config: &client_config,
+                    endpoint: &endpoint,
+                    publisher: outbound.consume(),
+                    subscriber: inbound.clone(),
+                    estimates: adapt::Estimates::new(estimate.clone()),
+                    metrics: metrics.clone(),
+                })
+                .await?;
+                let status = status.clone();
+                let keyframe = keyframe.clone();
                 Peer {
                     // Nothing here dials, so "reconnecting" is only ever a count
                     // of live sessions: the peer redials us. What this adds is
@@ -2780,5 +2832,105 @@ mod room_tests {
     fn an_iroh_relay_is_shortened() {
         let key = "a".repeat(64);
         assert_eq!(label(&format!("iroh://{key}/test")), "room test on aaaaaaaaaaaa");
+    }
+}
+
+/// The accept loop over a real local socket: raw QUIC to 127.0.0.1, which
+/// carries the request in the SETUP as an iroh dial does. No camera, no
+/// microphone, no iroh.
+#[cfg(test)]
+mod served_tests {
+    use super::*;
+
+    /// Long for a local socket; a run that needs it has failed anyway.
+    const WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// One shared origin, served on a local port through [`accept`].
+    async fn host() -> (Abort, u16) {
+        let shared = moq_tokio::origin::spawn();
+        let mut config = moq_tokio::server::Config::default();
+        config.listen.bind = Some(moq_tokio::listen::Bind::Addr(([127, 0, 0, 1], 0).into()));
+        config.listen.tls.generate = vec!["localhost".to_string()];
+        config.publisher = Some(shared.consume());
+        config.subscriber = Some(shared);
+        let server = config.init().unwrap().bind().await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
+        let (task, _) = accept(server, estimates, Arc::new(Metrics::default()));
+        (task, port)
+    }
+
+    /// Someone who dials `target` once and publishes as `id`, with their own
+    /// two origins as the app has.
+    struct Guest {
+        connection: moq_tokio::Connection,
+        inbound: moq_net::origin::Producer,
+        _outbound: moq_net::origin::Producer,
+        _camera: moq_net::broadcast::Producer,
+    }
+
+    fn guest(port: u16, target: &str, id: &str) -> Guest {
+        let outbound = moq_tokio::origin::spawn();
+        let camera = outbound.create_broadcast(camera_path(id)).unwrap();
+        camera.announce(moq_net::origin::Route::default()).unwrap();
+        let inbound = moq_tokio::origin::spawn();
+        let mut config = moq_tokio::client::Config::default();
+        config.connect.tls.insecure = Some(true);
+        let url: url::Url = format!("moqt://localhost:{port}{target}").parse().unwrap();
+        let connection = config
+            .init()
+            .unwrap()
+            .with_publisher(outbound.consume())
+            .with_subscriber(inbound.clone())
+            .with_reconnect(false)
+            .connect(url);
+        Guest {
+            connection,
+            inbound,
+            _outbound: outbound,
+            _camera: camera,
+        }
+    }
+
+    /// Waits for `id`'s camera to be announced to `guest`.
+    async fn sees(guest: &Guest, id: &str) {
+        let mut announced = guest.inbound.consume().announced();
+        let wanted = camera_path(id);
+        tokio::time::timeout(WITHIN, async {
+            while let Some(update) = announced.next().await {
+                if update.prefix.as_str() == wanted && update.kind.is_active() {
+                    return;
+                }
+            }
+            panic!("the announcements ended before {wanted}");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{wanted} was never announced"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guests_see_each_other_through_one_shared_origin() {
+        let (_accepting, port) = host().await;
+        let a = guest(port, "/room", "a");
+        let b = guest(port, "/room", "b");
+        sees(&a, "b").await;
+        sees(&b, "a").await;
+    }
+
+    /// Weaker than it looks: over this socket, dropping the listener closes its
+    /// QUIC connections by itself, so loose session tasks would pass too. Over
+    /// iroh the endpoint outlives the server (read in moq-tokio's `Listener`,
+    /// not run), and there the sessions' tasks ending is what ends them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sessions_end_with_the_accept_loop() {
+        let (accepting, port) = host().await;
+        let guest = guest(port, "/room", "a");
+        let connection = tokio::time::timeout(WITHIN, guest.connection.clone().established())
+            .await
+            .expect("never connected")
+            .expect("refused");
+        drop(accepting);
+        let ended = tokio::time::timeout(WITHIN, connection.closed()).await;
+        assert!(ended.is_ok(), "the session outlived the call");
     }
 }
