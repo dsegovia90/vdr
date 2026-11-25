@@ -660,6 +660,10 @@ pub(super) fn join(args: Join) -> Peer {
                         None => tracing::info!("our media goes through the relay"),
                         Some(id) => tracing::info!("our media goes through host {id}"),
                     }
+                    local.set_sending(Some(match &member.target.host {
+                        None => super::super::arrival::Sending::Relay,
+                        Some(id) => super::super::arrival::Sending::Host(id.clone()),
+                    }));
                     if let Some(session) = &member.session {
                         _following = Some(follow(session, &estimate, &metrics));
                     }
@@ -668,6 +672,7 @@ pub(super) fn join(args: Join) -> Peer {
                     on_guests = false;
                 } else if next.is_none() && serving && !on_guests && relay_tried {
                     tracing::info!("still hosting; no way to the relay");
+                    local.set_sending(Some(super::super::arrival::Sending::Guests));
                     _following = guests.clone().map(|guests| follow_guests(guests, &estimate));
                     carrier = None;
                     on_guests = true;
@@ -889,6 +894,12 @@ mod socket_tests {
         /// On a given port, so a relay can come up where members are already
         /// dialling it.
         async fn on(port: u16, origin: moq_net::origin::Producer) -> Meeting {
+            Self::try_on(port, origin).await.expect("bound")
+        }
+
+        /// The same, for a port that may still be held a moment by a relay
+        /// that just stopped there.
+        async fn try_on(port: u16, origin: moq_net::origin::Producer) -> Option<Meeting> {
             Self::speaking(port, origin, Vec::new()).await
         }
 
@@ -896,11 +907,12 @@ mod socket_tests {
         /// one does: its routes carry no price.
         async fn older() -> Meeting {
             let versions = vec!["moq-lite-05".parse().expect("a version this moq-net knows")];
-            Self::speaking(0, moq_tokio::origin::spawn(), versions).await
+            Self::speaking(0, moq_tokio::origin::spawn(), versions).await.expect("bound")
         }
 
         /// `versions` empty speaks every version, as a default server does.
-        async fn speaking(port: u16, origin: moq_net::origin::Producer, versions: Vec<moq_net::Version>) -> Meeting {
+        /// `None` when the port cannot be bound.
+        async fn speaking(port: u16, origin: moq_net::origin::Producer, versions: Vec<moq_net::Version>) -> Option<Meeting> {
             crypto();
             let mut config = moq_tokio::server::Config::default();
             config.listen.version = versions;
@@ -908,7 +920,7 @@ mod socket_tests {
             config.listen.tls.generate = vec!["localhost".to_string()];
             config.publisher = Some(origin.consume());
             config.subscriber = Some(origin.clone());
-            let mut server = config.init().unwrap().bind().await.unwrap();
+            let mut server = config.init().ok()?.bind().await.ok()?;
             let port = server.local_addr().unwrap().port();
             let sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
             let kept = sessions.clone();
@@ -922,12 +934,12 @@ mod socket_tests {
                     });
                 }
             }));
-            Meeting {
+            Some(Meeting {
                 origin,
                 port,
                 sessions,
                 _accepting: accepting,
-            }
+            })
         }
 
         fn url(&self) -> url::Url {
@@ -1182,7 +1194,7 @@ mod socket_tests {
         let port = server.local_addr().unwrap().port();
         let hosting = door::Hosting::open("team".to_string()).unwrap();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (_accepting, _) = accept(server, Some(hosting), Some(estimates), Arc::new(Metrics::default()), None);
+        let (_accepting, _) = accept(server, Some(hosting), Some(estimates), Arc::new(Metrics::default()), None, None);
         // No door: what a member holding an old one presents, as far as the
         // host can tell.
         let started = Instant::now();
@@ -1362,5 +1374,55 @@ mod socket_tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(m.ended.try_recv().is_err(), "m's join ended with the relay up");
         assert!(route_within(&v.inbound, &camera_path("m")).await.is_some(), "v lost m");
+    }
+
+    /// The route mark, read the way the call reads it, follows the relay: a
+    /// viewer on the relay and a host has m through the relay, through the
+    /// host once the relay dies, and through the relay again once it is back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_viewer_reads_m_through_the_host_while_the_relay_is_down_and_the_relay_after() {
+        use super::super::super::arrival::{self, Arrival};
+        let relay = Meeting::start().await;
+        let port = relay.port;
+        let host = Meeting::start().await;
+        let hosts = std::collections::BTreeMap::from([(host.origin.hop().id(), id('a'))]);
+        let targets = || vec![relay_at(at(port)), host_at('a', host.url())];
+        let _m = member_with("m", targets(), patient_client());
+        let v = member_with("v", targets(), patient_client());
+
+        let arrives = |wanted: Arrival| {
+            let inbound = v.inbound.clone();
+            let hosts = hosts.clone();
+            async move {
+                let guests = std::collections::HashSet::new();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut last = None;
+                loop {
+                    if let Some(route) = route_within(&inbound, &camera_path("m")).await {
+                        let hops: Vec<u64> = route.hops.as_slice().iter().map(|hop| hop.id()).collect();
+                        let known = arrival::Known { theirs: None, hosts: &hosts, guests: &guests, ours: 0, far: None, who: "m" };
+                        last = arrival::read(&hops, &known);
+                        if last.as_ref() == Some(&wanted) {
+                            return;
+                        }
+                    }
+                    assert!(Instant::now() < deadline, "m never arrived {wanted:?}; last {last:?}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+
+        arrives(Arrival::Relay { from: None }).await;
+        relay.stop().await;
+        arrives(Arrival::Host { id: id('a'), from: None }).await;
+        let deadline = Instant::now() + WITHIN;
+        let _relay = loop {
+            if let Some(relay) = Meeting::try_on(port, moq_tokio::origin::spawn()).await {
+                break relay;
+            }
+            assert!(Instant::now() < deadline, "the relay's port never came free");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        arrives(Arrival::Relay { from: None }).await;
     }
 }

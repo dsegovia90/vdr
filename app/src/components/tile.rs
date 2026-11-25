@@ -20,6 +20,7 @@ use crate::audio::Crosstalk;
 use crate::camera::{FrameSlot, Mirror};
 use crate::channel::use_channel;
 use crate::net::PeerStats;
+use crate::net::arrival::{self, Arrival, Sending};
 use crate::net::quality::{self, Quality};
 
 /// How often a tile re-reads its numbers. Matches the stats row.
@@ -50,6 +51,20 @@ struct Reading {
     /// `None` when they are not reporting or our connection report is off:
     /// no mark at all, rather than an "unknown" one.
     mark: Option<Quality>,
+    /// The way their video reaches us, or where ours goes on our own tile.
+    /// `None` while the route switch is off, so nothing changes and nothing
+    /// is sent for it then.
+    route: Option<Way>,
+    /// Whether they host the room (we, on our own tile). Only while the
+    /// route switch is on.
+    hosting: bool,
+}
+
+/// One tile's route.
+#[derive(Clone, PartialEq)]
+enum Way {
+    Arrives(Arrival),
+    Sends(Sending),
 }
 
 impl Default for Reading {
@@ -66,6 +81,8 @@ impl Default for Reading {
             sharing: false,
             share_problem: None,
             mark: None,
+            route: None,
+            hosting: false,
         }
     }
 }
@@ -174,6 +191,8 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
         let local = props.local.clone();
         move || {
             let Some(stats) = stats else { return };
+            // Our own entry is the one our tile is given.
+            let own = Arc::ptr_eq(&stats, &local);
             let spawned = std::thread::Builder::new()
                 .name("tile".into())
                 .spawn(move || {
@@ -182,6 +201,12 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                         // Off means neither publish nor show.
                         let shown = local.connection_report();
                         let link = if shown { stats.link() } else { None };
+                        let routes = local.show_routes();
+                        let route = match (routes, own) {
+                            (false, _) => None,
+                            (true, true) => stats.sending().map(Way::Sends),
+                            (true, false) => stats.arrival().map(Way::Arrives),
+                        };
                         let next = Reading {
                             // Only the state, which has hysteresis: the
                             // figures move every report, and any change
@@ -197,6 +222,8 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                             invites: stats.invites(),
                             sharing: stats.sharing(),
                             share_problem: stats.share_problem(),
+                            route,
+                            hosting: routes && stats.hosting(),
                         };
                         // Only a change is sent. Any message wakes the page, and blitz repaints
                         // the whole window whenever the page wakes, changed or not.
@@ -242,6 +269,15 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     // **Their name if they have one, on a peer's tile only**: ours says
     // "You" whatever we are called.
     let shown = shown_label(mine, now.name.as_deref(), &props.label);
+    // Words for the route, naming hosts as the rest of the page does.
+    let route = now.route.as_ref().map(|way| {
+        let names = names.read();
+        let name = |id: &str| Names::of(&names, id);
+        match way {
+            Way::Arrives(arrival) => arrival::arrival_words(arrival, name),
+            Way::Sends(sending) => arrival::sending_words(sending, name),
+        }
+    });
     let name = menu_name(&props.who);
     let open = !mine && current.read().as_deref() == Some(name.as_str());
     let our_room = rooms.read().get(&props.me).cloned().flatten();
@@ -303,6 +339,12 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                     class: if now.talking { "h-2 w-2 shrink-0 rounded-full bg-emerald-400" } else { "h-2 w-2 shrink-0 rounded-full bg-neutral-500" },
                 }
                 span { class: text, "{shown}{fps}" }
+                if now.hosting {
+                    span { class: "whitespace-nowrap text-xs text-amber-300", "\u{b7} host" }
+                }
+                if let Some(route) = route {
+                    span { class: "whitespace-nowrap text-xs text-sky-300", "\u{b7} {route}" }
+                }
                 if let Some(muted_by) = muted_by {
                     span { class: "whitespace-nowrap text-xs text-red-300", "\u{b7} {muted_by}" }
                 }
