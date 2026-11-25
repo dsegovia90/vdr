@@ -322,7 +322,7 @@ pub fn use_remote() -> Remote {
         // tab changes it from here on, and the call reads it as it goes.
         local.set_connection_report(saved.connection_report_on());
         // Whether we host the rooms we join; read by each join as it starts.
-        local.set_host_rooms(saved.hosts_rooms());
+        local.set_host_rooms(saved.hosts_rooms() || crate::args::Args::get().host_rooms);
         // What every decision to join goes through: the hosts an invite
         // lists come off the link before it goes anywhere, and with hosting
         // on the room gets its door, the one it already has or a new one.

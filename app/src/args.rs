@@ -250,6 +250,11 @@ pub struct Args {
     /// the person at it: each would otherwise take the microphone and play
     /// the others through the speakers.
     pub no_audio: bool,
+    /// Host the rooms joined in this run, as the Experimental switch does,
+    /// without saving it (`--host-rooms`). An `--ephemeral` instance starts
+    /// from empty settings and nobody is there to click the switch, so a
+    /// scripted test has no other way to be a host.
+    pub host_rooms: bool,
 }
 
 impl Args {
@@ -285,6 +290,7 @@ impl Args {
         let mut no_catchup = false;
         let mut audio_stall = None;
         let mut no_audio = false;
+        let mut host_rooms = false;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -338,6 +344,7 @@ impl Args {
                 },
                 "--no-catchup" => no_catchup = true,
                 "--no-audio" => no_audio = true,
+                "--host-rooms" => host_rooms = true,
                 "--audio-stall" => match args.next().as_deref().map(str::parse::<u64>) {
                     Some(Ok(ms)) => audio_stall = Some(std::time::Duration::from_millis(ms)),
                     Some(Err(error)) => tracing::error!("--audio-stall is not a number: {error}"),
@@ -358,6 +365,7 @@ impl Args {
             no_catchup,
             audio_stall,
             no_audio,
+            host_rooms,
         }
     }
 }
