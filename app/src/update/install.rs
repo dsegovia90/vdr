@@ -1,7 +1,7 @@
 //! Putting a verified package where the running app is, and starting it.
 //!
-//! **Only over a real install.** A build folder, a throwaway `--ephemeral`
-//! run, or an app macOS is running from a randomised read-only copy (App
+//! **Only over a real install.** A build folder, a test run (`--ephemeral` or
+//! `--profile`), or an app macOS is running from a randomised read-only copy (App
 //! Translocation, for an app opened straight from Downloads) is not
 //! something to overwrite; each says why instead. The path checks are pure
 //! ([`locate`]) and under test; the rest needs a disk.
@@ -62,9 +62,11 @@ pub enum Plan {
 /// Where the running binary would be replaced, from its path alone.
 ///
 /// The error is a sentence for the settings window.
-pub fn locate(exe: &Path, ephemeral: bool, platform: Platform) -> Result<Location, String> {
-    if ephemeral {
-        return Err("This is an --ephemeral run, which never updates itself.".into());
+/// `test_run` is an `--ephemeral` or `--profile` run: a copy started to test
+/// something, which must not replace the installed app under its owner.
+pub fn locate(exe: &Path, test_run: bool, platform: Platform) -> Result<Location, String> {
+    if test_run {
+        return Err("This is an --ephemeral or --profile run, which never updates itself.".into());
     }
     let components: Vec<Component> = exe.components().collect();
     if components.iter().any(|part| part.as_os_str() == "target") {
@@ -103,7 +105,7 @@ pub fn plan() -> Plan {
         Ok(exe) => exe,
         Err(error) => return Plan::Refused(format!("Could not tell where this copy is ({error}).")),
     };
-    let location = match locate(&exe, crate::args::Args::get().ephemeral, platform) {
+    let location = match locate(&exe, crate::settings::is_test_run(), platform) {
         Ok(location) => location,
         Err(reason) => return Plan::Refused(reason),
     };

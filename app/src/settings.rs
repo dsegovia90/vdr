@@ -112,12 +112,71 @@ pub fn log_file() -> Option<std::path::PathBuf> {
 /// Read from the raw arguments rather than [`crate::args::Args`], because
 /// logging is set up before the arguments are parsed, and the parser reports
 /// through logging.
+///
+/// **`--profile <dir>` is the persistent kind of the same thing**: a folder
+/// of the tester's choosing, so a scripted instance keeps its identity, its
+/// rooms and their hosts across a restart, which a test of "the app remembers
+/// where the room can meet" needs and `--ephemeral` forgets by design. It is
+/// never the real folder: a profile that names it, or names nothing, falls
+/// back to the throwaway one. `--ephemeral` wins over it.
 pub fn data_dir() -> Option<std::path::PathBuf> {
-    if std::env::args().any(|arg| arg == "--ephemeral") {
-        return Some(std::env::temp_dir().join(format!("{APP_DIR}-{}", std::process::id())));
+    let real = directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().join(APP_DIR));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match folder(&args, real.as_deref()) {
+        Folder::Throwaway => Some(std::env::temp_dir().join(format!("{APP_DIR}-{}", std::process::id()))),
+        Folder::Profile(dir) => Some(dir),
+        Folder::Real => real,
     }
-    let dirs = directories::BaseDirs::new()?;
-    Some(dirs.data_local_dir().join(APP_DIR))
+}
+
+/// Which data folder a run's arguments ask for.
+#[derive(Debug, PartialEq)]
+enum Folder {
+    Throwaway,
+    Profile(std::path::PathBuf),
+    Real,
+}
+
+/// [`data_dir`]'s decision, apart from the process so it can be tested.
+/// `real` is the real folder, when the platform has one.
+fn folder(args: &[String], real: Option<&std::path::Path>) -> Folder {
+    if args.iter().any(|arg| arg == "--ephemeral") {
+        return Folder::Throwaway;
+    }
+    let Some(at) = args.iter().position(|arg| arg == "--profile") else {
+        return Folder::Real;
+    };
+    // A missing value, or another flag where the folder should be, is a
+    // mistyped test run: never a reason to fall through to the real folder.
+    let Some(dir) = args.get(at + 1).filter(|dir| !dir.is_empty() && !dir.starts_with("--")) else {
+        return Folder::Throwaway;
+    };
+    let dir = std::path::Path::new(dir);
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(here) => here.join(dir),
+            Err(_) => return Folder::Throwaway,
+        }
+    };
+    // Compared as written and as resolved, since either may be a link.
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+    };
+    if real.is_some_and(|real| same(&dir, real)) {
+        return Folder::Throwaway;
+    }
+    Folder::Profile(dir)
+}
+
+/// Whether this run keeps its data away from the real folder, with
+/// `--ephemeral` or `--profile`: such a run is a test, and never updates the
+/// installed app.
+pub fn is_test_run() -> bool {
+    let real = directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().join(APP_DIR));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    folder(&args, real.as_deref()) != Folder::Real
 }
 
 /// Everything the app remembers between launches.
@@ -480,6 +539,29 @@ fn choose_microphone(devices: &[&str], persisted: Option<&str>) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn a_profile_is_its_own_folder_and_never_the_real_one() {
+        let real = std::env::temp_dir().join("vdr-real-folder-for-a-test");
+        let elsewhere = std::env::temp_dir().join("vdr-profile-a");
+        let named = |dir: &std::path::Path| folder(&args(&["--profile", &dir.to_string_lossy()]), Some(&real));
+        assert_eq!(folder(&args(&[]), Some(&real)), Folder::Real);
+        assert_eq!(named(&elsewhere), Folder::Profile(elsewhere.clone()));
+        assert_eq!(named(&real), Folder::Throwaway, "the real folder is never a profile");
+        assert_eq!(folder(&args(&["--profile"]), Some(&real)), Folder::Throwaway);
+        assert_eq!(folder(&args(&["--profile", "--camera-off"]), Some(&real)), Folder::Throwaway);
+        assert_eq!(folder(&args(&["--profile", "", "--x"]), Some(&real)), Folder::Throwaway);
+        assert_eq!(
+            folder(&args(&["--ephemeral", "--profile", &elsewhere.to_string_lossy()]), Some(&real)),
+            Folder::Throwaway
+        );
+        let Folder::Profile(relative) = folder(&args(&["--profile", "b"]), Some(&real)) else { panic!("a profile") };
+        assert!(relative.is_absolute() && relative.ends_with("b"), "{relative:?}");
+    }
 
     fn id(value: &str) -> DeviceId {
         DeviceId(value.to_string())

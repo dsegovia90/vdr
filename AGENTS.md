@@ -46,6 +46,12 @@ focus.
 - **Always `--ephemeral`** for a test instance: a throwaway identity and data
   folder under the system temp directory. Without it a second copy rotates the
   real app's log away and shares its settings.
+- **`--profile <dir>`** instead, when a test must survive a restart (an
+  instance that remembers its rooms, their hosts, and its own key): its own
+  folder for settings, `rooms.json`, the log and the key (kept 0600 like the
+  real one). It never uses the real data folder; one that names it, or names
+  nothing, falls back to a throwaway folder. Like `--ephemeral`, such a run never
+  updates itself, and `--ephemeral` wins if both are given.
 - **`--camera-off`** unless the camera is what you are testing. A second app
   opening the camera can change its format under another app that is using it.
 - **`--loopback` plays the microphone back through the speakers.** Do not use
@@ -188,7 +194,7 @@ focus.
   trusts that key instead, and only it reads `VDR_UPDATE_FEED` at runtime (a
   URL answering with GitHub's latest-release JSON; its asset URLs may be
   `http`). Release builds set neither. The installer refuses a copy under a
-  `target/` folder, an `--ephemeral` run and a translocated macOS app, so test
+  `target/` folder, an `--ephemeral` or `--profile` run and a translocated macOS app, so test
   on a copy of the bundle moved elsewhere.
 - **The `wayland-share` feature is off by default** so that clippy and tests
   need no PipeWire headers; the Linux package turns it on.
@@ -318,7 +324,7 @@ focus.
 
 | Path | Role |
 |---|---|
-| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--host`, `--loopback`, `--camera`, `--camera-off`, `--no-audio`, `--host-rooms`, `--ephemeral`, `--quality`, `--encoder`, …) |
+| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--host`, `--loopback`, `--camera`, `--camera-off`, `--no-audio`, `--host-rooms`, `--ephemeral`, `--profile`, `--quality`, `--encoder`, …) |
 | `settings.rs` | what the app remembers between launches, the data folder, the log path |
 | `hotkeys.rs` | keyboard shortcuts as a pure table: actions, chords, the keymap. No UI in it |
 | `name.rs` | display names: cleaning, the short id, which label to show |
