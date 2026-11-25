@@ -156,6 +156,11 @@ is not known yet. A person not reporting has none, and neither does a shared
 screen; the person's menu says it in a line. Turning the switch off stops
 telling the room about your connection and hides everyone else's. The
 thresholds are first guesses.
+*Show the route on each video*, off by default, is a debugging aid: each
+video's label says how it reaches you (through the relay, through someone
+hosting the room, or directly) and marks whoever hosts; your own says where
+your video goes. It shows the route announced as best, which the video
+follows within a moment.
 *Move the call*, off by default, is a test instrument for rooms with hosts:
 with it on, a host's menu offers "Move the call here", and everyone else who
 has the switch on follows the move, sending their video through that host's
@@ -239,7 +244,9 @@ and one of them with `--bounce <secs>`, which moves the call round the relay
 and each host it knows every so often (10 seconds at least, 30 if no number
 is given). `--move-call relay|<host id>` moves it once, as the join starts.
 Each move is logged, and each viewer logs `<id> left` and `<id> back after N
-ms` for a tile that went and came back.
+ms` for a tile that went and came back. `--show-routes` turns on the route
+marks for that run without saving it; each viewer logs `<id> now arrives …`
+whenever someone's route changes, whether or not the marks are on.
 
 Run it with `dx`, not `cargo run`: the stylesheet only resolves inside a dx
 bundle, and `cargo run` comes up unstyled. `cargo clippy` and `cargo test` work

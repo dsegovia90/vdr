@@ -324,7 +324,7 @@ focus.
 
 | Path | Role |
 |---|---|
-| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--host`, `--loopback`, `--camera`, `--camera-off`, `--no-audio`, `--host-rooms`, `--move-calls`, `--move-call`, `--bounce`, `--ephemeral`, `--profile`, `--quality`, `--encoder`, …) |
+| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--host`, `--loopback`, `--camera`, `--camera-off`, `--no-audio`, `--host-rooms`, `--move-calls`, `--move-call`, `--bounce`, `--show-routes`, `--ephemeral`, `--profile`, `--quality`, `--encoder`, …) |
 | `settings.rs` | what the app remembers between launches, the data folder, the log path |
 | `hotkeys.rs` | keyboard shortcuts as a pure table: actions, chords, the keymap. No UI in it |
 | `name.rs` | display names: cleaning, the short id, which label to show |
@@ -341,6 +341,7 @@ focus.
 | `camera/paint/` | `VideoPaintSource` (a blitz `Widget`), wgpu upload, fit math |
 | `net/call.rs` | a call over iroh + MoQ: rooms on a relay, direct calls, hosting a room (`--host`), presence |
 | `net/sessions.rs` | a join that dials the relay and the room's saved hosts together: which session carries our media, and moving it |
+| `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes: the route marks (`read` is pure) |
 | `net/moves.rs` | moving the call to a host, an experiment: the presence field, which choice wins, the bounce order (pure) |
 | `net/door.rs` | a hosted room's door: its name, the secret guests present as `?door=`, the check (pure) |
 | `net/audio.rs` | the audio half: Opus out, each peer's voice in, echo cancelled |
@@ -355,5 +356,5 @@ Frames never touch the DOM:
 
 `cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`, `rates.rs`, `net/quality.rs`,
 `camera/paint/fit.rs`, `audio/catchup.rs`, `components/layout.rs`,
-`update/release.rs`, `update/verify.rs`, `net/door.rs`, `net/moves.rs`) are where
+`update/release.rs`, `update/verify.rs`, `net/door.rs`, `net/moves.rs`, `net/arrival.rs`) are where
 logic that can be tested without a window belongs.

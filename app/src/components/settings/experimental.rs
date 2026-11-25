@@ -15,6 +15,11 @@
 //! starts, so turning it on waits for the next one; turning it off stops
 //! serving at once.
 //!
+//! Showing the route on each video (**off** by default: a debugging aid):
+//! each tile is marked with the way that person's video reaches us, ours with
+//! where our own goes, and whoever hosts is marked. Only the marks; the
+//! routes are read and logged either way.
+//!
 //! Moving the call (**off** by default, because a move sends everyone's
 //! video through someone's computer): we follow where the room says the call
 //! is, and can move it to a host from that person's tile menu. Off, we
