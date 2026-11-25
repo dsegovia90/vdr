@@ -1010,7 +1010,18 @@ mod socket_tests {
     /// A member whose own entry is `local`, where moves of the call are
     /// switched on and made.
     fn member_as(me: &str, targets: Vec<Target>, client: moq_tokio::Client, local: Arc<PeerStats>) -> Member {
-        let outbound = moq_tokio::origin::spawn();
+        member_from(me, targets, client, local, moq_tokio::origin::spawn())
+    }
+
+    /// The same, publishing from `outbound`, where something else of ours
+    /// may already be.
+    fn member_from(
+        me: &str,
+        targets: Vec<Target>,
+        client: moq_tokio::Client,
+        local: Arc<PeerStats>,
+        outbound: moq_net::origin::Producer,
+    ) -> Member {
         let camera = outbound.create_broadcast(camera_path(me)).unwrap();
         let mut track = camera.create_track("video", None).unwrap();
         camera.announce(moq_net::origin::Route::default()).unwrap();
@@ -1343,6 +1354,240 @@ mod socket_tests {
         routed_through(&v.inbound, &camera_path("m"), relay_hop, "m never went back to the relay").await;
         routed_through(&v.inbound, &camera_path("h"), relay_hop, "h never went back to the relay").await;
         drop(camera);
+    }
+
+    /// A member as a call wires one, for what travels in presence: a camera,
+    /// a control broadcast the call's own announcer keeps saying, and the
+    /// call's own reader of everyone else in the room, all on `local`.
+    struct Talker {
+        member: Member,
+        local: Arc<PeerStats>,
+        _control: moq_net::broadcast::Producer,
+        _announcing: Abort,
+        _attending: Abort,
+    }
+
+    fn talker(me: &str, targets: Vec<Target>, local: Arc<PeerStats>) -> Talker {
+        let outbound = moq_tokio::origin::spawn();
+        let (control, announcing) = saying(me, &outbound, &local);
+        let member = member_from(me, targets, client(), local.clone(), outbound);
+        let attending = attending(me, &member.inbound, &local);
+        Talker {
+            member,
+            local,
+            _control: control,
+            _announcing: announcing,
+            _attending: attending,
+        }
+    }
+
+    /// Our control broadcast on `outbound`, kept said by the call's own
+    /// announcer from `local`.
+    fn saying(me: &str, outbound: &moq_net::origin::Producer, local: &Arc<PeerStats>) -> (moq_net::broadcast::Producer, Abort) {
+        use super::super::{Presence, announce, control_path, presence_config, say, PRESENCE};
+        let control = outbound.create_broadcast(control_path(me)).unwrap();
+        let track = control.create_track(PRESENCE, None).unwrap();
+        let presence = Arc::new(std::sync::Mutex::new(moq_json::snapshot::Producer::new(track, presence_config())));
+        say(&presence, Presence::here(local));
+        control.announce(moq_net::origin::Route::default()).unwrap();
+        (control, Abort(tokio::spawn(announce(presence, local.clone()))))
+    }
+
+    /// The call's own reader of everyone announced at `inbound`.
+    fn attending(me: &str, inbound: &moq_net::origin::Producer, local: &Arc<PeerStats>) -> Abort {
+        use super::super::{Reports, Routing, attend};
+        let reports = Reports {
+            status: futures_channel::mpsc::unbounded().0,
+            participants: futures_channel::mpsc::unbounded().0,
+            hangup: futures_channel::mpsc::unbounded().0,
+            metrics: Arc::new(Metrics::default()),
+            in_room: true,
+            rooms: super::super::super::audio::Rooms {
+                local: local.clone(),
+                controls: Arc::default(),
+            },
+            news: None,
+            routing: Routing {
+                guests: Arc::default(),
+                ours: inbound.hop().id(),
+                far: None,
+            },
+        };
+        Abort(tokio::spawn(attend(inbound.consume(), me.to_string(), reports, None)))
+    }
+
+    /// Waits until `local` follows the call to `to` as chosen by `by`.
+    async fn follows(local: &PeerStats, to: Option<char>, by: char, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let on = local.followed_move();
+            if on.as_ref().is_some_and(|on| on.to == to.map(id) && on.by == id(by)) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{what}; following {on:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Past the overlap a move keeps its old sessions for, so the next move
+    /// starts from routes that have finished changing, as a person's does.
+    async fn settle() {
+        tokio::time::sleep(MOVE_OVERLAP + Duration::from_millis(500)).await;
+    }
+
+    /// A host bridging to a relay, as in a real room, with its own
+    /// origin's hop: what a member's route through it ends in.
+    struct Bridged {
+        relay: Meeting,
+        host: Meeting,
+        _to_relay: moq_tokio::Connection,
+    }
+
+    async fn bridged() -> Bridged {
+        let relay = Meeting::older().await;
+        let shared = moq_tokio::origin::spawn();
+        let to_relay = client()
+            .with_publisher(shared.consume())
+            .with_subscriber(shared.clone())
+            .connect(relay.url());
+        let host = Meeting::sharing(shared).await;
+        Bridged {
+            relay,
+            host,
+            _to_relay: to_relay,
+        }
+    }
+
+    impl Bridged {
+        fn targets(&self) -> Vec<Target> {
+            vec![relay_at(self.relay.url()), host_at('c', self.host.url())]
+        }
+    }
+
+    /// The whole path of a move, as the app runs it: one member's choice
+    /// goes out in its presence, through whichever way its media goes, and
+    /// another member's reader takes it in. Back and forth, because every
+    /// move changes the route the chooser's presence arrives by.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_said_by_one_member_is_followed_by_another_every_time() {
+        let room = bridged().await;
+        let b = talker(&id('b'), room.targets(), following());
+        let a = talker(&id('a'), room.targets(), following());
+        routed_through(&a.member.inbound, &super::super::control_path(&id('b')), room.relay.origin.hop(), "a never heard b").await;
+        // Past the first documents, so what follows is a change heard.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for round in 0..3 {
+            b.local.move_call(Some(id('c')), &id('b'));
+            follows(&a.local, Some('c'), 'b', &format!("a never followed b to the host, round {round}")).await;
+            settle().await;
+            b.local.move_call(None, &id('b'));
+            follows(&a.local, None, 'b', &format!("a never followed b back to the relay, round {round}")).await;
+            settle().await;
+        }
+    }
+
+    /// The host itself on the call, as a hosting member is: one origin for
+    /// its own broadcasts, its session to the relay and its guests, read by
+    /// the call's own reader. Every move redials a member's session to it,
+    /// and what the host read through the old one has to carry on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hosting_member_follows_every_move_said_by_a_guest() {
+        let relay = Meeting::older().await;
+        let shared = moq_tokio::origin::spawn();
+        let on_h = following();
+        let (_control, _announcing) = saying(&id('c'), &shared, &on_h);
+        let _attending = attending(&id('c'), &shared, &on_h);
+        let _to_relay = client()
+            .with_publisher(shared.consume())
+            .with_subscriber(shared.clone())
+            .connect(relay.url());
+        let host = Meeting::sharing(shared.clone()).await;
+        let targets = || vec![relay_at(relay.url()), host_at('c', host.url())];
+        let b = talker(&id('b'), targets(), following());
+        routed_through(&shared, &super::super::control_path(&id('b')), relay.origin.hop(), "the host never heard b through the relay").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for round in 0..3 {
+            b.local.move_call(Some(id('c')), &id('b'));
+            follows(&on_h, Some('c'), 'b', &format!("the host never followed b to itself, round {round}")).await;
+            settle().await;
+            b.local.move_call(None, &id('b'));
+            follows(&on_h, None, 'b', &format!("the host never followed b back to the relay, round {round}")).await;
+            settle().await;
+        }
+    }
+
+    /// A choice outlives whoever made it: every follower repeats it, so
+    /// someone joining after the chooser has gone still hears it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_joiner_hears_the_move_after_its_chooser_has_left() {
+        let room = bridged().await;
+        let b = talker(&id('b'), room.targets(), following());
+        let a = talker(&id('a'), room.targets(), following());
+        b.local.move_call(Some(id('c')), &id('b'));
+        follows(&a.local, Some('c'), 'b', "a never followed b").await;
+        drop(b);
+        let d = talker(&id('d'), room.targets(), following());
+        follows(&d.local, Some('c'), 'b', "a late joiner never heard the move from those still here").await;
+    }
+
+    /// A presence read that fails while its path is still announced is
+    /// asked for again: the announcement does not change, so nothing else
+    /// would ever start a new reader, and what they say next is still heard.
+    /// The failure here is their track aborting under a broadcast that stays;
+    /// in a call it is a route going away under the read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_presence_read_that_fails_while_still_announced_is_asked_for_again() {
+        use super::super::{Asked, Presence, control_path, listen, presence_config, PRESENCE};
+        let origin = moq_tokio::origin::spawn();
+        let control = origin.create_broadcast(control_path(&id('b'))).unwrap();
+        let mut first = moq_json::snapshot::Producer::new(control.create_track(PRESENCE, None).unwrap(), presence_config());
+        first.update(&Presence::default()).unwrap();
+        control.announce(moq_net::origin::Route::default()).unwrap();
+
+        let local = following();
+        let asked = Asked {
+            me: id('a'),
+            rooms: super::super::super::audio::Rooms {
+                local: local.clone(),
+                controls: Arc::default(),
+            },
+            seen: Arc::default(),
+        };
+        let broadcast = origin.consume().request_broadcast(control_path(&id('b')).as_str()).await.unwrap();
+        let (saying, _said) = futures_channel::mpsc::unbounded();
+        let _reading = Abort(tokio::spawn(listen(
+            origin.consume(),
+            broadcast,
+            id('b'),
+            saying,
+            Arc::new(PeerStats::default()),
+            asked,
+            None,
+        )));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        first.abort(moq_net::Error::Cancel).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let chooser = following();
+        chooser.move_call(Some(id('c')), &id('b'));
+        let mut second = moq_json::snapshot::Producer::new(control.create_track(PRESENCE, None).unwrap(), presence_config());
+        second.update(&Presence::here(&chooser)).unwrap();
+        follows(&local, Some('c'), 'b', "the reader never asked for b's presence again").await;
+    }
+
+    /// The relay dying moves everyone's presence to the host, and a move
+    /// said after that is still heard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_is_heard_after_the_relay_dies() {
+        let room = bridged().await;
+        let b = talker(&id('b'), room.targets(), following());
+        let a = talker(&id('a'), room.targets(), following());
+        routed_through(&a.member.inbound, &super::super::control_path(&id('b')), room.relay.origin.hop(), "a never heard b").await;
+        let host_hop = room.host.origin.hop();
+        room.relay.stop().await;
+        routed_through(&a.member.inbound, &super::super::control_path(&id('b')), host_hop, "b's presence never came through the host").await;
+        b.local.move_call(Some(id('c')), &id('b'));
+        follows(&a.local, Some('c'), 'b', "a never heard b move the call once the relay was gone").await;
     }
 
     /// Someone who cannot reach the host the call moved to stays in the

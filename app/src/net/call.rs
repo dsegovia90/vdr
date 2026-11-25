@@ -1156,10 +1156,7 @@ async fn run(
         let presence = control
             .create_track(PRESENCE, None)
             .map(|track| {
-                moq_json::snapshot::Producer::new(
-                    track,
-                    moq_json::snapshot::Config::default(),
-                )
+                moq_json::snapshot::Producer::new(track, presence_config())
             })
             .map_err(|error| format!("could not create a presence track: {error:#}"))?;
         // Shared with the announcer below and with the leave sequence. A plain
@@ -2171,6 +2168,7 @@ async fn attend(
                     listening.insert(
                         id.to_string(),
                         Abort(tokio::spawn(listen(
+                            inbound.clone(),
                             broadcast,
                             id.to_string(),
                             saying.clone(),
@@ -2383,6 +2381,16 @@ fn note_routes(
     }
 }
 
+/// How our presence track is written: **every document a group of its own**,
+/// as the library writes its catalogs, never a snapshot followed by deltas.
+/// The library carries a subscription across a change of route at a group
+/// boundary; a group held open for deltas has none, and a reader of one was
+/// seen to stall for good, with no error, at the first move of the call --
+/// every move changes routes. Readers of either shape read this one.
+fn presence_config() -> moq_json::snapshot::Config {
+    moq_json::snapshot::Config::default().with_delta_ratio(0)
+}
+
 /// Publishes one presence document, logging rather than failing: a word that
 /// does not get out is a degraded call, not a broken one.
 fn say(presence: &std::sync::Mutex<moq_json::snapshot::Producer<Presence>>, now: Presence) {
@@ -2413,8 +2421,10 @@ async fn announce(
         let now = Presence::here(&local);
         // What a person did, for the log. The connection report changes with
         // the link, and is only logged as it starts and stops.
-        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name, now.link.is_some(), &now.host)
-            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name, said.link.is_some(), &said.host);
+        // A move of the call is in it too: followers act on it as it is said,
+        // so it must not wait for the clock refresh.
+        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name, now.link.is_some(), &now.host, &now.moved)
+            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name, said.link.is_some(), &said.host, &said.moved);
         if changed {
             let asking = match now.requests.len() {
                 0 => String::new(),
@@ -2426,8 +2436,14 @@ async fn announce(
             let reporting = if now.link.is_some() { ", reporting the connection" } else { "" };
             // Whether, never the door.
             let hosting = if now.host.is_some() { ", hosting" } else { "" };
+            // Where we say the call is, so a scripted run can see the
+            // choice leave the chooser and each follower repeat it.
+            let moved = match &now.moved {
+                Some(on) => format!(", call on {}", super::moves::describe(on.to.as_deref())),
+                None => String::new(),
+            };
             tracing::info!(
-                "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}{hosting}",
+                "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}{hosting}{moved}",
                 on_off(now.camera),
                 on_off(now.mic),
                 room_name(&now.room)
@@ -2547,7 +2563,18 @@ fn alone(hangup: &UnboundedSender<String>, last: String, in_room: bool) {
 /// saying, so nothing here tracks what it has seen before or asks for anything
 /// to be repeated. Saying *leaving* is the one thing that ends a call from the
 /// far side rather than from the transport.
+///
+/// **Asked for again when the subscription fails** while they are still
+/// announced. Every move of the call redials a session, and a presence read
+/// through the session that went was seen to fail ("dropped", "internal
+/// error") with the path still announced: the announcement only changes
+/// route, so nothing else would ever start a new reader, and everything they
+/// said from then on -- a mute, a name, a move of the call -- was lost for
+/// the rest of the call. The library says as much: a broadcast whose route
+/// changes may end, and the next request serves it again. A reader that is
+/// asking again ends like any other, when the retraction lets it go.
 async fn listen(
+    inbound: moq_net::origin::Consumer,
     broadcast: moq_net::broadcast::Consumer,
     id: String,
     saying: UnboundedSender<String>,
@@ -2564,92 +2591,127 @@ async fn listen(
         local: asked.rooms.local.clone(),
         from: id.clone(),
     };
-    let track = match broadcast.track(PRESENCE) {
-        Ok(track) => track,
-        Err(error) => {
-            tracing::warn!("{id} has no presence track: {error:#}");
-            return;
-        }
-    };
-    // Preempts media, the way hang prioritises its own catalog: this is small
-    // and structural, and late it is worthless.
-    let subscription =
-        moq_net::track::Subscription::default().with_priority(CONTROL_PRIORITY);
-    let track = match track.subscribe(subscription).await {
-        Ok(track) => track,
-        Err(error) => {
-            tracing::warn!("could not subscribe to {id}'s presence: {error:#}");
-            return;
-        }
-    };
-    let mut presence = moq_json::snapshot::Consumer::<Presence>::new(
-        track,
-        moq_json::snapshot::consumer::Config::default(),
-    );
-
+    let mut broadcast = Some(broadcast);
+    // Whether we are asking again, so an outage is said once and its end too.
+    let mut lost = false;
     loop {
-        match presence.next().await {
-            Ok(Some(Presence {
-                state,
-                camera,
-                mic,
-                clock,
-                room,
-                requests,
-                sharing,
-                name,
-                link,
-                seen,
-                host,
-                moved,
-            })) => {
-                let room = subroom(room);
-                if let Some(clock) = clock {
-                    stats.set_clock(clock);
-                }
-                tracing::debug!(
-                    "{id} says {state:?}, camera {}, mic {}, room {}",
-                    on_off(camera),
-                    on_off(mic),
-                    room_name(&room)
-                );
-                // Their choice, for their tile: a card instead of a frozen
-                // frame, a badge instead of silence nobody can explain.
-                stats.set_camera(camera);
-                stats.set_mic(mic);
-                stats.set_sharing(sharing);
-                // Never trusted as sent: cleaned here whatever their build
-                // did, and shown only.
-                stats.set_name(name.as_deref().and_then(crate::name::clean));
-                // Cleaned again here, whatever their build did: a report is a
-                // claim like a name, and their own id has no place in it.
-                stats.set_link(link.map(Link::clean));
-                stats.set_seen(quality::clean_seen(seen, &id));
-                // Read by their audio task on every frame, which is what sets
-                // how loud they are to us.
-                stats.set_room(room.clone());
-                asked.act(&id, &room, mic, &requests);
-                stats.set_hosts_room(host.is_some());
-                // Their hop names them in a route; the door stays here.
-                stats.set_host_hop(host.clone().and_then(door::Offer::clean).map(|offer| offer.hop));
-                stats.set_heard();
-                heard_hosting(&id, state, host, &mut offered, news.as_ref());
-                followed(&asked.rooms.local, moved);
-                if state == State::Leaving {
-                    // Reported, not acted on: whether the call is over is a
-                    // question about everyone, and the loop that tracks
-                    // everyone answers it.
-                    let _ = saying.unbounded_send(id);
-                    return;
+        let broadcast = match broadcast.take() {
+            Some(broadcast) => broadcast,
+            None => {
+                tokio::time::sleep(PRESENCE_AGAIN).await;
+                match inbound.request_broadcast(control_path(&id).as_str()).await {
+                    Ok(broadcast) => broadcast,
+                    Err(error) => {
+                        tracing::debug!("{id}'s presence is not there to ask for yet: {error:#}");
+                        continue;
+                    }
                 }
             }
-            Ok(None) => return,
+        };
+        let mut presence = match subscribe_presence(&broadcast).await {
+            Ok(presence) => presence,
             Err(error) => {
-                tracing::warn!("could not read {id}'s presence: {error:#}");
-                return;
+                if !std::mem::replace(&mut lost, true) {
+                    tracing::warn!("could not subscribe to {id}'s presence: {error}; asking again");
+                }
+                continue;
+            }
+        };
+        loop {
+            match presence.next().await {
+                Ok(Some(Presence {
+                    state,
+                    camera,
+                    mic,
+                    clock,
+                    room,
+                    requests,
+                    sharing,
+                    name,
+                    link,
+                    seen,
+                    host,
+                    moved,
+                })) => {
+                    let room = subroom(room);
+                    if let Some(clock) = clock {
+                        stats.set_clock(clock);
+                    }
+                    tracing::debug!(
+                        "{id} says {state:?}, camera {}, mic {}, room {}",
+                        on_off(camera),
+                        on_off(mic),
+                        room_name(&room)
+                    );
+                    // Their choice, for their tile: a card instead of a frozen
+                    // frame, a badge instead of silence nobody can explain.
+                    stats.set_camera(camera);
+                    stats.set_mic(mic);
+                    stats.set_sharing(sharing);
+                    // Never trusted as sent: cleaned here whatever their build
+                    // did, and shown only.
+                    stats.set_name(name.as_deref().and_then(crate::name::clean));
+                    // Cleaned again here, whatever their build did: a report is a
+                    // claim like a name, and their own id has no place in it.
+                    stats.set_link(link.map(Link::clean));
+                    stats.set_seen(quality::clean_seen(seen, &id));
+                    // Read by their audio task on every frame, which is what sets
+                    // how loud they are to us.
+                    stats.set_room(room.clone());
+                    asked.act(&id, &room, mic, &requests);
+                    stats.set_hosts_room(host.is_some());
+                    // Their hop names them in a route; the door stays here.
+                    stats.set_host_hop(host.clone().and_then(door::Offer::clean).map(|offer| offer.hop));
+                    stats.set_heard();
+                    heard_hosting(&id, state, host, &mut offered, news.as_ref());
+                    followed(&asked.rooms.local, moved);
+                    if std::mem::take(&mut lost) {
+                        tracing::info!("{id}'s presence is back");
+                    }
+                    if state == State::Leaving {
+                        // Reported, not acted on: whether the call is over is a
+                        // question about everyone, and the loop that tracks
+                        // everyone answers it.
+                        let _ = saying.unbounded_send(id);
+                        return;
+                    }
+                }
+                // Ended without their goodbye: the same as a failure, since
+                // only the retraction says they went.
+                Ok(None) => {
+                    if !std::mem::replace(&mut lost, true) {
+                        tracing::info!("{id}'s presence ended without a goodbye; asking again");
+                    }
+                    break;
+                }
+                Err(error) => {
+                    if !std::mem::replace(&mut lost, true) {
+                        tracing::info!("lost {id}'s presence ({error:#}); asking again");
+                    }
+                    break;
+                }
             }
         }
     }
+}
+
+/// How long a presence reader waits before asking again for a document it
+/// lost: the time a route takes to settle after a session goes, near enough.
+const PRESENCE_AGAIN: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Subscribes to a participant's presence track on `broadcast`.
+async fn subscribe_presence(
+    broadcast: &moq_net::broadcast::Consumer,
+) -> Result<moq_json::snapshot::Consumer<Presence>, String> {
+    let track = broadcast.track(PRESENCE).map_err(|error| format!("no presence track: {error:#}"))?;
+    // Preempts media, the way hang prioritises its own catalog: this is small
+    // and structural, and late it is worthless.
+    let subscription = moq_net::track::Subscription::default().with_priority(CONTROL_PRIORITY);
+    let track = track.subscribe(subscription).await.map_err(|error| format!("{error:#}"))?;
+    Ok(moq_json::snapshot::Consumer::<Presence>::new(
+        track,
+        moq_json::snapshot::consumer::Config::default(),
+    ))
 }
 
 /// Takes in where someone says the call is, if we follow moves at all, and
