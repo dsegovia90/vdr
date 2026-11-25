@@ -8,6 +8,7 @@
 
 mod choice;
 mod devices;
+mod pattern;
 mod status;
 mod stream;
 
@@ -15,5 +16,6 @@ mod stream;
 // as an unused import. Same reason `camera/mod.rs` globs this module.
 pub use choice::*;
 pub use devices::*;
+pub use pattern::*;
 pub use status::*;
 pub use stream::*;

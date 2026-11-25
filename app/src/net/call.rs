@@ -2526,6 +2526,7 @@ fn write_stats(
         "t": t, "me": me, "link": true,
         "rtt_ms": metrics.rtt(), "loss_pct": metrics.loss(), "up_kbps": metrics.send_kbps(),
         "camera_cap_kbps": metrics.camera_cap_kbps(), "camera_sent_kbps": metrics.camera_sent_kbps(),
+        "camera_sent_fps": metrics.camera_fps(),
         "share_cap_kbps": metrics.share_cap_kbps(), "share_sent_kbps": metrics.share_sent_kbps(),
         "estimate_kbps": metrics.estimate_kbps(),
         "camera_slice_kbps": metrics.camera_slice_kbps(),

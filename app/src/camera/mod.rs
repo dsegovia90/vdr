@@ -4,6 +4,7 @@ mod format;
 mod frames;
 mod hooks;
 mod paint;
+pub mod pattern;
 
 pub use frames::{
     bitrate_for, encode_size, frame_tap, from_capture, from_decoded, Frame, FrameFeed, FrameSlot, FrameTap,

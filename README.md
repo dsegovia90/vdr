@@ -238,6 +238,16 @@ microphone nor the speaker). For a test that must survive a restart, use
 (settings, rooms, log and key) there, never the real one, and never updates
 itself.
 
+To send real, moving video without a camera, add `--test-pattern`: a
+generated 640x360 picture at 30 fps (a sliding colour field, a white block
+crossing it, and the frame number in the corner) goes in where the camera's
+frames would, so the encoder, rate control, publishing and your own tile all
+run as with a camera, and no camera is listed or opened. With `--camera-off`
+too it starts switched off, and the camera button turns it on. With
+`--stats <file>`, the sender's `"link": true` line carries `camera_sent_fps`,
+`camera_sent_kbps` and `camera_cap_kbps`, and each viewer's line for that
+sender (`"peer": <id>`) carries the received `fps` and `camera`.
+
 To test moving a call between the relay and a room's hosts from a script,
 start the instances with `--move-calls` (the *Move the call* switch, unsaved),
 and one of them with `--bounce <secs>`, which moves the call round the relay

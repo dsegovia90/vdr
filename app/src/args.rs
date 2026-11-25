@@ -23,6 +23,7 @@
 //! vdr --loopback                         # no network; the codec round trip
 //! vdr --camera facetime                   # picks a camera by name
 //! vdr --listen --camera-off               # starts with video off
+//! vdr --test-pattern                      # generated video in place of the camera; opens no camera
 //! vdr --quality high                      # 720p rung; low | mid | high, mid by default
 //! vdr --encoder software                  # auto | hardware | software, auto by default
 //! vdr --ephemeral                         # a throwaway key and data folder
@@ -224,6 +225,12 @@ pub struct Args {
     /// had been pressed before anything opened. The scriptable way to place a
     /// call with no video on a machine that has a working camera.
     pub camera_off: bool,
+    /// Generated frames in place of the camera (`--test-pattern`): a moving
+    /// picture with a frame counter, fed in where a camera's frames are, so
+    /// the encoder, rate control, publishing and the local tile run as with
+    /// a camera. No camera is enumerated or opened. Combines with
+    /// `--camera-off`, which starts it switched off.
+    pub test_pattern: bool,
     /// Which rung the encoder runs at. Everyone defaults to the same one.
     pub quality: Quality,
     /// Hardware, software, or whichever this machine has (`--encoder`).
@@ -300,6 +307,7 @@ impl Args {
         let mut peering = Peering::Idle;
         let mut camera = None;
         let mut camera_off = false;
+        let mut test_pattern = false;
         let mut quality = Quality::default();
         let mut encoder = EncoderChoice::default();
         let mut ephemeral = false;
@@ -344,6 +352,7 @@ impl Args {
                     None => tracing::error!("--camera needs part of a device name"),
                 },
                 "--camera-off" => camera_off = true,
+                "--test-pattern" => test_pattern = true,
                 "--quality" => match args.next().as_deref().map(Quality::parse) {
                     Some(Some(chosen)) => quality = chosen,
                     Some(None) => tracing::error!("--quality is one of low, mid, high"),
@@ -404,6 +413,7 @@ impl Args {
             peering,
             camera,
             camera_off,
+            test_pattern,
             quality,
             encoder,
             ephemeral,
