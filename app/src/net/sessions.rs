@@ -1182,7 +1182,7 @@ mod socket_tests {
         let port = server.local_addr().unwrap().port();
         let hosting = door::Hosting::open("team".to_string()).unwrap();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (_accepting, _) = accept(server, Some(hosting), Some(estimates), Arc::new(Metrics::default()));
+        let (_accepting, _) = accept(server, Some(hosting), Some(estimates), Arc::new(Metrics::default()), None);
         // No door: what a member holding an old one presents, as far as the
         // host can tell.
         let started = Instant::now();

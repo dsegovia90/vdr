@@ -56,6 +56,7 @@ use super::status::RemoteStatus;
 use super::{Feed, ParticipantEvent};
 use crate::args::Peering;
 use super::Metrics;
+use super::forwarded::Forwarded;
 use super::metrics::{Ask, Clock, Counts, FpsMeter, Path, PeerStats, Request, classify};
 use super::quality::{self, Link, Seen};
 use crate::audio::Controls;
@@ -149,14 +150,35 @@ async fn watch_path(endpoint: moq_tokio::iroh::Endpoint, metrics: Arc<Metrics>) 
 /// Timed by the elapsed time actually measured rather than the nominal second,
 /// so a late tick does not read as a burst. Writes atomics only: nothing here
 /// wakes the page, which samples [`Metrics`] on its own schedule.
-async fn meter_sent(metrics: Arc<Metrics>) {
+///
+/// A host's forwarded traffic is read on the same tick, before the second is
+/// kept, so each second's figures belong together; its summary is logged when
+/// this ends with the attempt.
+async fn meter_sent(metrics: Arc<Metrics>, forwarded: Option<Arc<Forwarded>>) {
+    let _summary = forwarded.clone().map(Summarise);
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last = ticker.tick().await;
     loop {
         let now = ticker.tick().await;
-        metrics.tick_sent(now.duration_since(last));
+        let elapsed = now.duration_since(last);
+        if let Some(forwarded) = &forwarded {
+            metrics.set_hosting(forwarded.sample(elapsed, metrics.estimate_kbps()));
+        }
+        metrics.tick_sent(elapsed);
         last = now;
+    }
+}
+
+/// Logs what hosting came to when the meter is dropped, which is how an
+/// attempt ends: aborted, not returned from.
+struct Summarise(Arc<Forwarded>);
+
+impl Drop for Summarise {
+    fn drop(&mut self) {
+        if let Some(summary) = self.0.summary() {
+            tracing::info!("{summary}");
+        }
     }
 }
 
@@ -356,6 +378,8 @@ struct Serve<'a> {
     /// guests' links must not steer what we send; see [`host_alongside`].
     estimates: Option<Arc<adapt::Estimates>>,
     metrics: Arc<Metrics>,
+    /// Where a host counts what it sends each guest; `None` for a listener.
+    forwarded: Option<Arc<Forwarded>>,
 }
 
 /// Starts accepting sessions on our endpoint, for as long as the returned
@@ -373,6 +397,7 @@ async fn serve(
         door,
         estimates,
         metrics,
+        forwarded,
     } = args;
     let mut server_config = moq_tokio::server::Config::default();
     server_config.listen.bind = Some(moq_tokio::listen::Bind::Addr(
@@ -391,7 +416,7 @@ async fn serve(
         .bind()
         .await
         .map_err(|error| format!("could not listen: {error:#}"))?;
-    Ok(accept(server, door, estimates, metrics))
+    Ok(accept(server, door, estimates, metrics, forwarded))
 }
 
 /// The accept loop, apart from the server it runs on so it can be driven over
@@ -413,6 +438,7 @@ fn accept(
     door: Option<door::Hosting>,
     estimates: Option<Arc<adapt::Estimates>>,
     metrics: Arc<Metrics>,
+    forwarded: Option<Arc<Forwarded>>,
 ) -> (Abort, futures_channel::mpsc::UnboundedReceiver<bool>) {
     let (events, receiver) = futures_channel::mpsc::unbounded::<bool>();
     let task = Abort(tokio::spawn(async move {
@@ -434,6 +460,10 @@ fn accept(
                 continue;
             }
             let _ = events.unbounded_send(true);
+            let request = match &forwarded {
+                Some(forwarded) => request.with_stats(forwarded.guest()),
+                None => request,
+            };
             let estimates = estimates.clone();
             let metrics = metrics.clone();
             let events = events.clone();
@@ -1187,6 +1217,8 @@ async fn run(
         // Where the last call was moved says nothing about this one.
         local.forget_moves();
         let shared = shares_origin(&peering, host_rooms);
+        // Only a host passes on other people's media, so only a host counts it.
+        let forwarded = shared.then(|| Forwarded::new(me.to_string()));
         let inbound = inbound_for(&outbound, shared);
         // Where else the room can meet, as the interface put it with the
         // decision. A join with somewhere else to go, or one we host, holds
@@ -1276,6 +1308,7 @@ async fn run(
                         doors: &doors,
                         estimates: adapt::Estimates::new(guests),
                         local: local.clone(),
+                        forwarded: forwarded.clone(),
                     })
                     .await;
                 }
@@ -1288,6 +1321,10 @@ async fn run(
                 if let Some(to) = crate::args::Args::get().move_call.clone() {
                     local.move_call(to, &me.to_string());
                 }
+                let client = match &forwarded {
+                    Some(forwarded) => client.with_stats(forwarded.outgoing()),
+                    None => client,
+                };
                 sessions::join(sessions::Join {
                     client,
                     me: me.to_string(),
@@ -1325,6 +1362,7 @@ async fn run(
                     door: None,
                     estimates: Some(adapt::Estimates::new(estimate.clone())),
                     metrics: metrics.clone(),
+                    forwarded: None,
                 })
                 .await?;
                 let status = status.clone();
@@ -1401,8 +1439,12 @@ async fn run(
                     door: Some(hosting.clone()),
                     estimates: Some(adapt::Estimates::new(estimate.clone())),
                     metrics: metrics.clone(),
+                    forwarded: forwarded.clone(),
                 })
                 .await?;
+                if let Some(forwarded) = &forwarded {
+                    forwarded.set_serving(true);
+                }
                 // **Stdout, not the log.** The invite carries the door, and
                 // the log file is what people attach to bug reports. Quoted,
                 // because an unquoted `?` is a glob to zsh.
@@ -1468,7 +1510,7 @@ async fn run(
             })
         });
         let pathing = over_iroh.then(|| Abort(tokio::spawn(watch_path(endpoint.clone(), metrics.clone()))));
-        let metering = Abort(tokio::spawn(meter_sent(metrics.clone())));
+        let metering = Abort(tokio::spawn(meter_sent(metrics.clone(), forwarded.clone())));
 
         // The person's wish to share a screen, served for this attempt. Its
         // own broadcast on the same outbound origin, so a share started now
@@ -2346,6 +2388,7 @@ fn write_stats(
         lines.push('\n');
     }
     let aec = metrics.aec().unwrap_or_default();
+    let hosting = metrics.hosting();
     let link = serde_json::json!({
         "t": t, "me": me, "link": true,
         "rtt_ms": metrics.rtt(), "loss_pct": metrics.loss(), "up_kbps": metrics.send_kbps(),
@@ -2357,6 +2400,9 @@ fn write_stats(
         "aec_erle_db": aec.erle_db, "aec_erl_db": aec.erl_db,
         "aec_delay_ms": aec.delay_ms,
         "aec_reference_frames": aec.reference_frames, "aec_reference_rms": aec.reference_rms,
+        "hosting": hosting.is_some(), "guests": hosting.map(|h| h.guests),
+        "guests_pulling": hosting.map(|h| h.pulling),
+        "forwarded_kbps": hosting.map(|h| h.forwarded), "own_out_kbps": hosting.map(|h| h.own),
     });
     lines.push_str(&link.to_string());
     lines.push('\n');
@@ -2602,6 +2648,7 @@ struct Alongside<'a> {
     /// our media.
     estimates: Arc<adapt::Estimates>,
     local: Arc<PeerStats>,
+    forwarded: Option<Arc<Forwarded>>,
 }
 
 /// Serves the room's members directly beside a join, behind the room's door,
@@ -2627,6 +2674,7 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         doors,
         estimates,
         local,
+        forwarded,
     } = args;
     let room = url.path().trim_matches('/').to_string();
     if room.is_empty() {
@@ -2648,6 +2696,7 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         // The guests' figures stay out of the Network tab, which shows the
         // link carrying our media; see the doc above.
         metrics: Arc::new(Metrics::default()),
+        forwarded: forwarded.clone(),
     })
     .await;
     let (accepting, mut events) = match served {
@@ -2658,6 +2707,9 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         }
     };
     local.set_offer(Some(hosting.offer(shared.hop().id())));
+    if let Some(forwarded) = &forwarded {
+        forwarded.set_serving(true);
+    }
     tracing::info!("hosting this room for its members as well as joining it");
     Some(Abort(tokio::spawn(async move {
         let mut accepting = Some(accepting);
@@ -2691,6 +2743,9 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         // read the door after it stopped opening.
         accepting.take();
         local.set_offer(None);
+        if let Some(forwarded) = &forwarded {
+            forwarded.set_serving(false);
+        }
     })))
 }
 
@@ -3626,7 +3681,7 @@ mod served_tests {
         let server = config.init().unwrap().bind().await.unwrap();
         let port = server.local_addr().unwrap().port();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (task, _) = accept(server, door, Some(estimates), Arc::new(Metrics::default()));
+        let (task, _) = accept(server, door, Some(estimates), Arc::new(Metrics::default()), None);
         (task, port)
     }
 
@@ -3744,7 +3799,7 @@ mod served_tests {
         let server = config.init().unwrap().bind().await.unwrap();
         let port = server.local_addr().unwrap().port();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (task, _) = accept(server, None, Some(estimates), Arc::new(Metrics::default()));
+        let (task, _) = accept(server, None, Some(estimates), Arc::new(Metrics::default()), None);
         (task, port)
     }
 
@@ -3872,5 +3927,92 @@ mod served_tests {
         drop(accepting);
         let ended = tokio::time::timeout(WITHIN, connection.closed()).await;
         assert!(ended.is_ok(), "the session outlived the call");
+    }
+
+    /// Writes 1000 bytes on `broadcast`'s video track every 20 ms (400 kbps)
+    /// for as long as the returned task lives.
+    fn stream(broadcast: &moq_net::broadcast::Producer) -> Abort {
+        let mut track = broadcast.create_track(TRACK, None).unwrap();
+        Abort(tokio::spawn(async move {
+            for n in 0u64.. {
+                if track.write_frame(moq_net::Timestamp::from_millis(n * 20).unwrap(), [0u8; 1000].as_slice()).is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }))
+    }
+
+    /// Reads every group of `path`'s video track as it arrives.
+    async fn pull(inbound: &moq_net::origin::Producer, path: String) -> Abort {
+        let broadcast = tokio::time::timeout(WITHIN, inbound.consume().routed_broadcast(path))
+            .await
+            .expect("announced in time")
+            .expect("a broadcast");
+        Abort(tokio::spawn(async move {
+            let Ok(track) = broadcast.track(TRACK) else { return };
+            let Ok(mut subscriber) = track.subscribe(None).await else { return };
+            while let Ok(Some(mut group)) = subscriber.recv_group().await {
+                while let Ok(Some(_)) = group.read_frame().await {}
+            }
+        }))
+    }
+
+    /// One second of the host's counters, read the way the meter reads them.
+    async fn second_of(forwarded: &Forwarded) -> crate::rates::Hosting {
+        let start = tokio::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        forwarded.sample(start.elapsed(), None).expect("serving")
+    }
+
+    /// A host behind its door, as the app wires one: one origin for its own
+    /// camera and its guests, each guest counted. Its own camera streams
+    /// throughout; a guest's media is what it forwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_counts_what_it_forwards_apart_from_its_own() {
+        let me = "h".repeat(64);
+        let hosting = team();
+        let shared = moq_tokio::origin::spawn();
+        let own = shared.create_broadcast(camera_path(&me)).unwrap();
+        let _own_stream = stream(&own);
+        own.announce(moq_net::origin::Route::default()).unwrap();
+        let mut config = moq_tokio::server::Config::default();
+        config.listen.bind = Some(moq_tokio::listen::Bind::Addr(([127, 0, 0, 1], 0).into()));
+        config.listen.tls.generate = vec!["localhost".to_string()];
+        config.publisher = Some(shared.consume());
+        config.subscriber = Some(shared);
+        let server = config.init().unwrap().bind().await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let forwarded = Forwarded::new(me.clone());
+        forwarded.set_serving(true);
+        let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
+        let (_accepting, _) = accept(
+            server,
+            Some(hosting.clone()),
+            Some(estimates),
+            Arc::new(Metrics::default()),
+            Some(forwarded.clone()),
+        );
+
+        let a = guest(port, &invited(&hosting), "a");
+        let _a_stream = stream(&a._camera);
+        let b = guest(port, &invited(&hosting), "b");
+        sees(&b, "a").await;
+        sees(&b, &me).await;
+
+        // Connected, everything announced, nobody pulling: nothing but
+        // control traffic, which is not payload.
+        second_of(&forwarded).await;
+        let idle = second_of(&forwarded).await;
+        assert_eq!(idle, crate::rates::Hosting { forwarded: 0, own: 0, guests: 2, pulling: 0 });
+
+        // b pulls a's video, which we forward, and ours, which is our own.
+        let _from_a = pull(&b.inbound, camera_path("a")).await;
+        let _from_us = pull(&b.inbound, camera_path(&me)).await;
+        second_of(&forwarded).await;
+        let busy = second_of(&forwarded).await;
+        assert!((300..=500).contains(&busy.forwarded), "{busy:?}");
+        assert!((300..=500).contains(&busy.own), "{busy:?}");
+        assert_eq!((busy.guests, busy.pulling), (2, 1), "{busy:?}");
     }
 }

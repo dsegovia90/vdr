@@ -20,6 +20,7 @@ mod adapt;
 mod audio;
 mod call;
 mod codec_check;
+mod forwarded;
 pub(crate) mod door;
 mod metrics;
 mod loopback;

@@ -190,6 +190,9 @@ pub struct Metrics {
     /// meter and once a second by the tab while it is open, never on an
     /// encode thread.
     history: std::sync::Mutex<History>,
+    /// What we forward for others while hosting, as of the last second;
+    /// `None` while not hosting. Written by the same once-a-second meter.
+    hosting: std::sync::Mutex<Option<crate::rates::Hosting>>,
 }
 
 /// One outgoing stream's cap, and the bytes it actually handed the transport.
@@ -510,6 +513,7 @@ impl Metrics {
             camera_slice: self.camera_slice_kbps(),
             share_slice: self.share_slice_kbps(),
             estimate: self.estimate_kbps(),
+            hosting: self.hosting(),
         };
         if let Ok(mut history) = self.history.lock() {
             history.push(second);
@@ -543,6 +547,17 @@ impl Metrics {
         }
     }
 
+    /// What we forwarded and sent over the last second while hosting.
+    pub fn hosting(&self) -> Option<crate::rates::Hosting> {
+        self.hosting.lock().ok().and_then(|hosting| *hosting)
+    }
+
+    pub(super) fn set_hosting(&self, hosting: Option<crate::rates::Hosting>) {
+        if let Ok(mut slot) = self.hosting.lock() {
+            *slot = hosting;
+        }
+    }
+
     /// The echo canceller's latest numbers.
     pub fn aec(&self) -> Option<AecStats> {
         self.aec.lock().ok().and_then(|aec| *aec)
@@ -563,6 +578,7 @@ impl Metrics {
             *codecs = (None, None);
         }
         self.set_path(Path::Unknown);
+        self.set_hosting(None);
         self.camera.clear();
         self.share.clear();
         self.camera_slice.set(None);

@@ -37,6 +37,22 @@ pub struct Second {
     pub share_slice: Option<u32>,
     /// The transport's estimate for the whole connection.
     pub estimate: Option<u32>,
+    /// What we passed on for other people, while we host; `None` otherwise.
+    pub hosting: Option<Hosting>,
+}
+
+/// One second of hosting: other people's media sent on through us, and our
+/// own, both as payload handed to the transport, in kbps.
+///
+/// Our own counts every copy: a host whose guests pull its video directly
+/// sends it once to each.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hosting {
+    pub forwarded: u32,
+    pub own: u32,
+    /// Guests connected directly, and how many of them we sent media to.
+    pub guests: u32,
+    pub pulling: u32,
 }
 
 impl Second {
@@ -373,6 +389,14 @@ mod tests {
         assert_eq!((Point::camera(&second).target, Point::camera(&second).link), (Some(400), Some(300)));
         assert_eq!((Point::share(&second).target, Point::share(&second).link), (Some(1800), Some(1700)));
         assert_eq!((Point::total(&second).target, Point::total(&second).link), (None, Some(2100)));
+    }
+
+    #[test]
+    fn a_second_of_hosting_alone_starts_the_history() {
+        let mut history = History::default();
+        let hosting = Hosting { guests: 1, ..Hosting::default() };
+        history.push(Second { hosting: Some(hosting), ..Second::default() });
+        assert_eq!(history.seconds().len(), 1);
     }
 
     #[test]
