@@ -25,6 +25,8 @@ mod metrics;
 mod loopback;
 pub(crate) mod quality;
 mod report;
+#[cfg(test)]
+mod routes;
 pub(crate) mod runtime;
 mod share;
 mod status;
