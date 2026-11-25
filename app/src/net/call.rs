@@ -2000,6 +2000,17 @@ async fn attend(
             }
         };
         let path = update.prefix.as_str().to_string();
+        // Our own broadcasts come back to us on a join over several sessions,
+        // through whoever bridges them: each session offers from a gate with a
+        // hop of its own (see `sessions::Gate`), so a session's split horizon
+        // no longer hides them. Skipped before asking for the broadcast, so
+        // reading them back opens nothing.
+        let owner = controller_of(&path)
+            .or_else(|| sharer_of(&path))
+            .or_else(|| participant_of(&path));
+        if owner == Some(me.as_str()) {
+            continue;
+        }
         // An announcement names a path; the broadcast is asked for by that path.
         // A re-priced route changes nothing we act on, and a retraction is the
         // goodbye, carried as `None` the way the old cursor carried it.

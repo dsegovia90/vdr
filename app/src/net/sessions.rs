@@ -9,9 +9,9 @@
 //! origin, and the library already makes two routes to one publisher one
 //! broadcast, splicing to the other when the one in use dies. What we publish
 //! is offered on one session only, the first live one in [`targets`]' order,
-//! through an origin of its own per session ([`Gate`]) that shares our
-//! publishing identity, so routes to us name one publisher whichever way they
-//! come. Offered on every session, a stream would be pulled once per route a
+//! through an origin of its own per session ([`Gate`]) whose offers name our
+//! publishing identity first, so routes to us name one publisher whichever way
+//! they come. Offered on every session, a stream would be pulled once per route a
 //! viewer happened to rank first: one upload per host instead of one.
 //!
 //! **The order is the relay, then the hosts by endpoint id**, which every app
@@ -210,16 +210,37 @@ pub(super) fn ended(states: &[State], hosting: bool, errors: &[Option<String>]) 
     )
 }
 
-/// What one session offers of ours: an origin of its own with our publishing
-/// identity, so every route to us still names one publisher.
+/// What one session offers of ours: an origin of its own, whose offers name
+/// our publishing identity first, so every route to us still names one
+/// publisher.
+///
+/// **Each gate is a hop of its own, after ours**: a route to us reads
+/// `[us, this gate, …]`, not `[us, …]`. Withdrawing an offer from a session
+/// that stays up is an explicit unannounce, and the library takes one as the
+/// sender giving the path up: at the far side, every route whose chain names
+/// the sender goes stale until the sender announces it again. Were the sender
+/// us, that would be every route to us, the relay's included, and a host we
+/// moved off would lose us for good the moment our offer left it, though we
+/// were on the relay it also holds. With a gate of its own as the sender, only
+/// the routes through that gate go.
+///
+/// The price: a session's split horizon hides only what came through its own
+/// gate, so our broadcasts now reach our inbound back through whoever bridges
+/// them. Only their announcements: `attend` passes over our own paths before
+/// asking for anything, and nothing reads our inbound into a gate.
 pub(super) struct Gate {
     pub(super) origin: moq_net::origin::Producer,
+    /// The first hop of every offer: our publishing identity.
+    publisher: moq_net::Hops,
 }
 
 impl Gate {
     pub(super) fn new(outbound: &moq_net::origin::Producer) -> Self {
+        // A chain of one hop cannot be too long or repeat itself.
+        let publisher = moq_net::Hops::try_from(vec![outbound.hop()]).unwrap_or_default();
         Self {
-            origin: moq_tokio::origin::spawn_config(moq_net::origin::Config::new(outbound.hop())),
+            origin: moq_tokio::origin::spawn(),
+            publisher,
         }
     }
 
@@ -228,6 +249,7 @@ impl Gate {
     /// broadcast, and a shared screen when there is one.
     pub(super) fn offer(&self, outbound: &moq_net::origin::Producer, me: &str) -> Abort {
         let gate = self.origin.clone();
+        let route = moq_net::origin::Route::default().with_hops(self.publisher.clone());
         let source = outbound.consume();
         let ours = format!("{me}/");
         Abort(tokio::spawn(async move {
@@ -241,7 +263,7 @@ impl Gate {
                 }
                 match update.kind {
                     moq_net::announce::Kind::Announced => {
-                        let dynamic = match gate.dynamic(path.as_str(), moq_net::origin::Route::default()) {
+                        let dynamic = match gate.dynamic(path.as_str(), route.clone()) {
                             Ok(dynamic) => dynamic,
                             Err(error) => {
                                 tracing::warn!("could not offer {path}: {error:#}");
@@ -733,9 +755,15 @@ mod socket_tests {
         }
 
         async fn sharing(origin: moq_net::origin::Producer) -> Meeting {
+            Self::on(0, origin).await
+        }
+
+        /// On a given port, so a relay can come up where members are already
+        /// dialling it.
+        async fn on(port: u16, origin: moq_net::origin::Producer) -> Meeting {
             crypto();
             let mut config = moq_tokio::server::Config::default();
-            config.listen.bind = Some(moq_tokio::listen::Bind::Addr(([127, 0, 0, 1], 0).into()));
+            config.listen.bind = Some(moq_tokio::listen::Bind::Addr(([127, 0, 0, 1], port).into()));
             config.listen.tls.generate = vec!["localhost".to_string()];
             config.publisher = Some(origin.consume());
             config.subscriber = Some(origin.clone());
@@ -807,6 +835,22 @@ mod socket_tests {
     }
 
     fn member(me: &str, targets: Vec<Target>) -> Member {
+        member_with(me, targets, client())
+    }
+
+    /// A client that keeps redialling a relay that is down, and notices it
+    /// back within half a second, as the app's does within its budget.
+    fn patient_client() -> moq_tokio::Client {
+        crypto();
+        let mut config = moq_tokio::client::Config::default();
+        config.connect.tls.insecure = Some(true);
+        config.connect.backoff.initial = Duration::from_millis(200);
+        config.connect.backoff.max = Duration::from_millis(500);
+        config.connect.backoff.timeout = Duration::from_secs(60);
+        config.init().unwrap()
+    }
+
+    fn member_with(me: &str, targets: Vec<Target>, client: moq_tokio::Client) -> Member {
         let outbound = moq_tokio::origin::spawn();
         let camera = outbound.create_broadcast(camera_path(me)).unwrap();
         let mut track = camera.create_track("video", None).unwrap();
@@ -822,7 +866,7 @@ mod socket_tests {
         let inbound = moq_tokio::origin::spawn();
         let (status, statuses) = futures_channel::mpsc::unbounded();
         let peer = join(Join {
-            client: client(),
+            client,
             me: me.to_string(),
             targets,
             outbound,
@@ -885,6 +929,15 @@ mod socket_tests {
         })
         .await
         .is_ok()
+    }
+
+    /// The best route to `path` at `origin`, if it has one within a moment:
+    /// `routed` alone waits for as long as the path is not there.
+    async fn route_within(origin: &moq_net::origin::Producer, path: &str) -> Option<moq_net::origin::Route> {
+        tokio::time::timeout(Duration::from_millis(200), origin.consume().routed(path))
+            .await
+            .ok()
+            .flatten()
     }
 
     /// The next status that names the ways in.
@@ -1017,5 +1070,59 @@ mod socket_tests {
         let route = m.inbound.consume().routed(camera_path("h")).await.expect("a route to h");
         assert_eq!(route.hops.as_slice().last(), Some(&relay.origin.hop()), "{route:?}");
         drop(camera);
+    }
+
+    /// The direction that went wrong: a host serving a member while the relay
+    /// is down, the relay coming back, and the member moving its offer up to
+    /// it. The member's offer leaves the host's session while the host is
+    /// also on the relay, and the host must keep it through the relay rather
+    /// than see a leave that never ends. Then the relay dies again, and the
+    /// host gets the member back directly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_keeps_a_member_who_moves_up_to_the_relay_and_back() {
+        let port = {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.local_addr().unwrap().port()
+        };
+        // The host: one origin for its session to the relay and its guests.
+        let shared = moq_tokio::origin::spawn();
+        let host = Meeting::sharing(shared.clone()).await;
+        let _to_relay = patient_client()
+            .with_publisher(shared.consume())
+            .with_subscriber(shared.clone())
+            .connect(at(port));
+        let _m = member_with("m", vec![relay_at(at(port)), host_at('h', host.url())], patient_client());
+        becomes(&shared, &camera_path("m"), true).await;
+
+        let relay = Meeting::on(port, moq_tokio::origin::spawn()).await;
+        // Moved once the relay has m from m, not bridged through the host.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(route) = route_within(&relay.origin, &camera_path("m")).await {
+                if !route.hops.as_slice().contains(&shared.hop()) {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "m never moved up to the relay");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Past the overlap, when the old offer leaves the host's session. A
+        // host that lost m then has no route to it at all, and never gets one.
+        tokio::time::sleep(MOVE_OVERLAP + Duration::from_secs(1)).await;
+        let route = route_within(&shared, &camera_path("m")).await.expect("the host lost m when m moved to the relay");
+        assert_eq!(route.hops.as_slice().last(), Some(&relay.origin.hop()), "{route:?}");
+
+        let relay_hop = relay.origin.hop();
+        relay.stop().await;
+        let deadline = Instant::now() + WITHIN;
+        loop {
+            if let Some(route) = route_within(&shared, &camera_path("m")).await {
+                if route.hops.as_slice().last() != Some(&relay_hop) {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "the host never had m back directly");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
