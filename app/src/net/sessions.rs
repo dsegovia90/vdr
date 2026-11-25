@@ -2434,7 +2434,6 @@ mod socket_tests {
         // Past the library's hold on a re-announcement, so a leave would show.
         w.arrivals.more(75, "video stopped when the relay did").await;
         let gap = w.arrivals.longest_gap(stopped);
-        eprintln!("splice gap {gap:?}");
         assert_eq!(count(&retracted), 0, "the viewer lost m");
         assert!(gap < SPLICE, "video was gone {gap:?} when the relay stopped");
     }
@@ -2452,8 +2451,8 @@ mod socket_tests {
         w.room.relay.stop().await;
         w.arrivals.more(30, "video never came back through the host").await;
         let gap = w.arrivals.longest_gap(stopped);
-        eprintln!("no-spare gap {gap:?}");
         assert!(count(&retracted) > 0, "m was never retracted, so the test above proves nothing");
+        assert!(gap > SPLICE, "video was gone only {gap:?} with no spare");
     }
 
     /// Moving the call to a host and back, on a relay that speaks moq-lite-05
@@ -2470,7 +2469,6 @@ mod socket_tests {
                 w.to(host, &format!("the call never moved, round {round}")).await;
                 w.arrivals.more(30, &format!("video stopped after a move, round {round}")).await;
                 let gap = w.arrivals.longest_gap(moved);
-                eprintln!("move gap {gap:?} to the {}", if host { "host" } else { "relay" });
                 assert!(gap < GAP, "video was gone {gap:?} moving to the {}, round {round}", if host { "host" } else { "relay" });
             }
         }
@@ -2578,7 +2576,6 @@ mod socket_tests {
 
         let spare = received(&room.host, Duration::from_secs(1)).await;
         let bridging = sent(&room._to_relay, Duration::from_secs(1)).await;
-        eprintln!("healthy: spare {spare} B/s, bridging {bridging} B/s");
         assert!(spare < IDLE, "the spare session uploads {spare} B/s with the relay up");
         assert!(bridging < IDLE, "the host uploads {bridging} B/s to the relay with the relay up");
 
@@ -2592,7 +2589,6 @@ mod socket_tests {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
         let carrying = received(&room.host, Duration::from_secs(1)).await;
-        eprintln!("relay gone: spare {carrying} B/s");
         assert!(carrying > IDLE * 5, "the spare carried only {carrying} B/s once the relay was gone");
     }
 
@@ -2636,7 +2632,6 @@ mod socket_tests {
         of_host.more(75, "the host's video stopped when the relay did").await;
         of_member.more(75, "the host's view of m stopped when the relay did").await;
         let (host_gap, member_gap) = (of_host.longest_gap(stopped), of_member.longest_gap(stopped));
-        eprintln!("host's own {host_gap:?}, host's view of m {member_gap:?}");
         assert_eq!(count(&host_left), 0, "the viewer lost the host");
         assert_eq!(count(&member_left), 0, "the host lost m");
         // This stand-in host is not a join, so nothing asks its encoder for a
