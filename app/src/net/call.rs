@@ -213,6 +213,7 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
         .init()
         .map_err(|error| format!("could not build a client: {error:#}"))?
         .with_iroh(endpoint.clone());
+    let mut refusals = Refusals::for_url(&url);
     let mut session = client
         .with_publisher(outbound)
         .with_subscriber(inbound)
@@ -239,6 +240,9 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
             loop {
                 match session.status().await {
                     Ok(moq_tokio::Status::Connected) => {
+                        if let Some(refusals) = refusals.as_mut() {
+                            refusals.connected(std::time::Instant::now());
+                        }
                         if connected {
                             tracing::info!("reconnected to {label}");
                             keyframe.ask();
@@ -258,6 +262,10 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
                         connected = true;
                     }
                     Ok(moq_tokio::Status::Disconnected) => {
+                        if refusals.as_mut().is_some_and(|refusals| refusals.dropped(std::time::Instant::now())) {
+                            tracing::warn!("{label} turned us away: the session ended as it began, twice");
+                            return TURNED_AWAY.to_string();
+                        }
                         tracing::warn!("the session dropped; redialling {label}");
                         let _ = status.unbounded_send(RemoteStatus::Reconnecting);
                     }
@@ -271,6 +279,59 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
         bandwidth,
         stats,
     })
+}
+
+/// How a session that was turned away ends, in place of the transport's
+/// words; [`explain`] says it to the person.
+const TURNED_AWAY: &str = "turned away: the session ended as soon as it began";
+
+/// How briefly a session must last to look turned away: the stack's own bar
+/// for a session that counts as healthy, its first backoff delay.
+const BRIEF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// **A heuristic for a refusal over iroh**, where the stack cannot see one.
+///
+/// A host that turns a guest away closes the session with the protocol's
+/// "unauthorized" code, which the client is meant to treat as final. Over raw
+/// QUIC it does. Over iroh the code is lost on the way up (web-transport-iroh
+/// 0.7 reports any application close as a bare connection error), so the
+/// client takes the refusal for a drop and redials it for the whole retry
+/// budget: thirty seconds of "reconnected" and "dropped" before a failure that
+/// never says refused.
+///
+/// So this reads the shape instead: the session came up (the host is there
+/// and answered) and ended within [`BRIEF`], twice running. **What it can
+/// misread**: a host that crashes or quits within a second of accepting us,
+/// twice, or a link that dies the instant it forms, twice; either way that
+/// host was not going to carry a call. A session that lasted is never counted,
+/// and one that lasts resets the count. Only for `iroh://`: every other
+/// transport reports the code, and the stack's own answer is better than this.
+#[derive(Debug, Default)]
+pub(super) struct Refusals {
+    since: Option<std::time::Instant>,
+    brief: u8,
+}
+
+impl Refusals {
+    /// The rule for sessions to `url`: `None` where the stack sees refusals.
+    pub(super) fn for_url(url: &url::Url) -> Option<Self> {
+        (url.scheme() == "iroh").then(Self::default)
+    }
+
+    pub(super) fn connected(&mut self, now: std::time::Instant) {
+        self.since = Some(now);
+    }
+
+    /// Whether this drop makes the session one that was turned away.
+    pub(super) fn dropped(&mut self, now: std::time::Instant) -> bool {
+        match self.since.take() {
+            Some(since) if now.duration_since(since) < BRIEF => self.brief += 1,
+            Some(_) => self.brief = 0,
+            // A drop without a connection is not a session that began.
+            None => {}
+        }
+        self.brief >= 2
+    }
 }
 
 /// Everything [`serve`] needs, named rather than positional.
@@ -423,7 +484,7 @@ pub(crate) fn redacted(url: &url::Url) -> String {
 /// reaches us is then the bare word (seen in this module's local-socket test).
 /// What reaches us at the end is transport text; this says what to do.
 fn explain(error: String) -> String {
-    if error.contains("reason=unauthorized") || error.trim() == "unauthorized" {
+    if error.contains("reason=unauthorized") || error.trim() == "unauthorized" || error == TURNED_AWAY {
         "the room refused this link: its token or door is missing, expired, or for another room".to_string()
     } else {
         error
@@ -3257,7 +3318,40 @@ mod presence_tests {
 
 #[cfg(test)]
 mod room_tests {
-    use super::{explain, redacted, room_label};
+    use super::{Refusals, TURNED_AWAY, explain, redacted, room_label};
+
+    fn iroh() -> Refusals {
+        Refusals::for_url(&format!("iroh://{}/team", "a".repeat(64)).parse().unwrap()).expect("iroh is judged")
+    }
+
+    #[test]
+    fn only_an_iroh_session_is_judged_by_its_shape() {
+        for other in ["http://localhost:4443/team", "https://relay.example.com/team", "moqt://localhost:1/team"] {
+            assert!(Refusals::for_url(&other.parse().unwrap()).is_none(), "{other}");
+        }
+    }
+
+    #[test]
+    fn two_brief_sessions_running_are_a_refusal_and_one_that_lasted_resets_it() {
+        let start = std::time::Instant::now();
+        let at = |ms: u64| start + std::time::Duration::from_millis(ms);
+        let mut refusals = iroh();
+        refusals.connected(at(0));
+        assert!(!refusals.dropped(at(200)), "one brief session is a blip");
+        refusals.connected(at(1500));
+        assert!(refusals.dropped(at(1700)), "two running are the door");
+
+        let mut refusals = iroh();
+        refusals.connected(at(0));
+        assert!(!refusals.dropped(at(200)));
+        refusals.connected(at(1000));
+        assert!(!refusals.dropped(at(5000)), "a session that lasted is not a refusal");
+        refusals.connected(at(6000));
+        assert!(!refusals.dropped(at(6100)), "and it reset the count");
+        assert!(!refusals.dropped(at(9000)), "a drop with no session is not counted");
+        refusals.connected(at(9500));
+        assert!(refusals.dropped(at(9600)));
+    }
 
     #[test]
     fn a_token_never_reaches_the_log() {
@@ -3291,6 +3385,11 @@ mod room_tests {
     fn a_url_without_a_token_is_left_alone() {
         let url: url::Url = "http://localhost:4443/test".parse().unwrap();
         assert_eq!(redacted(&url), "http://localhost:4443/test");
+    }
+
+    #[test]
+    fn a_door_that_turned_us_away_over_iroh_is_said_as_refused() {
+        assert!(explain(TURNED_AWAY.to_string()).starts_with("the room refused this link"));
     }
 
     #[test]
