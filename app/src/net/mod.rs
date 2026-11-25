@@ -332,6 +332,9 @@ pub fn use_remote() -> Remote {
         // Whether tiles show the way each video arrives; the Experimental tab
         // changes it from here on.
         local.set_show_routes(saved.shows_routes() || crate::args::Args::get().show_routes);
+        // Whether a join keeps a spare offer of our media; the flag wins
+        // either way for its run, and the Experimental tab changes it.
+        local.set_spare_route(crate::args::Args::get().spare_route.unwrap_or(saved.keeps_spare_route()));
         // The camera and microphone as launched. Our entry starts "on" for
         // both, and only a click changes it, so without this a camera started
         // off was announced as on, and so was a microphone that `--no-audio`

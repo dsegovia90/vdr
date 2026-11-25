@@ -25,6 +25,12 @@
 //! is, and can move it to a host from that person's tile menu. Off, we
 //! neither follow nor say, and our media goes back to the usual order.
 //!
+//! Keeping a spare route (**on** by default: it costs an announcement, not an
+//! upload, and does nothing in a room without hosts): in a room with hosts,
+//! our video is also offered through a second way in, priced so nobody uses
+//! it until the first goes, so the relay stopping does not take our tile
+//! away from everyone for a moment. A join reads it as it goes.
+//!
 //! **Off means neither publish nor show.** The flag lives on our own entry,
 //! where the presence announcer reads it four times a second (a report
 //! already out is withdrawn with the next document), and the tiles and the
@@ -67,6 +73,11 @@ pub fn ExperimentalTab(local: Arc<PeerStats>, me: String) -> Element {
         let local = local.clone();
         move || local.move_calls()
     });
+    let mut spare = use_signal({
+        let local = local.clone();
+        move || local.spare_route()
+    });
+    let spares = local.clone();
     let mut call_on = use_signal({
         let local = local.clone();
         move || local.call_host()
@@ -161,6 +172,21 @@ pub fn ExperimentalTab(local: Arc<PeerStats>, me: String) -> Element {
                             marks.set_show_routes(next);
                             tracing::info!("showing routes {}", if next { "on" } else { "off" });
                             Settings::update(move |settings| settings.show_routes = Some(next));
+                        },
+                    }
+                }
+                Row {
+                    title: "Keep a spare route",
+                    first: false,
+                    description: "In a room with hosts, also offers your video through a second way into the room, priced so that nobody uses it while the first works. If the relay stops, everyone switches to it at once instead of losing your video for a moment. It uses no upload until it is needed.",
+                    Switch {
+                        on: spare(),
+                        onclick: move |_| {
+                            let next = !*spare.peek();
+                            spare.set(next);
+                            spares.set_spare_route(next);
+                            tracing::info!("spare route {}", if next { "on" } else { "off" });
+                            Settings::update(move |settings| settings.spare_route = Some(next));
                         },
                     }
                 }

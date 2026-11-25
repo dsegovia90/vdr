@@ -331,7 +331,7 @@ focus.
 
 | Path | Role |
 |---|---|
-| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--host`, `--loopback`, `--camera`, `--camera-off`, `--test-pattern`, `--no-audio`, `--host-rooms`, `--move-calls`, `--move-call`, `--bounce`, `--show-routes`, `--ephemeral`, `--profile`, `--quality`, `--encoder`, …) |
+| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--host`, `--loopback`, `--camera`, `--camera-off`, `--test-pattern`, `--no-audio`, `--host-rooms`, `--move-calls`, `--move-call`, `--bounce`, `--show-routes`, `--spare-route`, `--no-spare-route`, `--ephemeral`, `--profile`, `--quality`, `--encoder`, …) |
 | `settings.rs` | what the app remembers between launches, the data folder, the log path |
 | `hotkeys.rs` | keyboard shortcuts as a pure table: actions, chords, the keymap. No UI in it |
 | `name.rs` | display names: cleaning, the short id, which label to show |

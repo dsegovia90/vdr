@@ -699,6 +699,10 @@ pub struct PeerStats {
     /// Whether we follow and say where the call is moved. Our own entry
     /// only; the Experimental tab sets it.
     move_calls: AtomicBool,
+    /// Whether a join over several sessions keeps a spare offer of our media
+    /// on a second one. Our own entry only; the Experimental tab sets it,
+    /// and a join reads it as it goes.
+    spare_route: AtomicBool,
     /// Where the call is, as the winning choice we heard or made; repeated
     /// in our presence while `move_calls` is on. Our own entry only.
     call_on: std::sync::Mutex<Option<super::moves::CallOn>>,
@@ -911,6 +915,7 @@ impl Default for PeerStats {
             sending: std::sync::Mutex::new(None),
             offer: std::sync::Mutex::new(None),
             move_calls: AtomicBool::new(false),
+            spare_route: AtomicBool::new(true),
             call_on: std::sync::Mutex::new(None),
             hosts_room: AtomicBool::new(false),
             link: std::sync::Mutex::new(None),
@@ -1310,6 +1315,16 @@ impl PeerStats {
 
     pub fn set_move_calls(&self, on: bool) {
         self.move_calls.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether we keep a spare offer of our media beside the one in use.
+    /// Meaningful on our own entry; on unless turned off, as the setting is.
+    pub fn spare_route(&self) -> bool {
+        self.spare_route.load(Ordering::Relaxed)
+    }
+
+    pub fn set_spare_route(&self, on: bool) {
+        self.spare_route.store(on, Ordering::Relaxed);
     }
 
     /// Where the call is, as we follow it: the host's endpoint id, `None`

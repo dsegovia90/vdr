@@ -37,6 +37,7 @@
 //! vdr --move-call relay                   # move the call as the join starts: relay or a host's id
 //! vdr --bounce 30                         # move it round the relay and the hosts every 30 s (10 at least)
 //! vdr --show-routes                       # mark each video with the way it arrives
+//! vdr --no-spare-route                    # no spare offer beside the one in use (--spare-route: one)
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry is a second
@@ -280,6 +281,11 @@ pub struct Args {
     /// does, without saving it (`--show-routes`). For looking at a scripted
     /// run; the routes are logged whether or not this is on.
     pub show_routes: bool,
+    /// Keep a spare offer of our media on a second session, or not, for
+    /// this run, without saving it (`--spare-route`, `--no-spare-route`).
+    /// `None` leaves it to the setting, which is on by default; a scripted
+    /// run compares the two.
+    pub spare_route: Option<bool>,
 }
 
 impl Args {
@@ -321,6 +327,7 @@ impl Args {
         let mut move_call = None;
         let mut bounce = None;
         let mut show_routes = false;
+        let mut spare_route = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -394,6 +401,8 @@ impl Args {
                     bounce = Some(crate::net::moves::bounce_every(secs.and_then(Result::ok)));
                 }
                 "--show-routes" => show_routes = true,
+                "--spare-route" => spare_route = Some(true),
+                "--no-spare-route" => spare_route = Some(false),
                 // Read by `settings::data_dir` from the raw arguments, since
                 // the log opens before this parser runs; only skipped here.
                 "--profile" => {
@@ -427,6 +436,7 @@ impl Args {
             move_call,
             bounce,
             show_routes,
+            spare_route,
         }
     }
 }

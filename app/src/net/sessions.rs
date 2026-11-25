@@ -74,6 +74,65 @@
 //! connection figures in the Network tab and in the report we send: that link
 //! is what our encoding has to fit. A host with no outgoing session left falls
 //! back to its guests' links, which are then what carries its media.
+//!
+//! **A spare offer, behind its own switch** (`PeerStats::spare_route`, on by
+//! default). With one offer, a session that dies leaves viewers with no route
+//! to us at all: they see a retraction, and the library holds the next
+//! announcement of us for two seconds when it ranks worse than the one lost,
+//! so every tile leaves and comes back. So we also offer on a second session,
+//! the first other live one in [`pick`]'s order ([`spare`]), at a price
+//! ([`SPARE_COST`]) that keeps it unused while the carrier works. Viewers
+//! then hold a route to us that outlives the carrier, and the library splices
+//! a read across at the next group instead of ending it. When the carrier
+//! goes or the call moves, the spare is promoted by **re-pricing it in
+//! place**, not by withdrawing one offer and making another, and the next
+//! live session becomes the spare. An offer is withdrawn only when its
+//! session leaves the pair, and only through its own gate, so the stale-route
+//! rule above touches nothing but that offer; a re-price is no withdrawal and
+//! marks nothing stale.
+//!
+//! How a spare is priced, worked from the ranking (cost first, then length):
+//! a route's cost is what it was offered at plus each link it crosses,
+//! [`HOST_COST`] into and out of a host ([`CHOSEN_COST`] into the one the call
+//! was moved to), one per link through a relay that speaks moq-lite-06, and
+//! nothing at all through one that speaks moq-lite-05, whose routes arrive as
+//! `(0, unknown)` and win on the first figure against any priced route.
+//!
+//! - **Carrier the relay, spare a host.** At the host our spare costs
+//!   `SPARE_COST + 100`; its route through the relay costs 2, or nothing on
+//!   moq-lite-05, so the host reads us through the relay, and forwards only
+//!   that best route to its guests. It also passes the spare up to the relay,
+//!   where it is one hop longer and dearer than our carrier: never pulled.
+//! - **Carrier a host, spare another host** (the relay down). The second host
+//!   has us through the first at 200 and the spare at `SPARE_COST + 100`.
+//! - **Carrier a host the call was moved to, spare the relay.** Only on a
+//!   relay that carries a price: the relay then has us through the host for
+//!   about 1 and the spare at `SPARE_COST + 1`. A moq-lite-05 relay cannot
+//!   carry the price, so it holds no spare: everyone who follows the move
+//!   would still prefer the free host link, but anyone who does not, or who
+//!   reaches only the relay, would pull the spare straight from us, a second
+//!   upload of our media where the host would otherwise have bridged it. The
+//!   spare goes to the next host instead, if there is one.
+//!
+//! So [`SPARE_COST`] has to exceed the dearest real route to us at any node
+//! holding a spare, a few hundred through two hosts. The socket tests below
+//! measure the spare session's upload with everything healthy, on both kinds
+//! of relay.
+//!
+//! **What a spare does not change**: a relay that stops answering but whose
+//! session has not timed out still holds the best route to us at every
+//! viewer, so the freeze until the timeout stays. What it changes is what
+//! follows: when that session ends, every reader splices to the spare at once
+//! instead of leaving and coming back two seconds later. Leaving a dying
+//! relay sooner is ending its session sooner: whatever decides it, the hook
+//! is [`Member::give_up`] on the relay's session, which hangs it up (its
+//! routes go, here and as a lost session at the far side, marking nothing
+//! stale), and the next pass promotes the spare.
+//!
+//! **A host needs no spare.** It offers its one origin on every session, so
+//! viewers already hold its own media through the relay and directly, and it
+//! holds each member through the relay and through the member's spare: when
+//! the relay goes, its own readers and its guests' splice like anyone's.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -105,6 +164,12 @@ const MOVE_OVERLAP: Duration = Duration::from_secs(1);
 /// What pulling through the host the call has been moved to costs: nothing,
 /// so its routes beat the relay's.
 const CHOSEN_COST: u64 = 0;
+
+/// What a spare offer is offered at, on top of the links it crosses: far
+/// above any real route to us, a few hundred at most through two hosts, so
+/// nobody pulls through it while anything else reaches us, and far below the
+/// library's ceiling, which marks a route that is going away.
+pub(super) const SPARE_COST: u64 = 10_000;
 
 /// How often the set looks at its timers and at whether we still host.
 const TICK: Duration = Duration::from_millis(250);
@@ -201,11 +266,7 @@ pub(super) fn pick(
     if states.first() == Some(&State::Dialing) && now.duration_since(started) < HOLD {
         return None;
     }
-    let preferred = preferred.filter(|&at| at < states.len());
-    let order: Vec<usize> = preferred
-        .into_iter()
-        .chain((0..states.len()).filter(|&at| Some(at) != preferred))
-        .collect();
+    let order = order(states.len(), preferred);
     if let Some(current) = current.filter(|&at| states.get(at).is_some_and(|state| state.live())) {
         let rank = order.iter().position(|&at| at == current).unwrap_or(order.len());
         let held = order[..rank]
@@ -215,6 +276,39 @@ pub(super) fn pick(
         return Some(held.unwrap_or(current));
     }
     order.into_iter().find(|&at| states[at].live())
+}
+
+/// The order our media prefers the sessions in: `preferred` first, when it
+/// is one of them, and the rest as listed.
+fn order(len: usize, preferred: Option<usize>) -> Vec<usize> {
+    let preferred = preferred.filter(|&at| at < len);
+    preferred.into_iter().chain((0..len).filter(|&at| Some(at) != preferred)).collect()
+}
+
+/// Which session keeps the spare offer beside `carrier`: the first other live
+/// one in [`pick`]'s order, so it is where our media would go next, among
+/// those that carry a route's price (`priced`). One that does not would hand
+/// the spare on free, and whoever reached us only that way would pull it.
+/// No hold: a spare carries nothing until it is needed.
+pub(super) fn spare(states: &[State], priced: &[bool], carrier: usize, preferred: Option<usize>) -> Option<usize> {
+    order(states.len(), preferred)
+        .into_iter()
+        .filter(|&at| at != carrier)
+        .find(|&at| states[at].live() && priced.get(at).copied().unwrap_or(false))
+}
+
+/// Whether a session at `version` carries a route's price. moq-lite-06 added
+/// it; older versions, and the IETF drafts we never speak to each other, do
+/// not. Read from the name, so a later lite version counts as carrying it.
+pub(super) fn carries_price(version: moq_net::Version) -> bool {
+    let name = version.as_str();
+    name.starts_with("moq-lite-") && !matches!(name, "moq-lite-01" | "moq-lite-02" | "moq-lite-03" | "moq-lite-04" | "moq-lite-05")
+}
+
+/// Whether a join keeps a spare offer at all: only with the switch on, and
+/// never while hosting, whose one origin is offered whole on every session.
+pub(super) fn keeps_spare(hosting: bool, switch: bool) -> bool {
+    switch && !hosting
 }
 
 /// What the status line says about where we are.
@@ -280,62 +374,121 @@ impl Gate {
         }
     }
 
-    /// Offers everything we publish under `me/` through this gate, as it is
-    /// announced, until the returned task is dropped: our camera, our control
-    /// broadcast, and a shared screen when there is one.
-    pub(super) fn offer(&self, outbound: &moq_net::origin::Producer, me: &str) -> Abort {
+    /// Offers everything we publish under `me/` through this gate at `price`,
+    /// as it is announced, until the returned offer is dropped: our camera,
+    /// our control broadcast, and a shared screen when there is one.
+    pub(super) fn offer(&self, outbound: &moq_net::origin::Producer, me: &str, price: u64) -> Offer {
         let gate = self.origin.clone();
         let route = moq_net::origin::Route::default().with_hops(self.publisher.clone());
         let source = outbound.consume();
         let ours = format!("{me}/");
-        Abort(tokio::spawn(async move {
+        let (pricing, mut priced) = tokio::sync::watch::channel(price);
+        let serving = Abort(tokio::spawn(async move {
             let mut announced = source.announced();
-            // Each path's offer, which ends (and withdraws) when dropped.
-            let mut offered: std::collections::HashMap<String, Abort> = std::collections::HashMap::new();
-            while let Some(update) = announced.next().await {
-                let path = update.prefix.as_str().to_string();
-                if !path.starts_with(&ours) {
-                    continue;
-                }
-                match update.kind {
-                    moq_net::announce::Kind::Announced => {
-                        let dynamic = match gate.dynamic(path.as_str(), route.clone()) {
-                            Ok(dynamic) => dynamic,
-                            Err(error) => {
-                                tracing::warn!("could not offer {path}: {error:#}");
-                                continue;
-                            }
-                        };
-                        let source = source.clone();
-                        let served = path.clone();
-                        offered.insert(
-                            path,
-                            Abort(tokio::spawn(async move {
-                                // The handler owns the route: ending it
-                                // withdraws the offer.
-                                while let Ok(request) = dynamic.requested_broadcast().await {
-                                    match source.request_broadcast(served.as_str()).await {
-                                        Ok(broadcast) => request.accept(broadcast),
-                                        Err(error) => request.reject(error),
+            // Each path's offer, and what serves it. Dropping both withdraws
+            // the offer; the route itself is shared so it can be re-priced.
+            let mut offered: std::collections::HashMap<String, (Arc<moq_net::origin::Dynamic>, Abort)> =
+                std::collections::HashMap::new();
+            loop {
+                tokio::select! {
+                    update = announced.next() => {
+                        let Some(update) = update else { return };
+                        let path = update.prefix.as_str().to_string();
+                        if !path.starts_with(&ours) {
+                            continue;
+                        }
+                        match update.kind {
+                            moq_net::announce::Kind::Announced => {
+                                let at = route.clone().with_cost(*priced.borrow());
+                                let dynamic = match gate.dynamic(path.as_str(), at) {
+                                    Ok(dynamic) => Arc::new(dynamic),
+                                    Err(error) => {
+                                        tracing::warn!("could not offer {path}: {error:#}");
+                                        continue;
                                     }
-                                }
-                            })),
-                        );
+                                };
+                                let handler = dynamic.clone();
+                                let source = source.clone();
+                                let served = path.clone();
+                                let serving = Abort(tokio::spawn(async move {
+                                    while let Ok(request) = handler.requested_broadcast().await {
+                                        match source.request_broadcast(served.as_str()).await {
+                                            Ok(broadcast) => request.accept(broadcast),
+                                            Err(error) => request.reject(error),
+                                        }
+                                    }
+                                }));
+                                offered.insert(path, (dynamic, serving));
+                            }
+                            moq_net::announce::Kind::Retracted => {
+                                offered.remove(&path);
+                            }
+                            moq_net::announce::Kind::Updated => {}
+                        }
                     }
-                    moq_net::announce::Kind::Retracted => {
-                        offered.remove(&path);
+                    changed = priced.changed() => {
+                        // The offer was dropped: so is this, and every route
+                        // with it.
+                        if changed.is_err() {
+                            return;
+                        }
+                        // In place: the same routes, from the same hops, at
+                        // another price. Viewers see a change of route, never
+                        // a retraction, and nothing goes stale.
+                        let at = route.clone().with_cost(*priced.borrow_and_update());
+                        for (path, (dynamic, _)) in &offered {
+                            if let Err(error) = dynamic.update(at.clone()) {
+                                tracing::warn!("could not re-price {path}: {error:#}");
+                            }
+                        }
                     }
-                    moq_net::announce::Kind::Updated => {}
                 }
             }
-        }))
+        }));
+        Offer {
+            _serving: serving,
+            pricing,
+        }
+    }
+}
+
+/// Our broadcasts offered through one gate, at a price that can change in
+/// place. Dropping it withdraws them.
+pub(super) struct Offer {
+    _serving: Abort,
+    pricing: tokio::sync::watch::Sender<u64>,
+}
+
+impl Offer {
+    /// Offers everything at `price` from now on, without withdrawing it.
+    fn reprice(&self, price: u64) {
+        self.pricing.send_replace(price);
+    }
+}
+
+/// What one offer of ours is for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Role {
+    /// It carries our media.
+    Carrier,
+    /// It waits, priced out of use, for the carrier to go.
+    Spare,
+}
+
+impl Role {
+    fn price(self) -> u64 {
+        match self {
+            Role::Carrier => 0,
+            Role::Spare => SPARE_COST,
+        }
     }
 }
 
 /// What one session reports to the set.
 #[derive(Debug)]
 enum Event {
-    Live,
+    /// Up, and whether it carries a route's price ([`carries_price`]).
+    Live { priced: bool },
     Down,
     Ended(String),
     Refused(String),
@@ -381,6 +534,31 @@ struct Member {
     /// Dialled again at a new price while up, so its answer is not a return.
     redialled: bool,
     session: Option<Session>,
+    /// Whether its session, when last up, carried a route's price.
+    priced: bool,
+    /// What we offer on it, and what for. Only with a gate.
+    offer: Option<(Offer, Role)>,
+}
+
+impl Member {
+    /// Gives this session up: hangs it up, so its routes go here and at the
+    /// far side as a lost session's do (marking nothing stale), and rests it
+    /// before it is dialled again. The next pass moves our media to the spare
+    /// by re-pricing it. What an ending session does, and what anything that
+    /// judged a session dead before its transport did would call.
+    fn give_up(&mut self, error: String) {
+        self.session = None;
+        self.error = Some(error);
+        self.state = State::Resting(Instant::now() + REST);
+    }
+}
+
+/// How the log names a session: the relay by its address, a host by its id.
+fn named(member: &Member, relay: &str) -> String {
+    match &member.target.host {
+        None => relay.to_string(),
+        Some(id) => format!("host {id}"),
+    }
 }
 
 /// A dialled session: its status task (which owns the connection, so
@@ -444,7 +622,8 @@ pub(super) fn join(args: Join) -> Peer {
                             if let Some(refusals) = refusals.as_mut() {
                                 refusals.connected(Instant::now());
                             }
-                            say(Event::Live);
+                            let priced = connection.version().is_some_and(carries_price);
+                            say(Event::Live { priced });
                         }
                         Ok(moq_tokio::Status::Disconnected) => {
                             if refusals.as_mut().is_some_and(|refusals| refusals.dropped(Instant::now())) {
@@ -480,6 +659,8 @@ pub(super) fn join(args: Join) -> Peer {
             joined: false,
             redialled: false,
             session: None,
+            priced: false,
+            offer: None,
         })
         .collect();
     let hosts = members.len() - 1;
@@ -501,7 +682,6 @@ pub(super) fn join(args: Join) -> Peer {
         closed: Box::pin(async move {
             let started = Instant::now();
             let mut carrier: Option<usize> = None;
-            let mut offer: Option<Abort> = None;
             // Held, and replaced only below: dropping it stops what it feeds.
             let mut _following: Option<Following> = None;
             let mut on_guests = false;
@@ -519,15 +699,17 @@ pub(super) fn join(args: Join) -> Peer {
                         let elsewhere = (hosting && local.offer().is_some())
                             || members.iter().enumerate().any(|(at, member)| at != index && member.state.live());
                         let member = &mut members[index];
-                        let name = |member: &Member| match &member.target.host {
-                            None => relay_label.clone(),
-                            Some(id) => format!("host {id}"),
-                        };
+                        let name = |member: &Member| named(member, &relay_label);
                         match event {
-                            Event::Live if std::mem::take(&mut member.redialled) && member.state.live() => {
+                            Event::Live { priced } if std::mem::take(&mut member.redialled) && member.state.live() => {
+                                member.priced = priced;
                                 tracing::info!("{} answered at its new price", name(member));
                             }
-                            Event::Live => {
+                            Event::Live { priced } => {
+                                member.priced = priced;
+                                if !priced && member.gate.is_some() && local.spare_route() {
+                                    tracing::info!("{} carries no route price, so it holds no spare offer of ours", name(member));
+                                }
                                 match (&member.target.host, member.joined) {
                                     (None, false) => tracing::info!("joined {relay_label}"),
                                     (Some(id), false) => tracing::info!("joined {path} through host {id}"),
@@ -544,9 +726,7 @@ pub(super) fn join(args: Join) -> Peer {
                                 member.state = State::Redialling;
                             }
                             Event::Ended(error) => {
-                                member.session = None;
-                                member.error = Some(error);
-                                member.state = State::Resting(Instant::now() + REST);
+                                member.give_up(error);
                                 match (&member.target.host, elsewhere) {
                                     (None, true) => tracing::warn!("the relay is unreachable; trying again in 15s"),
                                     (Some(id), true) => tracing::info!("host {id} is unreachable; trying again in 15s"),
@@ -639,23 +819,19 @@ pub(super) fn join(args: Join) -> Peer {
                 }
 
                 let next = pick(&states, carrier, now, started, chosen);
+                // With nothing live, every offer stays as it is: a session
+                // that died carries nothing, and one that comes back finds
+                // it still offered.
+                if let Some(next) = next {
+                    let priced: Vec<bool> = members.iter().map(|member| member.priced).collect();
+                    let spare_at = keeps_spare(hosting, local.spare_route())
+                        .then(|| spare(&states, &priced, next, chosen))
+                        .flatten();
+                    arrange(&mut members, next, spare_at, &outbound, &me, &relay_label);
+                }
                 if next.is_some() && next != carrier {
                     let index = next.unwrap_or_default();
                     let member = &members[index];
-                    // Make before break: offered there before withdrawn here.
-                    // The new offer is made by a task as our paths are read
-                    // back, so the old one is kept a moment longer rather than
-                    // dropped in the same instant; a session that died carries
-                    // nothing meanwhile.
-                    if let Some(gate) = &member.gate {
-                        let made = gate.offer(&outbound, &me);
-                        if let Some(old) = offer.replace(made) {
-                            tokio::spawn(async move {
-                                tokio::time::sleep(MOVE_OVERLAP).await;
-                                drop(old);
-                            });
-                        }
-                    }
                     match &member.target.host {
                         None => tracing::info!("our media goes through the relay"),
                         Some(id) => tracing::info!("our media goes through host {id}"),
@@ -674,6 +850,12 @@ pub(super) fn join(args: Join) -> Peer {
                     tracing::info!("still hosting; no way to the relay");
                     local.set_sending(Some(super::super::arrival::Sending::Guests));
                     _following = guests.clone().map(|guests| follow_guests(guests, &estimate));
+                    // Every guest reading our own media through the relay
+                    // has just spliced to its direct route, and the library
+                    // passes on what it reads there from the next group: a
+                    // keyframe now, rather than the rest of the encoder's
+                    // interval.
+                    keyframe.ask();
                     carrier = None;
                     on_guests = true;
                 }
@@ -697,6 +879,70 @@ pub(super) fn join(args: Join) -> Peer {
         }),
         bandwidth: None,
         stats: None,
+    }
+}
+
+/// Puts each session's offer where it should be: the carrier's at no price,
+/// the spare's at [`SPARE_COST`], the rest withdrawn.
+///
+/// **Make before break, and re-price rather than withdraw.** A session that
+/// keeps an offer, changing only what it is for, is re-priced in place, so a
+/// spare becomes the carrier with every viewer's read carried across. A new
+/// offer is made by a task as our paths are read back, so one leaving the
+/// pair is kept a moment longer rather than dropped in the same instant; a
+/// session that died carries nothing meanwhile.
+fn arrange(
+    members: &mut [Member],
+    carrier: usize,
+    spare: Option<usize>,
+    outbound: &moq_net::origin::Producer,
+    me: &str,
+    relay: &str,
+) {
+    for (index, member) in members.iter_mut().enumerate() {
+        let want = if index == carrier {
+            Some(Role::Carrier)
+        } else if Some(index) == spare {
+            Some(Role::Spare)
+        } else {
+            None
+        };
+        let had = member.offer.as_ref().map(|(_, role)| *role);
+        if want == had {
+            continue;
+        }
+        let name = named(member, relay);
+        match (had, want) {
+            (None, Some(role)) => {
+                let Some(gate) = &member.gate else { continue };
+                member.offer = Some((gate.offer(outbound, me, role.price()), role));
+                if role == Role::Spare {
+                    tracing::info!("a spare offer on {name}");
+                }
+            }
+            (Some(_), Some(role)) => {
+                if let Some((offer, held)) = member.offer.as_mut() {
+                    offer.reprice(role.price());
+                    *held = role;
+                }
+                match role {
+                    Role::Carrier => tracing::info!("the spare on {name} now carries our media"),
+                    Role::Spare => tracing::info!("our offer on {name} is the spare now"),
+                }
+            }
+            (Some(was), None) => {
+                if let Some((old, _)) = member.offer.take() {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(MOVE_OVERLAP).await;
+                        drop(old);
+                    });
+                }
+                if was == Role::Spare {
+                    tracing::info!("the spare on {name} is closed");
+                }
+            }
+            (None, None) => {}
+        }
     }
 }
 
@@ -831,6 +1077,43 @@ mod tests {
         assert_eq!(pick(&[Redialling, Live(at(0)), Resting(at(0))], None, at(5000), Some(2)), Some(1));
         assert_eq!(pick(&[Live(at(0)), Live(at(0))], Some(1), at(5000), Some(1)), Some(1), "stays on it");
         assert_eq!(pick(&all, Some(1), at(5000), Some(9)), Some(0), "a host we do not hold is no preference");
+    }
+
+    #[test]
+    fn the_spare_is_the_first_other_live_session_that_carries_a_price() {
+        use State::*;
+        let now = Instant::now();
+        let all = [Live(now), Live(now), Live(now)];
+        let priced = [true, true, true];
+        assert_eq!(spare(&all, &priced, 0, None), Some(1), "the relay carries, the first host waits");
+        assert_eq!(spare(&all, &priced, 1, None), Some(0), "where our media would go next: the relay");
+        assert_eq!(spare(&all, &priced, 2, Some(2)), Some(0), "moved to a host: the relay is next");
+        assert_eq!(spare(&all, &priced, 0, Some(2)), Some(2), "moved, not yet there: the chosen host");
+        assert_eq!(spare(&all, &[false, true, true], 2, Some(2)), Some(1), "a relay that cannot carry the price is passed over");
+        assert_eq!(spare(&all, &[false, true, true], 1, None), Some(2));
+        assert_eq!(spare(&[Live(now), Live(now)], &[false, true], 1, Some(1)), None, "nowhere priced to put it");
+        assert_eq!(spare(&[Redialling, Live(now), Resting(now), Live(now)], &[true; 4], 1, None), Some(3), "only a live one");
+        assert_eq!(spare(&[Live(now)], &[true], 0, None), None, "the relay alone");
+        assert_eq!(spare(&all, &[true], 0, None), None, "a price never heard is no price");
+    }
+
+    #[test]
+    fn a_route_price_is_carried_from_moq_lite_06_on() {
+        let version = |name: &str| name.parse::<moq_net::Version>().expect("a version this moq-net knows");
+        for older in ["moq-lite-01", "moq-lite-02", "moq-lite-03", "moq-lite-04", "moq-lite-05", "moq-transport-14"] {
+            assert!(!carries_price(version(older)), "{older}");
+        }
+        for newer in ["moq-lite-06", "moq-lite-07-wip"] {
+            assert!(carries_price(version(newer)), "{newer}");
+        }
+    }
+
+    #[test]
+    fn a_spare_is_kept_only_with_the_switch_on_and_never_while_hosting() {
+        assert!(keeps_spare(false, true));
+        assert!(!keeps_spare(false, false));
+        assert!(!keeps_spare(true, true), "a host offers its one origin on every session already");
+        assert!(!keeps_spare(true, false));
     }
 
     #[test]
@@ -1022,12 +1305,24 @@ mod socket_tests {
         local: Arc<PeerStats>,
         outbound: moq_net::origin::Producer,
     ) -> Member {
+        member_sending(me, targets, client, local, outbound, 100)
+    }
+
+    /// The same, with frames of `bytes` each.
+    fn member_sending(
+        me: &str,
+        targets: Vec<Target>,
+        client: moq_tokio::Client,
+        local: Arc<PeerStats>,
+        outbound: moq_net::origin::Producer,
+        bytes: usize,
+    ) -> Member {
         let camera = outbound.create_broadcast(camera_path(me)).unwrap();
         let mut track = camera.create_track("video", None).unwrap();
         camera.announce(moq_net::origin::Route::default()).unwrap();
         let writing = Abort(tokio::spawn(async move {
             for n in 0u64.. {
-                if track.write_frame(moq_net::Timestamp::from_millis(n * 20).unwrap(), [0u8; 100].as_slice()).is_err() {
+                if track.write_frame(moq_net::Timestamp::from_millis(n * 20).unwrap(), vec![0u8; bytes]).is_err() {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1048,6 +1343,19 @@ mod socket_tests {
         local: Arc<PeerStats>,
         outbound: moq_net::origin::Producer,
     ) -> Member {
+        joined_asking(me, targets, client, local, outbound, Arc::new(Keyframes::default()))
+    }
+
+    /// The same, asking for a keyframe through `keyframe` when our media
+    /// moves, as the call does of its encode thread.
+    fn joined_asking(
+        me: &str,
+        targets: Vec<Target>,
+        client: moq_tokio::Client,
+        local: Arc<PeerStats>,
+        outbound: moq_net::origin::Producer,
+        keyframe: Arc<Keyframes>,
+    ) -> Member {
         let inbound = moq_tokio::origin::spawn();
         let (status, statuses) = futures_channel::mpsc::unbounded();
         let peer = join(Join {
@@ -1062,7 +1370,7 @@ mod socket_tests {
             metrics: Arc::new(Metrics::default()),
             local,
             status,
-            keyframe: Arc::new(Keyframes::default()),
+            keyframe,
             room: "room team".to_string(),
             bounce: None,
         });
@@ -1155,11 +1463,14 @@ mod socket_tests {
         assert!(heard_within(&host.origin, &camera_path("m"), Duration::from_millis(200)).await);
     }
 
+    /// With the spare switched off, one offer and nowhere else.
     #[tokio::test(flavor = "multi_thread")]
-    async fn our_media_is_offered_on_the_relay_alone_while_it_is_up() {
+    async fn with_no_spare_our_media_is_offered_on_the_relay_alone_while_it_is_up() {
         let relay = Meeting::start().await;
         let host = Meeting::start().await;
-        let mut m = member("m", vec![relay_at(relay.url()), host_at('a', host.url())]);
+        let local = Arc::new(PeerStats::default());
+        local.set_spare_route(false);
+        let mut m = member_as("m", vec![relay_at(relay.url()), host_at('a', host.url())], client(), local);
         becomes(&relay.origin, &camera_path("m"), true).await;
         assert!(
             !heard_within(&host.origin, &camera_path("m"), Duration::from_secs(1)).await,
@@ -1203,6 +1514,22 @@ mod socket_tests {
         let back = died.elapsed();
         assert!(moved < Duration::from_secs(2), "the offer took {moved:?} to move");
         assert!(back < Duration::from_secs(5), "the viewer took {back:?} to have m again");
+    }
+
+    /// With the spare on, the host hears us too, but at the spare's price,
+    /// and the relay hears us free: the carrier and the spare, told apart by
+    /// what they cost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_spare_is_offered_on_the_host_at_its_price_and_the_carrier_free() {
+        let relay = Meeting::start().await;
+        let host = Meeting::start().await;
+        let _m = member("m", vec![relay_at(relay.url()), host_at('a', host.url())]);
+        becomes(&relay.origin, &camera_path("m"), true).await;
+        becomes(&host.origin, &camera_path("m"), true).await;
+        let carried = route_within(&relay.origin, &camera_path("m")).await.expect("m on the relay");
+        let spare = route_within(&host.origin, &camera_path("m")).await.expect("m on the host");
+        assert!(carried.cost.warm < HOST_COST, "{carried:?}");
+        assert!(spare.cost.warm >= SPARE_COST + HOST_COST, "{spare:?}");
     }
 
     /// A refused session is dropped rather than redialled for the whole
@@ -1459,7 +1786,11 @@ mod socket_tests {
     }
 
     async fn bridged() -> Bridged {
-        let relay = Meeting::older().await;
+        bridged_to(Meeting::older().await).await
+    }
+
+    /// The same, to a given relay.
+    async fn bridged_to(relay: Meeting) -> Bridged {
         let shared = moq_tokio::origin::spawn();
         let to_relay = client()
             .with_publisher(shared.consume())
@@ -1688,11 +2019,13 @@ mod socket_tests {
 
     /// A camera as the call publishes one: a catalog from the start, and the
     /// video track added to it when the camera is turned on, encoded from the
-    /// test pattern on a thread of its own, as the encode thread does.
+    /// test pattern on a thread of its own, as the encode thread does, which
+    /// cuts a keyframe when asked.
     struct Camera {
         broadcast: moq_net::broadcast::Producer,
         catalog: moq_mux::catalog::Producer,
         encoding: Option<Encoding>,
+        keyframe: Arc<Keyframes>,
     }
 
     /// The encode thread, stopped and waited for when dropped.
@@ -1722,6 +2055,7 @@ mod socket_tests {
             broadcast,
             catalog,
             encoding: None,
+            keyframe: Arc::new(Keyframes::default()),
         }
     }
 
@@ -1731,6 +2065,7 @@ mod socket_tests {
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let runtime = tokio::runtime::Handle::current();
             let (broadcast, catalog, stopping) = (self.broadcast.clone(), self.catalog.clone(), stop.clone());
+            let keyframe = self.keyframe.clone();
             let thread = std::thread::spawn(move || {
                 let (width, height) = PATTERN;
                 let mut config = moq_video::encode::Config::new(width, height, framerate());
@@ -1745,6 +2080,9 @@ mod socket_tests {
                     }
                     if let Some(wait) = (start + every * n).checked_duration_since(Instant::now()) {
                         std::thread::sleep(wait);
+                    }
+                    if keyframe.camera.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        encoder.cut().unwrap();
                     }
                     let frame = crate::camera::pattern::frame(width, height, n as u64, start.elapsed());
                     let surface = frame.to_i420_surface(1).unwrap();
@@ -1799,6 +2137,11 @@ mod socket_tests {
     /// The call's own reader of everyone at `inbound`, as [`attending`],
     /// counting the frames each camera tile is given.
     fn viewing(me: &str, inbound: &moq_net::origin::Producer) -> (Abort, Abort, Arrivals) {
+        viewing_of(me, inbound, None)
+    }
+
+    /// The same, counting only `who`'s camera when given.
+    fn viewing_of(me: &str, inbound: &moq_net::origin::Producer, who: Option<&str>) -> (Abort, Abort, Arrivals) {
         use super::super::super::{Feed, ParticipantEvent};
         use super::super::{Reports, Routing, attend};
         let local = Arc::new(PeerStats::default());
@@ -1822,9 +2165,13 @@ mod socket_tests {
         };
         let arrivals = Arrivals::default();
         let counting = arrivals.clone();
+        let who = who.map(str::to_string);
         let tiles = Abort(tokio::spawn(async move {
             while let Some(event) = events.next().await {
-                if let ParticipantEvent::Joined { slot, feed: Feed::Camera, .. } = event {
+                if let ParticipantEvent::Joined { id, slot, feed: Feed::Camera, .. } = event {
+                    if who.as_ref().is_some_and(|who| *who != id) {
+                        continue;
+                    }
                     let counting = counting.clone();
                     let seen = Arc::new(std::sync::atomic::AtomicU64::new(slot.published()));
                     let watched = slot.clone();
@@ -1958,11 +2305,17 @@ mod socket_tests {
     }
 
     async fn moving() -> Moving {
-        let room = bridged().await;
+        moving_on(Meeting::older().await, true).await
+    }
+
+    /// The same on a given relay, with the member's spare offer on or off.
+    async fn moving_on(relay: Meeting, spare: bool) -> Moving {
+        let room = bridged_to(relay).await;
         let (on_m, on_v) = (following(), following());
+        on_m.set_spare_route(spare);
         let outbound = moq_tokio::origin::spawn();
         let camera = camera("m", &outbound);
-        let m = joined("m", room.targets(), client(), on_m.clone(), outbound);
+        let m = joined_asking("m", room.targets(), client(), on_m.clone(), outbound, camera.keyframe.clone());
         let v = member_as("v", room.targets(), client(), on_v.clone());
         let (reading, tiles, arrivals) = viewing("v", &v.inbound);
         routed_through(&v.inbound, &camera_path("m"), room.relay.origin.hop(), "m never arrived through the relay").await;
@@ -2025,5 +2378,270 @@ mod socket_tests {
                 assert!(gap < GAP, "video was gone {gap:?} moving to the {}, round {round}", if host { "host" } else { "relay" });
             }
         }
+    }
+
+    /// Counts the retractions of `path` at `origin` from now on: what makes
+    /// a tile leave.
+    fn retractions(origin: &moq_net::origin::Producer, path: &str) -> (Abort, Arc<std::sync::atomic::AtomicUsize>) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = count.clone();
+        let mut announced = origin.consume().announced();
+        let path = path.to_string();
+        let watching = Abort(tokio::spawn(async move {
+            while let Some(update) = announced.next().await {
+                if update.prefix.as_str() == path && !update.kind.is_active() {
+                    counting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }));
+        (watching, count)
+    }
+
+    fn count(of: &std::sync::atomic::AtomicUsize) -> usize {
+        of.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The longest a viewer may go without a frame when a spare takes over
+    /// from a carrier that stopped cleanly. The library splices the read to
+    /// the spare's route as soon as the carrier's goes, but what it then
+    /// passes on starts at the next group: on its own that is the rest of the
+    /// encoder's keyframe interval, up to two seconds (measured: 1.0 s with
+    /// the stop a second into a group, 0.5 s at a second and a half). The
+    /// member's own move to the spare asks its encoder for a keyframe, as the
+    /// call does, which starts that group at once: about 45 ms measured. The
+    /// bound leaves room for a debug build on a busy machine. Without a spare
+    /// the same stop takes 2 s: a retraction, the library's hold, and the
+    /// media asked for again.
+    const SPLICE: Duration = Duration::from_millis(500);
+
+    /// The same for media whose sender is not asked for a keyframe when the
+    /// route changes: the rest of the group in flight, at most the encoder's
+    /// two-second keyframe interval, and a margin.
+    const GROUP: Duration = Duration::from_millis(2500);
+
+    /// A clean relay stop with a host there: the viewer's read of the member
+    /// carries on through the member's spare on the host. No retraction, so
+    /// no tile leaves, and no wait for the library's hold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_relay_that_stops_is_a_splice_to_the_spare_not_a_leave() {
+        let mut w = moving().await;
+        w.camera.turn_on();
+        w.arrivals.more(30, "no video through the relay").await;
+        let (_watching, retracted) = retractions(&w.v.inbound, &camera_path("m"));
+        let stopped = Instant::now();
+        w.room.relay.stop().await;
+        routed_through(&w.v.inbound, &camera_path("m"), w.room.host.origin.hop(), "m never came through the host").await;
+        // Past the library's hold on a re-announcement, so a leave would show.
+        w.arrivals.more(75, "video stopped when the relay did").await;
+        let gap = w.arrivals.longest_gap(stopped);
+        eprintln!("splice gap {gap:?}");
+        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        assert!(gap < SPLICE, "video was gone {gap:?} when the relay stopped");
+    }
+
+    /// The control: the same stop with the spare switched off is a leave, as
+    /// it always was. Without this the test above could pass for a reason
+    /// that has nothing to do with the spare.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_spare_the_same_stop_is_a_leave() {
+        let mut w = moving_on(Meeting::older().await, false).await;
+        w.camera.turn_on();
+        w.arrivals.more(30, "no video through the relay").await;
+        let (_watching, retracted) = retractions(&w.v.inbound, &camera_path("m"));
+        let stopped = Instant::now();
+        w.room.relay.stop().await;
+        w.arrivals.more(30, "video never came back through the host").await;
+        let gap = w.arrivals.longest_gap(stopped);
+        eprintln!("no-spare gap {gap:?}");
+        assert!(count(&retracted) > 0, "m was never retracted, so the test above proves nothing");
+    }
+
+    /// Moving the call to a host and back, on a relay that speaks moq-lite-05
+    /// (which holds no spare while the call is on the host) and on one that
+    /// carries a price (which does): never a leave, and each gap bounded.
+    async fn moves_are_never_a_leave(relay: Meeting) {
+        let mut w = moving_on(relay, true).await;
+        w.camera.turn_on();
+        w.arrivals.more(30, "no video through the relay").await;
+        let (_watching, retracted) = retractions(&w.v.inbound, &camera_path("m"));
+        for round in 0..2 {
+            for host in [true, false] {
+                let moved = Instant::now();
+                w.to(host, &format!("the call never moved, round {round}")).await;
+                w.arrivals.more(30, &format!("video stopped after a move, round {round}")).await;
+                let gap = w.arrivals.longest_gap(moved);
+                eprintln!("move gap {gap:?} to the {}", if host { "host" } else { "relay" });
+                assert!(gap < GAP, "video was gone {gap:?} moving to the {}, round {round}", if host { "host" } else { "relay" });
+            }
+        }
+        assert_eq!(count(&retracted), 0, "the viewer lost m across a move");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_moved_to_a_host_and_back_is_never_a_leave() {
+        moves_are_never_a_leave(Meeting::older().await).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_moved_to_a_host_and_back_over_a_priced_relay_is_never_a_leave() {
+        moves_are_never_a_leave(Meeting::start().await).await;
+    }
+
+    /// The longest a frame may be late while nothing that carries it changes:
+    /// a frame is due every 33 ms, and a debug build on a busy machine is
+    /// late now and then.
+    const STEADY: Duration = Duration::from_millis(500);
+
+    /// The host goes while the relay carries everyone: the member's spare on
+    /// it closes, and viewers, who never used it, see nothing change.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_that_stops_while_the_relay_carries_changes_nothing_for_viewers() {
+        let mut w = moving().await;
+        w.camera.turn_on();
+        w.arrivals.more(30, "no video through the relay").await;
+        let relay_hop = w.room.relay.origin.hop();
+        let (_watching, retracted) = retractions(&w.v.inbound, &camera_path("m"));
+        let stopped = Instant::now();
+        drop(w.room._to_relay);
+        w.room.host.stop().await;
+        w.arrivals.more(60, "video stopped when the host did").await;
+        let gap = w.arrivals.longest_gap(stopped);
+        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        assert!(gap < STEADY, "video was gone {gap:?} when an unused host stopped");
+        let route = route_within(&w.v.inbound, &camera_path("m")).await.expect("m is still there");
+        assert_eq!(route.hops.as_slice().last(), Some(&relay_hop), "{route:?}");
+    }
+
+    /// Reads `path`'s video at `origin` for as long as it is there, asking
+    /// again when a read ends, as a viewer does.
+    fn reading(origin: &moq_net::origin::Producer, path: String) -> Abort {
+        let consumer = origin.consume();
+        Abort(tokio::spawn(async move {
+            loop {
+                if let Ok(broadcast) = consumer.request_broadcast(path.as_str()).await {
+                    if let Ok(track) = broadcast.track("video") {
+                        if let Ok(mut subscriber) = track.subscribe(None).await {
+                            while let Ok(Some(mut group)) = subscriber.recv_group().await {
+                                while let Ok(Some(_)) = group.read_frame().await {}
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }))
+    }
+
+    /// Bytes a second a host receives over every session it accepted,
+    /// measured over `over`: what its guests upload to it.
+    async fn received(host: &Meeting, over: Duration) -> u64 {
+        let total = || -> u64 {
+            host.sessions.lock().unwrap().iter().map(|session| session.stats().bytes_received.unwrap_or(0)).sum()
+        };
+        let start = total();
+        tokio::time::sleep(over).await;
+        (total() - start) * 1000 / over.as_millis() as u64
+    }
+
+    /// Bytes a second a connection sends, measured over `over`.
+    async fn sent(connection: &moq_tokio::Connection, over: Duration) -> u64 {
+        let monitor = connection.monitor();
+        let total = || monitor.stats().and_then(|stats| stats.bytes_sent).unwrap_or(0);
+        let start = total();
+        tokio::time::sleep(over).await;
+        (total() - start) * 1000 / over.as_millis() as u64
+    }
+
+    /// What the member sends: 2000 bytes every 20 ms, 100 kB/s.
+    const FRAME: usize = 2000;
+
+    /// Well below the member's stream: keep-alives, announcements and the
+    /// acknowledgements of what the host itself reads.
+    const IDLE: u64 = 10_000;
+
+    /// With everything healthy nobody pulls through a spare: the member, the
+    /// host and a viewer all read the member, all through the relay. The
+    /// spare session's upload (what the host receives from its guests) and
+    /// the bridging host's upload to the relay stay at keep-alive level. Then
+    /// the relay stops and the same measure carries the stream, which shows
+    /// the spare was there all along.
+    async fn nobody_pulls_the_spare_while_everything_is_healthy(relay: Meeting) {
+        let room = bridged_to(relay).await;
+        let relay_hop = room.relay.origin.hop();
+        let _m = member_sending("m", room.targets(), client(), Arc::new(PeerStats::default()), moq_tokio::origin::spawn(), FRAME);
+        let v = joined("v", room.targets(), client(), Arc::new(PeerStats::default()), moq_tokio::origin::spawn());
+        let _v_reads = reading(&v.inbound, camera_path("m"));
+        let _host_reads = reading(&room.host.origin, camera_path("m"));
+        routed_through(&v.inbound, &camera_path("m"), relay_hop, "v never had m through the relay").await;
+        routed_through(&room.host.origin, &camera_path("m"), relay_hop, "the host never had m through the relay").await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let spare = received(&room.host, Duration::from_secs(1)).await;
+        let bridging = sent(&room._to_relay, Duration::from_secs(1)).await;
+        eprintln!("healthy: spare {spare} B/s, bridging {bridging} B/s");
+        assert!(spare < IDLE, "the spare session uploads {spare} B/s with the relay up");
+        assert!(bridging < IDLE, "the host uploads {bridging} B/s to the relay with the relay up");
+
+        room.relay.stop().await;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if route_within(&room.host.origin, &camera_path("m")).await.is_some_and(|route| !route.hops.as_slice().contains(&relay_hop)) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the host had no spare of m to fall back on");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let carrying = received(&room.host, Duration::from_secs(1)).await;
+        eprintln!("relay gone: spare {carrying} B/s");
+        assert!(carrying > IDLE * 5, "the spare carried only {carrying} B/s once the relay was gone");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nobody_pulls_the_spare_through_an_older_relay() {
+        nobody_pulls_the_spare_while_everything_is_healthy(Meeting::older().await).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nobody_pulls_the_spare_through_a_priced_relay() {
+        nobody_pulls_the_spare_while_everything_is_healthy(Meeting::start().await).await;
+    }
+
+    /// The host itself, when the relay stops: a guest reading the host's own
+    /// video, and the host reading a member, both carry on with no leave. The
+    /// host needs no spare of its own (it offers on every session already);
+    /// what it reads of the member splices to the member's spare on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_hosts_own_video_and_its_view_of_a_member_carry_on_when_the_relay_stops() {
+        let room = bridged().await;
+        let relay_hop = room.relay.origin.hop();
+        let shared = room.host.origin.clone();
+        let mut own = camera("h", &shared);
+        let outbound = moq_tokio::origin::spawn();
+        let mut theirs = camera("m", &outbound);
+        let _m = joined_asking("m", room.targets(), client(), Arc::new(PeerStats::default()), outbound, theirs.keyframe.clone());
+        let v = joined("v", room.targets(), client(), Arc::new(PeerStats::default()), moq_tokio::origin::spawn());
+        let (_v_reading, _v_tiles, of_host) = viewing_of("v", &v.inbound, Some("h"));
+        let (_h_reading, _h_tiles, of_member) = viewing_of("h", &shared, Some("m"));
+        own.turn_on();
+        theirs.turn_on();
+        of_host.more(30, "no video from the host").await;
+        of_member.more(30, "the host saw no video from m").await;
+        routed_through(&v.inbound, &camera_path("h"), relay_hop, "v never had the host through the relay").await;
+        routed_through(&shared, &camera_path("m"), relay_hop, "the host never had m through the relay").await;
+        let (_watching_host, host_left) = retractions(&v.inbound, &camera_path("h"));
+        let (_watching_member, member_left) = retractions(&shared, &camera_path("m"));
+
+        let stopped = Instant::now();
+        room.relay.stop().await;
+        of_host.more(75, "the host's video stopped when the relay did").await;
+        of_member.more(75, "the host's view of m stopped when the relay did").await;
+        let (host_gap, member_gap) = (of_host.longest_gap(stopped), of_member.longest_gap(stopped));
+        eprintln!("host's own {host_gap:?}, host's view of m {member_gap:?}");
+        assert_eq!(count(&host_left), 0, "the viewer lost the host");
+        assert_eq!(count(&member_left), 0, "the host lost m");
+        // This stand-in host is not a join, so nothing asks its encoder for a
+        // keyframe: its own video waits out the group in flight.
+        assert!(host_gap < GROUP, "the host's video was gone {host_gap:?}");
+        assert!(member_gap < SPLICE, "the host's view of m was gone {member_gap:?}");
     }
 }

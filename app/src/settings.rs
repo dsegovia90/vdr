@@ -268,6 +268,14 @@ pub struct Settings {
     /// **off** ([`shows_routes`](Self::shows_routes)): it is a debugging aid.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
     pub show_routes: Option<bool>,
+    /// Whether a join that can meet in several places keeps a spare offer of
+    /// our media on a second one, so a relay going away is a splice rather
+    /// than everyone's tiles leaving and coming back. `None` is the default,
+    /// which is **on** ([`keeps_spare_route`](Self::keeps_spare_route)): it
+    /// costs an announcement, not an upload, and does nothing in a room
+    /// without hosts.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
+    pub spare_route: Option<bool>,
 }
 
 impl Settings {
@@ -294,6 +302,11 @@ impl Settings {
     /// Whether each video is marked with the way it arrives.
     pub fn shows_routes(&self) -> bool {
         self.show_routes.unwrap_or(false)
+    }
+
+    /// Whether we keep a spare offer of our media beside the one in use.
+    pub fn keeps_spare_route(&self) -> bool {
+        self.spare_route.unwrap_or(true)
     }
 }
 
@@ -950,6 +963,22 @@ mod tests {
         let bad: Settings = serde_json::from_str(r#"{"camera":"abc","show_routes":"yes"}"#).expect("still valid");
         assert_eq!(bad.camera.as_deref(), Some("abc"));
         assert!(!bad.shows_routes(), "a malformed flag costs only itself");
+    }
+
+    #[test]
+    fn a_spare_route_is_kept_unless_turned_off_and_read_leniently() {
+        assert!(Settings::default().keeps_spare_route());
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","move_calls":true}"#).expect("valid");
+        assert!(older.keeps_spare_route(), "a file from before the setting means on");
+        let off: Settings = serde_json::from_str(r#"{"spare_route":false}"#).expect("valid");
+        assert!(!off.keeps_spare_route());
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&off).expect("serialises")).expect("deserialises");
+        assert_eq!(back, off);
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("spare_route"), "left out until changed: {json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","spare_route":"no"}"#).expect("still valid");
+        assert_eq!(bad.camera.as_deref(), Some("abc"));
+        assert!(bad.keeps_spare_route(), "a malformed flag costs only itself");
     }
 
     #[test]

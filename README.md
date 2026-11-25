@@ -161,6 +161,12 @@ video's label says how it reaches you (through the relay, through someone
 hosting the room, or directly) and marks whoever hosts; your own says where
 your video goes. It shows the route announced as best, which the video
 follows within a moment.
+*Keep a spare route*, on by default, does something only in a room with
+hosts: your video is also offered through a second way into the room, priced
+so that nobody uses it while the first works, so when the relay stops
+everyone switches to it at once instead of your video leaving their screens
+for a moment. It uses no upload until it is needed. A relay that freezes
+without closing still freezes the call until its connection times out.
 *Move the call*, off by default, is a test instrument for rooms with hosts:
 with it on, a host's menu offers "Move the call here", and everyone else who
 has the switch on follows the move, sending their video through that host's
@@ -257,6 +263,10 @@ Each move is logged, and each viewer logs `<id> left` and `<id> back after N
 ms` for a tile that went and came back. `--show-routes` turns on the route
 marks for that run without saving it; each viewer logs `<id> now arrives …`
 whenever someone's route changes, whether or not the marks are on.
+`--no-spare-route` (or `--spare-route`) turns the *Keep a spare route* switch
+off (or on) for that run without saving it, to compare the two; with it on,
+the log says where the spare is (`a spare offer on host <id>`) and when it
+takes over (`the spare on host <id> now carries our media`).
 
 Run it with `dx`, not `cargo run`: the stylesheet only resolves inside a dx
 bundle, and `cargo run` comes up unstyled. `cargo clippy` and `cargo test` work

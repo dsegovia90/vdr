@@ -3734,6 +3734,10 @@ mod presence_tests {
         }
         let join = Peering::Join(url);
         assert!(!dials_several(&join, false, false), "no hosts, not hosting: as before");
+        // The spare route lives only in the set, so it cannot touch a join
+        // that never reaches it; and a host's join keeps none.
+        assert!(super::sessions::keeps_spare(false, true), "on by default for a member of a room with hosts");
+        assert!(!super::sessions::keeps_spare(true, true), "a hosting join offers everything everywhere already");
         assert!(dials_several(&join, false, true), "a room with hosts");
         assert!(dials_several(&join, true, false), "a room we host");
         assert!(dials_several(&join, true, true));
