@@ -137,6 +137,8 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
     let camera: Vec<Point> = seconds.iter().map(Point::camera).collect();
     let share: Vec<Point> = seconds.iter().map(Point::share).collect();
     let total: Vec<Point> = seconds.iter().map(Point::total).collect();
+    let forwarded: Vec<Point> = seconds.iter().map(Point::forwarded).collect();
+    let hosting_now = hosting_words(seconds.last());
 
     // "Sent" counts what the encoder handed to the transport, and a stream
     // nobody subscribed to goes no further: without these words the chart
@@ -149,8 +151,11 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
     // "Shared within the minute", not "sharing now": a share that just ended
     // keeps its chart, and the total, until its seconds have scrolled away.
     let has_share = share.iter().any(|point| point.cap.is_some() || point.sent.is_some());
+    // Hosting within the minute shown, as for the share: a non-host never
+    // sees the section.
+    let has_hosting = seconds.iter().any(|second| second.hosting.is_some());
 
-    if !has_camera && !has_share {
+    if !has_camera && !has_share && !has_hosting {
         return rsx! {
             p { class: "mt-6 text-sm text-neutral-300",
                 "Nothing to show yet. The charts fill in once a call is sending video."
@@ -180,8 +185,39 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
             Chart { points: total, draw_cap: false, link: ESTIMATE }
             p { class: "mt-1 text-xs text-neutral-500", "Video only: audio is not included." }
         }
+        if has_hosting {
+            Heading { text: "Hosting" }
+            p { class: "font-mono text-xs text-neutral-300", "{hosting_now}" }
+            Chart { points: forwarded, draw_cap: false, link: ESTIMATE, sent_label: "forwarded" }
+            p { class: "mt-1 text-xs text-neutral-500",
+                "Other people's media you pass on to your guests and the relay. Guests' connections share your uplink but are estimated separately."
+            }
+        }
     }
 }
+
+/// The hosting section's line for the latest second.
+fn hosting_words(second: Option<&Second>) -> String {
+    let Some((hosting, estimate)) = second.and_then(|second| second.hosting.map(|hosting| (hosting, second.estimate))) else {
+        return "Not hosting now.".to_string();
+    };
+    let guests = if hosting.guests == 1 { "guest" } else { "guests" };
+    let total = hosting.forwarded.saturating_add(hosting.own);
+    let link = match estimate {
+        Some(estimate) => format!("{} of a {} link estimate", rate(total), rate(estimate)),
+        None => format!("{} in all; no link estimate", rate(total)),
+    };
+    format!(
+        "Forwarding {} for {} {guests} ({} pulling). With your own {}, {link}.",
+        rate(hosting.forwarded),
+        hosting.guests,
+        hosting.pulling,
+        rate(hosting.own),
+    )
+}
+
+/// What a chart's filled line is, unless it says otherwise.
+const SENT_LABEL: &str = "sent";
 
 /// Said after a second's figures when nobody was subscribed to the stream.
 const UNWATCHED: &str = "no one is watching: encoded, not uploaded";
@@ -209,6 +245,7 @@ fn Chart(
     #[props(default = 1)] step: u32,
     #[props(default = rates::SMOOTH)] smooth: usize,
     #[props(default)] notes: Vec<String>,
+    #[props(default = SENT_LABEL)] sent_label: &'static str,
 ) -> Element {
     // Averaged before it is cut to the minute shown, over the few older
     // seconds the history keeps for this, so the left edge is a full average
@@ -266,10 +303,13 @@ fn Chart(
     let mut hovered = use_signal(|| None::<usize>);
     let over = hovered();
     let numbers = match over.and_then(|index| slots.get(index).copied().map(|slot| (index, slot))) {
-        Some((index, Some(point))) => with_note(numbers(&ago(index, step), point, draw_cap, link, top), &note_at(index)),
-        Some((index, None)) => format!("{}  \u{b7}  nothing sent yet", ago(index, step)),
+        Some((index, Some(point))) => with_note(
+            numbers_as(sent_label, &ago(index, step), point, draw_cap, link, top),
+            &note_at(index),
+        ),
+        Some((index, None)) => format!("{}  \u{b7}  nothing {sent_label} yet", ago(index, step)),
         None => with_note(
-            numbers("now", points.last().copied().unwrap_or_default(), draw_cap, link, top),
+            numbers_as(sent_label, "now", points.last().copied().unwrap_or_default(), draw_cap, link, top),
             &notes.last().cloned().unwrap_or_default(),
         ),
     };
@@ -350,9 +390,9 @@ fn Chart(
             div { class: "flex flex-row items-center gap-1.5",
                 div { class: "h-[2px] w-4 shrink-0 bg-blue-500" }
                 if smooth > 1 {
-                    span { "sent (5 s average)" }
+                    span { "{sent_label} (5 s average)" }
                 } else {
-                    span { "sent" }
+                    span { "{sent_label}" }
                 }
             }
             if !cap_line.is_empty() {
@@ -399,12 +439,13 @@ fn with_note(figures: String, note: &str) -> String {
 /// estimate 39.0 Mbps (off the chart)`, the dashed line named as `link` says.
 /// Every figure carries its unit, and only what the chart or its legend also
 /// shows is named: a target sitting on the cap is the cap. A dashed value above
-/// the scale is not drawn, so here it says so.
-fn numbers(when: &str, point: Point, with_cap: bool, link: &str, top: u32) -> String {
+/// the scale is not drawn, so here it says so. The filled line is named
+/// `label`: "sent" for our own streams, "forwarded" while hosting.
+fn numbers_as(label: &str, when: &str, point: Point, with_cap: bool, link: &str, top: u32) -> String {
     let mut parts = vec![when.to_string()];
     match point.sent {
-        Some(sent) => parts.push(format!("sent {}", rate(sent))),
-        None => parts.push("nothing sent".to_string()),
+        Some(sent) => parts.push(format!("{label} {}", rate(sent))),
+        None => parts.push(format!("nothing {label}")),
     }
     if let (true, Some(cap)) = (with_cap, point.cap) {
         parts.push(format!("cap {}", rate(cap)));
@@ -718,6 +759,11 @@ fn cell_class(quality: Quality) -> &'static str {
 mod tests {
     use super::*;
 
+    /// Our own streams' words, which every chart but hosting's uses.
+    fn numbers(when: &str, point: Point, with_cap: bool, link: &str, top: u32) -> String {
+        numbers_as(SENT_LABEL, when, point, with_cap, link, top)
+    }
+
     #[test]
     fn every_figure_carries_its_unit_and_a_target_on_the_cap_is_not_named() {
         let point = Point {
@@ -739,6 +785,42 @@ mod tests {
             numbers("now", held, true, SLICE, 400),
             "now  \u{b7}  sent 272 kbps  \u{b7}  cap 345 kbps  \u{b7}  target 300 kbps  \u{b7}  slice of the link 310 kbps"
         );
+    }
+
+    #[test]
+    fn the_forwarded_chart_names_its_line() {
+        let point = Point { sent: Some(340), cap: None, target: None, link: Some(3000) };
+        assert_eq!(
+            numbers_as("forwarded", "now", point, false, ESTIMATE, 400),
+            "now  \u{b7}  forwarded 340 kbps  \u{b7}  link estimate 3000 kbps (off the chart)"
+        );
+        assert_eq!(
+            numbers_as("forwarded", "now", Point::default(), false, ESTIMATE, 400),
+            "now  \u{b7}  nothing forwarded"
+        );
+    }
+
+    #[test]
+    fn hosting_is_said_against_the_link() {
+        use crate::rates::Hosting;
+        let second = Second {
+            hosting: Some(Hosting { forwarded: 340, own: 60, guests: 2, pulling: 1 }),
+            estimate: Some(3000),
+            ..Second::default()
+        };
+        assert_eq!(
+            hosting_words(Some(&second)),
+            "Forwarding 340 kbps for 2 guests (1 pulling). With your own 60 kbps, 400 kbps of a 3000 kbps link estimate."
+        );
+        let alone = Second {
+            hosting: Some(Hosting { guests: 1, ..Hosting::default() }),
+            ..Second::default()
+        };
+        assert_eq!(
+            hosting_words(Some(&alone)),
+            "Forwarding 0 kbps for 1 guest (0 pulling). With your own 0 kbps, 0 kbps in all; no link estimate."
+        );
+        assert_eq!(hosting_words(Some(&Second::default())), "Not hosting now.");
     }
 
     #[test]
