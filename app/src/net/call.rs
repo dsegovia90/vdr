@@ -42,7 +42,6 @@ use std::sync::Arc;
 
 use futures_channel::mpsc::UnboundedSender;
 use futures_util::StreamExt as _;
-use moq_mux::catalog::Stream as _;
 
 #[path = "sessions.rs"]
 mod sessions;
@@ -57,6 +56,7 @@ use super::status::RemoteStatus;
 use super::{Feed, ParticipantEvent};
 use crate::args::Peering;
 use super::Metrics;
+use super::follow;
 use super::forwarded::Forwarded;
 use super::metrics::{Ask, Clock, Counts, FpsMeter, Path, PeerStats, Request, classify};
 use super::quality::{self, Link, Seen};
@@ -2241,6 +2241,10 @@ async fn attend(
                     sharing.insert(
                         id.to_string(),
                         Abort(tokio::spawn(watch(
+                            follow::Asking {
+                                inbound: inbound.clone(),
+                                path: path.clone(),
+                            },
                             broadcast,
                             slot,
                             format!("{id}/screen"),
@@ -2311,6 +2315,10 @@ async fn attend(
         });
 
         let mut tasks = vec![Abort(tokio::spawn(watch(
+            follow::Asking {
+                inbound: inbound.clone(),
+                path: path.clone(),
+            },
             broadcast.clone(),
             slot,
             id.to_string(),
@@ -2326,8 +2334,12 @@ async fn attend(
                 static IGNORED: std::sync::Once = std::sync::Once::new();
                 IGNORED.call_once(|| tracing::warn!("--audio-stall is for --loopback only; ignored in a call"));
             }
+            let asking = follow::Asking {
+                inbound: inbound.clone(),
+                path: path.clone(),
+            };
             tasks.push(Abort(tokio::spawn(async move {
-                audio::subscribe(broadcast, peer, engine, stats, Some(rooms), None).await;
+                audio::subscribe(Some(asking), broadcast, peer, engine, stats, Some(rooms), None).await;
             })));
         } else if !crate::args::Args::get().no_audio {
             tracing::warn!("[audio] {id} cannot be heard: there is no output device");
@@ -2599,7 +2611,7 @@ async fn listen(
         let broadcast = match broadcast.take() {
             Some(broadcast) => broadcast,
             None => {
-                tokio::time::sleep(PRESENCE_AGAIN).await;
+                tokio::time::sleep(follow::AGAIN).await;
                 match inbound.request_broadcast(control_path(&id).as_str()).await {
                     Ok(broadcast) => broadcast,
                     Err(error) => {
@@ -2695,10 +2707,6 @@ async fn listen(
         }
     }
 }
-
-/// How long a presence reader waits before asking again for a document it
-/// lost: the time a route takes to settle after a session goes, near enough.
-const PRESENCE_AGAIN: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Subscribes to a participant's presence track on `broadcast`.
 async fn subscribe_presence(
@@ -3027,13 +3035,15 @@ impl Drop for Invited {
     }
 }
 
-/// Opens a decoder from one participant's catalog and drains frames into their
-/// slot.
+/// Plays one participant's video into their slot, from their own catalog,
+/// for as long as they are here: across changes of route, a camera turned on
+/// late, and a rendition that changes (see `follow`).
 ///
 /// **The catalog is theirs, never a local guess.** An early version failed here
 /// by passing a *local* config and a hardcoded track name instead, and got `Net(Remote(30))`
 /// for it.
 async fn watch(
+    asking: follow::Asking,
     broadcast: moq_net::broadcast::Consumer,
     slot: FrameSlot,
     peer: String,
@@ -3043,116 +3053,137 @@ async fn watch(
     stats: Arc<PeerStats>,
     metrics: Arc<Metrics>,
 ) {
-    // The catalog is the peer's description of what it is sending. An early
-    // version failed here by passing a *local* config and a hardcoded track name instead, and
-    // got `Net(Remote(30))` for it.
-    let mut catalog = match moq_mux::catalog::Consumer::<()>::new(
-        &broadcast,
-        moq_mux::catalog::CatalogFormat::Hang,
-    )
-    .await
-    {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            tracing::error!("no catalog from the peer: {error:#}");
-            return;
-        }
+    let video = Video {
+        slot,
+        peer: peer.clone(),
+        status,
+        stats,
+        metrics,
+        opened: false,
     };
-    // **Waits for a video rendition rather than reading one snapshot.** A
-    // peer whose camera is off publishes its microphone alone, and adds video
-    // when the camera produces its first frame -- possibly mid-call. The audio
-    // subscriber waits for its rendition the same way.
-    let mut reported = false;
-    let (name, config) = loop {
-        let snapshot = match catalog.next().await {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                tracing::warn!("{peer}'s catalog closed before it offered video");
-                return;
-            }
-            Err(error) if catalog_cut_off(&error) => {
-                tracing::warn!("{peer}'s catalog was cut off: {error:#}");
-                return;
-            }
-            Err(error) => {
-                tracing::error!("could not read {peer}'s catalog: {error:#}");
-                return;
-            }
-        };
+    follow::follow(Some(asking), broadcast, peer, video).await;
+}
+
+/// A participant's video, as `follow` plays it.
+struct Video {
+    slot: FrameSlot,
+    peer: String,
+    status: Option<UnboundedSender<RemoteStatus>>,
+    stats: Arc<PeerStats>,
+    metrics: Arc<Metrics>,
+    /// Whether a decoder has opened before, so a reopening after a change of
+    /// route is not announced like the first.
+    opened: bool,
+}
+
+impl follow::Reader for Video {
+    const WHAT: &'static str = "video";
+
+    fn pick(&self, catalog: &follow::Catalog) -> Option<follow::Rendition> {
+        catalog.video.renditions.iter().next().map(|(name, config)| follow::Rendition::new(name, config))
+    }
+
+    fn heard(&mut self, first: bool, offered: bool) {
         // **The listening side can name its caller now.** iroh exposes no
         // client identity to a server, so the transport genuinely cannot say
         // who this is -- but the broadcast path can, and does. Said on their
         // first catalog rather than their first video, which a peer with the
         // camera off never sends.
-        let first = !reported;
-        if first {
-            reported = true;
-            if let Some(status) = &status {
-                let _ = status.unbounded_send(RemoteStatus::Connected {
-                    peer: Some(peer.clone()),
-                });
-            }
-        }
-        match snapshot.video.renditions.iter().next() {
-            Some((name, config)) => break (name.clone(), config.clone()),
-            // Once: the catalog is rewritten often (audio's own updates), and
-            // each would otherwise say the same thing again.
-            None if first => tracing::info!("{peer} has no video yet; waiting for it"),
-            None => {}
-        }
-    };
-
-    let mut consumer = match moq_video::decode::Consumer::new(
-        &broadcast,
-        &config,
-        &name,
-        // Default options: a zero `max_age`, so a stalled group is skipped as
-        // soon as a newer one exists -- video's newest-wins posture.
-        moq_video::decode::Options::default(),
-    )
-    .await
-    {
-        Ok(consumer) => consumer,
-        Err(error) => {
-            tracing::error!("no decoder for the peer's video: {error:#}");
+        if !first {
             return;
         }
-    };
-    tracing::info!("decoding {peer}'s video with {}", consumer.name());
-    metrics.set_decoder(consumer.name());
-
-    // The network half's own rate, independent of whether anything is painting.
-    // `camera::paint::FrameRate` measures capture against the GPU; this measures
-    // what actually arrived from the peer, which is the only number that tells
-    // a stalled connection apart from an occluded window.
-    let mut decoded = 0u32;
-    let mut since = std::time::Instant::now();
-
-    // Per tile, so a stalled peer shows as one tile at zero rather than hiding
-    // behind whichever healthy peer wrote the shared number last.
-    let meter = FpsMeter::new(stats.clone());
-
-    while let Ok(Some(frame)) = consumer.read().await {
-        meter.frame();
-        stats.frame_arrived(frame.timestamp.as_micros() as u64);
-        decoded += 1;
-        if decoded == REPORT_EVERY {
-            let elapsed = since.elapsed().as_secs_f32();
-            if elapsed > 0.0 {
-                // Named, because in a room there are several of these lines
-                // and an unnamed rate cannot be told apart from the others.
-                tracing::debug!("[remote] {peer}: {:.1} fps decoded", decoded as f32 / elapsed);
-            }
-            decoded = 0;
-            since = std::time::Instant::now();
+        if let Some(status) = &self.status {
+            let _ = status.unbounded_send(RemoteStatus::Connected {
+                peer: Some(self.peer.clone()),
+            });
         }
-        if let Some(frame) = from_decoded(frame) {
-            slot.publish(frame);
+        // **Waits for a video rendition rather than giving up.** A peer whose
+        // camera is off publishes its microphone alone, and adds video when
+        // the camera produces its first frame -- possibly mid-call.
+        if !offered {
+            tracing::info!("{} has no video yet; waiting for it", self.peer);
         }
     }
-    // The producer is gone, so the last frame must come off the screen rather
-    // than sit there looking live.
-    slot.clear();
+
+    fn play(
+        &mut self,
+        broadcast: &moq_net::broadcast::Consumer,
+        catalog: &follow::Catalog,
+        rendition: &follow::Rendition,
+    ) -> follow::Playing {
+        let config = catalog.video.renditions.get(&rendition.name).cloned();
+        let broadcast = broadcast.clone();
+        let name = rendition.name.clone();
+        let (slot, peer, stats, metrics) = (self.slot.clone(), self.peer.clone(), self.stats.clone(), self.metrics.clone());
+        let again = std::mem::replace(&mut self.opened, true);
+        Box::pin(async move {
+            let Some(config) = config else { return follow::Played::Failed };
+            let mut consumer = match moq_video::decode::Consumer::new(
+                &broadcast,
+                &config,
+                &name,
+                // Default options: a zero `max_age`, so a stalled group is skipped as
+                // soon as a newer one exists -- video's newest-wins posture.
+                moq_video::decode::Options::default(),
+            )
+            .await
+            {
+                Ok(consumer) => consumer,
+                // The broadcast went from under it: asked for again.
+                Err(moq_video::Error::Net(error)) => {
+                    tracing::debug!("could not subscribe to {peer}'s video: {error:#}");
+                    return follow::Played::Lost;
+                }
+                Err(error) => {
+                    tracing::error!("no decoder for {peer}'s video: {error:#}");
+                    return follow::Played::Failed;
+                }
+            };
+            if again {
+                tracing::debug!("decoding {peer}'s video again with {}", consumer.name());
+            } else {
+                tracing::info!("decoding {peer}'s video with {}", consumer.name());
+            }
+            metrics.set_decoder(consumer.name());
+
+            // The network half's own rate, independent of whether anything is painting.
+            // `camera::paint::FrameRate` measures capture against the GPU; this measures
+            // what actually arrived from the peer, which is the only number that tells
+            // a stalled connection apart from an occluded window.
+            let mut decoded = 0u32;
+            let mut since = std::time::Instant::now();
+
+            // Per tile, so a stalled peer shows as one tile at zero rather than hiding
+            // behind whichever healthy peer wrote the shared number last.
+            let meter = FpsMeter::new(stats.clone());
+
+            while let Ok(Some(frame)) = consumer.read().await {
+                meter.frame();
+                stats.frame_arrived(frame.timestamp.as_micros() as u64);
+                decoded += 1;
+                if decoded == REPORT_EVERY {
+                    let elapsed = since.elapsed().as_secs_f32();
+                    if elapsed > 0.0 {
+                        // Named, because in a room there are several of these lines
+                        // and an unnamed rate cannot be told apart from the others.
+                        tracing::debug!("[remote] {peer}: {:.1} fps decoded", decoded as f32 / elapsed);
+                    }
+                    decoded = 0;
+                    since = std::time::Instant::now();
+                }
+                if let Some(frame) = from_decoded(frame) {
+                    slot.publish(frame);
+                }
+            }
+            follow::Played::Lost
+        })
+    }
+
+    /// The producer is gone, so the last frame must come off the screen
+    /// rather than sit there looking live.
+    fn stopped(&mut self) {
+        self.slot.clear();
+    }
 }
 
 #[cfg(test)]

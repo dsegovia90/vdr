@@ -982,8 +982,8 @@ mod socket_tests {
         inbound: moq_net::origin::Producer,
         statuses: futures_channel::mpsc::UnboundedReceiver<RemoteStatus>,
         ended: tokio::sync::oneshot::Receiver<String>,
-        _camera: moq_net::broadcast::Producer,
-        _writing: Abort,
+        _camera: Option<moq_net::broadcast::Producer>,
+        _writing: Option<Abort>,
         _joined: Abort,
     }
 
@@ -1033,6 +1033,21 @@ mod socket_tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }));
+        let mut member = joined(me, targets, client, local, outbound);
+        member._camera = Some(camera);
+        member._writing = Some(writing);
+        member
+    }
+
+    /// A member joined through the set with nothing of its own published
+    /// yet: what it offers is whatever `outbound` comes to hold.
+    fn joined(
+        me: &str,
+        targets: Vec<Target>,
+        client: moq_tokio::Client,
+        local: Arc<PeerStats>,
+        outbound: moq_net::origin::Producer,
+    ) -> Member {
         let inbound = moq_tokio::origin::spawn();
         let (status, statuses) = futures_channel::mpsc::unbounded();
         let peer = join(Join {
@@ -1059,8 +1074,8 @@ mod socket_tests {
             inbound,
             statuses,
             ended,
-            _camera: camera,
-            _writing: writing,
+            _camera: None,
+            _writing: None,
             _joined: joined,
         }
     }
@@ -1669,5 +1684,346 @@ mod socket_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         arrives(Arrival::Relay { from: None }).await;
+    }
+
+    /// A camera as the call publishes one: a catalog from the start, and the
+    /// video track added to it when the camera is turned on, encoded from the
+    /// test pattern on a thread of its own, as the encode thread does.
+    struct Camera {
+        broadcast: moq_net::broadcast::Producer,
+        catalog: moq_mux::catalog::Producer,
+        encoding: Option<Encoding>,
+    }
+
+    /// The encode thread, stopped and waited for when dropped.
+    struct Encoding {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for Encoding {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Small, so a debug build encodes it in time.
+    const PATTERN: (u32, u32) = (320, 180);
+
+    /// Our camera on `outbound`, switched off.
+    fn camera(me: &str, outbound: &moq_net::origin::Producer) -> Camera {
+        let mut broadcast = outbound.create_broadcast(camera_path(me)).unwrap();
+        let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+        broadcast.announce(moq_net::origin::Route::default()).unwrap();
+        Camera {
+            broadcast,
+            catalog,
+            encoding: None,
+        }
+    }
+
+    impl Camera {
+        fn turn_on(&mut self) {
+            use super::super::{VIDEO_PRIORITY, add_video, framerate};
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let runtime = tokio::runtime::Handle::current();
+            let (broadcast, catalog, stopping) = (self.broadcast.clone(), self.catalog.clone(), stop.clone());
+            let thread = std::thread::spawn(move || {
+                let (width, height) = PATTERN;
+                let mut config = moq_video::encode::Config::new(width, height, framerate());
+                config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(crate::camera::bitrate_for(width, height, 30)));
+                let mut producer = runtime.block_on(add_video(&broadcast, &catalog, &mut config, VIDEO_PRIORITY)).unwrap();
+                let mut encoder = moq_video::encode::Encoder::new(&config).unwrap();
+                let start = Instant::now();
+                let every = Duration::from_secs(1) / 30;
+                for n in 0u32.. {
+                    if stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(wait) = (start + every * n).checked_duration_since(Instant::now()) {
+                        std::thread::sleep(wait);
+                    }
+                    let frame = crate::camera::pattern::frame(width, height, n as u64, start.elapsed());
+                    let surface = frame.to_i420_surface(1).unwrap();
+                    let timestamp = moq_net::Timestamp::from_micros(frame.timestamp.as_micros() as u64).unwrap();
+                    let encoded = encoder.encode(&moq_video::Frame::new(surface, timestamp)).unwrap();
+                    if !encoded.is_empty() && producer.publish(&encoded).is_err() {
+                        break;
+                    }
+                }
+                let _ = producer.finish();
+            });
+            self.encoding = Some(Encoding {
+                stop,
+                thread: Some(thread),
+            });
+        }
+    }
+
+    /// When each of someone's camera frames reached its tile at a viewer.
+    #[derive(Clone, Default)]
+    struct Arrivals(Arc<std::sync::Mutex<Vec<Instant>>>);
+
+    impl Arrivals {
+        fn count(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+
+        /// Waits for `more` frames beyond those seen so far.
+        async fn more(&self, more: usize, what: &str) {
+            let from = self.count();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.count() < from + more {
+                assert!(Instant::now() < deadline, "{what}: {} of {more} frames", self.count() - from);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// The longest wait between frames from `from` on, counting the wait
+        /// from `from` to the first.
+        fn longest_gap(&self, from: Instant) -> Duration {
+            let times = self.0.lock().unwrap();
+            let mut last = from;
+            let mut longest = Duration::ZERO;
+            for at in times.iter().filter(|at| **at > from) {
+                longest = longest.max(*at - last);
+                last = *at;
+            }
+            longest
+        }
+    }
+
+    /// The call's own reader of everyone at `inbound`, as [`attending`],
+    /// counting the frames each camera tile is given.
+    fn viewing(me: &str, inbound: &moq_net::origin::Producer) -> (Abort, Abort, Arrivals) {
+        use super::super::super::{Feed, ParticipantEvent};
+        use super::super::{Reports, Routing, attend};
+        let local = Arc::new(PeerStats::default());
+        let (participants, mut events) = futures_channel::mpsc::unbounded();
+        let reports = Reports {
+            status: futures_channel::mpsc::unbounded().0,
+            participants,
+            hangup: futures_channel::mpsc::unbounded().0,
+            metrics: Arc::new(Metrics::default()),
+            in_room: true,
+            rooms: super::super::super::audio::Rooms {
+                local,
+                controls: Arc::default(),
+            },
+            news: None,
+            routing: Routing {
+                guests: Arc::default(),
+                ours: inbound.hop().id(),
+                far: None,
+            },
+        };
+        let arrivals = Arrivals::default();
+        let counting = arrivals.clone();
+        let tiles = Abort(tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                if let ParticipantEvent::Joined { slot, feed: Feed::Camera, .. } = event {
+                    let counting = counting.clone();
+                    let seen = Arc::new(std::sync::atomic::AtomicU64::new(slot.published()));
+                    let watched = slot.clone();
+                    slot.watch(Arc::new(move || {
+                        let now = watched.published();
+                        if seen.swap(now, std::sync::atomic::Ordering::Relaxed) != now {
+                            counting.0.lock().unwrap().push(Instant::now());
+                        }
+                    }));
+                }
+            }
+        }));
+        let reading = Abort(tokio::spawn(attend(inbound.consume(), me.to_string(), reports, None)));
+        (reading, tiles, arrivals)
+    }
+
+    /// A relay a member reaches on a fixed port, so it can be stopped and
+    /// brought back where members are already dialling it.
+    async fn relay_again(port: u16) -> Meeting {
+        let deadline = Instant::now() + WITHIN;
+        loop {
+            if let Some(relay) = Meeting::try_on(port, moq_tokio::origin::spawn()).await {
+                return relay;
+            }
+            assert!(Instant::now() < deadline, "the relay's port never came free");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A member with a camera of its own, and a viewer reading it the way
+    /// the call does, both on the relay and a host.
+    struct Watched {
+        camera: Camera,
+        arrivals: Arrivals,
+        _m: Member,
+        _v: Member,
+        _reading: Abort,
+        _tiles: Abort,
+    }
+
+    fn watched(targets: impl Fn() -> Vec<Target>) -> Watched {
+        let outbound = moq_tokio::origin::spawn();
+        let camera = camera("m", &outbound);
+        let m = joined("m", targets(), patient_client(), Arc::new(PeerStats::default()), outbound);
+        let v = member_with("v", targets(), patient_client());
+        let (reading, tiles, arrivals) = viewing("v", &v.inbound);
+        Watched {
+            camera,
+            arrivals,
+            _m: m,
+            _v: v,
+            _reading: reading,
+            _tiles: tiles,
+        }
+    }
+
+    /// Someone whose camera is off when their route changes, and who turns it
+    /// on after: the viewer gets the video. The route changes because the
+    /// relay goes, and the camera's broadcast moves to the host.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_camera_turned_on_after_its_route_changed_is_seen() {
+        let relay = Meeting::start().await;
+        let port = relay.port;
+        let host = Meeting::start().await;
+        let host_url = host.url();
+        let mut w = watched(|| vec![relay_at(at(port)), host_at('a', host_url.clone())]);
+        becomes(&w._v.inbound, &camera_path("m"), true).await;
+        // The viewer's readers are up and waiting for video.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        relay.stop().await;
+        routed_through(&w._v.inbound, &camera_path("m"), host.origin.hop(), "m never came through the host").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        w.camera.turn_on();
+        w.arrivals.more(30, "the viewer never saw the camera turned on after the route changed").await;
+    }
+
+    /// Video flowing through the relay keeps flowing when the relay stops and
+    /// a host is there, and again when the relay comes back and the camera
+    /// moves back up to it. Each gap is bounded by how long the change takes
+    /// to be noticed and served again, not by anything waiting on a person.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn video_keeps_arriving_when_the_relay_stops_and_when_it_comes_back() {
+        let relay = Meeting::start().await;
+        let port = relay.port;
+        let host = Meeting::start().await;
+        let host_url = host.url();
+        let mut w = watched(|| vec![relay_at(at(port)), host_at('a', host_url.clone())]);
+        w.camera.turn_on();
+        w.arrivals.more(30, "no video through the relay").await;
+
+        let stopped = Instant::now();
+        relay.stop().await;
+        routed_through(&w._v.inbound, &camera_path("m"), host.origin.hop(), "m never came through the host").await;
+        w.arrivals.more(60, "video stopped when the relay did").await;
+        let down = w.arrivals.longest_gap(stopped);
+
+        let relay = relay_again(port).await;
+        // Back on the relay once it has held, then past the overlap.
+        routed_through(&w._v.inbound, &camera_path("m"), relay.origin.hop(), "m never went back to the relay").await;
+        let back = Instant::now();
+        tokio::time::sleep(MOVE_OVERLAP + Duration::from_secs(1)).await;
+        w.arrivals.more(30, "video stopped when the relay came back").await;
+        let up = w.arrivals.longest_gap(back);
+        assert!(down < GAP, "video was gone {down:?} when the relay stopped");
+        assert!(up < GAP, "video was gone {up:?} when the relay came back");
+    }
+
+    /// The longest a viewer may go without a frame across a change of route.
+    /// A read carried across picks up at the next group, and one asked for
+    /// again starts at the newest, so the bound is a group (the encoder's
+    /// keyframe interval, two seconds) plus the wait before asking again and
+    /// the route settling: about 2 s was measured for a relay stopping, under
+    /// 1 s for one coming back, and 0.4 to 2 s for each move of the call.
+    /// Before a lost read was asked for again, the gap after a move had no
+    /// bound at all.
+    const GAP: Duration = Duration::from_millis(3500);
+
+    /// A member and a viewer in a room a host bridges to the relay, both
+    /// following moves of the call, the viewer reading the member's camera
+    /// the way the call does.
+    struct Moving {
+        room: Bridged,
+        camera: Camera,
+        arrivals: Arrivals,
+        on_m: Arc<PeerStats>,
+        on_v: Arc<PeerStats>,
+        v: Member,
+        _m: Member,
+        _reading: Abort,
+        _tiles: Abort,
+    }
+
+    async fn moving() -> Moving {
+        let room = bridged().await;
+        let (on_m, on_v) = (following(), following());
+        let outbound = moq_tokio::origin::spawn();
+        let camera = camera("m", &outbound);
+        let m = joined("m", room.targets(), client(), on_m.clone(), outbound);
+        let v = member_as("v", room.targets(), client(), on_v.clone());
+        let (reading, tiles, arrivals) = viewing("v", &v.inbound);
+        routed_through(&v.inbound, &camera_path("m"), room.relay.origin.hop(), "m never arrived through the relay").await;
+        Moving {
+            room,
+            camera,
+            arrivals,
+            on_m,
+            on_v,
+            v,
+            _m: m,
+            _reading: reading,
+            _tiles: tiles,
+        }
+    }
+
+    impl Moving {
+        /// Moves the call to the host (`Some`) or back to the relay, waits
+        /// until the viewer has m that way, and past the overlap.
+        async fn to(&self, host: bool, what: &str) {
+            let (to, through) = match host {
+                true => (Some(id('c')), self.room.host.origin.hop()),
+                false => (None, self.room.relay.origin.hop()),
+            };
+            self.on_m.move_call(to.clone(), "m");
+            self.on_v.move_call(to, "v");
+            routed_through(&self.v.inbound, &camera_path("m"), through, what).await;
+            settle().await;
+        }
+    }
+
+    /// The fault as it was seen: a camera off while the call moves to a host
+    /// and back. Moving back cuts the viewer's catalog read off ("dropped")
+    /// with m still announced, and nothing used to read it again, so the
+    /// camera turned on after stayed blank for the rest of the call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_camera_turned_on_after_the_call_moved_is_seen() {
+        let mut w = moving().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for round in 0..2 {
+            w.to(true, &format!("m never came through the host, round {round}")).await;
+            w.to(false, &format!("m never went back to the relay, round {round}")).await;
+        }
+        w.camera.turn_on();
+        w.arrivals.more(30, "the viewer never saw the camera turned on after the call moved").await;
+    }
+
+    /// Video keeps arriving across every move of the call, there and back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn video_keeps_arriving_across_every_move_of_the_call() {
+        let mut w = moving().await;
+        w.camera.turn_on();
+        w.arrivals.more(30, "no video through the relay").await;
+        for round in 0..2 {
+            for host in [true, false] {
+                let moved = Instant::now();
+                w.to(host, &format!("the call never moved, round {round}")).await;
+                w.arrivals.more(30, &format!("video stopped after a move, round {round}")).await;
+                let gap = w.arrivals.longest_gap(moved);
+                assert!(gap < GAP, "video was gone {gap:?} moving to the {}, round {round}", if host { "host" } else { "relay" });
+            }
+        }
     }
 }

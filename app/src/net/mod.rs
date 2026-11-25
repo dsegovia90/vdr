@@ -21,6 +21,7 @@ pub(crate) mod arrival;
 mod audio;
 mod call;
 mod codec_check;
+mod follow;
 mod forwarded;
 pub(crate) mod door;
 mod metrics;

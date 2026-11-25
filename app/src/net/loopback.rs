@@ -125,6 +125,7 @@ async fn pump(
     let audio_decode = engine.map(|engine| {
         let broadcast = broadcast.consume();
         tokio::spawn(audio::subscribe(
+            None,
             broadcast,
             "loopback".to_string(),
             engine,
