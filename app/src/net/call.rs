@@ -3499,18 +3499,15 @@ mod served_tests {
         }
     }
 
-    /// Waits for `path` to be announced in `origin`, or, with `active` false,
-    /// retracted from it.
-    async fn announced_in(origin: &moq_net::origin::Producer, path: &str, active: bool) {
-        let mut announced = origin.consume().announced();
-        let mut live = false;
+    /// Waits for `path` to become announced (`active`) or retracted on a
+    /// cursor. The cursor is taken before the change it waits for, so a
+    /// retraction that has already happened is still seen: a fresh cursor
+    /// says nothing about a path that is gone.
+    async fn becomes(announced: &mut moq_net::announce::Consumer, path: &str, active: bool) {
         tokio::time::timeout(WITHIN, async {
             while let Some(update) = announced.next().await {
-                if update.prefix.as_str() == path {
-                    live = update.kind.is_active();
-                    if live == active {
-                        return;
-                    }
+                if update.prefix.as_str() == path && update.kind.is_active() == active {
+                    return;
                 }
             }
             panic!("the announcements ended before {path}");
@@ -3538,9 +3535,13 @@ mod served_tests {
         let route = relay.consume().routed(camera_path("c")).await.expect("the relay has c");
         assert_eq!(route.hops.len(), 1, "c straight from c, not through the host: {:?}", route.hops);
 
+        let mut at_relay = relay.consume().announced();
+        let mut at_guest = guest_of_host.inbound.consume().announced();
+        becomes(&mut at_relay, &camera_path("c"), true).await;
+        becomes(&mut at_guest, &camera_path("c"), true).await;
         drop(member);
-        announced_in(&relay, &camera_path("c"), false).await;
-        announced_in(&guest_of_host.inbound, &camera_path("c"), false).await;
+        becomes(&mut at_relay, &camera_path("c"), false).await;
+        becomes(&mut at_guest, &camera_path("c"), false).await;
     }
 
     /// What the relay is offered by a hosting member: its own camera and its
@@ -3559,8 +3560,10 @@ mod served_tests {
         let guest_of_host = guest(host.port, "/room", "g");
         // The host has the member, so it could reflect them if it were going to.
         sees(&guest_of_host, "c").await;
-        announced_in(&from_host, &camera_path("h"), true).await;
-        announced_in(&from_host, &camera_path("g"), true).await;
+        let mut offered_by_host = from_host.consume().announced();
+        becomes(&mut offered_by_host, &camera_path("h"), true).await;
+        let mut offered_by_host = from_host.consume().announced();
+        becomes(&mut offered_by_host, &camera_path("g"), true).await;
 
         let mut offered = from_host.consume().announced();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
