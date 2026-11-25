@@ -60,7 +60,8 @@ pub enum Arrival {
 pub enum Sending {
     /// To the room's relay.
     Relay,
-    /// To a host, by endpoint id, because the relay is not there.
+    /// To a host, by endpoint id: the relay is not there, or the call was
+    /// moved to that host (both reach `sessions`' pick the same way).
     Host(String),
     /// Only to our own guests: we host, and nothing else carries.
     Guests,
