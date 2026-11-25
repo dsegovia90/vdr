@@ -99,6 +99,11 @@ impl Host {
         &self.id
     }
 
+
+    /// As an invite carries it.
+    fn param(&self) -> String {
+        format!("{}.{}", self.id, self.door)
+    }
 }
 
 /// Reads one `host=` value of an invite.
@@ -240,6 +245,28 @@ impl Room {
     /// The link for a log line, with the token blanked.
     pub fn log_form(&self) -> String {
         self.url().map_or_else(|| "an unreadable link".to_string(), |url| crate::net::redacted(&url))
+    }
+
+    /// The link to hand someone so they can join, and meet here when the
+    /// relay is down: the link with the room's hosts after it, ourselves
+    /// first when `me` is given (we host it and have a door), then the most
+    /// recently heard. **Carries the token and every door**: for the
+    /// clipboard, never a screen or a log.
+    pub fn invite(&self, me: Option<&str>) -> String {
+        let Some(mut url) = self.url() else { return self.link.clone() };
+        let ours = me.zip(self.door.as_deref()).and_then(|(me, door)| Host::new(me, door, None, 0));
+        let hosts: Vec<String> = ours
+            .iter()
+            .chain(self.hosts.iter().filter(|host| Some(host.id.as_str()) != me))
+            .map(Host::param)
+            .collect();
+        if !hosts.is_empty() {
+            let mut pairs = url.query_pairs_mut();
+            for host in &hosts {
+                pairs.append_pair(crate::net::door::HOST_PARAM, host);
+            }
+        }
+        url.to_string()
     }
 
     /// Takes in a host heard now: a known one is refreshed, its door
@@ -760,6 +787,26 @@ mod tests {
     }
 
     #[test]
+    fn an_invite_lists_the_hosts_and_splits_back_into_the_link_and_them() {
+        let (mut list, key) = team();
+        list.keep_door(&key, DOOR);
+        list.heard(&key, host('b', OTHER_DOOR, 10), 10);
+        list.heard(&key, host('c', DOOR, 20), 20);
+        let me = hex('a');
+        let invite = list.rooms()[0].invite(Some(&me));
+        let parsed = url(&invite);
+        let (link, hosts) = split_invite(&parsed, 99);
+        assert_eq!(link.as_str(), format!("https://relay.example.com/team?jwt={TOKEN}"));
+        let got: Vec<(String, String)> = hosts.iter().map(|host| (host.id.clone(), host.door.clone())).collect();
+        assert_eq!(got, [(me, DOOR.to_string()), (hex('c'), DOOR.to_string()), (hex('b'), OTHER_DOOR.to_string())]);
+        assert!(hosts.iter().all(|host| host.told_by.is_none() && host.heard == 99));
+        assert_eq!(identity(&parsed), key, "an invite is the same room as its link");
+
+        let alone = list.rooms()[0].invite(None);
+        assert_eq!(split_invite(&url(&alone), 0).1.len(), 2, "without us, the hosts heard");
+    }
+
+    #[test]
     fn a_link_with_only_hosts_loses_its_query_and_a_bad_host_costs_only_itself() {
         let a = hex('a');
         let text = format!("iroh://{b}/team?host={a}.{DOOR}&host=nonsense&host={a}.{OTHER_DOOR}&host={a}", b = hex('b'));
@@ -769,6 +816,19 @@ mod tests {
         assert_eq!(hosts[0].door, DOOR);
         let plain = url("https://relay.example.com/team?jwt=x");
         assert_eq!(split_invite(&plain, 0).0, plain);
+    }
+
+    #[test]
+    fn hosts_and_doors_are_in_no_display_or_log_string() {
+        let (mut list, key) = team();
+        list.keep_door(&key, DOOR);
+        list.heard(&key, host('b', OTHER_DOOR, 10), 10);
+        let room = &list.rooms()[0];
+        let invite = room.invite(Some(&hex('a')));
+        for shown in [room.name(), room.host(), room.log_form(), room.key(), format!("{room:?}"), format!("{list:?}"), crate::net::redacted(&url(&invite))] {
+            assert!(!shown.contains(DOOR) && !shown.contains(OTHER_DOOR), "{shown}");
+        }
+        assert!(invite.contains(DOOR) && invite.contains(OTHER_DOOR));
     }
 
     #[test]

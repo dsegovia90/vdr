@@ -359,6 +359,8 @@ pub fn CallScreen() -> Element {
             rooms: remote.recent,
             status: remote.status,
             connect: remote.connect,
+            me: remote.me,
+            local: remote.local.clone(),
         }
         // **Everyone in one area, ourselves included, and it takes whatever
         // height is left.** `flex-1 min-h-0` inside the app's full-height
