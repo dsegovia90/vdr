@@ -123,11 +123,30 @@
 //! session has not timed out still holds the best route to us at every
 //! viewer, so the freeze until the timeout stays. What it changes is what
 //! follows: when that session ends, every reader splices to the spare at once
-//! instead of leaving and coming back two seconds later. Leaving a dying
-//! relay sooner is ending its session sooner: whatever decides it, the hook
-//! is [`Member::give_up`] on the relay's session, which hangs it up (its
-//! routes go, here and as a lost session at the far side, marking nothing
-//! stale), and the next pass promotes the spare.
+//! instead of leaving and coming back two seconds later.
+//!
+//! **So a relay that goes quiet is left sooner** (`super::super::quiet` has
+//! the rule and why it is relative): each pass samples what every session has
+//! received, and a relay session that has heard nothing for its limit while
+//! another of ours (or, when we host, a guest's session) has been heard is
+//! given up ([`Member::give_up`]). That hangs it up from our side, so its
+//! routes go here as a lost session's do, marking nothing stale, and every
+//! read through it splices to whatever route is left (a socket test pins
+//! it); the same pass promotes the spare. It then rests and is dialled again
+//! like any session that ended, and our media waits a hold before moving back
+//! to it that grows each time it is left again soon after
+//! (`quiet::Hold`). Everyone acts by the same rule on their own session:
+//! members, and the host a second later, so that its members' media has
+//! moved to it before it lets go of the relay.
+//!
+//! **A relay that says it is going away** (a GOAWAY, which relay 0.17 sends
+//! on SIGINT or SIGTERM) is not redialled at once (`Restart::Wait`: the
+//! address names the one process that is leaving), and its session becomes
+//! [`State::Draining`]: still heard through, still counted as a way in, but
+//! never picked to carry our media or a spare. So our media moves make before
+//! break while the old session still serves, and the library itself already
+//! ranks every route through a draining session last, so reads splice to the
+//! spare before the relay's deadline.
 //!
 //! **A host needs no spare.** It offers its one origin on every session, so
 //! viewers already hold its own media through the relay and directly, and it
@@ -142,6 +161,7 @@ use futures_util::StreamExt as _;
 
 use super::super::adapt;
 use super::super::door;
+use super::super::quiet::{self, Quiet};
 use super::super::status::{RemoteStatus, Via};
 use super::super::{Metrics, PeerStats};
 use super::{Abort, Keyframes, Peer, Refusals, TURNED_AWAY, is_refusal, redacted};
@@ -226,6 +246,11 @@ pub(super) enum State {
     Dialing,
     /// Up since then.
     Live(Instant),
+    /// Up, but its far side said it is going away: it still serves what it
+    /// carries, and we still hear through it, but nothing new of ours goes
+    /// onto it. A session that a GOAWAY reached refuses new requests, so not
+    /// even a spare could be pulled through it.
+    Draining,
     /// Dropped; the stack is redialling it.
     Redialling,
     /// Gave up; dialled again from then if the call is still going.
@@ -235,8 +260,15 @@ pub(super) enum State {
 }
 
 impl State {
+    /// Up and taking new offers: where our media or a spare may go.
     fn live(self) -> bool {
         matches!(self, State::Live(_))
+    }
+
+    /// Up at all, draining included: what we hear through, and what keeps
+    /// the call going.
+    fn up(self) -> bool {
+        matches!(self, State::Live(_) | State::Draining)
     }
 
     /// Still trying, so the call is not over while this is.
@@ -256,12 +288,18 @@ impl State {
 ///
 /// `preferred`, the host the call has been moved to, goes first in the order
 /// and the rest keep theirs; when it is not live the order is the usual one.
+///
+/// `holds` is each session's own hold before our media moves up to it, where
+/// one was left as quiet and has been made to wait longer ([`quiet::Hold`]);
+/// [`HOLD`] for any it does not name. A draining session is never picked: it
+/// is not live.
 pub(super) fn pick(
     states: &[State],
     current: Option<usize>,
     now: Instant,
     started: Instant,
     preferred: Option<usize>,
+    holds: &[Duration],
 ) -> Option<usize> {
     if states.first() == Some(&State::Dialing) && now.duration_since(started) < HOLD {
         return None;
@@ -272,7 +310,10 @@ pub(super) fn pick(
         let held = order[..rank]
             .iter()
             .copied()
-            .find(|&at| matches!(states[at], State::Live(since) if now.duration_since(since) >= HOLD));
+            .find(|&at| {
+                let hold = holds.get(at).copied().unwrap_or(HOLD);
+                matches!(states[at], State::Live(since) if now.duration_since(since) >= hold)
+            });
         return Some(held.unwrap_or(current));
     }
     order.into_iter().find(|&at| states[at].live())
@@ -289,7 +330,9 @@ fn order(len: usize, preferred: Option<usize>) -> Vec<usize> {
 /// one in [`pick`]'s order, so it is where our media would go next, among
 /// those that carry a route's price (`priced`). One that does not would hand
 /// the spare on free, and whoever reached us only that way would pull it.
-/// No hold: a spare carries nothing until it is needed.
+/// No hold: a spare carries nothing until it is needed. Never a draining
+/// session, even with nothing else: its far side refuses new requests, so a
+/// spare there could never be pulled, and it is about to close anyway.
 pub(super) fn spare(states: &[State], priced: &[bool], carrier: usize, preferred: Option<usize>) -> Option<usize> {
     order(states.len(), preferred)
         .into_iter()
@@ -314,8 +357,8 @@ pub(super) fn keeps_spare(hosting: bool, switch: bool) -> bool {
 /// What the status line says about where we are.
 pub(super) fn via(states: &[State], hosting: bool) -> Via {
     Via {
-        relay: states.first().is_some_and(|state| state.live()),
-        hosts: states.iter().skip(1).filter(|state| state.live()).count(),
+        relay: states.first().is_some_and(|state| state.up()),
+        hosts: states.iter().skip(1).filter(|state| state.up()).count(),
         hosting,
     }
 }
@@ -324,7 +367,7 @@ pub(super) fn via(states: &[State], hosting: bool) -> Via {
 /// on while anything is up, anything is still being tried, or we host. At the
 /// end the reason is the relay's, or "turned away" if every one refused us.
 pub(super) fn ended(states: &[State], hosting: bool, errors: &[Option<String>]) -> Option<String> {
-    if hosting || states.iter().any(|state| state.live() || state.trying()) {
+    if hosting || states.iter().any(|state| state.up() || state.trying()) {
         return None;
     }
     if states.iter().all(|state| *state == State::Refused) {
@@ -489,6 +532,8 @@ impl Role {
 enum Event {
     /// Up, and whether it carries a route's price ([`carries_price`]).
     Live { priced: bool },
+    /// Its far side said it is going away, and it serves on until then.
+    Draining,
     Down,
     Ended(String),
     Refused(String),
@@ -512,6 +557,9 @@ pub(super) struct Join {
     pub(super) estimate: moq_net::bandwidth::Producer,
     /// Our guests' slowest link, for when we host and nothing else carries.
     pub(super) guests: Option<moq_net::bandwidth::Consumer>,
+    /// When our guests' sessions were last heard, when we host: evidence
+    /// that our own link works while a session of ours has gone quiet.
+    pub(super) heard: Option<Arc<quiet::Heard>>,
     pub(super) metrics: Arc<Metrics>,
     pub(super) local: Arc<PeerStats>,
     pub(super) status: UnboundedSender<RemoteStatus>,
@@ -538,6 +586,11 @@ struct Member {
     priced: bool,
     /// What we offer on it, and what for. Only with a gate.
     offer: Option<(Offer, Role)>,
+    /// How long it must hold before our media moves up to it again, longer
+    /// each time it is left as quiet.
+    hold: quiet::Hold,
+    /// How long it may hear nothing before it counts as quiet.
+    limit: Duration,
 }
 
 impl Member {
@@ -547,7 +600,11 @@ impl Member {
     /// by re-pricing it. What an ending session does, and what anything that
     /// judged a session dead before its transport did would call.
     fn give_up(&mut self, error: String) {
-        self.session = None;
+        // Aborted rather than only dropped, so the close goes out at once
+        // with the session's own routes, whatever else still holds a handle.
+        if let Some(session) = self.session.take() {
+            session.connection.abort(moq_net::Error::Cancel);
+        }
         self.error = Some(error);
         self.state = State::Resting(Instant::now() + REST);
     }
@@ -561,10 +618,20 @@ fn named(member: &Member, relay: &str) -> String {
     }
 }
 
+/// How a sentence about a session names it: "the relay", or a host by its id.
+fn spoken(member: &Member) -> String {
+    match &member.target.host {
+        None => "the relay".to_string(),
+        Some(id) => format!("host {id}"),
+    }
+}
+
 /// A dialled session: its status task (which owns the connection, so
 /// dropping this hangs up), and what the set follows when it carries us.
 struct Session {
     _running: Abort,
+    /// A handle on the connection the status task owns, to hang it up.
+    connection: moq_tokio::Connection,
     bandwidth: moq_net::bandwidth::Consumer,
     monitor: moq_tokio::connection::Monitor,
 }
@@ -587,6 +654,7 @@ pub(super) fn join(args: Join) -> Peer {
         hosting,
         estimate,
         guests,
+        heard: guests_heard,
         metrics,
         local,
         status,
@@ -599,7 +667,13 @@ pub(super) fn join(args: Join) -> Peer {
         let inbound = inbound.clone();
         let outbound = outbound.clone();
         move |index: usize, member: &Member, chosen: bool| -> Session {
-            let mut client = client.clone();
+            // **Wait out a restart rather than redial into it.** A relay that
+            // says it is going away without naming anywhere else is the one
+            // process at that address shutting down: dialling it again at
+            // once only reaches the process that is leaving. Our media moves
+            // to another session meanwhile (see `Event::Draining`), and the
+            // relay is dialled again as after any drop once it has closed.
+            let mut client = client.clone().with_restart(moq_tokio::Restart::Wait);
             if member.target.host.is_some() {
                 client = client.with_cost(if chosen { CHOSEN_COST } else { HOST_COST });
             }
@@ -608,6 +682,7 @@ pub(super) fn join(args: Join) -> Peer {
                 None => client.with_publisher(&outbound),
             };
             let mut connection = client.with_subscriber(inbound.clone()).connect(member.target.url.clone());
+            let handle = connection.clone();
             let bandwidth = connection.send_bandwidth();
             let monitor = connection.monitor();
             let mut refusals = Refusals::for_url(&member.target.url);
@@ -616,16 +691,45 @@ pub(super) fn join(args: Join) -> Peer {
                 let say = |event| {
                     let _ = events.unbounded_send((index, event));
                 };
+                // The live session's going-away notice. Under `Restart::Wait`
+                // one naming no other address changes no status, so it is
+                // watched here; one that does is `Migrating`.
+                let mut going: Option<moq_net::goaway::Consumer> = None;
                 loop {
-                    match connection.status().await {
+                    let watched = going.clone();
+                    let goaway = async move {
+                        match watched {
+                            Some(going) => going.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    let status = tokio::select! {
+                        status = connection.status() => status,
+                        notice = goaway => {
+                            // Said once per session; a session that closed
+                            // without one has nothing more to say either.
+                            going = None;
+                            if notice.is_some() {
+                                say(Event::Draining);
+                            }
+                            continue;
+                        }
+                    };
+                    match status {
                         Ok(moq_tokio::Status::Connected) => {
                             if let Some(refusals) = refusals.as_mut() {
                                 refusals.connected(Instant::now());
                             }
                             let priced = connection.version().is_some_and(carries_price);
+                            going = connection.draining();
                             say(Event::Live { priced });
                         }
+                        Ok(moq_tokio::Status::Migrating) => {
+                            going = None;
+                            say(Event::Draining);
+                        }
                         Ok(moq_tokio::Status::Disconnected) => {
+                            going = None;
                             if refusals.as_mut().is_some_and(|refusals| refusals.dropped(Instant::now())) {
                                 say(Event::Refused(TURNED_AWAY.to_string()));
                                 return;
@@ -643,6 +747,7 @@ pub(super) fn join(args: Join) -> Peer {
             }));
             Session {
                 _running: running,
+                connection: handle,
                 bandwidth,
                 monitor,
             }
@@ -652,7 +757,7 @@ pub(super) fn join(args: Join) -> Peer {
     let mut members: Vec<Member> = targets
         .into_iter()
         .map(|target| Member {
-            target,
+            limit: quiet::limit(&target.url, hosting),
             gate: (!hosting).then(|| Gate::new(&outbound)),
             state: State::Dialing,
             error: None,
@@ -661,6 +766,8 @@ pub(super) fn join(args: Join) -> Peer {
             session: None,
             priced: false,
             offer: None,
+            hold: quiet::Hold::new(),
+            target,
         })
         .collect();
     let hosts = members.len() - 1;
@@ -688,6 +795,10 @@ pub(super) fn join(args: Join) -> Peer {
             let mut said: Option<Via> = None;
             let mut down_said = false;
             let mut next_bounce = bounce.map(|every| started + every);
+            // Each session's history of hearing anything, and our guests'
+            // one past them, for leaving a session that went quiet.
+            let mut quiet = Quiet::default();
+            let guests_at = members.len();
             let mut ticker = tokio::time::interval(TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -697,7 +808,7 @@ pub(super) fn join(args: Join) -> Peer {
                         // Whether the call goes on elsewhere, so an ending here
                         // is said as a retry or as what it is.
                         let elsewhere = (hosting && local.offer().is_some())
-                            || members.iter().enumerate().any(|(at, member)| at != index && member.state.live());
+                            || members.iter().enumerate().any(|(at, member)| at != index && member.state.up());
                         let member = &mut members[index];
                         let name = |member: &Member| named(member, &relay_label);
                         match event {
@@ -707,6 +818,7 @@ pub(super) fn join(args: Join) -> Peer {
                             }
                             Event::Live { priced } => {
                                 member.priced = priced;
+                                quiet.forget(index);
                                 if !priced && member.gate.is_some() && local.spare_route() {
                                     tracing::info!("{} carries no route price, so it holds no spare offer of ours", name(member));
                                 }
@@ -720,6 +832,18 @@ pub(super) fn join(args: Join) -> Peer {
                                 }
                                 member.joined = true;
                                 member.state = State::Live(Instant::now());
+                            }
+                            // Acted on once, from the notice or from a
+                            // migration, whichever the status task saw first.
+                            Event::Draining => {
+                                if member.state.live() {
+                                    member.state = State::Draining;
+                                    if carrier == Some(index) {
+                                        tracing::info!("{} says it is going away; moving our media", spoken(member));
+                                    } else {
+                                        tracing::info!("{} says it is going away; nothing new of ours goes on it", spoken(member));
+                                    }
+                                }
                             }
                             Event::Down => {
                                 tracing::warn!("the session dropped; redialling {}", name(member));
@@ -758,7 +882,7 @@ pub(super) fn join(args: Join) -> Peer {
 
                 // A session that gave up is dialled again while the call goes
                 // on somewhere, so a relay that comes back is found.
-                let going = serving || states.iter().any(|state| state.live());
+                let going = serving || states.iter().any(|state| state.up());
                 for (index, member) in members.iter_mut().enumerate() {
                     if let State::Resting(until) = member.state {
                         if going && now >= until {
@@ -768,7 +892,48 @@ pub(super) fn join(args: Join) -> Peer {
                     }
                 }
 
+                // A session that hears nothing while another of ours is
+                // heard is left now rather than at its idle timeout. Its
+                // routes go as a lost session's, the pass below moves our
+                // media to the spare, and it rests and is dialled again as
+                // one that ended does.
+                for (index, member) in members.iter().enumerate() {
+                    match (&member.session, member.state.up()) {
+                        (Some(session), true) => {
+                            let bytes = session.monitor.stats().and_then(|stats| stats.bytes_received);
+                            // Only the relay is judged; a host is evidence.
+                            quiet.observe(index, bytes, member.limit, member.target.host.is_none(), now);
+                        }
+                        _ => quiet.forget(index),
+                    }
+                }
+                if let Some(guests_heard) = &guests_heard {
+                    quiet.heard(guests_at, guests_heard.last(), quiet::QUIET_IROH);
+                }
+                if let Some(verdict) = quiet.quiet(now) {
+                    let evidence = match members.get(verdict.heard) {
+                        Some(other) => format!("{} is heard", spoken(other)),
+                        None => "our guests are heard".to_string(),
+                    };
+                    let member = &mut members[verdict.quiet];
+                    member.hold.left(now);
+                    tracing::info!(
+                        "{} went quiet for {:.1}s while {evidence}; leaving it, trying it again in 15s, and holding our media off it for {}s once it is back",
+                        spoken(member),
+                        verdict.silent.as_secs_f64(),
+                        member.hold.hold().as_secs(),
+                    );
+                    member.give_up(format!("{} went quiet", spoken(member)));
+                    quiet.forget(verdict.quiet);
+                }
+                for member in members.iter_mut() {
+                    if let State::Live(since) = member.state {
+                        member.hold.up(since, now);
+                    }
+                }
+
                 let states: Vec<State> = members.iter().map(|member| member.state).collect();
+                let holds: Vec<Duration> = members.iter().map(|member| member.hold.hold()).collect();
                 // Until the relay has answered or failed once, a host with
                 // nobody else up is still joining, not cut off.
                 let relay_tried = states.first().is_some_and(|state| *state != State::Dialing);
@@ -818,7 +983,7 @@ pub(super) fn join(args: Join) -> Peer {
                     chosen = now_chosen;
                 }
 
-                let next = pick(&states, carrier, now, started, chosen);
+                let next = pick(&states, carrier, now, started, chosen, &holds);
                 // With nothing live, every offer stays as it is: a session
                 // that died carries nothing, and one that comes back finds
                 // it still offered.
@@ -847,7 +1012,11 @@ pub(super) fn join(args: Join) -> Peer {
                     carrier = next;
                     on_guests = false;
                 } else if next.is_none() && serving && !on_guests && relay_tried {
-                    tracing::info!("still hosting; no way to the relay");
+                    if states.first() == Some(&State::Draining) {
+                        tracing::info!("still hosting; the relay is going away");
+                    } else {
+                        tracing::info!("still hosting; no way to the relay");
+                    }
                     local.set_sending(Some(super::super::arrival::Sending::Guests));
                     _following = guests.clone().map(|guests| follow_guests(guests, &estimate));
                     // Every guest reading our own media through the relay
@@ -1046,7 +1215,7 @@ mod tests {
         let start = Instant::now();
         let at = |ms: u64| start + Duration::from_millis(ms);
         use State::*;
-        let pick = |states: &[State], current, now| pick(states, current, now, start, None);
+        let pick = |states: &[State], current, now| pick(states, current, now, start, None, &[]);
         assert_eq!(pick(&[Dialing, Dialing], None, at(0)), None);
         assert_eq!(pick(&[Dialing, Live(at(0))], None, at(500)), None, "the relay gets a moment to answer");
         assert_eq!(pick(&[Dialing, Live(at(0))], None, at(2000)), Some(1), "then a host while the relay still dials");
@@ -1063,7 +1232,7 @@ mod tests {
         let start = Instant::now();
         let at = |ms: u64| start + Duration::from_millis(ms);
         use State::*;
-        let pick = |states: &[State], current, now, preferred| pick(states, current, now, start, preferred);
+        let pick = |states: &[State], current, now, preferred| pick(states, current, now, start, preferred, &[]);
         let all = [Live(at(0)), Live(at(0)), Live(at(0))];
         assert_eq!(pick(&all, Some(0), at(5000), Some(2)), Some(2), "held, so at once");
         assert_eq!(pick(&all, None, at(5000), Some(1)), Some(1));
@@ -1095,6 +1264,36 @@ mod tests {
         assert_eq!(spare(&[Redialling, Live(now), Resting(now), Live(now)], &[true; 4], 1, None), Some(3), "only a live one");
         assert_eq!(spare(&[Live(now)], &[true], 0, None), None, "the relay alone");
         assert_eq!(spare(&all, &[true], 0, None), None, "a price never heard is no price");
+    }
+
+    #[test]
+    fn a_session_that_says_it_is_going_away_carries_nothing_new_but_still_counts_as_up() {
+        use State::*;
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let pick = |states: &[State], current| pick(states, current, at(5000), start, None, &[]);
+        assert_eq!(pick(&[Draining, Live(at(0))], Some(0)), Some(1), "off it at once");
+        assert_eq!(pick(&[Draining, Live(at(4000))], Some(0)), Some(1), "down needs no hold");
+        assert_eq!(pick(&[Draining, Redialling], Some(0)), None, "nowhere else: the offer stays where it is");
+        assert_eq!(pick(&[Live(at(0)), Draining], Some(0)), Some(0));
+        let priced = [true; 3];
+        assert_eq!(spare(&[Live(at(0)), Draining, Live(at(0))], &priced, 0, None), Some(2));
+        assert_eq!(spare(&[Live(at(0)), Draining], &priced[..2], 0, None), None, "never a spare on it, even alone");
+        assert_eq!(via(&[Draining, Live(at(0))], false), Via { relay: true, hosts: 1, hosting: false });
+        assert_eq!(ended(&[Draining, Refused], false, &[None, None]), None, "the call goes on through it");
+    }
+
+    #[test]
+    fn a_session_left_as_quiet_waits_its_own_hold_before_our_media_moves_back() {
+        use State::*;
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let holds = [Duration::from_secs(8), HOLD];
+        let pick = |states: &[State], current, now| pick(states, current, now, start, None, &holds);
+        let back = [Live(at(10_000)), Live(at(0))];
+        assert_eq!(pick(&back, Some(1), at(12_000)), Some(1), "the usual hold is not enough");
+        assert_eq!(pick(&back, Some(1), at(17_999)), Some(1));
+        assert_eq!(pick(&back, Some(1), at(18_000)), Some(0), "its own hold");
     }
 
     #[test]
@@ -1256,6 +1455,8 @@ mod socket_tests {
         let mut config = moq_tokio::client::Config::default();
         config.connect.tls.insecure = Some(true);
         config.connect.backoff.timeout = Duration::from_secs(2);
+        // As a join's client pings: what the quiet limits are set against.
+        config.quic.keep_alive = quiet::KEEP_ALIVE;
         config.init().unwrap()
     }
 
@@ -1283,6 +1484,7 @@ mod socket_tests {
         config.connect.backoff.initial = Duration::from_millis(200);
         config.connect.backoff.max = Duration::from_millis(500);
         config.connect.backoff.timeout = Duration::from_secs(60);
+        config.quic.keep_alive = quiet::KEEP_ALIVE;
         config.init().unwrap()
     }
 
@@ -1367,6 +1569,7 @@ mod socket_tests {
             hosting: false,
             estimate: moq_net::bandwidth::Producer::new(),
             guests: None,
+            heard: None,
             metrics: Arc::new(Metrics::default()),
             local,
             status,
@@ -1547,7 +1750,7 @@ mod socket_tests {
         let port = server.local_addr().unwrap().port();
         let hosting = door::Hosting::open("team".to_string()).unwrap();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (_accepting, _) = accept(server, Some(hosting), Some(estimates), Arc::new(Metrics::default()), None, None);
+        let (_accepting, _) = accept(server, Some(hosting), Some(estimates), Arc::new(Metrics::default()), None, None, None);
         // No door: what a member holding an old one presents, as far as the
         // host can tell.
         let started = Instant::now();
@@ -2483,6 +2686,418 @@ mod socket_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_call_moved_to_a_host_and_back_over_a_priced_relay_is_never_a_leave() {
         moves_are_never_a_leave(Meeting::start().await).await;
+    }
+
+    /// A viewer that hangs up its own session to the relay, with the relay
+    /// still up and a host bridging it, keeps reading m: what came through
+    /// that session goes as a lost session's routes do, never as a
+    /// withdrawal, and the read splices to the route through the host. What
+    /// leaving a quiet relay from our side relies on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_relay_session_hung_up_here_splices_the_viewers_read_to_the_host() {
+        let room = bridged().await;
+        let outbound = moq_tokio::origin::spawn();
+        let mut theirs = camera("m", &outbound);
+        let _m = joined_asking("m", room.targets(), client(), Arc::new(PeerStats::default()), outbound, theirs.keyframe.clone());
+        let inbound = moq_tokio::origin::spawn();
+        let nothing = moq_tokio::origin::spawn();
+        let to_relay = client()
+            .with_publisher(nothing.consume())
+            .with_subscriber(inbound.clone())
+            .connect(room.relay.url());
+        let _to_host = client()
+            .with_cost(HOST_COST)
+            .with_publisher(nothing.consume())
+            .with_subscriber(inbound.clone())
+            .connect(room.host.url());
+        let (_reading, _tiles, arrivals) = viewing("v", &inbound);
+        theirs.turn_on();
+        arrivals.more(30, "no video through the relay").await;
+        routed_through(&inbound, &camera_path("m"), room.relay.origin.hop(), "m never arrived through the relay").await;
+        // The host's route has had time to arrive beside it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (_watching, retracted) = retractions(&inbound, &camera_path("m"));
+        let cut = Instant::now();
+        to_relay.abort(moq_net::Error::Cancel);
+        routed_through(&inbound, &camera_path("m"), room.host.origin.hop(), "m never came through the host").await;
+        arrivals.more(75, "video stopped when we hung up on the relay").await;
+        let gap = arrivals.longest_gap(cut);
+        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        // Nobody asks m for a keyframe here: the read picks up at m's next group.
+        assert!(gap < GROUP, "video was gone {gap:?}");
+        eprintln!("hung up: gap {gap:?}");
+    }
+
+    /// A network path between members and a server, over UDP, that can fail:
+    /// it forwards everything, drops everything, or drops a share of the
+    /// packets, both ways, as `loss` (a percentage) says from one packet to
+    /// the next. Members dial its port instead of the server's.
+    struct Path {
+        port: u16,
+        loss: Arc<std::sync::atomic::AtomicU8>,
+        _forwarding: Abort,
+    }
+
+    /// Every packet through.
+    const FORWARD: u8 = 0;
+    /// Nothing through: a server that died without a word, as far as anyone
+    /// on this path can tell.
+    const DROP: u8 = 100;
+
+    impl Path {
+        async fn to(server: u16) -> Path {
+            use tokio::net::UdpSocket;
+            let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let port = socket.local_addr().unwrap().port();
+            let loss = Arc::new(std::sync::atomic::AtomicU8::new(FORWARD));
+            let dropping = loss.clone();
+            let forwarding = Abort(tokio::spawn(async move {
+                // One upstream socket per client, so the server tells them apart.
+                let mut clients: std::collections::HashMap<std::net::SocketAddr, (Arc<UdpSocket>, Abort)> =
+                    std::collections::HashMap::new();
+                let mut buffer = vec![0u8; 65_536];
+                let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+                loop {
+                    let Ok((length, from)) = socket.recv_from(&mut buffer).await else { continue };
+                    if let std::collections::hash_map::Entry::Vacant(slot) = clients.entry(from) {
+                        let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                        upstream.connect(("127.0.0.1", server)).await.unwrap();
+                        let back = upstream.clone();
+                        let socket = socket.clone();
+                        let dropping = dropping.clone();
+                        let returning = Abort(tokio::spawn(async move {
+                            let mut buffer = vec![0u8; 65_536];
+                            let mut seed = from.port() as u64 | 1;
+                            loop {
+                                let Ok(length) = back.recv(&mut buffer).await else {
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                    continue;
+                                };
+                                if passes(&dropping, &mut seed) {
+                                    let _ = socket.send_to(&buffer[..length], from).await;
+                                }
+                            }
+                        }));
+                        slot.insert((upstream, returning));
+                    }
+                    if passes(&dropping, &mut seed) {
+                        let (upstream, _) = &clients[&from];
+                        let _ = upstream.send(&buffer[..length]).await;
+                    }
+                }
+            }));
+            Path {
+                port,
+                loss,
+                _forwarding: forwarding,
+            }
+        }
+
+        fn url(&self) -> url::Url {
+            at(self.port)
+        }
+
+        fn set(&self, loss: u8) {
+            self.loss.store(loss, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Whether one packet gets through, by a cheap generator of our own.
+    fn passes(loss: &std::sync::atomic::AtomicU8, seed: &mut u64) -> bool {
+        let loss = loss.load(std::sync::atomic::Ordering::Relaxed);
+        if loss == FORWARD {
+            return true;
+        }
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        (*seed % 100) as u8 >= loss
+    }
+
+    /// A member hosting the room, as the app runs one: one origin for its
+    /// own broadcasts, its guests and its join; a server of its own its
+    /// guests reach it on, noting when their sessions hear anything; and its
+    /// join on the relay, hosting.
+    struct Hosted {
+        origin: moq_net::origin::Producer,
+        port: u16,
+        local: Arc<PeerStats>,
+        _accepting: Abort,
+        _joined: Abort,
+    }
+
+    async fn hosted(relay: url::Url) -> Hosted {
+        crypto();
+        let shared = moq_tokio::origin::spawn();
+        let mut config = moq_tokio::server::Config::default();
+        config.listen.bind = Some(moq_tokio::listen::Bind::Addr(([127, 0, 0, 1], 0).into()));
+        config.listen.tls.generate = vec!["localhost".to_string()];
+        config.publisher = Some(shared.consume());
+        config.subscriber = Some(shared.clone());
+        let server = config.init().unwrap().bind().await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let heard = Arc::new(quiet::Heard::default());
+        let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
+        let (accepting, _) = accept(server, None, Some(estimates), Arc::new(Metrics::default()), None, None, Some(heard.clone()));
+        let local = Arc::new(PeerStats::default());
+        local.set_offer(Some(door::Offer {
+            door: "door".to_string(),
+            hop: shared.hop().id(),
+        }));
+        let host = join(Join {
+            client: client(),
+            me: id('c'),
+            targets: vec![relay_at(relay)],
+            outbound: shared.clone(),
+            inbound: shared.clone(),
+            hosting: true,
+            estimate: moq_net::bandwidth::Producer::new(),
+            guests: None,
+            heard: Some(heard),
+            metrics: Arc::new(Metrics::default()),
+            local: local.clone(),
+            status: futures_channel::mpsc::unbounded().0,
+            keyframe: Arc::new(Keyframes::default()),
+            room: "room team".to_string(),
+            bounce: None,
+        });
+        let joined = Abort(tokio::spawn(async move {
+            let _ = host.closed.await;
+        }));
+        let deadline = Instant::now() + WITHIN;
+        while !sending_through_relay(&local) {
+            assert!(Instant::now() < deadline, "the host never joined the relay");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Hosted {
+            origin: shared,
+            port,
+            local,
+            _accepting: accepting,
+            _joined: joined,
+        }
+    }
+
+    /// A room whose relay and host the members reach only through paths
+    /// that can fail: the relay behind one, the host (hosting, its own join
+    /// on the relay through that same path) behind another. m publishes a
+    /// camera that cuts a keyframe when its media moves, as the call's does;
+    /// v reads it as the call does, through the relay, with m's spare on the
+    /// host.
+    struct Behind {
+        relay: Meeting,
+        host: Hosted,
+        to_relay: Path,
+        to_host: Path,
+        arrivals: Arrivals,
+        on_m: Arc<PeerStats>,
+        m: Member,
+        v: Member,
+        _camera: Camera,
+        _reading: Abort,
+        _tiles: Abort,
+    }
+
+    async fn behind() -> Behind {
+        let relay = Meeting::older().await;
+        let to_relay = Path::to(relay.port).await;
+        let host = hosted(to_relay.url()).await;
+        let to_host = Path::to(host.port).await;
+        let targets = || vec![relay_at(to_relay.url()), host_at('c', to_host.url())];
+        let on_m = Arc::new(PeerStats::default());
+        let outbound = moq_tokio::origin::spawn();
+        let mut camera = camera("m", &outbound);
+        let m = joined_asking("m", targets(), client(), on_m.clone(), outbound, camera.keyframe.clone());
+        let v = joined("v", targets(), client(), Arc::new(PeerStats::default()), moq_tokio::origin::spawn());
+        let (reading, tiles, arrivals) = viewing("v", &v.inbound);
+        camera.turn_on();
+        arrivals.more(30, "no video through the relay").await;
+        routed_through(&v.inbound, &camera_path("m"), relay.origin.hop(), "m never arrived through the relay").await;
+        // The spare is offered, and every route has arrived and been ranked.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Behind {
+            relay,
+            host,
+            to_relay,
+            to_host,
+            arrivals,
+            on_m,
+            m,
+            v,
+            _camera: camera,
+            _reading: reading,
+            _tiles: tiles,
+        }
+    }
+
+    /// Whether `member` has said, since this was last asked, that it is no
+    /// longer on the relay: what leaving it shows as.
+    fn left_the_relay(member: &mut Member) -> bool {
+        let mut left = false;
+        while let Ok(status) = member.statuses.try_recv() {
+            if let RemoteStatus::InRoom { via: Some(via), .. } = status {
+                left |= !via.relay;
+            }
+        }
+        left
+    }
+
+    fn sending_through_relay(local: &PeerStats) -> bool {
+        local.sending() == Some(super::super::super::arrival::Sending::Relay)
+    }
+
+    /// The longest a viewer may go without a frame when the relay goes
+    /// silent and a host is there. Everything then comes through the host,
+    /// which leaves the relay at its own quiet limit, [`quiet::HOSTING_EXTRA`]
+    /// after its members, within a tick of the join and a stale sample; its
+    /// read of m then splices to m directly and picks up at m's next group.
+    /// Measured 2.6 to 3.6 s over twenty runs (about half a second less with
+    /// no extra second for the host); the bound leaves a margin for a debug
+    /// build on a busy machine.
+    const QUIET_GAP: Duration = Duration::from_millis(
+        (quiet::QUIET_QUIC.as_millis() + quiet::HOSTING_EXTRA.as_millis()) as u64 + 1500,
+    );
+
+    /// The relay stops answering (killed, frozen, or its network gone), and
+    /// nobody's session to it has ended. Everyone still hears the host, so
+    /// each member, and the host, leaves the relay at its quiet limit rather
+    /// than its idle timeout, and the viewer's read splices to the host: no
+    /// leave, and a gap of about that limit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_relay_that_goes_silent_is_left_and_the_video_comes_through_the_host() {
+        let r = behind().await;
+        let (_watching, retracted) = retractions(&r.v.inbound, &camera_path("m"));
+        let cut = Instant::now();
+        r.to_relay.set(DROP);
+        routed_through(&r.v.inbound, &camera_path("m"), r.host.origin.hop(), "m never came through the host").await;
+        r.arrivals.more(60, "video stopped when the relay went silent").await;
+        let gap = r.arrivals.longest_gap(cut);
+        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        assert_eq!(r.on_m.sending(), Some(super::super::super::arrival::Sending::Host(id('c'))), "m's media never left the relay");
+        assert_eq!(r.host.local.sending(), Some(super::super::super::arrival::Sending::Guests), "the host never left the relay");
+        assert!(gap < QUIET_GAP, "video was gone {gap:?} when the relay went silent");
+        eprintln!("silent relay: gap {gap:?}");
+    }
+
+    /// Watches `local`'s carrier for `over`, and says whether it ever left
+    /// the relay.
+    async fn ever_left(local: &PeerStats, over: Duration) -> bool {
+        let until = Instant::now() + over;
+        let mut left = false;
+        while Instant::now() < until {
+            left |= !sending_through_relay(local);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        left
+    }
+
+    /// Our own link stalls: every session is silent at once, for longer than
+    /// the quiet limit, then everything comes back. Nothing is left, and our
+    /// media never moves: nothing was heard to say the relay was the fault.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_that_stalls_everywhere_and_comes_back_leaves_nothing() {
+        let mut r = behind().await;
+        left_the_relay(&mut r.m);
+        left_the_relay(&mut r.v);
+        let (_watching, lost) = retractions(&r.relay.origin, &camera_path("m"));
+        r.to_relay.set(DROP);
+        r.to_host.set(DROP);
+        let stalled = ever_left(&r.on_m, Duration::from_millis(2500)).await;
+        r.to_relay.set(FORWARD);
+        r.to_host.set(FORWARD);
+        let moved = ever_left(&r.on_m, Duration::from_secs(5)).await;
+        assert!(!stalled && !moved, "m's media left the relay");
+        assert!(!left_the_relay(&mut r.m), "m left the relay");
+        assert!(!left_the_relay(&mut r.v), "v left the relay");
+        assert_eq!(count(&lost), 0, "the relay lost m");
+        r.arrivals.more(30, "video never came back").await;
+        let route = route_within(&r.v.inbound, &camera_path("m")).await.expect("m is there");
+        assert_eq!(route.hops.as_slice().last(), Some(&r.relay.origin.hop()), "{route:?}");
+    }
+
+    /// A bad path to the relay, losing a third of its packets for five
+    /// seconds, is not a silent one: nothing is left.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lossy_relay_path_is_not_left() {
+        let mut r = behind().await;
+        left_the_relay(&mut r.m);
+        left_the_relay(&mut r.v);
+        let (_watching, lost) = retractions(&r.relay.origin, &camera_path("m"));
+        r.to_relay.set(30);
+        let lossy = ever_left(&r.on_m, Duration::from_secs(5)).await;
+        r.to_relay.set(FORWARD);
+        let after = ever_left(&r.on_m, Duration::from_secs(1)).await;
+        assert!(!lossy && !after, "m's media left the relay");
+        assert!(!left_the_relay(&mut r.m), "m left the relay");
+        assert!(!left_the_relay(&mut r.v), "v left the relay");
+        assert!(sending_through_relay(&r.host.local), "the host left the relay");
+        assert_eq!(count(&lost), 0, "the relay lost m");
+        r.arrivals.more(30, "video never came back").await;
+    }
+
+    /// How long the relay below gives its sessions once it says it is going.
+    const DRAIN: Duration = Duration::from_secs(3);
+
+    /// A relay that says it is going away, as relay 0.17 does when it is
+    /// stopped: our media moves to the host while the relay still serves,
+    /// so the viewer sees no gap across the relay's deadline.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_relay_going_away_moves_our_media_before_it_closes() {
+        let relay = Meeting::start().await;
+        let host = hosted(relay.url()).await;
+        let targets = || vec![relay_at(relay.url()), host_at('c', at(host.port))];
+        let on_m = Arc::new(PeerStats::default());
+        let outbound = moq_tokio::origin::spawn();
+        let mut camera = camera("m", &outbound);
+        let _m = joined_asking("m", targets(), client(), on_m.clone(), outbound, camera.keyframe.clone());
+        let v = joined("v", targets(), client(), Arc::new(PeerStats::default()), moq_tokio::origin::spawn());
+        let (_reading, _tiles, arrivals) = viewing("v", &v.inbound);
+        camera.turn_on();
+        arrivals.more(30, "no video through the relay").await;
+        routed_through(&v.inbound, &camera_path("m"), relay.origin.hop(), "m never arrived through the relay").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (_watching, retracted) = retractions(&v.inbound, &camera_path("m"));
+        let said = Instant::now();
+        for session in relay.sessions.lock().unwrap().iter() {
+            let _ = session.drain().send(moq_net::goaway::Goaway::new().with_timeout(DRAIN));
+        }
+        while sending_through_relay(&on_m) {
+            assert!(said.elapsed() < Duration::from_millis(500), "m's media was still on the relay {:?} after it said it was going", said.elapsed());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let moved = said.elapsed();
+        tokio::time::sleep_until((said + DRAIN + Duration::from_secs(2)).into()).await;
+        let gap = arrivals.longest_gap(said);
+        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        assert!(gap < Duration::from_secs(1), "video was gone {gap:?} across the relay going away");
+        eprintln!("going away: moved in {moved:?}, gap {gap:?}");
+    }
+
+    /// The host itself: its relay goes silent while its guests are heard,
+    /// and it leaves the relay too, a second after its members do, and
+    /// carries on hosting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_leaves_a_silent_relay_while_its_guests_are_heard() {
+        let relay = Meeting::older().await;
+        let to_relay = Path::to(relay.port).await;
+        let host = hosted(to_relay.url()).await;
+        let _m = member("m", vec![relay_at(to_relay.url()), host_at('c', at(host.port))]);
+        becomes(&host.origin, &camera_path("m"), true).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let cut = Instant::now();
+        to_relay.set(DROP);
+        let deadline = cut + Duration::from_secs(8);
+        while host.local.sending() != Some(super::super::super::arrival::Sending::Guests) {
+            assert!(Instant::now() < deadline, "the host never left the silent relay");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Measured from the cut; the host's last byte from an idle relay
+        // came up to a keep-alive before it.
+        let took = cut.elapsed();
+        let limit = quiet::QUIET_QUIC + quiet::HOSTING_EXTRA;
+        assert!(took >= limit - quiet::KEEP_ALIVE - Duration::from_millis(250), "the host left after only {took:?}");
+        assert!(took < limit + Duration::from_millis(1500), "the host took {took:?} to leave");
+        eprintln!("host left the relay after {took:?}");
     }
 
     /// The longest a frame may be late while nothing that carries it changes:

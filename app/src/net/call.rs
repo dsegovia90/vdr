@@ -49,6 +49,7 @@ mod sessions;
 use super::adapt;
 use super::arrival;
 use super::audio;
+use super::quiet;
 use super::door;
 use super::runtime::runtime;
 use super::share::{self, ShareWish};
@@ -384,6 +385,10 @@ struct Serve<'a> {
     /// Where each guest's session hop is kept while it lasts, so a route
     /// straight from a guest reads as direct; `None` where nothing reads it.
     guests: Option<Arc<arrival::Guests>>,
+    /// Where the last time any guest's session heard anything is kept, for a
+    /// join beside this to tell its own link from its relay's; `None` where
+    /// nothing reads it.
+    heard: Option<Arc<quiet::Heard>>,
 }
 
 /// Starts accepting sessions on our endpoint, for as long as the returned
@@ -403,6 +408,7 @@ async fn serve(
         metrics,
         forwarded,
         guests,
+        heard,
     } = args;
     let mut server_config = moq_tokio::server::Config::default();
     server_config.listen.bind = Some(moq_tokio::listen::Bind::Addr(
@@ -421,7 +427,7 @@ async fn serve(
         .bind()
         .await
         .map_err(|error| format!("could not listen: {error:#}"))?;
-    Ok(accept(server, door, estimates, metrics, forwarded, guests))
+    Ok(accept(server, door, estimates, metrics, forwarded, guests, heard))
 }
 
 /// The accept loop, apart from the server it runs on so it can be driven over
@@ -445,6 +451,7 @@ fn accept(
     metrics: Arc<Metrics>,
     forwarded: Option<Arc<Forwarded>>,
     guests: Option<Arc<arrival::Guests>>,
+    heard: Option<Arc<quiet::Heard>>,
 ) -> (Abort, futures_channel::mpsc::UnboundedReceiver<bool>) {
     let (events, receiver) = futures_channel::mpsc::unbounded::<bool>();
     let task = Abort(tokio::spawn(async move {
@@ -473,13 +480,20 @@ fn accept(
             let estimates = estimates.clone();
             let metrics = metrics.clone();
             let events = events.clone();
+            let heard = heard.clone();
             // The hop the guest declared, kept while its session lives.
             let declared = guests.clone().zip(request.peer_hop().map(|hop| hop.id()).filter(|&hop| hop != 0));
             if let Some((guests, hop)) = &declared {
                 guests.add(*hop);
             }
             sessions.spawn(async move {
-                match (request.ok().await, estimates) {
+                let session = request.ok().await;
+                // Ends with this task, so it never outlives the session.
+                let _sampling = match (&session, heard) {
+                    (Ok(session), Some(heard)) => Some(Abort(tokio::spawn(sample_heard(session.clone(), heard)))),
+                    _ => None,
+                };
+                match (session, estimates) {
                     (Ok(session), Some(estimates)) => adapt::forward(session, estimates, metrics).await,
                     (Ok(session), None) => {
                         let _ = session.closed().await;
@@ -494,6 +508,23 @@ fn accept(
         }
     }));
     (task, receiver)
+}
+
+/// Notes in `heard` whenever a guest's session receives anything, on the
+/// join's own cadence: a host's evidence that its link works while its relay
+/// says nothing. Holds a handle on the session only while it is sampled.
+async fn sample_heard(session: moq_net::Session, heard: Arc<quiet::Heard>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last = None;
+    loop {
+        ticker.tick().await;
+        let bytes = session.stats().bytes_received;
+        if bytes.is_some() && bytes != last {
+            heard.heard(std::time::Instant::now());
+            last = bytes;
+        }
+    }
 }
 
 /// Query parameters that carry a way in: a relay's token, a host's door, and
@@ -1326,6 +1357,7 @@ async fn run(
                 // on, and so a relay that is down cannot hold it up.
                 let guests = moq_net::bandwidth::Producer::new();
                 let guests_link = guests.consume();
+                let heard = Arc::new(quiet::Heard::default());
                 if shared {
                     alongside = host_alongside(Alongside {
                         config: &client_config,
@@ -1337,11 +1369,18 @@ async fn run(
                         local: local.clone(),
                         forwarded: forwarded.clone(),
                         guests: routing.guests.clone(),
+                        heard: heard.clone(),
                     })
                     .await;
                 }
-                let client = client_config
-                    .clone()
+                // A healthy session to an `http(s)` relay then hears
+                // something at least every second, which is what lets a join
+                // leave one that went quiet after two (see `quiet`). Only
+                // here: a join with one session has nothing to compare with,
+                // and is left as it was. iroh sessions ignore it.
+                let mut several_config = client_config.clone();
+                several_config.quic.keep_alive = quiet::KEEP_ALIVE;
+                let client = several_config
                     .init()
                     .map_err(|error| format!("could not build a client: {error:#}"))?
                     .with_iroh(endpoint.clone());
@@ -1362,6 +1401,7 @@ async fn run(
                     hosting: shared,
                     estimate: estimate.clone(),
                     guests: alongside.is_some().then_some(guests_link),
+                    heard: alongside.is_some().then_some(heard),
                     metrics: metrics.clone(),
                     local: local.clone(),
                     status: status.clone(),
@@ -1392,6 +1432,7 @@ async fn run(
                     metrics: metrics.clone(),
                     forwarded: None,
                     guests: None,
+                    heard: None,
                 })
                 .await?;
                 let status = status.clone();
@@ -1470,6 +1511,8 @@ async fn run(
                     metrics: metrics.clone(),
                     forwarded: forwarded.clone(),
                     guests: Some(routing.guests.clone()),
+                    // Hosting alone, there is no relay to judge.
+                    heard: None,
                 })
                 .await?;
                 if let Some(forwarded) = &forwarded {
@@ -2851,6 +2894,8 @@ struct Alongside<'a> {
     forwarded: Option<Arc<Forwarded>>,
     /// Where our guests' session hops are kept, for reading routes.
     guests: Arc<arrival::Guests>,
+    /// Where the last time a guest's session heard anything is kept.
+    heard: Arc<quiet::Heard>,
 }
 
 /// Serves the room's members directly beside a join, behind the room's door,
@@ -2878,6 +2923,7 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         local,
         forwarded,
         guests,
+        heard,
     } = args;
     let room = url.path().trim_matches('/').to_string();
     if room.is_empty() {
@@ -2901,6 +2947,7 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         metrics: Arc::new(Metrics::default()),
         forwarded: forwarded.clone(),
         guests: Some(guests),
+        heard: Some(heard),
     })
     .await;
     let (accepting, mut events) = match served {
@@ -3924,7 +3971,7 @@ mod served_tests {
         let server = config.init().unwrap().bind().await.unwrap();
         let port = server.local_addr().unwrap().port();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (task, _) = accept(server, door, Some(estimates), Arc::new(Metrics::default()), None, None);
+        let (task, _) = accept(server, door, Some(estimates), Arc::new(Metrics::default()), None, None, None);
         (task, port)
     }
 
@@ -4042,7 +4089,7 @@ mod served_tests {
         let server = config.init().unwrap().bind().await.unwrap();
         let port = server.local_addr().unwrap().port();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (task, _) = accept(server, None, Some(estimates), Arc::new(Metrics::default()), None, None);
+        let (task, _) = accept(server, None, Some(estimates), Arc::new(Metrics::default()), None, None, None);
         (task, port)
     }
 
@@ -4235,6 +4282,7 @@ mod served_tests {
             Some(estimates),
             Arc::new(Metrics::default()),
             Some(forwarded.clone()),
+            None,
             None,
         );
 

@@ -28,6 +28,7 @@ mod metrics;
 mod loopback;
 pub(crate) mod moves;
 pub(crate) mod quality;
+mod quiet;
 mod report;
 #[cfg(test)]
 mod routes;
