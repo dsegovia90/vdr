@@ -354,6 +354,18 @@ mod tests {
     }
 
     #[test]
+    fn a_hosted_room_keeps_its_door_out_of_sight() {
+        const DOOR: &str = "00112233445566778899aabbccddeeff";
+        let mut list = RecentRooms::default();
+        list.joined(&url(&format!("iroh://{}/team?door={DOOR}", "a".repeat(64))), 1);
+        let room = &list.rooms()[0];
+        for shown in [room.name(), room.host(), room.log_form(), room.key(), format!("{room:?}")] {
+            assert!(!shown.contains(DOOR), "{shown}");
+        }
+        assert!(room.link().contains(DOOR), "the link itself keeps it, for rejoining");
+    }
+
+    #[test]
     fn the_same_room_with_another_token_is_one_entry_and_the_newer_link_wins() {
         let mut list = RecentRooms::default();
         list.joined(&url("https://relay.example.com/team?jwt=old"), 100);

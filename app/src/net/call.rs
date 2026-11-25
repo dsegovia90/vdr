@@ -11,7 +11,13 @@
 //! the room is a client of. Each participant publishes once and the relay fans
 //! out, so the uplink cost does not grow with the room. To this module a relay
 //! is just a server we dial, which is why `--dial` and `--relay` share
-//! [`connect`]. A participant hosting the relay itself is not built yet.
+//! [`connect`].
+//!
+//! **`--host` is the third mode: a room whose meeting place is this app.** It
+//! accepts as `--listen` does, through the same [`serve`], but on one origin
+//! that its guests and its own broadcasts share, behind a door (see
+//! [`super::door`]); and it is a room, not a call with one peer. Its guests
+//! join it as they would a relay's room, which is why they need nothing new.
 //!
 //! Every arm converges on [`Peer`], so the claim above is structural rather
 //! than a description: anything per-connection is reached the same way
@@ -36,6 +42,7 @@ use moq_mux::catalog::Stream as _;
 
 use super::adapt;
 use super::audio;
+use super::door;
 use super::runtime::runtime;
 use super::share::{self, ShareWish};
 use super::status::RemoteStatus;
@@ -274,6 +281,9 @@ struct Serve<'a> {
     publisher: moq_net::origin::Consumer,
     /// Where every accepted session's broadcasts land.
     subscriber: moq_net::origin::Producer,
+    /// The room and its door, when this side hosts one; `None` lets anyone in,
+    /// as a 1:1 listener always has.
+    door: Option<door::Hosting>,
     estimates: Arc<adapt::Estimates>,
     metrics: Arc<Metrics>,
 }
@@ -290,6 +300,7 @@ async fn serve(
         endpoint,
         publisher,
         subscriber,
+        door,
         estimates,
         metrics,
     } = args;
@@ -310,7 +321,7 @@ async fn serve(
         .bind()
         .await
         .map_err(|error| format!("could not listen: {error:#}"))?;
-    Ok(accept(server, estimates, metrics))
+    Ok(accept(server, door, estimates, metrics))
 }
 
 /// The accept loop, apart from the server it runs on so it can be driven over
@@ -329,6 +340,7 @@ async fn serve(
 /// `JoinSet` here, they end with the loop, and with the call.
 fn accept(
     mut server: moq_tokio::Listener,
+    door: Option<door::Hosting>,
     estimates: Arc<adapt::Estimates>,
     metrics: Arc<Metrics>,
 ) -> (Abort, futures_channel::mpsc::UnboundedReceiver<bool>) {
@@ -341,6 +353,16 @@ fn accept(
         // for. Finished sessions are reaped as each new one arrives instead.
         while let Some(request) = server.accept().await {
             while sessions.try_join_next().is_some() {}
+            // Checked before accepting, so someone turned away never sees
+            // the room: not who is in it, not a frame. Which check failed is
+            // logged; what they presented is not.
+            if let Some(refusal) = door.as_ref().and_then(|door| door.admits(request.path(), request.query()).err()) {
+                tracing::warn!("turned a guest away: they {refusal}");
+                sessions.spawn(async move {
+                    let _ = request.reject(moq_tokio::server::Reject::Unauthorized).await;
+                });
+                continue;
+            }
             let _ = events.unbounded_send(true);
             let estimates = estimates.clone();
             let metrics = metrics.clone();
@@ -357,21 +379,25 @@ fn accept(
     (task, receiver)
 }
 
+/// Query parameters that carry a way in: a relay's token, a host's door.
+const SECRET_PARAMS: [&str; 2] = ["jwt", super::door::PARAM];
+
 /// The URL with any token's value blanked, for logs and labels.
 ///
-/// **A room URL can carry its invitation** (`?jwt=…`, the relay's token), and
-/// anyone holding it can join that room until it expires, so it must never be
-/// written anywhere a log or a screenshot might travel. Only our own lines are
-/// covered: moq-tokio logs the full URL at `info` itself, which the default
-/// `RUST_LOG=vdr=…` filter happens to hide.
+/// **A room URL can carry its invitation** (`?jwt=…`, the relay's token, or
+/// `?door=…`, a hosted room's), and anyone holding it can join that room, so it
+/// must never be written anywhere a log or a screenshot might travel. Only our
+/// own lines are covered; moq-tokio 0.19's own connection lines print scheme,
+/// host and port only (read in its `connect.rs`, `Endpoint`).
 pub(crate) fn redacted(url: &url::Url) -> String {
     let mut clean = url.clone();
-    if url.query_pairs().any(|(key, _)| key == "jwt") {
+    let secret = |key: &str| SECRET_PARAMS.contains(&key);
+    if url.query_pairs().any(|(key, _)| secret(&key)) {
         let kept: Vec<(String, String)> = url
             .query_pairs()
             .map(|(key, value)| {
                 // Plain ASCII: a URL would percent-encode an ellipsis.
-                let value = if key == "jwt" { "redacted".to_string() } else { value.into_owned() };
+                let value = if secret(&key) { "redacted".to_string() } else { value.into_owned() };
                 (key.into_owned(), value)
             })
             .collect();
@@ -385,10 +411,13 @@ pub(crate) fn redacted(url: &url::Url) -> String {
 /// The relay refusing a token arrives as a closed session (`code=6
 /// reason=unauthorized`), which moq-native (now moq-tokio) retried like any drop until its
 /// budget runs out -- it does not tell a refusal from a flaky link until then.
+/// A host turning a guest away at its door closes the session the same way;
+/// moq-tokio 0.19 recognises that close and gives up at once, and what
+/// reaches us is then the bare word (seen in this module's local-socket test).
 /// What reaches us at the end is transport text; this says what to do.
 fn explain(error: String) -> String {
-    if error.contains("reason=unauthorized") {
-        "the relay refused this room's token (missing, expired, or for another room)".to_string()
+    if error.contains("reason=unauthorized") || error.trim() == "unauthorized" {
+        "the room refused this link: its token or door is missing, expired, or for another room".to_string()
     } else {
         error
     }
@@ -1021,16 +1050,26 @@ async fn run(
         // keeps the path announced instead, and a session re-attaching within
         // the window splices into the same broadcast, so the gap is never
         // observed above this line.
-        let inbound = moq_tokio::origin::spawn();
+        //
+        // **A host has one origin, not two.** What its guests publish is
+        // offered back out to every other guest, which is what lets them see
+        // each other through it; and its own broadcasts sit beside theirs, as
+        // a relay room's participants do. `attend` skips our own id, so
+        // reading our own announcements back is harmless.
+        let inbound = match peering {
+            Peering::Host(_) => outbound.clone(),
+            _ => moq_tokio::origin::spawn(),
+        };
 
-        // Read before the match below takes `peering` apart.
-        let in_room = matches!(peering, Peering::Join(_));
+        // Read before the match below takes `peering` apart. A hosted room is
+        // a room: nobody leaving ends it, and the status line stays on it.
+        let in_room = matches!(peering, Peering::Join(_) | Peering::Host(_));
         // Only an iroh call has a path worth naming: an `https://` room goes
         // over plain QUIC, and the endpoint's counters would only ever say
         // "nothing moved".
         let over_iroh = match &peering {
             Peering::Join(url) => url.scheme() == "iroh",
-            Peering::Dial(_) | Peering::Listen => true,
+            Peering::Dial(_) | Peering::Listen | Peering::Host(_) => true,
             Peering::Loopback | Peering::Idle => false,
         };
         let peer_transport: Peer = match peering {
@@ -1089,6 +1128,7 @@ async fn run(
                     endpoint: &endpoint,
                     publisher: outbound.consume(),
                     subscriber: inbound.clone(),
+                    door: None,
                     estimates: adapt::Estimates::new(estimate.clone()),
                     metrics: metrics.clone(),
                 })
@@ -1149,6 +1189,53 @@ async fn run(
                                     }
                                     None => return "the listener stopped".to_string(),
                                 },
+                            }
+                        }
+                    }),
+                    bandwidth: None,
+                    stats: None,
+                }
+            }
+            Peering::Host(room) => {
+                let hosting = door::Hosting::open(room)?;
+                let room = format!("room {}, hosted here", hosting.room());
+                let (accepting, mut events) = serve(Serve {
+                    config: &client_config,
+                    endpoint: &endpoint,
+                    publisher: outbound.consume(),
+                    subscriber: inbound.clone(),
+                    door: Some(hosting.clone()),
+                    estimates: adapt::Estimates::new(estimate.clone()),
+                    metrics: metrics.clone(),
+                })
+                .await?;
+                // **Stdout, not the log.** The invite carries the door, and
+                // the log file is what people attach to bug reports. Quoted,
+                // because an unquoted `?` is a glob to zsh.
+                println!(
+                    "Hosting {}. Guests join with:\n  vdr --relay '{}'",
+                    hosting.room(),
+                    hosting.invite(&me.to_string())
+                );
+                tracing::info!("hosting {}; the invite went to stdout, not to this log", hosting.room());
+                report(RemoteStatus::InRoom { room });
+                Peer {
+                    // Guests coming and going is the room's ordinary life,
+                    // not the call's: it ends only when we stop serving.
+                    closed: Box::pin(async move {
+                        let _accepting = accepting;
+                        let mut live = 0usize;
+                        loop {
+                            match events.next().await {
+                                Some(true) => {
+                                    live += 1;
+                                    tracing::info!("a guest came in; {live} connected");
+                                }
+                                Some(false) => {
+                                    live = live.saturating_sub(1);
+                                    tracing::info!("a guest's session ended; {live} connected");
+                                }
+                                None => return "stopped hosting".to_string(),
                             }
                         }
                     }),
@@ -2801,6 +2888,17 @@ mod room_tests {
     }
 
     #[test]
+    fn a_door_never_reaches_the_log_or_the_status_line() {
+        let door = "00112233445566778899aabbccddeeff";
+        let url: url::Url = format!("iroh://{}/team?door={door}&x=1", "a".repeat(64)).parse().unwrap();
+        let shown = redacted(&url);
+        assert!(!shown.contains(door), "{shown}");
+        assert!(shown.contains("door=redacted") && shown.contains("x=1"), "{shown}");
+        let status = crate::net::RemoteStatus::InRoom { room: room_label(&url) }.to_string();
+        assert!(!status.contains(door), "{status}");
+    }
+
+    #[test]
     fn a_url_without_a_token_is_left_alone() {
         let url: url::Url = "http://localhost:4443/test".parse().unwrap();
         assert_eq!(redacted(&url), "http://localhost:4443/test");
@@ -2809,7 +2907,8 @@ mod room_tests {
     #[test]
     fn a_refused_token_is_said_in_words() {
         let raw = "reconnect timed out after 30s: transport: webtransport error: closed: code=6 reason=unauthorized";
-        assert!(explain(raw.to_string()).starts_with("the relay refused this room's token"));
+        assert!(explain(raw.to_string()).starts_with("the room refused this link"));
+        assert!(explain("unauthorized".to_string()).starts_with("the room refused this link"));
         assert_eq!(explain("something else".to_string()), "something else");
     }
 
@@ -2846,7 +2945,7 @@ mod served_tests {
     const WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// One shared origin, served on a local port through [`accept`].
-    async fn host() -> (Abort, u16) {
+    async fn host(door: Option<door::Hosting>) -> (Abort, u16) {
         let shared = moq_tokio::origin::spawn();
         let mut config = moq_tokio::server::Config::default();
         config.listen.bind = Some(moq_tokio::listen::Bind::Addr(([127, 0, 0, 1], 0).into()));
@@ -2856,7 +2955,7 @@ mod served_tests {
         let server = config.init().unwrap().bind().await.unwrap();
         let port = server.local_addr().unwrap().port();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (task, _) = accept(server, estimates, Arc::new(Metrics::default()));
+        let (task, _) = accept(server, door, estimates, Arc::new(Metrics::default()));
         (task, port)
     }
 
@@ -2870,6 +2969,12 @@ mod served_tests {
     }
 
     fn guest(port: u16, target: &str, id: &str) -> Guest {
+        dial(port, target, id, false)
+    }
+
+    /// `redial` as the app has it, which is what decides how long a refusal
+    /// takes to be final.
+    fn dial(port: u16, target: &str, id: &str, redial: bool) -> Guest {
         let outbound = moq_tokio::origin::spawn();
         let camera = outbound.create_broadcast(camera_path(id)).unwrap();
         camera.announce(moq_net::origin::Route::default()).unwrap();
@@ -2882,7 +2987,7 @@ mod served_tests {
             .unwrap()
             .with_publisher(outbound.consume())
             .with_subscriber(inbound.clone())
-            .with_reconnect(false)
+            .with_reconnect(redial)
             .connect(url);
         Guest {
             connection,
@@ -2910,11 +3015,51 @@ mod served_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn guests_see_each_other_through_one_shared_origin() {
-        let (_accepting, port) = host().await;
+        let (_accepting, port) = host(None).await;
         let a = guest(port, "/room", "a");
         let b = guest(port, "/room", "b");
         sees(&a, "b").await;
         sees(&b, "a").await;
+    }
+
+    fn team() -> door::Hosting {
+        door::Hosting::open("team".to_string()).unwrap()
+    }
+
+    /// The path and query of the invite, which is what a guest dials with.
+    fn invited(hosting: &door::Hosting) -> String {
+        let invite: url::Url = hosting.invite(&"a".repeat(64)).parse().unwrap();
+        format!("{}?{}", invite.path(), invite.query().unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invited_guests_see_each_other_through_the_door() {
+        let hosting = team();
+        let (_accepting, port) = host(Some(hosting.clone())).await;
+        let a = guest(port, &invited(&hosting), "a");
+        let b = guest(port, &invited(&hosting), "b");
+        sees(&a, "b").await;
+        sees(&b, "a").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_door_turns_away_a_wrong_door_a_missing_one_and_another_room() {
+        let hosting = team();
+        let (_accepting, port) = host(Some(hosting.clone())).await;
+        let room_only = "/team".to_string();
+        let wrong = format!("/team?door={}", "0".repeat(32));
+        let elsewhere = invited(&hosting).replace("/team?", "/other?");
+        // Redialling, as the app does: a refusal the client took for a drop
+        // would keep it trying for the whole retry budget and time out here.
+        // The session does come up first -- the door is checked after SETUP
+        // -- so it is the ending that says refused.
+        for target in [room_only, wrong, elsewhere] {
+            let refused = dial(port, &target, "x", true);
+            let ended = tokio::time::timeout(WITHIN, refused.connection.closed()).await;
+            let Ok(Err(error)) = ended else { panic!("{target} was not refused in time") };
+            assert_eq!(error.connect_error(), Some(moq_tokio::ConnectError::Unauthorized), "{target}: {error}");
+            assert!(explain(format!("{error:#}")).starts_with("the room refused"), "{error:#}");
+        }
     }
 
     /// Weaker than it looks: over this socket, dropping the listener closes its
@@ -2923,7 +3068,7 @@ mod served_tests {
     /// not run), and there the sessions' tasks ending is what ends them.
     #[tokio::test(flavor = "multi_thread")]
     async fn sessions_end_with_the_accept_loop() {
-        let (accepting, port) = host().await;
+        let (accepting, port) = host(None).await;
         let guest = guest(port, "/room", "a");
         let connection = tokio::time::timeout(WITHIN, guest.connection.clone().established())
             .await

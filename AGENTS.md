@@ -305,13 +305,16 @@ focus.
 - **Buttons use `components/button.rs`**; its `shrink-0 whitespace-nowrap` are
   load-bearing, not decorative.
 - **Nothing secret in logs or on screen.** A room URL can carry a token
-  (`?jwt=…`); `net/call.rs` has the helper that redacts it for a log line.
+  (`?jwt=…`) or a hosted room's door (`?door=…`); `net/call.rs` has the
+  helper that redacts both for a log line. A new secret parameter goes in its
+  list. `--host` prints its invite with `println!`, never through `tracing`,
+  because the log is a file people attach to bug reports.
 
 ## Layout of `app/src/`
 
 | Path | Role |
 |---|---|
-| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--loopback`, `--camera`, `--camera-off`, `--ephemeral`, `--quality`, `--encoder`, …) |
+| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--host`, `--loopback`, `--camera`, `--camera-off`, `--ephemeral`, `--quality`, `--encoder`, …) |
 | `settings.rs` | what the app remembers between launches, the data folder, the log path |
 | `hotkeys.rs` | keyboard shortcuts as a pure table: actions, chords, the keymap. No UI in it |
 | `name.rs` | display names: cleaning, the short id, which label to show |
@@ -326,7 +329,8 @@ focus.
 | `camera/hooks/` | chosen device, on/off, persistence, the stream and its watchdog |
 | `camera/frames.rs` | `FrameSlot`: newest-wins handoff, with its own neutral `Frame`/`Pixels` |
 | `camera/paint/` | `VideoPaintSource` (a blitz `Widget`), wgpu upload, fit math |
-| `net/call.rs` | a call over iroh + MoQ: rooms on a relay, direct calls, presence |
+| `net/call.rs` | a call over iroh + MoQ: rooms on a relay, direct calls, hosting a room (`--host`), presence |
+| `net/door.rs` | a hosted room's door: its name, the secret guests present as `?door=`, the check (pure) |
 | `net/audio.rs` | the audio half: Opus out, each peer's voice in, echo cancelled |
 | `net/share.rs` | screen sharing: capture and its own broadcast |
 | `net/loopback.rs` | the in-process H.264 round trip |
@@ -339,5 +343,5 @@ Frames never touch the DOM:
 
 `cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`, `rates.rs`, `net/quality.rs`,
 `camera/paint/fit.rs`, `audio/catchup.rs`, `components/layout.rs`,
-`update/release.rs`, `update/verify.rs`) are where
+`update/release.rs`, `update/verify.rs`, `net/door.rs`) are where
 logic that can be tested without a window belongs.

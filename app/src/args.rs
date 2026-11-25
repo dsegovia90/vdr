@@ -19,6 +19,7 @@
 //! vdr --secret <hex> --listen             # prints its endpoint id and waits
 //! vdr --secret <hex> --dial <peer-id>     # dials it
 //! vdr --relay http://localhost:4443/room  # joins a room on a relay
+//! vdr --host team                         # hosts room team; the invite goes to stdout
 //! vdr --loopback                         # no network; the codec round trip
 //! vdr --camera facetime                   # picks a camera by name
 //! vdr --listen --camera-off               # starts with video off
@@ -61,6 +62,10 @@
 //! - `https://host/room` -- a relay with a real certificate.
 //! - `iroh://<relay-endpoint-id>/room` -- a relay with iroh enabled, dialled by
 //!   key the same way a peer is.
+//!
+//! `--host <room>` makes this app the room's meeting place, with no relay:
+//! members dial it with `--relay iroh://<our id>/<room>?door=<secret>`, the
+//! invite it prints to stdout at start. See `net::door`.
 
 use std::sync::OnceLock;
 
@@ -90,6 +95,13 @@ pub enum Peering {
     /// still goes direct, which needs nothing running anywhere. Merging the two
     /// (switching topology as a call grows) is not done yet.
     Join(url::Url),
+    /// Host this room: accept its members directly, on one origin they all
+    /// share, behind a door made fresh for the attempt.
+    ///
+    /// Only the room's name travels here; the door is made by the call, so the
+    /// secret never sits in [`Args`], which is cached for the life of the
+    /// process and printable with `{:?}`.
+    Host(String),
 }
 
 /// Reads a relay URL, or says why it is not one.
@@ -280,6 +292,11 @@ impl Args {
                     Some(Ok(url)) => peering = Peering::Join(url),
                     Some(Err(error)) => tracing::error!("--relay is not a relay url: {error}"),
                     None => tracing::error!("--relay needs a url"),
+                },
+                "--host" => match args.next().as_deref().map(crate::net::door::room_name) {
+                    Some(Ok(room)) => peering = Peering::Host(room),
+                    Some(Err(error)) => tracing::error!("--host: {error}"),
+                    None => tracing::error!("--host needs a room name"),
                 },
                 "--secret" => match args.next() {
                     // Read back by `net::call` on the call thread, which has
