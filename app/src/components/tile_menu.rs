@@ -65,6 +65,10 @@ pub struct TileMenuProps {
     pub their_room: Option<String>,
     /// Whether their microphone is on.
     pub their_mic: bool,
+    /// Their connection in one line, when they report it and our
+    /// connection report is on. A line rather than a tooltip on the bars,
+    /// since blitz has no tooltips.
+    pub connection: Option<String>,
     /// Our subroom, from the page's [`Rooms`].
     pub our_room: Option<String>,
     /// Ourselves: where requests are recorded, and our room is set.
@@ -121,6 +125,10 @@ pub fn TileMenu(props: TileMenuProps) -> Element {
                     span { class: "truncate text-sm text-neutral-100", "{name}" }
                     span { class: "text-xs text-neutral-500", {crate::name::short(&props.who)} }
                 }
+                div { class: "my-1 h-px bg-neutral-800" }
+            }
+            if let Some(line) = props.connection.as_ref() {
+                div { class: "px-2.5 pb-1.5 pt-1 text-xs text-neutral-400", "{line}" }
                 div { class: "my-1 h-px bg-neutral-800" }
             }
             if offered.is_empty() {

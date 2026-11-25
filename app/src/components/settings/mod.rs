@@ -10,6 +10,7 @@
 //! was removed. It also keeps the open tab across a close.
 
 mod about;
+mod experimental;
 mod keyboard;
 mod network;
 mod profile;
@@ -20,8 +21,8 @@ use std::sync::Arc;
 use dioxus_native::prelude::*;
 
 use super::keys::{KeyFocus, SettingsPanel};
-use super::{ChartIcon, CloseIcon, InfoIcon, KeyboardIcon, PersonIcon, UpdateIcon};
-use crate::net::{Metrics, PeerStats};
+use super::{ChartIcon, CloseIcon, FlaskIcon, InfoIcon, KeyboardIcon, PersonIcon, UpdateIcon};
+use crate::net::{Metrics, Participant, PeerStats};
 
 pub(super) use keyboard::record;
 pub(super) use updates::{UpdateBanner, Updates, use_updates_provider};
@@ -33,11 +34,12 @@ pub(crate) enum Tab {
     Keyboard,
     Updates,
     Network,
+    Experimental,
     About,
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [Tab::Profile, Tab::Keyboard, Tab::Updates, Tab::Network, Tab::About];
+    const ALL: [Tab; 6] = [Tab::Profile, Tab::Keyboard, Tab::Updates, Tab::Network, Tab::Experimental, Tab::About];
 
     fn label(self) -> &'static str {
         match self {
@@ -45,6 +47,7 @@ impl Tab {
             Tab::Keyboard => "Keyboard",
             Tab::Updates => "Updates",
             Tab::Network => "Network",
+            Tab::Experimental => "Experimental",
             Tab::About => "About",
         }
     }
@@ -56,27 +59,45 @@ impl Tab {
             Tab::Keyboard => rsx! { KeyboardIcon {} },
             Tab::Updates => rsx! { UpdateIcon {} },
             Tab::Network => rsx! { ChartIcon {} },
+            Tab::Experimental => rsx! { FlaskIcon {} },
             Tab::About => rsx! { InfoIcon {} },
         }
     }
 
     /// `open` is whether the window is showing: the window stays mounted
     /// while closed, and the Network tab samples only while it can be seen.
-    fn body(self, local: Arc<PeerStats>, metrics: Arc<Metrics>, open: bool) -> Element {
+    fn body(self, call: Call, open: bool) -> Element {
+        let Call { local, metrics, participants, me } = call;
         match self {
             Tab::Profile => rsx! { profile::ProfileTab { local } },
             Tab::Keyboard => rsx! { keyboard::KeyboardTab {} },
             Tab::Updates => rsx! { updates::UpdatesTab {} },
-            Tab::Network => rsx! { network::NetworkTab { metrics, open } },
+            Tab::Network => rsx! { network::NetworkTab { metrics, local, participants, me, open } },
+            Tab::Experimental => rsx! { experimental::ExperimentalTab { local } },
             Tab::About => rsx! { about::AboutTab {} },
         }
     }
 }
 
-/// The window. `local` is our own entry, which the Profile tab names;
-/// `metrics` the call's numbers, which the Network tab draws.
+/// What the tabs need of the call.
+#[derive(Clone)]
+struct Call {
+    local: Arc<PeerStats>,
+    metrics: Arc<Metrics>,
+    participants: Signal<Vec<Participant>>,
+    me: String,
+}
+
+/// The window. `local` is our own entry, which the Profile tab names and the
+/// Experimental tab switches; `metrics` the call's numbers and
+/// `participants` everyone else, which the Network tab draws; `me` our id.
 #[component]
-pub fn SettingsModal(local: Arc<PeerStats>, metrics: Arc<Metrics>) -> Element {
+pub fn SettingsModal(
+    local: Arc<PeerStats>,
+    metrics: Arc<Metrics>,
+    participants: Signal<Vec<Participant>>,
+    me: String,
+) -> Element {
     let panel = use_context::<SettingsPanel>();
     let focus = use_context::<KeyFocus>();
     let SettingsPanel { mut tab, .. } = panel;
@@ -127,7 +148,7 @@ pub fn SettingsModal(local: Arc<PeerStats>, metrics: Arc<Metrics>) -> Element {
                 }
                 // The same thumb and track as every scrolling list in the app.
                 div { class: "min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-8 py-6 [scrollbar-color:rgb(115,115,115)_rgb(38,38,38)]",
-                    {current.body(local.clone(), metrics.clone(), open)}
+                    {current.body(Call { local: local.clone(), metrics: metrics.clone(), participants, me: me.clone() }, open)}
                 }
                 // A way out that can be seen: Esc and the backdrop close it
                 // too, but neither says so. Over the pane's corner, after it

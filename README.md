@@ -114,6 +114,28 @@ the link's whole estimate (video only; audio is not counted). The lines are a
 five-second average. The estimate is divided between the microphone, the
 screen share and the camera, in that order, and each video stream follows its
 slice, so the last chart is where it shows whether everything together fit.
+Under the charts, while the connection report is on and someone else is
+in the call, *People* lists everyone, you first, with what each says about
+their own connection: the link's estimate, round trip, recent loss, the frame
+rate they send, whether their camera and share are at their caps or held by
+the link, and on iroh whether the path is direct or relayed. A person whose
+build does not report, or who turned it off, is listed as not reporting.
+Everyone else also gets a chart of the last 2 minutes built from their
+reports, one point every 2 seconds. Then a grid of who gets what: rows send,
+columns receive, and each cell is what that column's person gets from that
+row's (frames a second, and how much later than its best the video arrives),
+coloured by quality; the diagonal is each person's own connection. A row
+mostly poor is marked "their upload?", a column mostly poor "their
+download?"; a single bad cell stays a single cell.
+Its *Experimental* tab has a switch per feature still being tried out. *Connection report*, on by default: with it on, your
+presence tells the room how your connection is doing and what you get from
+each person, and you see what they say. Each video's name label then carries
+signal bars: three green bars is good, two amber is held by the link (it
+cannot carry everything being sent), one red is poor, three hollow grey ones
+is not known yet. A person not reporting has none, and neither does a shared
+screen; the person's menu says it in a line. Turning the switch off stops
+telling the room about your connection and hides everyone else's. The
+thresholds are first guesses.
 Its *About* tab shows the version and where the
 log is, which is what to send after a call that went wrong.
 

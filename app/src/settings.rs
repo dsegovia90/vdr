@@ -182,12 +182,24 @@ pub struct Settings {
     /// [`crate::update::banner`], which treats anything unparseable as none.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_text")]
     pub dismissed_update: Option<String>,
+
+    /// Whether the connection report is on: telling the room how
+    /// our connection is doing and showing what others tell. `None` is the
+    /// default, which is on ([`connection_report_on`](Self::connection_report_on)), as
+    /// for `check_updates`.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
+    pub connection_report: Option<bool>,
 }
 
 impl Settings {
     /// Whether the automatic update check is on.
     pub fn checks_updates(&self) -> bool {
         self.check_updates.unwrap_or(true)
+    }
+
+    /// Whether the connection report is on.
+    pub fn connection_report_on(&self) -> bool {
+        self.connection_report.unwrap_or(true)
     }
 }
 
@@ -759,6 +771,22 @@ mod tests {
         let back: Settings = serde_json::from_str(r#"{"camera":"abc","check_updates":"no"}"#).expect("still valid");
         assert_eq!(back.camera.as_deref(), Some("abc"));
         assert!(back.checks_updates());
+    }
+
+    #[test]
+    fn the_connection_report_is_on_unless_turned_off_and_read_leniently() {
+        assert!(Settings::default().connection_report_on());
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","check_updates":false}"#).expect("valid");
+        assert!(older.connection_report_on(), "a file from before the setting means on");
+        let off: Settings = serde_json::from_str(r#"{"connection_report":false}"#).expect("valid");
+        assert!(!off.connection_report_on());
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&off).expect("serialises")).expect("deserialises");
+        assert_eq!(back, off);
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("connection_report"), "left out until changed: {json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","connection_report":"nope"}"#).expect("still valid");
+        assert_eq!(bad.camera.as_deref(), Some("abc"));
+        assert!(bad.connection_report_on(), "a malformed flag costs only itself");
     }
 
     #[test]

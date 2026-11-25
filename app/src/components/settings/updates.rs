@@ -212,7 +212,7 @@ fn Offered(
 /// An on/off switch. A plain element rather than a [`Button`]: it has no
 /// label to keep from wrapping, and its look is its state.
 #[component]
-fn Switch(on: bool, onclick: EventHandler<MouseEvent>) -> Element {
+pub(super) fn Switch(on: bool, onclick: EventHandler<MouseEvent>) -> Element {
     rsx! {
         div {
             class: if on {

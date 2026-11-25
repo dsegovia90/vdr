@@ -26,6 +26,13 @@
 //! the charts are mounted, which is only while the window is open on this tab,
 //! and it sends only when the minute changed. Any wake of the page repaints
 //! the whole window.
+//!
+//! **Under the charts, the people in the call** (only while the connection
+//! switch is on, and someone else is here): each person's own report on their
+//! connection, in figures and, for others, as a chart of the last couple of
+//! minutes built from their reports; then the grid of who gets what from
+//! whom. The charts above stay outside the switch: they are ours, local, and
+//! tell nobody anything.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,9 +41,11 @@ use std::time::Duration;
 use dioxus_native::prelude::*;
 
 use super::Heading;
+use super::super::SignalBars;
 use crate::channel::use_channel;
-use crate::net::Metrics;
-use crate::rates::{self, Point, Second};
+use crate::net::quality::{self, Blame, Link, Quality, Seen};
+use crate::net::{Feed, Metrics, Participant, PeerStats};
+use crate::rates::{self, Point, Second, kbps_words as rate};
 
 /// How often the poller looks. The history moves once a second, so faster
 /// would only find the same minute again.
@@ -56,7 +65,13 @@ const LINK: &str = "rgb(52,211,153)";
 const GRID: &str = "rgb(38,38,38)";
 
 #[component]
-pub fn NetworkTab(metrics: Arc<Metrics>, open: bool) -> Element {
+pub fn NetworkTab(
+    metrics: Arc<Metrics>,
+    local: Arc<PeerStats>,
+    participants: Signal<Vec<Participant>>,
+    me: String,
+    open: bool,
+) -> Element {
     rsx! {
         div { class: "flex flex-col",
             div { class: "text-lg font-semibold text-neutral-100", "Network" }
@@ -65,6 +80,7 @@ pub fn NetworkTab(metrics: Arc<Metrics>, open: bool) -> Element {
             }
             if open {
                 Charts { metrics }
+                People { local, participants, me }
             }
         }
     }
@@ -122,6 +138,13 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
     let share: Vec<Point> = seconds.iter().map(Point::share).collect();
     let total: Vec<Point> = seconds.iter().map(Point::total).collect();
 
+    // "Sent" counts what the encoder handed to the transport, and a stream
+    // nobody subscribed to goes no further: without these words the chart
+    // shows an upload that is not happening.
+    let unwatched = |alone: bool| if alone { UNWATCHED.to_string() } else { String::new() };
+    let camera_notes: Vec<String> = seconds.iter().map(|second| unwatched(second.camera_unwatched())).collect();
+    let share_notes: Vec<String> = seconds.iter().map(|second| unwatched(second.share_unwatched())).collect();
+
     let has_camera = camera.iter().any(|point| point.cap.is_some());
     // "Shared within the minute", not "sharing now": a share that just ended
     // keeps its chart, and the total, until its seconds have scrolled away.
@@ -146,13 +169,13 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
         p { class: "mt-4 font-mono text-xs text-neutral-300", "{whole}" }
         Heading { text: "Camera" }
         if has_camera {
-            Chart { points: camera, draw_cap: true, link: SLICE }
+            Chart { points: camera, draw_cap: true, link: SLICE, notes: camera_notes }
         } else {
             p { class: "text-sm text-neutral-300", "The camera is not sending." }
         }
         if has_share {
             Heading { text: "Screen share" }
-            Chart { points: share, draw_cap: true, link: SLICE }
+            Chart { points: share, draw_cap: true, link: SLICE, notes: share_notes }
             Heading { text: "Everything sent" }
             Chart { points: total, draw_cap: false, link: ESTIMATE }
             p { class: "mt-1 text-xs text-neutral-500", "Video only: audio is not included." }
@@ -160,6 +183,8 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
     }
 }
 
+/// Said after a second's figures when nobody was subscribed to the stream.
+const UNWATCHED: &str = "no one is watching: encoded, not uploaded";
 /// What a stream's dashed line is: its own slice of the link.
 const SLICE: &str = "slice of the link";
 /// What the total's dashed line is: the whole connection's estimate.
@@ -171,18 +196,32 @@ const ESTIMATE: &str = "link estimate";
 /// Every line follows its own value second by second, so a cap that changed
 /// mid-minute (Sharp turned on, the camera reopening at another size) shows
 /// where it changed.
+///
+/// `step` is the seconds between points and `smooth` how many the sent line
+/// averages over: our own charts are a point a second, averaged over five; a
+/// peer's are a point per report, each already an average, so not again.
+/// `notes`, one per point when given, is said after a point's figures.
 #[component]
-fn Chart(points: Vec<Point>, draw_cap: bool, link: &'static str) -> Element {
+fn Chart(
+    points: Vec<Point>,
+    draw_cap: bool,
+    link: &'static str,
+    #[props(default = 1)] step: u32,
+    #[props(default = rates::SMOOTH)] smooth: usize,
+    #[props(default)] notes: Vec<String>,
+) -> Element {
     // Averaged before it is cut to the minute shown, over the few older
     // seconds the history keeps for this, so the left edge is a full average
     // like every other point.
     let raw: Vec<Option<u32>> = points.iter().map(|point| point.sent).collect();
     let points: Vec<Point> = points
         .iter()
-        .zip(rates::smoothed(&raw, rates::SMOOTH))
+        .zip(rates::smoothed(&raw, smooth))
         .map(|(point, sent)| Point { sent, ..*point })
         .collect();
     let slots = rates::slots(&points);
+    let note_slots = rates::slots(&notes);
+    let note_at = |index: usize| note_slots.get(index).cloned().flatten().unwrap_or_default();
     let of = |pick: fn(&Point) -> Option<u32>| -> Vec<Option<u32>> {
         slots.iter().map(|slot| slot.as_ref().and_then(pick)).collect()
     };
@@ -227,9 +266,12 @@ fn Chart(points: Vec<Point>, draw_cap: bool, link: &'static str) -> Element {
     let mut hovered = use_signal(|| None::<usize>);
     let over = hovered();
     let numbers = match over.and_then(|index| slots.get(index).copied().map(|slot| (index, slot))) {
-        Some((index, Some(point))) => numbers(&ago(index), point, draw_cap, link, top),
-        Some((index, None)) => format!("{}  \u{b7}  nothing sent yet", ago(index)),
-        None => numbers("now", points.last().copied().unwrap_or_default(), draw_cap, link, top),
+        Some((index, Some(point))) => with_note(numbers(&ago(index, step), point, draw_cap, link, top), &note_at(index)),
+        Some((index, None)) => format!("{}  \u{b7}  nothing sent yet", ago(index, step)),
+        None => with_note(
+            numbers("now", points.last().copied().unwrap_or_default(), draw_cap, link, top),
+            &notes.last().cloned().unwrap_or_default(),
+        ),
     };
     let half_label = rate(top / 2);
     let top_label = rate(top);
@@ -307,7 +349,11 @@ fn Chart(points: Vec<Point>, draw_cap: bool, link: &'static str) -> Element {
         div { class: "mt-2 flex flex-row flex-wrap items-center gap-4 text-xs text-neutral-400",
             div { class: "flex flex-row items-center gap-1.5",
                 div { class: "h-[2px] w-4 shrink-0 bg-blue-500" }
-                span { "sent (5 s average)" }
+                if smooth > 1 {
+                    span { "sent (5 s average)" }
+                } else {
+                    span { "sent" }
+                }
             }
             if !cap_line.is_empty() {
                 div { class: "flex flex-row items-center gap-1.5",
@@ -335,20 +381,18 @@ fn Chart(points: Vec<Point>, draw_cap: bool, link: &'static str) -> Element {
     }
 }
 
-/// A rate as a person reads it: `345 kbps`, `39.0 Mbps`.
-fn rate(kbps: u32) -> String {
-    match kbps {
-        0..10_000 => format!("{kbps} kbps"),
-        _ => format!("{:.1} Mbps", kbps as f64 / 1000.0),
-    }
-}
-
-/// How long ago the second in slot `index` was, the newest being the last.
-fn ago(index: usize) -> String {
-    match rates::SECONDS.saturating_sub(index + 1) {
+/// How long ago the point in slot `index` was, the newest being the last,
+/// with `step` seconds between points.
+fn ago(index: usize, step: u32) -> String {
+    match rates::SECONDS.saturating_sub(index + 1) as u32 * step {
         0 => "now".to_string(),
         seconds => format!("{seconds} s ago"),
     }
+}
+
+/// A point's figures, then its note if it has one.
+fn with_note(figures: String, note: &str) -> String {
+    if note.is_empty() { figures } else { format!("{figures}  \u{b7}  {note}") }
 }
 
 /// One second in words, e.g. `now · sent 272 kbps · cap 345 kbps · link
@@ -376,6 +420,298 @@ fn numbers(when: &str, point: Point, with_cap: bool, link: &str, top: u32) -> St
         None => {}
     }
     parts.join("  \u{b7}  ")
+}
+
+/// One person in the People section: ours first.
+#[derive(Clone, Debug, PartialEq)]
+struct Person {
+    id: String,
+    /// Their name, or their short id; "You" for us.
+    label: String,
+    you: bool,
+    /// Their own report; `None` is not reporting.
+    link: Option<Link>,
+    /// What they get from each other person, by id.
+    seen: std::collections::BTreeMap<String, Seen>,
+    /// Their reports over the last couple of minutes; empty for us.
+    history: Vec<Option<Link>>,
+}
+
+/// One cell of the grid: what the column's person gets from the row's.
+#[derive(Clone, Debug, PartialEq)]
+enum Cell {
+    /// A person against themselves: their own report's quality.
+    Own(Option<Quality>),
+    /// What the receiver said they get.
+    Seen(Seen),
+    /// The receiver is not reporting, or did not include the sender.
+    Missing,
+}
+
+impl Cell {
+    fn quality(&self) -> Option<Quality> {
+        match self {
+            Cell::Seen(seen) => Some(seen.q),
+            _ => None,
+        }
+    }
+}
+
+/// Everything the section draws, sampled off the interface.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct View {
+    people: Vec<Person>,
+    /// `grid[sender][receiver]`, both in `people`'s order.
+    grid: Vec<Vec<Cell>>,
+    blame: Blame,
+}
+
+/// The grid for `people`: rows send, columns receive.
+fn grid_of(people: &[Person]) -> Vec<Vec<Cell>> {
+    people
+        .iter()
+        .enumerate()
+        .map(|(row, sender)| {
+            people
+                .iter()
+                .enumerate()
+                .map(|(column, receiver)| {
+                    if row == column {
+                        Cell::Own(sender.link.as_ref().map(|link| link.q))
+                    } else {
+                        receiver.seen.get(&sender.id).cloned().map_or(Cell::Missing, Cell::Seen)
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The section's view, or `None` when it is not shown: the switch is off, or
+/// nobody else is here.
+fn gather(me: &str, local: &PeerStats, roster: &[(String, Arc<PeerStats>)]) -> Option<View> {
+    if !local.connection_report() || roster.is_empty() {
+        return None;
+    }
+    let mut people = vec![Person {
+        id: me.to_string(),
+        label: "You".to_string(),
+        you: true,
+        link: local.link(),
+        seen: local.seen(),
+        history: Vec::new(),
+    }];
+    for (id, stats) in roster {
+        people.push(Person {
+            id: id.clone(),
+            label: crate::name::label(stats.name().as_deref(), id),
+            you: false,
+            link: stats.link(),
+            seen: stats.seen(),
+            history: stats.reports(),
+        });
+    }
+    let grid = grid_of(&people);
+    let qualities: Vec<Vec<Option<Quality>>> =
+        grid.iter().map(|row| row.iter().map(Cell::quality).collect()).collect();
+    let blame = quality::blame(&qualities);
+    Some(View { people, grid, blame })
+}
+
+/// Everyone else in the call, once each, by their camera's entry: a share
+/// carries its sharer's, so it would only be them again.
+fn roster_of(participants: &[Participant]) -> Vec<(String, Arc<PeerStats>)> {
+    let mut roster: Vec<(String, Arc<PeerStats>)> = Vec::new();
+    for participant in participants.iter().filter(|participant| participant.feed == Feed::Camera) {
+        if !roster.iter().any(|(id, _)| *id == participant.id) {
+            roster.push((participant.id.clone(), participant.stats.clone()));
+        }
+    }
+    roster
+}
+
+/// The People section: each person's report, and the grid.
+///
+/// Sampled by a thread of its own once a second, as the charts are, and sent
+/// to the page only when what it draws changed. Who is here comes from the
+/// page's participants, handed to the thread through a lock each render.
+#[component]
+fn People(local: Arc<PeerStats>, participants: Signal<Vec<Participant>>, me: String) -> Element {
+    let roster = roster_of(&participants.read());
+    let shared = use_hook(|| Arc::new(std::sync::Mutex::new((String::new(), Vec::<(String, Arc<PeerStats>)>::new()))));
+    if let Ok(mut slot) = shared.lock() {
+        *slot = (me.clone(), roster.clone());
+    }
+    let mut view = use_signal({
+        let local = local.clone();
+        let me = me.clone();
+        move || gather(&me, &local, &roster)
+    });
+
+    let stop = use_hook(|| Arc::new(AtomicBool::new(false)));
+    use_drop({
+        let stop = stop.clone();
+        move || stop.store(true, Ordering::Relaxed)
+    });
+    let tx = use_channel(move |next: Option<View>| view.set(next));
+    use_hook({
+        let local = local.clone();
+        let shared = shared.clone();
+        let stop = stop.clone();
+        let first = view.peek().clone();
+        move || {
+            let spawned = std::thread::Builder::new()
+                .name("network-people".into())
+                .spawn(move || {
+                    let mut sent = first;
+                    loop {
+                        std::thread::sleep(POLL);
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let (me, roster) = shared.lock().map(|slot| slot.clone()).unwrap_or_default();
+                        let next = gather(&me, &local, &roster);
+                        // Only a change is sent: any message wakes the page.
+                        if next != sent {
+                            if tx.unbounded_send(next.clone()).is_err() {
+                                return;
+                            }
+                            sent = next;
+                        }
+                    }
+                });
+            if let Err(error) = spawned {
+                tracing::warn!("could not spawn the people poller: {error}");
+            }
+        }
+    });
+
+    let Some(now) = view() else { return rsx! {} };
+    let View { people, grid, blame } = now;
+    let shown_grid = people.len() >= 2;
+    let download: Vec<String> = blame
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, flagged)| **flagged)
+        .map(|(column, _)| format!("{} ({}): their download?", column + 1, people[column].label))
+        .collect();
+
+    rsx! {
+        Heading { text: "People" }
+        p { class: "text-xs text-neutral-500",
+            "What each person says about their own connection, rounded. Others' charts are built from their reports: the last 2 minutes, one point every 2 seconds."
+        }
+        for person in people.iter().cloned() {
+            PersonRow { key: "{person.id}", person }
+        }
+        if shown_grid {
+            Heading { text: "Who gets what" }
+            p { class: "mb-3 text-xs text-neutral-500",
+                "Rows send, columns receive, numbered as the rows. Each cell is what that column's person gets from that row's: frames a second, and how much later than its best their video arrives. The diagonal is each person's own connection."
+            }
+            div { class: "flex flex-row items-end gap-[2px]",
+                div { class: "w-[120px] shrink-0" }
+                for column in 0..people.len() {
+                    div {
+                        key: "{column}",
+                        class: if blame.columns.get(column).copied().unwrap_or(false) {
+                            "w-[40px] shrink-0 text-center text-xs font-semibold text-red-400"
+                        } else {
+                            "w-[40px] shrink-0 text-center text-xs text-neutral-400"
+                        },
+                        "{column + 1}"
+                    }
+                }
+            }
+            for (row, cells) in grid.iter().cloned().enumerate() {
+                div { key: "{row}", class: "mt-[2px] flex flex-row items-center gap-[2px]",
+                    div { class: "flex h-[34px] w-[120px] shrink-0 flex-col justify-center pr-2",
+                        span { class: "truncate text-xs text-neutral-200", "{row + 1}  {people[row].label}" }
+                        if blame.rows.get(row).copied().unwrap_or(false) {
+                            span { class: "text-[10px] text-red-400", "their upload?" }
+                        }
+                    }
+                    for (column, cell) in cells.into_iter().enumerate() {
+                        GridCell { key: "{column}", cell }
+                    }
+                }
+            }
+            for line in download {
+                p { class: "mt-2 text-xs text-red-400", "{line}" }
+            }
+        }
+    }
+}
+
+/// One person: their bars and name, their figures, and for others a chart.
+#[component]
+fn PersonRow(person: Person) -> Element {
+    let figures = person.link.as_ref().map(|link| quality::figures(link).join("  \u{b7}  "));
+    let points: Vec<Point> = person.history.iter().map(|link| quality::chart_point(link.as_ref())).collect();
+    let notes: Vec<String> = person.history.iter().map(|link| link.as_ref().map(quality::note).unwrap_or_default()).collect();
+    let charted = !person.you && points.iter().any(|point| point.sent.is_some() || point.cap.is_some());
+    rsx! {
+        div { class: "mt-4 flex flex-col",
+            div { class: "flex flex-row items-center gap-2",
+                if let Some(link) = person.link.as_ref() {
+                    SignalBars { quality: link.q }
+                }
+                span { class: "truncate text-sm text-neutral-100", "{person.label}" }
+                if let Some(link) = person.link.as_ref() {
+                    span { class: "text-xs text-neutral-400", {link.q.words()} }
+                }
+            }
+            match figures {
+                Some(figures) => rsx! { p { class: "mt-1 font-mono text-xs text-neutral-300", "{figures}" } },
+                None => rsx! { p { class: "mt-1 text-xs text-neutral-500", "not reporting (older version or turned off)" } },
+            }
+            if charted {
+                div { class: "mt-2",
+                    Chart { points, draw_cap: true, link: ESTIMATE, step: 2, smooth: 1, notes }
+                }
+            }
+        }
+    }
+}
+
+/// One grid cell, fixed in size so twelve fit the pane.
+#[component]
+fn GridCell(cell: Cell) -> Element {
+    match cell {
+        Cell::Own(quality) => rsx! {
+            div { class: "flex h-[34px] w-[40px] shrink-0 items-center justify-center rounded border border-neutral-600 bg-neutral-900",
+                if let Some(quality) = quality {
+                    SignalBars { quality }
+                }
+            }
+        },
+        Cell::Seen(seen) => {
+            let fps = seen.fps.map_or("\u{2013}".to_string(), |fps| format!("{fps} fps"));
+            let late = seen.ms.map_or(String::new(), |ms| format!("{ms} ms"));
+            rsx! {
+                div { class: cell_class(seen.q),
+                    span { "{fps}" }
+                    span { "{late}" }
+                }
+            }
+        }
+        Cell::Missing => rsx! {
+            div { class: "flex h-[34px] w-[40px] shrink-0 items-center justify-center rounded bg-neutral-900 text-[10px] text-neutral-600",
+                "\u{2013}"
+            }
+        },
+    }
+}
+
+/// A received cell's look, by its quality. Whole literals, as everywhere.
+fn cell_class(quality: Quality) -> &'static str {
+    match quality {
+        Quality::Good => "flex h-[34px] w-[40px] shrink-0 flex-col items-center justify-center rounded bg-emerald-900 text-[10px] leading-tight text-neutral-100",
+        Quality::Held => "flex h-[34px] w-[40px] shrink-0 flex-col items-center justify-center rounded bg-amber-900 text-[10px] leading-tight text-neutral-100",
+        Quality::Poor => "flex h-[34px] w-[40px] shrink-0 flex-col items-center justify-center rounded bg-red-900 text-[10px] leading-tight text-neutral-100",
+        Quality::Unknown => "flex h-[34px] w-[40px] shrink-0 flex-col items-center justify-center rounded bg-neutral-800 text-[10px] leading-tight text-neutral-300",
+    }
 }
 
 #[cfg(test)]
@@ -419,10 +755,55 @@ mod tests {
         );
     }
 
+    fn person(id: &str, link: Option<Link>, seen: &[(&str, Quality)]) -> Person {
+        Person {
+            id: id.to_string(),
+            label: id.to_string(),
+            you: false,
+            link,
+            seen: seen.iter().map(|(id, q)| (id.to_string(), Seen { q: *q, ..Seen::default() })).collect(),
+            history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rows_send_columns_receive_and_the_diagonal_is_their_own() {
+        let held = Link { q: Quality::Held, ..Link::default() };
+        let people = [
+            person("a", Some(held), &[("b", Quality::Poor)]),
+            person("b", None, &[]),
+            person("c", Some(Link::default()), &[("a", Quality::Good), ("b", Quality::Held)]),
+        ];
+        let grid = grid_of(&people);
+        assert_eq!(grid[0][0], Cell::Own(Some(Quality::Held)));
+        assert_eq!(grid[1][1], Cell::Own(None), "not reporting");
+        // What c gets from a, and what a gets from b.
+        assert_eq!(grid[0][2].quality(), Some(Quality::Good));
+        assert_eq!(grid[1][0].quality(), Some(Quality::Poor));
+        assert_eq!(grid[1][2].quality(), Some(Quality::Held));
+        // b says nothing about anyone; a says nothing about c.
+        assert_eq!(grid[0][1], Cell::Missing);
+        assert_eq!(grid[2][0], Cell::Missing);
+    }
+
+    #[test]
+    fn nothing_is_gathered_with_the_switch_off_or_nobody_else_here() {
+        let local = PeerStats::default();
+        let peer = Arc::new(PeerStats::default());
+        let roster = vec![("b".to_string(), peer)];
+        assert!(gather("a", &local, &[]).is_none());
+        let view = gather("a", &local, &roster).expect("on by default");
+        assert_eq!(view.people.len(), 2);
+        assert!(view.people[0].you);
+        local.set_connection_report(false);
+        assert!(gather("a", &local, &roster).is_none());
+    }
+
     #[test]
     fn the_newest_slot_is_now() {
-        assert_eq!(ago(rates::SECONDS - 1), "now");
-        assert_eq!(ago(rates::SECONDS - 13), "12 s ago");
-        assert_eq!(ago(0), "59 s ago");
+        assert_eq!(ago(rates::SECONDS - 1, 1), "now");
+        assert_eq!(ago(rates::SECONDS - 13, 1), "12 s ago");
+        assert_eq!(ago(0, 1), "59 s ago");
+        assert_eq!(ago(rates::SECONDS - 13, 2), "24 s ago", "a peer's chart is a point per report");
     }
 }

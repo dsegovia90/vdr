@@ -40,6 +40,17 @@ pub struct Second {
 }
 
 impl Second {
+    /// Whether the camera was encoding with nobody subscribed: the connection
+    /// had an estimate and the camera no slice of it.
+    pub fn camera_unwatched(&self) -> bool {
+        self.camera_cap.is_some() && self.camera_slice.is_none() && self.estimate.is_some()
+    }
+
+    /// As [`camera_unwatched`](Self::camera_unwatched), for the share.
+    pub fn share_unwatched(&self) -> bool {
+        self.share_cap.is_some() && self.share_slice.is_none() && self.estimate.is_some()
+    }
+
     fn is_empty(&self) -> bool {
         *self == Second::default()
     }
@@ -143,11 +154,19 @@ impl Point {
 /// `points` laid into [`SECONDS`] slots, newest at the right, empty slots on
 /// the left until the history is full. Keeps the time axis fixed, so a bar's
 /// position always means the same age.
-pub fn slots(points: &[Point]) -> Vec<Option<Point>> {
+pub fn slots<T: Clone>(points: &[T]) -> Vec<Option<T>> {
     let points = &points[points.len().saturating_sub(SECONDS)..];
     let mut slots = vec![None; SECONDS - points.len()];
-    slots.extend(points.iter().copied().map(Some));
+    slots.extend(points.iter().cloned().map(Some));
     slots
+}
+
+/// A rate as a person reads it: `345 kbps`, `39.0 Mbps`.
+pub fn kbps_words(kbps: u32) -> String {
+    match kbps {
+        0..10_000 => format!("{kbps} kbps"),
+        _ => format!("{:.1} Mbps", kbps as f64 / 1000.0),
+    }
 }
 
 /// The value at the top of a chart, in kbps: the larger of the highest cap
@@ -354,6 +373,27 @@ mod tests {
         assert_eq!((Point::camera(&second).target, Point::camera(&second).link), (Some(400), Some(300)));
         assert_eq!((Point::share(&second).target, Point::share(&second).link), (Some(1800), Some(1700)));
         assert_eq!((Point::total(&second).target, Point::total(&second).link), (None, Some(2100)));
+    }
+
+    #[test]
+    fn a_stream_with_a_link_and_no_slice_is_unwatched() {
+        let alone = Second {
+            camera_cap: Some(345),
+            share_cap: Some(2500),
+            estimate: Some(12_000),
+            ..Second::default()
+        };
+        assert!(alone.camera_unwatched() && alone.share_unwatched());
+        let watched = Second {
+            camera_slice: Some(345),
+            share_slice: Some(0),
+            ..alone
+        };
+        assert!(!watched.camera_unwatched(), "a slice is someone asking");
+        assert!(!watched.share_unwatched(), "starved is watched");
+        // No estimate says nothing about who watches, and no encoder nothing at all.
+        assert!(!Second { estimate: None, ..alone }.camera_unwatched());
+        assert!(!Second { camera_cap: None, ..alone }.camera_unwatched());
     }
 
     #[test]
