@@ -14,7 +14,7 @@ use std::time::Duration;
 use dioxus_native::prelude::*;
 
 use super::device_menu::OpenMenu;
-use super::tile_menu::{TileMenu, menu_name};
+use super::tile_menu::{TileMenu, menu_name, move_item};
 use super::{Invites, MicIcon, Names, OwnShare, ParticipantVideo, PersonIcon, Rooms, SignalBars, Through};
 use crate::audio::Crosstalk;
 use crate::camera::{FrameSlot, Mirror};
@@ -336,10 +336,16 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     };
     // Read the same way, as the menu opens: whether they host, and whether
     // the call is on them already.
-    let move_here = open
-        && props.local.move_calls()
-        && props.stats.as_ref().is_some_and(|stats| stats.hosts_room())
-        && props.local.call_host().as_deref() != Some(props.who.as_str());
+    let moving = if open {
+        move_item(
+            props.local.move_calls(),
+            props.stats.as_ref().is_some_and(|stats| stats.hosts_room()),
+            props.local.call_host().as_deref(),
+            &props.who,
+        )
+    } else {
+        None
+    };
     // **No z-index while closed**, so the dim layer still covers it; lifted
     // above its own click-away layer while open, so a second click closes it.
     let label = if mine {
@@ -416,7 +422,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                     their_room: now.room.clone(),
                     their_mic: now.mic_on,
                     connection,
-                    move_here,
+                    moving,
                     our_room,
                     local: props.local.clone(),
                     me: props.me.clone(),

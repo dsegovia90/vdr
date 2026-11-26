@@ -120,7 +120,10 @@ pub fn ExperimentalTab(local: Arc<PeerStats>, me: String) -> Element {
     });
     let where_now = match call_on() {
         None => "On the relay, or wherever the usual order puts it when the relay is down.".to_string(),
-        Some(id) => format!("On host {}. Everyone following moves sends their video through that computer.", crate::name::short(&id)),
+        Some(id) => format!(
+            "On host {}. Everyone following moves sends their video through that computer. Moving it back puts it on the relay, or on a host while the relay is unreachable.",
+            crate::name::short(&id)
+        ),
     };
     let movers = local.clone();
     let back = local.clone();
@@ -220,7 +223,7 @@ pub fn ExperimentalTab(local: Arc<PeerStats>, me: String) -> Element {
                                 back.move_call(None, &me);
                                 call_on.set(back.call_host());
                             },
-                            "Back to automatic"
+                            "Move the call back to the relay"
                         }
                     }
                 }

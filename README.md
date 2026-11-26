@@ -172,8 +172,10 @@ without closing still freezes the call until its connection times out.
 *Move the call*, off by default, is a test instrument for rooms with hosts:
 with it on, a host's menu offers "Move the call here", and everyone else who
 has the switch on follows the move, sending their video through that host's
-computer until someone chooses "Back to automatic" in the same tab. People
-who cannot reach the host stay on the relay, and the host carries them across.
+computer until someone chooses "Move the call back to the relay", in that
+host's menu or in the same tab (a host still carries the call while the relay
+is unreachable). People who cannot reach the host stay on the relay, and the
+host carries them across.
 Its *About* tab shows the version and where the
 log is, which is what to send after a call that went wrong.
 
