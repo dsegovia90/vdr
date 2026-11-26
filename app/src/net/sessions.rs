@@ -772,6 +772,9 @@ pub(super) fn join(args: Join) -> Peer {
         .collect();
     let hosts = members.len() - 1;
     tracing::info!("dialling the relay and {hosts} saved hosts");
+    // Said in our `routes.json`, so whoever reads it can tell our gates from
+    // a relay in the chains of our media: to anyone else they look alike.
+    local.set_gates(members.iter().filter_map(|member| member.gate.as_ref()).map(|gate| gate.origin.hop().id()).collect());
     // Where the call is said to be as we join, so its host is dialled at its
     // price from the start rather than dialled twice.
     let mut chosen = chosen_member(&members, &local);
@@ -2282,7 +2285,7 @@ mod socket_tests {
                 loop {
                     if let Some(route) = route_within(&inbound, &camera_path("m")).await {
                         let hops: Vec<u64> = route.hops.as_slice().iter().map(|hop| hop.id()).collect();
-                        let known = arrival::Known { theirs: None, hosts: &hosts, guests: &guests, ours: 0, far: None, who: "m" };
+                        let known = arrival::Known { theirs: None, hosts: &hosts, guests: &guests, ours: 0, far: None, who: "m", venue: &guests };
                         last = arrival::read(&hops, &known);
                         if last.as_ref() == Some(&wanted) {
                             return;

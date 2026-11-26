@@ -694,6 +694,32 @@ const CONTROL: &str = "control";
 /// The document inside it.
 const PRESENCE: &str = "presence.json";
 
+/// Beside it: how every other person's media reaches this one, for the
+/// room map (`web` says what the document holds).
+///
+/// **A track of its own, asked for on demand**, rather than more presence.
+/// A hundred people each describing ninety-nine paths is kilobytes a
+/// person, worth sending only to someone looking at the map. A subscription
+/// is what makes a publisher serve a track, so a track nobody has asked for
+/// costs nothing on the wire; and its writer works out and writes nothing
+/// while it is unused (`publish_routes`), so it costs no work either.
+/// Readers ask only while their map is open (`attend`). An older build
+/// neither publishes nor asks for it.
+const ROUTES: &str = "routes.json";
+
+/// What a routes read asks of the publisher: below audio and video, since
+/// it is drawn and never heard, and a few hundred bytes every few seconds.
+const ROUTES_PRIORITY: u8 = 50;
+
+/// How long a peer whose routes could not be asked for is left before
+/// asking again. An older build has none, and asking it every quarter
+/// second, as presence is asked for again, would be a request per peer for
+/// nothing.
+const ROUTES_AGAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the routes writer looks for a change while it is used.
+const ROUTES_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// How long a departed participant's reader may keep running to deliver their
 /// last word. Generous: it only ever runs out on a reader that hears nothing.
 const GOODBYE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1259,6 +1285,12 @@ async fn run(
         // The first word already carries the camera and microphone as they
         // are, so joining muted is announced from the start.
         say(&presence, Presence::here(&local));
+        // Beside presence, and written only while someone is subscribed: the
+        // room map is the only reader, and it asks only while it is open.
+        let routes_track = control
+            .create_track(ROUTES, None)
+            .map_err(|error| format!("could not create a routes track: {error:#}"))?;
+        let _routes_out = Abort(tokio::spawn(publish_routes(routes_track, local.clone())));
         // Advertised only now that the presence track exists: an announce is
         // acted on at once, so a peer must find the document waiting.
         control
@@ -2258,6 +2290,8 @@ async fn attend(
     // as it changes, so a host's presence has had time to name its hop.
     let mut chains: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
     let mut routes: std::collections::HashMap<String, arrival::Arrival> = std::collections::HashMap::new();
+    // Whose `routes.json` we read, while our map is open: none otherwise.
+    let mut following: std::collections::HashMap<String, Abort> = std::collections::HashMap::new();
 
     loop {
         let update = tokio::select! {
@@ -2267,7 +2301,8 @@ async fn attend(
             },
             _ = stats_tick.tick() => {
                 reporter.tick(std::time::Instant::now(), &metrics, &rooms.local, &people, &present, &me);
-                note_routes(&chains, &people, &mut routes, &routing, in_room);
+                note_routes(&chains, &people, &mut routes, &routing, in_room, &rooms.local, &me);
+                follow_all_routes(&rooms.local, &present, &people, &mut following, &inbound);
                 if let Some(file) = stats_file.as_mut() {
                     write_stats(file, &me, &people, &metrics);
                 }
@@ -2521,6 +2556,10 @@ async fn attend(
 /// scripted run can be judged from the log. Nobody is read before their
 /// presence has arrived: until then, a host would read as the relay.
 ///
+/// **And works out our `routes.json`, only while it is wanted**: someone
+/// subscribed to it, or our own map open. Otherwise nothing beyond the
+/// arrivals is worked out, and the last document is let go.
+///
 /// Outside a room (a call dialled to one peer) there is nobody between.
 fn note_routes(
     chains: &std::collections::HashMap<String, Vec<u64>>,
@@ -2528,6 +2567,8 @@ fn note_routes(
     said: &mut std::collections::HashMap<String, arrival::Arrival>,
     routing: &Routing,
     in_room: bool,
+    local: &PeerStats,
+    me: &str,
 ) {
     let hosts: std::collections::BTreeMap<u64, String> = people
         .iter()
@@ -2535,29 +2576,99 @@ fn note_routes(
         .collect();
     let guests = routing.guests.hops();
     let far = routing.far.as_deref().filter(|far| people.contains_key(*far));
+    let wanted = local.routes_wanted() || local.map_open();
+    let heard = |id: &String| people.get(id).filter(|stats| stats.heard());
+    // The far side of our session to the meeting place, from every chain
+    // that ends there: what names the relay further back in another's.
+    let mut venue = std::collections::HashSet::new();
+    if wanted && in_room {
+        let none = std::collections::HashSet::new();
+        for (id, hops) in chains {
+            let Some(stats) = heard(id) else { continue };
+            let reading = arrival::Known { theirs: stats.host_hop(), hosts: &hosts, guests: &guests, ours: routing.ours, far, who: id, venue: &none };
+            if arrival::ends_at_venue(hops, &reading) {
+                venue.extend(hops.last().copied());
+            }
+        }
+    }
+    let gates = if wanted { arrival::own_gates(chains.values().map(Vec::as_slice)) } else { Default::default() };
+    let mut paths: std::collections::BTreeMap<String, Option<Vec<super::web::Hop>>> = std::collections::BTreeMap::new();
     for (id, hops) in chains {
-        let Some(stats) = people.get(id).filter(|stats| stats.heard()) else { continue };
-        let arrival = if in_room {
-            arrival::read(
-                hops,
-                &arrival::Known {
-                    theirs: stats.host_hop(),
-                    hosts: &hosts,
-                    guests: &guests,
-                    ours: routing.ours,
-                    far,
-                    who: id,
-                },
-            )
-        } else {
-            Some(arrival::Arrival::Direct)
-        };
+        let Some(stats) = heard(id) else { continue };
+        let reading = arrival::Known { theirs: stats.host_hop(), hosts: &hosts, guests: &guests, ours: routing.ours, far, who: id, venue: &venue };
+        if wanted {
+            let path = if in_room { arrival::path_of(hops, &reading) } else { Some(Vec::new()) };
+            let path = path.map(|mut path| {
+                path.retain(|hop| !matches!(hop, super::web::Hop::Unnamed(hop) if gates.contains(hop)));
+                path
+            });
+            paths.insert(id.clone(), path);
+        }
+        let arrival = if in_room { arrival::read(hops, &reading) } else { Some(arrival::Arrival::Direct) };
         let Some(arrival) = arrival else { continue };
         if said.get(id) != Some(&arrival) {
             tracing::info!("{id} now arrives {}", arrival::arrival_log(&arrival));
             stats.set_arrival(Some(arrival.clone()));
             said.insert(id.clone(), arrival);
         }
+    }
+    if !wanted {
+        if local.routes_out().is_some() {
+            local.set_routes_out(None);
+        }
+        return;
+    }
+    // Someone heard whose broadcast has no route to us: not received.
+    for (id, _) in people.iter().filter(|(id, stats)| stats.heard() && id.as_str() != me) {
+        paths.entry(id.clone()).or_insert(None);
+    }
+    let mut roster: Vec<&str> = people.keys().map(String::as_str).chain(std::iter::once(me)).collect();
+    roster.sort_unstable();
+    let routes = super::web::Routes {
+        origin: routing.ours,
+        gates: local.gates(),
+        venue: {
+            let mut venue: Vec<u64> = venue.into_iter().collect();
+            venue.sort_unstable();
+            venue
+        },
+        paths,
+    };
+    let document: Arc<[u8]> = super::web::say_routes(&routes, &roster).into();
+    if local.routes_out().as_deref() != Some(&*document) {
+        local.set_routes_out(Some(document));
+    }
+}
+
+/// Keeps one routes reader per person present while our map is open, and
+/// none while it is closed: what makes the map cost nothing unseen. Logged
+/// as it starts and stops, so a run shows that no `routes` subscription is
+/// left behind.
+fn follow_all_routes(
+    local: &PeerStats,
+    present: &std::collections::HashSet<String>,
+    people: &std::collections::HashMap<String, Arc<PeerStats>>,
+    following: &mut std::collections::HashMap<String, Abort>,
+    inbound: &moq_net::origin::Consumer,
+) {
+    if !local.map_open() {
+        if !following.is_empty() {
+            tracing::info!("the room map closed: following nobody's routes");
+            following.clear();
+        }
+        return;
+    }
+    let before = following.len();
+    following.retain(|id, _| present.contains(id));
+    for id in present {
+        if following.contains_key(id) {
+            continue;
+        }
+        let Some(stats) = people.get(id) else { continue };
+        following.insert(id.clone(), Abort(tokio::spawn(follow_routes(inbound.clone(), id.clone(), stats.clone()))));
+    }
+    if following.len() != before {
+        tracing::info!("the room map is open: following {} people's routes", following.len());
     }
 }
 
@@ -2671,6 +2782,141 @@ async fn announce(
             say(&presence, now.clone());
             said = now;
             said_at = tokio::time::Instant::now();
+        }
+    }
+}
+
+/// Writes our `routes.json` while anyone is subscribed to it, and nothing
+/// while nobody is.
+///
+/// **On the used edge, on any change, and every [`super::fresh::HEARTBEAT`]**:
+/// each document a group of its own, as presence is, and written again
+/// unchanged, because a reader carried across a change of route waits for
+/// a group that may never come otherwise (`fresh.rs`). While unused it
+/// waits on the track, no timer running, and says so on our entry, so the
+/// attendance loop stops working routes out too; the last document is
+/// dropped, so a later reader never gets a stale one first.
+///
+/// The library counts every live handle to the track as a use: one per
+/// subscription a session serves (read in moq-net's publisher), so a
+/// subscriber anywhere downstream is one here, through a relay too, which
+/// holds its upstream subscription while someone reads through it
+/// (inferred, not read in the relay).
+async fn publish_routes(mut track: moq_net::track::Producer, local: Arc<PeerStats>) {
+    loop {
+        if track.used().await.is_err() {
+            return;
+        }
+        tracing::info!("our routes are asked for");
+        local.set_routes_wanted(true);
+        let mut last: Option<Arc<[u8]>> = None;
+        let mut written = tokio::time::Instant::now();
+        let mut ticker = tokio::time::interval(ROUTES_TICK);
+        let closed = loop {
+            tokio::select! {
+                gone = track.unused() => break gone.is_err(),
+                _ = ticker.tick() => {}
+            }
+            // Nothing until the attendance loop has worked it out, within its
+            // second.
+            let Some(now) = local.routes_out() else { continue };
+            if last.as_ref() != Some(&now) || written.elapsed() >= super::fresh::HEARTBEAT {
+                if let Err(error) = track.write_frame(moq_net::Timestamp::now(), now.to_vec()) {
+                    tracing::warn!("could not publish our routes: {error:#}");
+                }
+                last = Some(now);
+                written = tokio::time::Instant::now();
+            }
+        };
+        local.set_routes_wanted(false);
+        // Our own map reads it too, and keeps it while open.
+        if !local.map_open() {
+            local.set_routes_out(None);
+        }
+        if closed {
+            return;
+        }
+        tracing::info!("our routes are no longer asked for");
+    }
+}
+
+/// Reads one peer's `routes.json` onto their entry, for as long as it runs:
+/// `attend` keeps one per person while our map is open and drops it when it
+/// closes or they leave, which takes what they said off their entry.
+///
+/// Asked for again as presence is when a read ends; one that hears nothing
+/// within [`follow::PATIENCE`] of starting, or for a heartbeat and that
+/// again after a document, is given up and asked again, since a reader
+/// carried to a new route may wait for good. A peer without the track (an
+/// older build) is asked again only after [`ROUTES_AGAIN`].
+async fn follow_routes(inbound: moq_net::origin::Consumer, id: String, stats: Arc<PeerStats>) {
+    struct Forget(Arc<PeerStats>);
+    impl Drop for Forget {
+        fn drop(&mut self) {
+            self.0.set_reported(None);
+        }
+    }
+    let _forget = Forget(stats.clone());
+    // Reads in a row that heard nothing: the first is asked again at once.
+    let mut quiet = 0u32;
+    loop {
+        let wait = match read_routes(&inbound, &id, &stats).await {
+            RoutesRead::Missing => ROUTES_AGAIN,
+            RoutesRead::Quiet => {
+                quiet += 1;
+                if quiet >= 2 { ROUTES_AGAIN } else { follow::AGAIN }
+            }
+            RoutesRead::Ended => {
+                quiet = 0;
+                follow::AGAIN
+            }
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// How one read of someone's routes ended.
+enum RoutesRead {
+    /// It could not be asked for: they have no such track, or are gone.
+    Missing,
+    /// Asked for, and nothing came.
+    Quiet,
+    /// It was heard, then ended or went quiet.
+    Ended,
+}
+
+async fn read_routes(inbound: &moq_net::origin::Consumer, id: &str, stats: &PeerStats) -> RoutesRead {
+    let Ok(broadcast) = inbound.request_broadcast(control_path(id).as_str()).await else {
+        return RoutesRead::Missing;
+    };
+    let Ok(track) = broadcast.track(ROUTES) else { return RoutesRead::Missing };
+    let subscription = moq_net::track::Subscription::default().with_priority(ROUTES_PRIORITY);
+    let subscriber = match tokio::time::timeout(follow::PATIENCE, track.subscribe(subscription)).await {
+        Ok(Ok(subscriber)) => subscriber,
+        Ok(Err(error)) => {
+            tracing::debug!("{id} has no routes to follow: {error:#}");
+            return RoutesRead::Missing;
+        }
+        Err(_) => return RoutesRead::Missing,
+    };
+    let mut groups = subscriber.ordered();
+    let mut heard = false;
+    loop {
+        let limit = if heard { super::fresh::HEARTBEAT + follow::PATIENCE } else { follow::PATIENCE };
+        let mut group = match tokio::time::timeout(limit, groups.next_group()).await {
+            Ok(Ok(Some(group))) => group,
+            Ok(Ok(None)) | Ok(Err(_)) if !heard => return RoutesRead::Missing,
+            Ok(Ok(None)) | Ok(Err(_)) => return RoutesRead::Ended,
+            Err(_) if heard => return RoutesRead::Ended,
+            Err(_) => return RoutesRead::Quiet,
+        };
+        let Ok(Ok(Some(frame))) = tokio::time::timeout(follow::PATIENCE, group.read_frame()).await else { continue };
+        match super::web::read_routes(&frame.payload, id) {
+            Some(reported) => {
+                stats.set_reported(Some(Arc::new(reported)));
+                heard = true;
+            }
+            None => tracing::debug!("{id}'s routes could not be read ({} bytes)", frame.payload.len()),
         }
     }
 }
@@ -4877,5 +5123,82 @@ mod said_tests {
         say(&presence, said.clone());
         let again = tokio::time::timeout(wait, reading.next()).await.expect("said again, unchanged");
         assert_eq!(again.unwrap(), Some(said));
+    }
+
+    /// Our routes: nothing written while nobody is subscribed, written on
+    /// the used edge and on a change, and quiet again once they go.
+    #[tokio::test]
+    async fn the_routes_writer_is_quiet_while_nobody_reads() {
+        let origin = moq_tokio::origin::spawn();
+        let control = origin.create_broadcast(control_path("someone")).unwrap();
+        let track = control.create_track(ROUTES, None).unwrap();
+        let watch = track.clone();
+        control.announce(moq_net::origin::Route::default()).unwrap();
+        let local = Arc::new(PeerStats::default());
+        let first: Arc<[u8]> = Arc::from(&br#"{"v":1}"#[..]);
+        local.set_routes_out(Some(first.clone()));
+        let _writer = Abort(tokio::spawn(publish_routes(track, local.clone())));
+        let wait = std::time::Duration::from_secs(2);
+
+        tokio::time::sleep(ROUTES_TICK * 3).await;
+        assert_eq!(watch.latest(), None, "nothing written while unused");
+        assert!(!local.routes_wanted());
+
+        let broadcast = origin.consume().request_broadcast(control_path("someone").as_str()).await.unwrap();
+        let subscriber = broadcast.track(ROUTES).unwrap().subscribe(moq_net::track::Subscription::default()).await.unwrap();
+        let mut reader = subscriber.ordered();
+        {
+            let mut group = tokio::time::timeout(wait, reader.next_group()).await.expect("written on the used edge").unwrap().unwrap();
+            assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], &first[..]);
+        }
+        assert!(local.routes_wanted());
+
+        let changed: Arc<[u8]> = Arc::from(&br#"{"v":1,"n":1}"#[..]);
+        local.set_routes_out(Some(changed.clone()));
+        {
+            let mut group = tokio::time::timeout(wait, reader.next_group()).await.expect("a change goes at once").unwrap().unwrap();
+            assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], &changed[..]);
+        }
+
+        drop((reader, broadcast));
+        tokio::time::sleep(ROUTES_TICK * 2).await;
+        assert!(!local.routes_wanted());
+        assert_eq!(local.routes_out(), None, "the last document is let go while our map is closed");
+        let after = watch.latest();
+        local.set_routes_out(Some(first));
+        tokio::time::sleep(ROUTES_TICK * 4).await;
+        assert_eq!(watch.latest(), after, "quiet again");
+    }
+
+    /// Routes are worked out only while someone wants them, and say every
+    /// peer we hear.
+    #[test]
+    fn routes_are_worked_out_only_while_wanted() {
+        let (b, c) = ("b".repeat(64), "c".repeat(64));
+        let people: std::collections::HashMap<String, Arc<PeerStats>> =
+            [b.clone(), c.clone()].into_iter().map(|id| (id, Arc::new(PeerStats::default()))).collect();
+        for stats in people.values() {
+            stats.set_heard();
+        }
+        let chains = std::collections::HashMap::from([(b.clone(), vec![20, 21, 99]), (c.clone(), vec![30, 31, 99])]);
+        let routing = Routing { guests: Arc::default(), ours: 10, far: None };
+        let local = PeerStats::default();
+        let me = "a".repeat(64);
+        let mut said = std::collections::HashMap::new();
+        note_routes(&chains, &people, &mut said, &routing, true, &local, &me);
+        assert_eq!(local.routes_out(), None);
+        assert_eq!(said.len(), 2, "arrivals are read either way");
+        local.set_map_open(true);
+        note_routes(&chains, &people, &mut said, &routing, true, &local, &me);
+        let document = local.routes_out().expect("worked out while the map is open");
+        let reported = super::super::web::read_routes(&document, &me).unwrap();
+        // Each one's gate is in their chain alone, so theirs; the relay's hop
+        // ends both chains, so it is the meeting place.
+        assert_eq!(reported.default, Some(vec![super::super::web::Hop::Venue]));
+        assert!(reported.except.is_empty());
+        assert_eq!((reported.origin, reported.venue.as_slice(), reported.heard), (Some(10), &[99][..], Some(2)));
+        local.set_map_open(false);
+        note_routes(&chains, &people, &mut said, &routing, true, &local, &me);
+        assert_eq!(local.routes_out(), None);
     }
 }
