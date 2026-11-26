@@ -153,7 +153,7 @@ pub fn ExperimentalTab(local: Arc<PeerStats>, me: String) -> Element {
                 Row {
                     title: "Host rooms I'm in",
                     first: false,
-                    description: "While you are in a room, its members can also connect through your computer, and their apps remember how, so the room can still meet if its relay is down. Their video may then travel over your connection and use your upload. Takes effect the next time you join a room.",
+                    description: "While you are in a room, its members can also connect through your computer, and their apps remember how, so the room can still meet if its relay is down. Their video may then travel over your connection and use your upload. Turning it off takes effect at once. Turning it on takes effect at once in a room you joined with it on, and otherwise the next time you join a room.",
                     Switch {
                         on: hosting(),
                         onclick: move |_| {

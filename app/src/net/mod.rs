@@ -331,7 +331,8 @@ pub fn use_remote() -> Remote {
         // Whether we report our connection and show others'; the Experimental
         // tab changes it from here on, and the call reads it as it goes.
         local.set_connection_report(saved.connection_report_on());
-        // Whether we host the rooms we join; read by each join as it starts.
+        // Whether we host the rooms we join: read by each join as it starts,
+        // and by a join that started with it on for as long as it lasts.
         local.set_host_rooms(saved.hosts_rooms() || crate::args::Args::get().host_rooms);
         // Whether we follow moves of the call; the Experimental tab changes it.
         local.set_move_calls(saved.moves_calls() || crate::args::Args::get().move_calls);

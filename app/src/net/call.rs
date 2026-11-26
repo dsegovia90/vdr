@@ -500,10 +500,10 @@ fn accept(
             let events = events.clone();
             let heard = heard.clone();
             // The hop the guest declared, kept while its session lives.
-            let declared = guests.clone().zip(request.peer_hop().map(|hop| hop.id()).filter(|&hop| hop != 0));
-            if let Some((guests, hop)) = &declared {
-                guests.add(*hop);
-            }
+            let declared = guests
+                .clone()
+                .zip(request.peer_hop().map(|hop| hop.id()).filter(|&hop| hop != 0))
+                .map(|(guests, hop)| Declared::new(guests, hop));
             sessions.spawn(async move {
                 let session = request.ok().await;
                 // Ends with this task, so it never outlives the session.
@@ -518,14 +518,36 @@ fn accept(
                     }
                     (Err(error), _) => tracing::warn!("a session failed to start: {error:#}"),
                 }
-                if let Some((guests, hop)) = declared {
-                    guests.remove(hop);
-                }
+                drop(declared);
                 let _ = events.unbounded_send(false);
             });
         }
     }));
     (task, receiver)
+}
+
+/// A guest's hop in [`arrival::Guests`] while its session lives.
+///
+/// **Taken back on drop**, because the accept loop is aborted when hosting is
+/// switched off, which drops each session's task mid-await: a removal written
+/// after the await never ran, and every guest turned away stayed a guest for
+/// the rest of the attempt.
+struct Declared {
+    guests: Arc<arrival::Guests>,
+    hop: u64,
+}
+
+impl Declared {
+    fn new(guests: Arc<arrival::Guests>, hop: u64) -> Self {
+        guests.add(hop);
+        Self { guests, hop }
+    }
+}
+
+impl Drop for Declared {
+    fn drop(&mut self) {
+        self.guests.remove(self.hop);
+    }
 }
 
 /// Notes in `heard` whenever a guest's session receives anything, on the
@@ -1295,11 +1317,15 @@ async fn run(
         // that from looping (a route is never offered back to the session it
         // came in on), which this module's bridge tests show. With hosting off a
         // join is wired exactly as it always was, two origins, until a change
-        // to everyone's has been tried by hand.
+        // to everyone's has been tried by hand. So the switch is read here for
+        // the wiring; once wired, a shared join follows it both ways for the
+        // rest of the attempt (`keep_hosting`), and one wired apart says why
+        // switching on waits for the next join.
         let host_rooms = local.host_rooms();
         // Where the last call was moved says nothing about this one.
         local.forget_moves();
         let shared = shares_origin(&peering, host_rooms);
+        let _noting = (wired(&peering, shared) == Wired::Apart).then(|| Abort(tokio::spawn(note_next_join(local.clone()))));
         // Only a host passes on other people's media, so only a host counts it.
         let forwarded = shared.then(|| Forwarded::new(me.to_string()));
         let inbound = inbound_for(&outbound, shared);
@@ -1321,7 +1347,7 @@ async fn run(
             }),
             _ => None,
         };
-        // Serving the room's members beside the join, while hosting stays on.
+        // Serving the room's members beside the join, while hosting is on.
         let mut alongside: Option<Abort> = None;
 
         // Read before the match below takes `peering` apart. A hosted room is
@@ -1408,11 +1434,11 @@ async fn run(
                 let heard = Arc::new(quiet::Heard::default());
                 if shared {
                     alongside = host_alongside(Alongside {
-                        config: &client_config,
-                        endpoint: &endpoint,
+                        config: client_config.clone(),
+                        endpoint: endpoint.clone(),
                         shared: outbound.clone(),
-                        url,
-                        doors: &doors,
+                        url: url.clone(),
+                        doors: doors.clone(),
                         estimates: adapt::Estimates::new(guests),
                         local: local.clone(),
                         forwarded: forwarded.clone(),
@@ -2629,11 +2655,7 @@ async fn announce(
                 Some(on) => format!(", call on {}", super::moves::describe(on.to.as_deref())),
                 None => String::new(),
             };
-            // Hosts by count: `sessions` logs each one as it comes and goes.
-            let held = match now.held.len() {
-                0 => String::new(),
-                n => format!(", holding {n} host session(s)"),
-            };
+            let held = held_said(&now.held);
             tracing::info!(
                 "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}{hosting}{moved}{held}",
                 on_off(now.camera),
@@ -2660,6 +2682,21 @@ const CLOCK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long a request is said before we give up on it. An invite nobody
 /// accepts simply goes away; there is no decline.
 const ASK_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The sessions we hold, for the status line: the relay by name, hosts by
+/// count, since `sessions` logs each host as it comes and goes. `held`
+/// carries the relay as a word beside the hosts' ids, so a plain count would
+/// call it a host.
+fn held_said(held: &[String]) -> String {
+    let relay = held.iter().any(|id| id == super::web::HELD_RELAY);
+    let hosts = held.len() - usize::from(relay);
+    match (relay, hosts) {
+        (false, 0) => String::new(),
+        (true, 0) => ", holding the relay".to_string(),
+        (false, n) => format!(", holding {n} host session(s)"),
+        (true, n) => format!(", holding the relay and {n} host session(s)"),
+    }
+}
 
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
@@ -3021,15 +3058,17 @@ fn inbound_for(outbound: &moq_net::origin::Producer, shared: bool) -> moq_net::o
     if shared { outbound.clone() } else { moq_tokio::origin::spawn() }
 }
 
-/// Everything [`host_alongside`] needs, named rather than positional.
-struct Alongside<'a> {
-    config: &'a moq_tokio::client::Config,
-    endpoint: &'a moq_tokio::iroh::Endpoint,
+/// Everything [`host_alongside`] needs, named rather than positional. Owned,
+/// because the door is opened again from inside the hosting task each time
+/// the switch comes back on.
+struct Alongside {
+    config: moq_tokio::client::Config,
+    endpoint: moq_tokio::iroh::Endpoint,
     /// The one origin the join and its guests share.
     shared: moq_net::origin::Producer,
     /// The room on the relay; its path is the room we host.
-    url: &'a url::Url,
-    doors: &'a door::Doors,
+    url: url::Url,
+    doors: Arc<door::Doors>,
     /// Where the guests' links are gathered, for when nothing else carries
     /// our media.
     estimates: Arc<adapt::Estimates>,
@@ -3041,9 +3080,66 @@ struct Alongside<'a> {
     heard: Arc<quiet::Heard>,
 }
 
+/// One opening of the door: the accept loop with its sessions, what it says
+/// about them, and what we say in presence while it runs.
+struct Served {
+    accepting: Abort,
+    events: futures_channel::mpsc::UnboundedReceiver<bool>,
+    offer: door::Offer,
+}
+
+impl Alongside {
+    /// Starts accepting the room's members behind its door. `None` when it
+    /// cannot, logged once here.
+    ///
+    /// **The room's own door, every time.** It is the one the interface issued
+    /// for this room as the join started, which is the one its members saved
+    /// with the room, so switching hosting off and on again leaves their
+    /// saved invites working, as a rejoin would.
+    async fn open(&self) -> Option<Served> {
+        let room = self.url.path().trim_matches('/').to_string();
+        if room.is_empty() {
+            tracing::info!("not hosting: this room is the relay's root, which has no name a guest could ask for");
+            return None;
+        }
+        let Some(entry) = self.doors.get(&crate::recent::identity(&self.url)) else {
+            tracing::warn!("not hosting: no door was issued for this room");
+            return None;
+        };
+        let hosting = door::Hosting::with_door(room, entry);
+        let served = serve(Serve {
+            config: &self.config,
+            endpoint: &self.endpoint,
+            publisher: self.shared.consume(),
+            subscriber: self.shared.clone(),
+            door: Some(hosting.clone()),
+            estimates: Some(self.estimates.clone()),
+            // The guests' figures stay out of the Network tab, which shows the
+            // link carrying our media; see `host_alongside`.
+            metrics: Arc::new(Metrics::default()),
+            forwarded: self.forwarded.clone(),
+            guests: Some(self.guests.clone()),
+            heard: Some(self.heard.clone()),
+        })
+        .await;
+        match served {
+            Ok((accepting, events)) => Some(Served {
+                accepting,
+                events,
+                offer: hosting.offer(self.shared.hop().id()),
+            }),
+            Err(error) => {
+                tracing::warn!("not hosting: {error}");
+                None
+            }
+        }
+    }
+}
+
 /// Serves the room's members directly beside a join, behind the room's door,
-/// and says so in presence, until hosting is switched off or the attempt
-/// ends. `None` when it cannot: logged, and the join goes on regardless.
+/// and says so in presence, while hosting is switched on, until the attempt
+/// ends. `None` when it cannot as the join starts: logged, and the join goes
+/// on regardless.
 ///
 /// **The guests' links steer what we send only when nothing else carries
 /// it.** They are gathered apart from the call's estimate, and the join
@@ -3052,95 +3148,178 @@ struct Alongside<'a> {
 /// connection figures never reach the Network tab, so that it always shows
 /// one link.
 ///
-/// Switching hosting off ends this at once and every guest's session with
-/// it; switching it on again takes effect from the next join, because the
-/// origins are wired as the attempt starts.
-async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
-    let Alongside {
-        config,
-        endpoint,
-        shared,
-        url,
-        doors,
-        estimates,
-        local,
-        forwarded,
-        guests,
-        heard,
-    } = args;
-    let room = url.path().trim_matches('/').to_string();
-    if room.is_empty() {
-        tracing::info!("not hosting: this room is the relay's root, which has no name a guest could ask for");
-        return None;
-    }
-    let Some(entry) = doors.get(&crate::recent::identity(url)) else {
-        tracing::warn!("not hosting: no door was issued for this room");
-        return None;
-    };
-    let hosting = door::Hosting::with_door(room, entry);
-    let served = serve(Serve {
-        config,
-        endpoint,
-        publisher: shared.consume(),
-        subscriber: shared.clone(),
-        door: Some(hosting.clone()),
-        estimates: Some(estimates),
-        // The guests' figures stay out of the Network tab, which shows the
-        // link carrying our media; see the doc above.
-        metrics: Arc::new(Metrics::default()),
-        forwarded: forwarded.clone(),
-        guests: Some(guests),
-        heard: Some(heard),
-    })
-    .await;
-    let (accepting, mut events) = match served {
-        Ok(served) => served,
-        Err(error) => {
-            tracing::warn!("not hosting: {error}");
-            return None;
-        }
-    };
-    local.set_offer(Some(hosting.offer(shared.hop().id())));
-    if let Some(forwarded) = &forwarded {
-        forwarded.set_serving(true);
-    }
+/// Switching hosting off closes the door at once and ends every guest's
+/// session with it; switching it on again opens it again in the same call
+/// (see [`keep_hosting`]). That needs the join's one shared origin, so it
+/// holds only for a join that started with hosting on; one that started with
+/// it off is wired apart and waits for the next join (see [`turn`]).
+async fn host_alongside(args: Alongside) -> Option<Abort> {
+    let first = args.open().await?;
     tracing::info!("hosting this room for its members as well as joining it");
-    Some(Abort(tokio::spawn(async move {
-        let mut accepting = Some(accepting);
-        let mut live = 0usize;
-        // Polled as the presence announcer polls: a quarter of a second to
-        // notice a switch is not something anyone can see.
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => if !local.host_rooms() {
-                    tracing::info!("hosting switched off; turning {live} guests away");
-                    break;
-                },
-                event = events.next() => match event {
-                    Some(true) => {
-                        live += 1;
-                        tracing::info!("a guest came in directly; {live} connected");
+    let local = args.local.clone();
+    let forwarded = args.forwarded.clone();
+    let args = Arc::new(args);
+    Some(Abort(tokio::spawn(keep_hosting(local, forwarded, first, move || {
+        let args = args.clone();
+        async move { args.open().await }
+    }))))
+}
+
+/// How an attempt was wired for hosting as it started, which is what the
+/// switch can still change during it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wired {
+    /// A join on one shared origin: the door can open and close at will.
+    Shared,
+    /// A join on two origins, joined with hosting off. What guests publish
+    /// could not reach the relay, nor the relay's room them, so nothing is
+    /// served before the next join.
+    Apart,
+    /// Not a join: a room hosted here serves whatever the switch says, and a
+    /// direct call or a listener has no room to host.
+    Elsewhere,
+}
+
+/// What the switch asks of an attempt, given how it was wired and whether
+/// the switch was on when we last acted on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Turn {
+    /// Open the door.
+    Start,
+    /// Close it, turning every guest away.
+    Stop,
+    /// Switched on where it cannot apply before the next join.
+    NextJoin,
+    /// Nothing changed that this attempt acts on.
+    Stay,
+}
+
+/// Acts on an edge, never a level: a door that failed to open, or a server
+/// that ended, is tried again only when the switch goes off and on again,
+/// never every tick.
+fn turn(wired: Wired, switch: bool, acted: bool) -> Turn {
+    match (wired, switch, acted) {
+        (Wired::Elsewhere, ..) | (_, true, true) | (_, false, false) => Turn::Stay,
+        (Wired::Shared, true, false) => Turn::Start,
+        (Wired::Shared, false, true) => Turn::Stop,
+        (Wired::Apart, true, false) => Turn::NextJoin,
+        (Wired::Apart, false, true) => Turn::Stay,
+    }
+}
+
+/// How an attempt is wired for hosting; see [`Wired`].
+fn wired(peering: &Peering, shared: bool) -> Wired {
+    match peering {
+        Peering::Join(_) if shared => Wired::Shared,
+        Peering::Join(_) => Wired::Apart,
+        _ => Wired::Elsewhere,
+    }
+}
+
+/// Keeps the door open while the switch is on and closed while it is off,
+/// from `first` until the attempt ends.
+///
+/// **One task, one door at most.** The accept loop is held here and only
+/// here, and is dropped before another is opened, so switching on and off
+/// any number of times never leaves two loops on the endpoint or a listener
+/// behind. Dropping this task drops whichever is open.
+///
+/// `open` is how a door is opened, apart so the tests can open one on a
+/// plain local socket.
+async fn keep_hosting<F, Fut>(local: Arc<PeerStats>, forwarded: Option<Arc<Forwarded>>, first: Served, mut open: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<Served>>,
+{
+    let mut serving = Some(first);
+    said_serving(&local, &forwarded, serving.as_ref());
+    // The switch as last acted on: on, since the first door is open.
+    let mut acted = true;
+    let mut live = 0usize;
+    // Polled as the presence announcer polls: a quarter of a second to
+    // notice a switch is not something anyone can see.
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        let event = async {
+            match serving.as_mut() {
+                Some(served) => served.events.next().await,
+                None => std::future::pending().await,
+            }
+        };
+        let woke = tokio::select! {
+            _ = ticker.tick() => None,
+            event = event => Some(event),
+        };
+        match woke {
+            None => match turn(Wired::Shared, local.host_rooms(), acted) {
+                Turn::Start => {
+                    acted = true;
+                    tracing::info!("hosting switched on; opening this room's door again");
+                    serving = open().await;
+                    live = 0;
+                    if serving.is_some() {
+                        tracing::info!("hosting this room for its members as well as joining it");
                     }
-                    Some(false) => {
-                        live = live.saturating_sub(1);
-                        tracing::info!("a direct guest's session ended; {live} connected");
+                    said_serving(&local, &forwarded, serving.as_ref());
+                }
+                Turn::Stop => {
+                    acted = false;
+                    if serving.is_some() {
+                        tracing::info!("hosting switched off; turning {live} guests away");
                     }
-                    None => {
-                        tracing::warn!("stopped hosting: the server ended");
-                        break;
-                    }
-                },
+                    closed(&mut serving, &local, &forwarded);
+                    live = 0;
+                }
+                Turn::NextJoin | Turn::Stay => {}
+            },
+            Some(Some(true)) => {
+                live += 1;
+                tracing::info!("a guest came in directly; {live} connected");
+            }
+            Some(Some(false)) => {
+                live = live.saturating_sub(1);
+                tracing::info!("a direct guest's session ended; {live} connected");
+            }
+            Some(None) => {
+                tracing::warn!("stopped hosting: the server ended");
+                closed(&mut serving, &local, &forwarded);
+                live = 0;
             }
         }
-        // The server and its sessions first, then the word: nobody should
-        // read the door after it stopped opening.
-        accepting.take();
-        local.set_offer(None);
-        if let Some(forwarded) = &forwarded {
-            forwarded.set_serving(false);
+    }
+}
+
+/// Says in presence what is being served now, and counts what we forward
+/// only while it is.
+fn said_serving(local: &PeerStats, forwarded: &Option<Arc<Forwarded>>, serving: Option<&Served>) {
+    local.set_offer(serving.map(|served| served.offer.clone()));
+    if let Some(forwarded) = forwarded {
+        forwarded.set_serving(serving.is_some());
+    }
+}
+
+/// The server and its sessions first, then the word: nobody should read the
+/// door after it stopped opening.
+fn closed(serving: &mut Option<Served>, local: &PeerStats, forwarded: &Option<Arc<Forwarded>>) {
+    if let Some(served) = serving.take() {
+        drop(served.accepting);
+    }
+    said_serving(local, forwarded, None);
+}
+
+/// Says once per switching on, for a join wired apart, why nothing is served
+/// yet; see [`Wired::Apart`].
+async fn note_next_join(local: Arc<PeerStats>) {
+    let mut acted = local.host_rooms();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        ticker.tick().await;
+        let switch = local.host_rooms();
+        if turn(Wired::Apart, switch, acted) == Turn::NextJoin {
+            tracing::info!("hosting switched on; this room was joined with it off, so it is hosted from the next join");
         }
-    })))
+        acted = switch;
+    }
 }
 
 /// What a presence reader needs to act on requests addressed to us: who we
@@ -3433,7 +3612,7 @@ mod path_tests {
 
 #[cfg(test)]
 mod presence_tests {
-    use super::{HostNews, Link, Presence, RoomNews, Seen, State, asked_of, dials_several, door, followed, heard_hosting, honour, inbound_for, quality, shares_origin, subroom};
+    use super::{HostNews, Link, Presence, RoomNews, Seen, State, Turn, Wired, asked_of, dials_several, door, followed, heard_hosting, held_said, honour, inbound_for, quality, shares_origin, subroom, turn, wired};
     use crate::args::Peering;
     use crate::net::metrics::{Ask, Clock, Request};
     use crate::net::quality::Quality;
@@ -4042,6 +4221,61 @@ mod presence_tests {
                 assert!(!dials_several(&other, host_rooms, has_hosts), "{other:?}");
             }
         }
+    }
+
+    /// The switch is acted on at its edges: a shared join opens and closes
+    /// the door as it turns, a join wired apart only says it waits for the
+    /// next one, and nothing else is touched. Nothing is asked twice for one
+    /// turn, so a door that failed to open is not retried every tick.
+    #[test]
+    fn the_switch_opens_and_closes_the_door_only_where_the_join_was_wired_for_it() {
+        assert_eq!(turn(Wired::Shared, true, false), Turn::Start);
+        assert_eq!(turn(Wired::Shared, false, true), Turn::Stop);
+        assert_eq!(turn(Wired::Shared, true, true), Turn::Stay);
+        assert_eq!(turn(Wired::Shared, false, false), Turn::Stay);
+        assert_eq!(turn(Wired::Apart, true, false), Turn::NextJoin);
+        for (switch, acted) in [(false, true), (true, true), (false, false)] {
+            assert_eq!(turn(Wired::Apart, switch, acted), Turn::Stay, "{switch} {acted}");
+        }
+        for switch in [false, true] {
+            for acted in [false, true] {
+                assert_eq!(turn(Wired::Elsewhere, switch, acted), Turn::Stay);
+            }
+        }
+        // On, off, on again: each edge asked for once, each level never.
+        let mut acted = true;
+        let mut asked = Vec::new();
+        for switch in [true, false, false, true, true, false, true] {
+            let next = turn(Wired::Shared, switch, acted);
+            if next != Turn::Stay {
+                asked.push(next);
+            }
+            acted = switch;
+        }
+        assert_eq!(asked, [Turn::Stop, Turn::Start, Turn::Stop, Turn::Start]);
+
+        let url: url::Url = "https://relay.example.com/team".parse().unwrap();
+        let peer: iroh::EndpointId = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        assert_eq!(wired(&Peering::Join(url.clone()), true), Wired::Shared);
+        assert_eq!(wired(&Peering::Join(url), false), Wired::Apart);
+        // A room hosted here serves regardless, as it always has; the guests
+        // of a relay-less room are joins, and follow the rules above.
+        for other in [Peering::Host("team".into()), Peering::Dial(peer), Peering::Listen, Peering::Loopback, Peering::Idle] {
+            for shared in [false, true] {
+                assert_eq!(wired(&other, shared), Wired::Elsewhere, "{other:?}");
+            }
+        }
+    }
+
+    /// The status line names the relay apart from the hosts it counts.
+    #[test]
+    fn the_status_line_does_not_count_the_relay_as_a_host() {
+        let relay = super::super::web::HELD_RELAY.to_string();
+        let host = "a".repeat(64);
+        assert_eq!(held_said(&[]), "");
+        assert_eq!(held_said(std::slice::from_ref(&relay)), ", holding the relay");
+        assert_eq!(held_said(std::slice::from_ref(&host)), ", holding 1 host session(s)");
+        assert_eq!(held_said(&[relay, host.clone(), "b".repeat(64)]), ", holding the relay and 2 host session(s)");
     }
 
     /// With hosting off a join keeps two origins, as it always has: the

@@ -3379,4 +3379,116 @@ mod socket_tests {
         assert!(host_gap < GROUP, "the host's video was gone {host_gap:?}");
         assert!(member_gap < SPLICE, "the host's view of m was gone {member_gap:?}");
     }
+
+    /// Hosting switched off and on again in the same call opens the room's
+    /// door again: a guest holding it gets in, one without it is turned away,
+    /// at most one accept loop is ever open, and a guest turned away by the
+    /// switch is no longer counted as one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hosting_switched_off_and_on_again_lets_guests_in_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use super::super::{Served, keep_hosting};
+
+        /// One open accept loop, counted until it is dropped.
+        struct Open(Arc<AtomicUsize>);
+        impl Drop for Open {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        crypto();
+        let shared = moq_tokio::origin::spawn();
+        let local = Arc::new(PeerStats::default());
+        local.set_host_rooms(true);
+        let hosting = door::Hosting::open("team".to_string()).unwrap();
+        let offer = hosting.offer(shared.hop().id());
+        let guests = Arc::new(super::super::arrival::Guests::default());
+        let open_now = Arc::new(AtomicUsize::new(0));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let port = Arc::new(std::sync::Mutex::new(0u16));
+        let open = {
+            let (shared, guests, open_now, opened, port) = (shared.clone(), guests.clone(), open_now.clone(), opened.clone(), port.clone());
+            move || {
+                let (shared, hosting, guests, open_now, opened, port) =
+                    (shared.clone(), hosting.clone(), guests.clone(), open_now.clone(), opened.clone(), port.clone());
+                async move {
+                    let mut config = moq_tokio::server::Config::default();
+                    config.listen.bind = Some(moq_tokio::listen::Bind::Addr(([127, 0, 0, 1], 0).into()));
+                    config.listen.tls.generate = vec!["localhost".to_string()];
+                    config.publisher = Some(shared.consume());
+                    config.subscriber = Some(shared.clone());
+                    let server = config.init().ok()?.bind().await.ok()?;
+                    *port.lock().unwrap() = server.local_addr().ok()?.port();
+                    let offer = hosting.offer(shared.hop().id());
+                    let (accepting, events) = accept(server, Some(hosting), None, Arc::new(Metrics::default()), None, Some(guests), None);
+                    opened.fetch_add(1, Ordering::SeqCst);
+                    open_now.fetch_add(1, Ordering::SeqCst);
+                    let counted = Open(open_now);
+                    let accepting = Abort(tokio::spawn(async move {
+                        let _held = (accepting, counted);
+                        std::future::pending::<()>().await
+                    }));
+                    Some(Served { accepting, events, offer })
+                }
+            }
+        };
+        let open_first = open.clone();
+        let first = open_first().await.expect("the first door opens");
+        let _hosting = Abort(tokio::spawn(keep_hosting(local.clone(), None, first, open)));
+
+        // Until what the switch asks for is what is served, and said.
+        let settles = |on: bool, times: usize| {
+            let (local, open_now, opened) = (local.clone(), open_now.clone(), opened.clone());
+            async move {
+                tokio::time::timeout(WITHIN, async {
+                    while local.offer().is_some() != on
+                        || open_now.load(Ordering::SeqCst) != usize::from(on)
+                        || opened.load(Ordering::SeqCst) != times
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("never settled {}", if on { "on" } else { "off" }));
+            }
+        };
+        settles(true, 1).await;
+        assert_eq!(local.offer(), Some(offer.clone()));
+        for times in [2, 3] {
+            local.set_host_rooms(false);
+            settles(false, times - 1).await;
+            assert!(!local.hosting(), "our own entry stops saying so");
+            local.set_host_rooms(true);
+            settles(true, times).await;
+            assert!(local.hosting(), "and says so again");
+        }
+        // The same room's door, every time, so its members' saved invites work.
+        assert_eq!(local.offer(), Some(offer.clone()));
+
+        let at_door = |door: Option<&str>| {
+            let mut url = at(*port.lock().unwrap());
+            if let Some(door) = door {
+                url.set_query(Some(&format!("{}={door}", door::PARAM)));
+            }
+            url
+        };
+        let wrong = door::fresh().unwrap();
+        let w = member("w", vec![relay_at(at_door(Some(&wrong)))]);
+        let ended = tokio::time::timeout(WITHIN, w.ended).await.expect("ended in time").expect("an ending");
+        assert_eq!(ended, TURNED_AWAY, "{ended}");
+        let _g = member("g", vec![relay_at(at_door(Some(&offer.door)))]);
+        becomes(&shared, &camera_path("g"), true).await;
+        assert_eq!(guests.hops().len(), 1, "the guest's hop is kept while it is in");
+
+        local.set_host_rooms(false);
+        settles(false, 3).await;
+        // Polled, not awaited as an update: the session can be gone before a
+        // watcher would be listening for its retraction.
+        let gone = Instant::now();
+        while heard_within(&shared, &camera_path("g"), Duration::from_millis(200)).await {
+            assert!(gone.elapsed() < WITHIN, "the guest was never turned away");
+        }
+        assert!(guests.hops().is_empty(), "a guest turned away is still counted as one");
+    }
 }
