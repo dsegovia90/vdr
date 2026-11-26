@@ -241,7 +241,8 @@ dx serve --renderer native --args="--loopback"   # camera -> H.264 -> screen, no
 To run several instances on one machine without touching its camera or audio,
 give each a throwaway identity and leave the devices closed:
 `vdr --ephemeral --camera-off --no-audio …` (`--no-audio` opens neither the
-microphone nor the speaker). For a test that must survive a restart, use
+microphone nor the speaker). `--name <name>` gives a run a display name
+without saving it, so the windows can be told apart. For a test that must survive a restart, use
 `--profile <dir>` instead of `--ephemeral`: the instance keeps its own folder
 (settings, rooms, log and key) there, never the real one, and never updates
 itself.

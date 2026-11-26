@@ -32,6 +32,7 @@
 //! vdr --no-catchup                        # measure audio sync, never speed it up
 //! vdr --loopback --audio-stall 800        # hold audio back once, to make a backlog
 //! vdr --ephemeral --no-audio              # opens neither microphone nor speaker
+//! vdr --ephemeral --name guest            # a display name for this run only
 //! vdr --profile /tmp/vdr-a                # a test instance's own lasting folder and key
 //! vdr --move-calls                       # follow the call when someone moves it
 //! vdr --move-call relay                   # move the call as the join starts: relay or a host's id
@@ -263,6 +264,10 @@ pub struct Args {
     /// the person at it: each would otherwise take the microphone and play
     /// the others through the speakers.
     pub no_audio: bool,
+    /// What this run calls itself, without saving it (`--name <name>`). Test
+    /// instances start from empty settings, so their tiles show an id each;
+    /// a name says which window is which.
+    pub name: Option<String>,
     /// Host the rooms joined in this run, as the Experimental switch does,
     /// without saving it (`--host-rooms`). An `--ephemeral` instance starts
     /// from empty settings and nobody is there to click the switch, so a
@@ -323,6 +328,7 @@ impl Args {
         let mut no_catchup = false;
         let mut audio_stall = None;
         let mut no_audio = false;
+        let mut name = None;
         let mut host_rooms = false;
         let mut move_calls = false;
         let mut move_call = None;
@@ -383,6 +389,10 @@ impl Args {
                 },
                 "--no-catchup" => no_catchup = true,
                 "--no-audio" => no_audio = true,
+                "--name" => match args.next() {
+                    Some(wanted) => name = Some(wanted),
+                    None => tracing::error!("--name needs a name"),
+                },
                 "--host-rooms" => host_rooms = true,
                 "--move-calls" => move_calls = true,
                 "--move-call" => match args.next().as_deref().map(crate::net::moves::parse_target) {
@@ -432,6 +442,7 @@ impl Args {
             no_catchup,
             audio_stall,
             no_audio,
+            name,
             host_rooms,
             move_calls,
             move_call,

@@ -323,8 +323,10 @@ pub fn use_remote() -> Remote {
         }
         let metrics = Arc::new(Metrics::default());
         let local = Arc::new(PeerStats::default());
-        // Our name, as last saved; the Profile tab changes it from here on.
-        local.set_name(saved.name.as_deref().and_then(crate::name::clean));
+        // Our name, as last saved or as this run was told; the Profile tab
+        // changes it from here on.
+        let name = crate::args::Args::get().name.as_deref().or(saved.name.as_deref());
+        local.set_name(name.and_then(crate::name::clean));
         // Whether we report our connection and show others'; the Experimental
         // tab changes it from here on, and the call reads it as it goes.
         local.set_connection_report(saved.connection_report_on());
