@@ -5,10 +5,12 @@
 
 use dioxus_native::prelude::*;
 
-use super::connect::join_room;
+use super::connect::{copy_to_clipboard, join_room};
 use super::{Button, CloseIcon, PinIcon, Size};
 use crate::args::Peering;
-use crate::net::RemoteStatus;
+use crate::net::{PeerStats, RemoteStatus};
+
+use std::sync::Arc;
 use crate::recent::{self, RecentRooms};
 
 /// One row's worth, read out of the list so no guard is held while rendering.
@@ -33,6 +35,10 @@ pub fn RecentRoomList(
     status: Signal<RemoteStatus>,
     /// The connect row's own, so a Join behaves as Connect does.
     connect: Callback<Peering>,
+    /// Our own endpoint id, for an invite to list us as a host.
+    me: Signal<Option<String>>,
+    /// Ourselves: whether we host the rooms we join.
+    local: Arc<PeerStats>,
 ) -> Element {
     let mut rooms = rooms;
     // The same states that show the paste field: not joining, not in a call,
@@ -78,6 +84,29 @@ pub fn RecentRoomList(
                                 move |_| join_room(&link, connect, status)
                             },
                             "Join"
+                        }
+                        // **Built on the click, never rendered**: the invite
+                        // carries the token and every host's door. Lists us
+                        // only while we host the rooms we join.
+                        Button {
+                            size: Size::Small,
+                            onclick: {
+                                let key = row.key.clone();
+                                let local = local.clone();
+                                move |_| {
+                                    let me = me.peek().clone().filter(|_| local.host_rooms());
+                                    let invite = rooms
+                                        .peek()
+                                        .rooms()
+                                        .iter()
+                                        .find(|room| room.key() == key)
+                                        .map(|room| room.invite(me.as_deref()));
+                                    if let Some(invite) = invite {
+                                        copy_to_clipboard(&invite);
+                                    }
+                                }
+                            },
+                            "Copy invite"
                         }
                         button {
                             // Plain colours, not palette shades: an inline

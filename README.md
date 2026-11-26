@@ -58,9 +58,29 @@ under `app/vendor/` (each has a `PATCH.md`).
   cameras), copy the key from one window into the other, and you are on a
   call with nothing else to set up.
 
+- **Hosted by one of you, as a room (experimental).** For a room with no
+  relay at all: one person runs `vdr --host <room>`, and their app becomes the
+  room's meeting place. It prints an invite to the terminal, once:
+
+  ```sh
+  vdr --host team
+  # Hosting team. Guests join with:
+  #   vdr --relay 'iroh://<host key>/team?door=<secret>'
+  ```
+
+  Guests join with that link like any room (`--relay`, or paste it into the
+  field), and see and hear each other through the host, who is in the room
+  too. The `door` is a random secret made fresh each time the host starts, so
+  each start needs a new invite; a dial without it, with the wrong one, or for
+  another room is turned away. The invite is printed to the terminal and never
+  written to the log, so start the host from a terminal. Everything everyone
+  sends passes through the host's upload, so it suits a few people; when the
+  host leaves, the room ends for everyone. Hosts are not announced or
+  remembered yet, and the room name is letters, digits, `-`, `_` and `.`.
+
 Paste a room URL or a key into the field at the top of the window, or pass it
-on the command line (`--relay <url>`, `--dial <key>`, `--listen`; `--help`
-lists the rest).
+on the command line (`--relay <url>`, `--dial <key>`, `--listen`, `--host
+<room>`; the module docs in `app/src/args.rs` list the rest).
 
 **Recent rooms.** Rooms you have joined are listed under the field while you
 are not in a call, newest first, with one-click *Join*. Pin one to keep it at
@@ -199,6 +219,11 @@ cd app
 dx serve --renderer native                       # hot-reloading debug window
 dx serve --renderer native --args="--loopback"   # camera -> H.264 -> screen, no network
 ```
+
+To run several instances on one machine without touching its camera or audio,
+give each a throwaway identity and leave the devices closed:
+`vdr --ephemeral --camera-off --no-audio …` (`--no-audio` opens neither the
+microphone nor the speaker).
 
 Run it with `dx`, not `cargo run`: the stylesheet only resolves inside a dx
 bundle, and `cargo run` comes up unstyled. `cargo clippy` and `cargo test` work

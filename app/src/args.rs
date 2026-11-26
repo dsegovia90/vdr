@@ -19,6 +19,7 @@
 //! vdr --secret <hex> --listen             # prints its endpoint id and waits
 //! vdr --secret <hex> --dial <peer-id>     # dials it
 //! vdr --relay http://localhost:4443/room  # joins a room on a relay
+//! vdr --host team                         # hosts room team; the invite goes to stdout
 //! vdr --loopback                         # no network; the codec round trip
 //! vdr --camera facetime                   # picks a camera by name
 //! vdr --listen --camera-off               # starts with video off
@@ -29,6 +30,7 @@
 //! vdr --stats alice.jsonl                 # one line of measurements a second
 //! vdr --no-catchup                        # measure audio sync, never speed it up
 //! vdr --loopback --audio-stall 800        # hold audio back once, to make a backlog
+//! vdr --ephemeral --no-audio              # opens neither microphone nor speaker
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry is a second
@@ -61,6 +63,10 @@
 //! - `https://host/room` -- a relay with a real certificate.
 //! - `iroh://<relay-endpoint-id>/room` -- a relay with iroh enabled, dialled by
 //!   key the same way a peer is.
+//!
+//! `--host <room>` makes this app the room's meeting place, with no relay:
+//! members dial it with `--relay iroh://<our id>/<room>?door=<secret>`, the
+//! invite it prints to stdout at start. See `net::door`.
 
 use std::sync::OnceLock;
 
@@ -90,6 +96,13 @@ pub enum Peering {
     /// still goes direct, which needs nothing running anywhere. Merging the two
     /// (switching topology as a call grows) is not done yet.
     Join(url::Url),
+    /// Host this room: accept its members directly, on one origin they all
+    /// share, behind a door made fresh for the attempt.
+    ///
+    /// Only the room's name travels here; the door is made by the call, so the
+    /// secret never sits in [`Args`], which is cached for the life of the
+    /// process and printable with `{:?}`.
+    Host(String),
 }
 
 /// Reads a relay URL, or says why it is not one.
@@ -232,6 +245,11 @@ pub struct Args {
     /// this long, so it queues and lands as a burst (`--audio-stall <ms>`).
     /// Reproduces a network stall's backlog on one machine.
     pub audio_stall: Option<std::time::Duration>,
+    /// Open neither the microphone nor the speaker (`--no-audio`). For running
+    /// several test instances on one machine without touching the audio of
+    /// the person at it: each would otherwise take the microphone and play
+    /// the others through the speakers.
+    pub no_audio: bool,
 }
 
 impl Args {
@@ -266,6 +284,7 @@ impl Args {
         let mut stats = None;
         let mut no_catchup = false;
         let mut audio_stall = None;
+        let mut no_audio = false;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -280,6 +299,11 @@ impl Args {
                     Some(Ok(url)) => peering = Peering::Join(url),
                     Some(Err(error)) => tracing::error!("--relay is not a relay url: {error}"),
                     None => tracing::error!("--relay needs a url"),
+                },
+                "--host" => match args.next().as_deref().map(crate::net::door::room_name) {
+                    Some(Ok(room)) => peering = Peering::Host(room),
+                    Some(Err(error)) => tracing::error!("--host: {error}"),
+                    None => tracing::error!("--host needs a room name"),
                 },
                 "--secret" => match args.next() {
                     // Read back by `net::call` on the call thread, which has
@@ -313,6 +337,7 @@ impl Args {
                     None => tracing::error!("--stats needs a file path"),
                 },
                 "--no-catchup" => no_catchup = true,
+                "--no-audio" => no_audio = true,
                 "--audio-stall" => match args.next().as_deref().map(str::parse::<u64>) {
                     Some(Ok(ms)) => audio_stall = Some(std::time::Duration::from_millis(ms)),
                     Some(Err(error)) => tracing::error!("--audio-stall is not a number: {error}"),
@@ -332,6 +357,7 @@ impl Args {
             stats,
             no_catchup,
             audio_stall,
+            no_audio,
         }
     }
 }

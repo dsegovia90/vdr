@@ -20,6 +20,7 @@ mod adapt;
 mod audio;
 mod call;
 mod codec_check;
+pub(crate) mod door;
 mod metrics;
 mod loopback;
 pub(crate) mod quality;
@@ -36,12 +37,16 @@ pub use metrics::{Ask, Metrics, Path, PeerStats};
 pub use share::{ShareOption, ShareQuality, ShareSource, ShareWish, available as share_available, lists as share_lists, sources as share_sources};
 pub use status::RemoteStatus;
 pub(crate) use call::redacted;
+use call::HostNews;
 
 use crate::args::{Args, Peering};
 use crate::audio::Controls;
 use crate::camera::{frame_tap, FrameSlot, FrameTap};
 use crate::channel::use_channel;
 use crate::recent::RecentRooms;
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// How long a room has to hold, with no drop, before it is remembered: long
 /// enough to outlast a relay turning the session away, short enough that a
@@ -178,17 +183,70 @@ pub fn use_remote() -> Remote {
     // not "in the room" in the meantime bumps the count, and the wait's
     // message then finds it stale.
     let mut arrival = use_signal(|| 0u64);
-    let settled = use_channel(move |waited_for: u64| {
-        if *arrival.peek() != waited_for {
-            return;
+    // The doors issued for rooms joined with hosting on; see `door::Doors`.
+    let doors = use_hook(|| Arc::new(door::Doors::default()));
+    // Hosts heard, or listed by an invite, for a room not remembered yet,
+    // keyed by the room's identity: kept when it is, dropped if it never is.
+    // Not a signal, because nothing on screen reads it.
+    let waiting: Rc<RefCell<Vec<(String, crate::recent::Host)>>> = use_hook(|| Rc::new(RefCell::new(Vec::new())));
+    let settled = use_channel({
+        let doors = doors.clone();
+        let waiting = waiting.clone();
+        move |waited_for: u64| {
+            if *arrival.peek() != waited_for {
+                return;
+            }
+            let pending = chosen.peek().clone();
+            if let Some(url) = pending {
+                // Cleared, so a reconnect later in the call does not record it
+                // again.
+                chosen.set(None);
+                tracing::info!("remembering {}", redacted(&url));
+                let key = crate::recent::identity(&url);
+                let now = crate::recent::now();
+                let door = doors.get(&key);
+                let hosts: Vec<crate::recent::Host> = {
+                    let mut waiting = waiting.borrow_mut();
+                    let (ours, rest) = waiting.drain(..).partition(|(room, _)| *room == key);
+                    *waiting = rest;
+                    ours.into_iter().map(|(_, host)| host).collect()
+                };
+                crate::recent::change(&mut recent, |list| {
+                    list.joined(&url, now);
+                    if let Some(door) = door {
+                        list.keep_door(&key, &door);
+                    }
+                    for host in hosts {
+                        list.heard(&key, host, now);
+                    }
+                });
+            }
         }
-        let pending = chosen.peek().clone();
-        if let Some(url) = pending {
-            // Cleared, so a reconnect later in the call does not record it
-            // again.
-            chosen.set(None);
-            tracing::info!("remembering {}", redacted(&url));
-            crate::recent::change(&mut recent, |list| list.joined(&url, crate::recent::now()));
+    });
+    // What the call hears about the room's hosts. Written to the list only
+    // when the room is in it; the call sends only changes, so this is rare.
+    let heard = use_channel({
+        let waiting = waiting.clone();
+        move |news: HostNews| match news {
+            HostNews::Heard { room, id, door, told_by } => {
+                let now = crate::recent::now();
+                let Some(host) = crate::recent::Host::new(&id, &door, Some(&told_by), now) else { return };
+                let known = recent.peek().rooms().iter().any(|entry| entry.key() == room);
+                if known {
+                    crate::recent::change(&mut recent, |list| {
+                        list.heard(&room, host, now);
+                    });
+                } else {
+                    waiting.borrow_mut().push((room, host));
+                }
+            }
+            HostNews::Stopped { room, id } => {
+                waiting.borrow_mut().retain(|(waiting_room, host)| !(*waiting_room == room && host.id() == id));
+                let known = recent.peek().rooms().iter().any(|entry| entry.key() == room);
+                if known {
+                    crate::recent::change(&mut recent, |list| list.forget(&room, &id));
+                }
+            }
         }
     });
     let mut arrivals = 0u64;
@@ -261,6 +319,38 @@ pub fn use_remote() -> Remote {
         // Whether we report our connection and show others'; the Experimental
         // tab changes it from here on, and the call reads it as it goes.
         local.set_connection_report(saved.connection_report_on());
+        // Whether we host the rooms we join; read by each join as it starts.
+        local.set_host_rooms(saved.hosts_rooms());
+        // What every decision to join goes through: the hosts an invite
+        // lists come off the link before it goes anywhere, and with hosting
+        // on the room gets its door, the one it already has or a new one.
+        let prepare = {
+            let doors = doors.clone();
+            let waiting = waiting.clone();
+            let local = local.clone();
+            move |peering: Peering| -> Peering {
+                let Peering::Join(url) = peering else { return peering };
+                let (url, invited) = crate::recent::split_invite(&url, crate::recent::now());
+                let key = crate::recent::identity(&url);
+                {
+                    let mut waiting = waiting.borrow_mut();
+                    // A new decision: what an earlier attempt left is stale.
+                    waiting.clear();
+                    waiting.extend(invited.into_iter().map(|host| (key.clone(), host)));
+                }
+                if local.host_rooms() {
+                    let door = recent.peek().door_for(&key).map(Ok).unwrap_or_else(door::fresh);
+                    match door {
+                        Ok(door) => doors.issue(key, door),
+                        Err(error) => tracing::warn!("not hosting this room: {error}"),
+                    }
+                } else {
+                    // Only a room joined with hosting on is given a door.
+                    doors.withdraw(&key);
+                }
+                Peering::Join(url)
+            }
+        };
         let share = ShareWish::new();
         let (tap, feed) = frame_tap();
         // The decision, not the feed, is what gets deferred. The call thread
@@ -301,12 +391,15 @@ pub fn use_remote() -> Remote {
                     metrics.clone(),
                     local.clone(),
                     share.clone(),
+                    doors.clone(),
+                    heard,
                 );
                 // `--listen` / `--dial` decide immediately; `Idle` waits for the
                 // UI. The CLI path is deliberately unchanged: it is how two
                 // instances get driven from a script.
                 if peering != Peering::Idle {
                     crate::update::set_call_active(true);
+                    let peering = prepare.clone()(peering);
                     if let Peering::Join(url) = &peering {
                         chosen.set(Some(url.clone()));
                     }
@@ -318,6 +411,7 @@ pub fn use_remote() -> Remote {
         let connect = Callback::new({
             let decide = decide.clone();
             move |peering: Peering| {
+                let peering = prepare(peering);
                 // At once, before the call's first status arrives: an update
                 // must not restart the app in that gap.
                 if peering != Peering::Idle {
