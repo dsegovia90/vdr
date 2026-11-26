@@ -277,10 +277,10 @@ pub struct Settings {
     /// without hosts.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
     pub spare_route: Option<bool>,
-    /// Whether the Network tab's map shows which way media travels by
+    /// Whether the Topology tab's map shows which way media travels by
     /// dashes drifting along its lines. `None` is the default, which is
     /// **on** ([`animates_map`](Self::animates_map)): off freezes them, and
-    /// the map then wakes the window only when the room changes.
+    /// the map then redraws the window only when the room changes.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
     pub animate_map: Option<bool>,
 }

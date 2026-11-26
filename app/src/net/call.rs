@@ -820,7 +820,7 @@ struct Presence {
     moved: Option<super::moves::CallOn>,
     /// Where their media goes now: `"relay"`, `"guests"`, or a host's
     /// endpoint id (`web` says what each means). Said by every build that
-    /// has it, switch or no switch, for the room's map in the Network tab;
+    /// has it, switch or no switch, for the room's map in the Topology tab;
     /// absent outside a room and from older builds. **Read leniently**: a
     /// bad value is nothing said.
     #[serde(

@@ -250,7 +250,7 @@ focus.
   our media goes (`"relay"`, `"guests"`, or a host's endpoint id) and the
   sessions we hold (hosts by id only, never a door, plus `"relay"` while the
   session to where the room meets is up; at most `web::HELD_MAX`). A peer
-  that says neither is drawn with an assumed line to the meeting place. They are what the Network tab's map of the room is built
+  that says neither is drawn with an assumed line to the meeting place. They are what the Topology tab's map of the room is built
   from (`net/web.rs`), so they go out at once when they change, in the
   announcer's existing poll, not at the clock refresh. Read leniently and
   cleaned with the sender's id, like `seen`. **"relay" means wherever the room
@@ -261,7 +261,8 @@ focus.
   sender's carrier.
 - **Which way media travels on each link comes from `routes.json`**, a
   track of its own in the control broadcast beside presence, **asked for only
-  while someone has the map open**. Each receiver says the path every other
+  while someone has the map open** (the Topology tab, with the settings
+  window open). Each receiver says the path every other
   person's media takes to it (from the whole hop chain, `arrival::path_of`),
   its own origin and gate hops, and the hops it knows to be the meeting
   place; a viewer names every hop from everyone's claims (`web::build_reported`).
@@ -290,24 +291,28 @@ focus.
   **plain colour** on the parent (`text-white`, `text-[rgb(…)]`), because
   `currentColor` becomes the computed colour and Tailwind v4's palette is
   `oklch()`.
-- **The Network tab's map is a widget, not an inline SVG**
+- **The Topology tab's map is a widget, not an inline SVG**
   (`components/settings/room_map.rs`): blitz re-parses an SVG subtree on any
   change and its children take no clicks. Blitz calls every widget's `paint`
   on every window paint, so the map caches its `Scene` and rebuilds it only
   when the drawing or the size changes. Its square is two boxes: on one flex
   item with `w-full max-w-[…] aspect-square`, taffy derives the height from
-  the unclamped width (read in taffy's source, not seen).
+  the unclamped width (read in taffy's source, not seen). It is up to 560 px
+  and bounded by the window's height too (`max(160px, min(560px, 80vh -
+  136px))`), so the square fits under the tab's heading without scrolling.
 - **The map shows direction by motion**: a carrying line is one light line
   and white dashes drift along it from sender to receiver, two lanes for a
   link carrying both ways (`web_layout::dashes`, `lanes`). Half-white,
   half-grey lines were tried and read as broken lines. The lines and nodes
-  stay cached; only the dash layer is built per frame, between them. Frames
-  come from a `Ticker` component in `room_map.rs` whose thread calls
-  `schedule_update` every 83 ms (about 12 fps), the same wake a video frame
-  uses; its thread **parks** while the map's Animate switch is off
-  (`Settings::animate_map`) or no line moves, and ends when the map is
-  dropped. Over `web_layout::MOVING_MAX` carrying lines only the focus's
-  paths move. Keep `requires_redraw` false here too.
+  stay cached; only the dash layer is built per frame, between them, from
+  wall-clock time (`web_layout::DASH_SPEED`), never a frame count. **It is
+  the one deliberate exception that redraws continuously**: its widget's
+  `requires_redraw` is `true` while the Animate switch is on
+  (`Settings::animate_map`), a line moves and blitz painted it within the
+  last 250 ms, which is only while its tab is on screen, since the map is
+  mounted only then. Blitz-shell then redraws once per display refresh
+  (`AutoVsync`), repainting the whole window each time. Over
+  `web_layout::MOVING_MAX` carrying lines only the focus's paths move.
 - **Video tiles are flex rows, not a grid** (`components/layout.rs`), with
   zero-height line breaks per breakpoint. The box *is* the card; the paint code
   crops the sides when a box is narrower than the video.
@@ -340,9 +345,10 @@ focus.
   `VideoPaintSource::requires_redraw` is `false`; a `FrameSlot` watcher wakes
   the tile when a frame is published or cleared (`components/participant.rs`).
   Returning `true` there repaints at the display's refresh rate with no video
-  on screen. Anything that moves is driven the same way, from a thread that
-  wakes one component at the rate it needs and parks when nothing moves (the
-  room map's `Ticker`). A wake of one component still repaints the whole
+  on screen. Anything that moves at a rate of its own is driven the same
+  way, from a thread that wakes one component at that rate and parks when
+  nothing moves; the room map is the one exception, above. A wake of one
+  component still repaints the whole
   window: blitz-shell's `redraw` resolves the document, calls every widget's
   `paint` and renders the one scene (read in the source).
 - **`overflow-y-auto` makes the other axis scroll too**, and scrollbar thumbs
@@ -406,15 +412,15 @@ focus.
 | `net/sessions.rs` | a join that dials the relay and the room's saved hosts together: which session carries our media, and moving it |
 | `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes, for the log and the host borders on tiles (`read` and `through` are pure) |
 | `net/moves.rs` | moving the call to a host, an experiment: the presence field, which choice wins, the bounce order (pure) |
-| `net/web.rs` | the room as a web of nodes for the Network tab: the `via`/`held` presence fields and the `routes.json` document (wire form, lenient reading, cleaning, id prefixes), naming hops from everyone's claims, and the pure graph built from every entry, with each link's streams counted per direction and where a sender's word and its receivers part |
-| `web_layout.rs` | where the Network tab's map puts each node (one ring with the relays at six o'clock, a thin inner ring for people past about ninety; in a unit square, from counts and order only) and its name (radially outside it), which lines it draws, how a line bows round a node it does not end at, where its drifting dashes are and which lines have them, what a selection keeps lit, and the made-up room of `--fake-web` (reports included) |
+| `net/web.rs` | the room as a web of nodes for the Topology tab: the `via`/`held` presence fields and the `routes.json` document (wire form, lenient reading, cleaning, id prefixes), naming hops from everyone's claims, and the pure graph built from every entry, with each link's streams counted per direction and where a sender's word and its receivers part |
+| `web_layout.rs` | where the Topology tab's map puts each node (one ring with the relays at six o'clock, a thin inner ring for people past about ninety; in a unit square, from counts and order only) and its name (radially outside it), which lines it draws, how a line bows round a node it does not end at, where its drifting dashes are and which lines have them, what a selection keeps lit, and the made-up room of `--fake-web` (reports included) |
 | `net/door.rs` | a hosted room's door: its name, the secret guests present as `?door=`, the check (pure) |
 | `net/audio.rs` | the audio half: Opus out, each peer's voice in, echo cancelled |
 | `net/share.rs` | screen sharing: capture and its own broadcast |
 | `net/loopback.rs` | the in-process H.264 round trip |
 | `net/runtime.rs` | the single tokio runtime |
 | `components/` | `call_screen.rs` (the page and its key handler), `layout.rs`, `tile.rs`, `tile_menu.rs`, `participant.rs`, `bar.rs`, `microphone.rs`, `share.rs`, `subroom.rs`, `device_menu.rs`, `connect.rs`, `recent.rs` (the recent rooms list), `keys.rs`, `icons.rs`, `button.rs`, `stats.rs`, `signal.rs` (signal bars) |
-| `components/settings/` | the settings window: a `Tab` variant plus a component per tab (`profile.rs`, `keyboard.rs`, `updates.rs`, `network.rs`, `experimental.rs`, `about.rs`); `room_map.rs` is the Network tab's map, a blitz `Widget` painting lines and shapes with names and click targets over it |
+| `components/settings/` | the settings window: a `Tab` variant plus a component per tab (`profile.rs`, `keyboard.rs`, `updates.rs`, `network.rs`, `topology.rs`, `experimental.rs`, `about.rs`); `room_map.rs` is the Topology tab's map, a blitz `Widget` painting lines and shapes with names and click targets over it |
 
 Frames never touch the DOM:
 `cameras::pump` → `FrameSlot` → `VideoPaintSource` → vello.

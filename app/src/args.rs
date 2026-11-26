@@ -39,7 +39,7 @@
 //! vdr --bounce 30                         # move it round the relay and the hosts every 30 s (10 at least)
 //! vdr --show-routes                       # border hosts' videos, brighter while they carry the call
 //! vdr --no-spare-route                    # no spare offer beside the one in use (--spare-route: one)
-//! vdr --fake-web 100,50                   # the Network tab's room map draws a made-up room of 100 people, 50 relays
+//! vdr --fake-web 100,50                   # the Topology tab's room map draws a made-up room of 100 people, 50 relays
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry is a second
@@ -293,7 +293,7 @@ pub struct Args {
     /// `None` leaves it to the setting, which is on by default; a scripted
     /// run compares the two.
     pub spare_route: Option<bool>,
-    /// Draw a made-up room on the Network tab's map in place of the real
+    /// Draw a made-up room on the Topology tab's map in place of the real
     /// one (`--fake-web <people>,<relays>`): for looking at a big room
     /// without gathering a hundred people. Changes nothing else.
     pub fake_web: Option<(usize, usize)>,

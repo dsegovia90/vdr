@@ -21,7 +21,7 @@ pub const HOST: &str = "#38bdf8";
 pub const HOST_QUIET_ALPHA: f32 = 0.4;
 
 /// A `#rrggbb` colour's three bytes, for painting it with something that
-/// takes numbers rather than CSS (the room's map in the Network tab).
+/// takes numbers rather than CSS (the room's map in the Topology tab).
 pub fn rgb(hex: &str) -> Option<[u8; 3]> {
     let digits = hex.strip_prefix('#')?;
     if digits.len() != 6 || !digits.is_ascii() {

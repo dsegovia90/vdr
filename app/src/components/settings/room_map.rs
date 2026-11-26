@@ -1,4 +1,4 @@
-//! The room as a picture, at the top of the Network tab: relays as squares,
+//! The room as a picture, the Topology tab's content: relays as squares,
 //! people as circles (a host-coloured ring on those who can host), and a
 //! line for every link: white while media travels on it, either way, grey
 //! while it is held with nothing on it, dashed while it is only assumed.
@@ -18,26 +18,31 @@
 //! dashes between them (one path per dash width), which is all
 //! `Scene::append_scene` would do too: a recorded scene is a list of
 //! commands, so there is nothing cheaper to append. The drift is worked out
-//! from the time of the paint, so whatever repaints the window shows the
-//! dashes where they should be.
+//! from the wall-clock time of the paint, never from a count of frames, so
+//! the speed is the same at any frame rate and a late frame lands where the
+//! dashes should be by then.
 //!
-//! **Woken at twelve frames a second, and only while something moves.**
-//! `requires_redraw` stays `false`: true makes blitz repaint at the
-//! display's refresh rate for as long as the map is mounted. Instead a
-//! [`Ticker`] thread wakes one empty component, as a video frame wakes its
-//! tile; the render that follows is the redraw. Every wake repaints the whole
-//! window, as any wake does (blitz-shell's `redraw` resolves the document and
-//! paints every node and widget into one scene; read in its source), so the
-//! ticker parks, not sleeps, while the switch is off or no line moves, and
-//! stops when the map is dropped.
+//! **Redrawn at the display's rate, and only while something moves.** This
+//! is the one widget whose `requires_redraw` is ever `true`, and only while
+//! the switch is on, a line moves and blitz is still painting it. Blitz-shell
+//! (read in its source) asks every widget after resolving the document, and
+//! if any says yes, asks winit for another redraw once this one is painted;
+//! the surface presents with `AutoVsync`, so that is one frame per refresh of
+//! the display, with no thread or timer of ours and no work for the virtual
+//! DOM. A timer at 16 ms would instead beat against the refresh (inferred,
+//! not seen) and wake the virtual DOM every frame for nothing. Each of these
+//! redraws repaints the whole window, which is accepted here because the map
+//! is on screen only while someone is looking at it.
 //!
-//! **No work while it cannot be seen.** It is mounted only while the window
-//! is open on this tab; its poller stops when it is dropped, builds the model
-//! once a second, and sends only when it differs, because any wake of the
-//! page repaints the whole window. Blitz skips a widget that measures 0×0,
-//! which is what a closed (`hidden`) window's widget does. And it is what
-//! asks the room for its routes: mounting sets `map_open` on our entry and
-//! dropping clears it, which is all the call reads (`call.rs`).
+//! **Nothing at all while it cannot be seen.** It is mounted only while the
+//! window is open on its tab: dropping it removes the widget, and with it the
+//! only `true`. Its poller stops when it is dropped, builds the model once a
+//! second, and sends only when it differs, because any wake of the page
+//! repaints the whole window. Blitz skips painting a widget that measures
+//! 0×0, so a widget not painted for [`STALE`] stops asking, and asks again
+//! the first time it is painted after that. And it is what asks the room for
+//! its routes: mounting sets `map_open` on our entry and dropping clears it,
+//! which is all the call reads (`call.rs`).
 //!
 //! **What people say is drawn, not what we infer** (see `net::web`). A direct
 //! call meets nowhere, so it has no relay and no assumed lines; its one line
@@ -59,7 +64,7 @@ use peniko::kurbo::{Affine, BezPath, Circle, Point, Rect, Stroke, Vec2};
 use peniko::{Color, Fill};
 
 use super::super::colour;
-use super::network::{POLL, roster_of};
+use super::network::roster_of;
 use crate::channel::use_channel;
 use crate::net::arrival::Arrival;
 use crate::net::web::{self, Kind, State, Web};
@@ -67,10 +72,14 @@ use crate::net::{Participant, PeerStats};
 use crate::settings::Settings;
 use crate::web_layout::{self, Place, Side, Way};
 
-/// How often the dashes are redrawn while they move: about twelve frames a
-/// second, smooth enough at [`web_layout::DASH_SPEED`] (under 3 px a frame)
-/// and a fifth of what a 60 Hz display would ask.
-const FRAME: Duration = Duration::from_millis(83);
+/// How often the poller builds the model. What it reads moves once a second
+/// at most (reports, presence), so faster would only find the same room.
+const POLL: Duration = Duration::from_secs(1);
+
+/// A widget blitz has not painted for this long is not on screen (it
+/// measures 0×0), so it stops asking for redraws. Many frames at any refresh
+/// rate, so a slow frame never stops the drift by mistake.
+const STALE: Duration = Duration::from_millis(250);
 
 /// What the widget paints, worked out on the interface's side so the paint
 /// only turns it into shapes.
@@ -83,7 +92,8 @@ struct Drawing {
 }
 
 impl Drawing {
-    /// Whether any line has dashes to drift, which is when the ticker runs.
+    /// Whether any line has dashes to drift, which is when the map asks for
+    /// redraws.
     fn moves(&self) -> bool {
         self.lines.iter().any(|line| line.moving)
     }
@@ -179,23 +189,65 @@ struct MapPaint {
     /// When the drift began: a dash's place is the time since, at
     /// [`web_layout::DASH_SPEED`].
     began: Instant,
+    /// When blitz last painted it, which it does only while it measures more
+    /// than 0×0.
+    painted: Option<Instant>,
+    /// To ask for the first redraw after a pause (see [`MapPaint::paint`]).
+    window: Option<Arc<dyn Window>>,
 }
 
 impl Widget for MapPaint {
-    /// `false`, always: `true` repaints the window at the display's refresh
-    /// rate. The [`Ticker`] wakes the page instead, at [`FRAME`], and only
-    /// while dashes move.
+    /// `true` makes blitz redraw the whole window at the display's refresh
+    /// rate, so only while it is wanted: see [`MapPaint::animating_at`].
     fn requires_redraw(&self) -> bool {
-        false
+        self.animating_at(Instant::now())
     }
 
+    /// Blitz asks [`Widget::requires_redraw`] before painting, so the paint
+    /// that ends a pause (the switch turned on, a line starting to carry, the
+    /// map painted again after measuring 0×0) is seen too late to be followed
+    /// by another. That paint asks for the next redraw itself, and from then
+    /// on the answer is yes.
     fn paint(&mut self, _render_ctx: &mut dyn RenderContext, _styles: &ComputedStyles, width: u32, height: u32, scale: f64) -> Scene {
-        self.scene(width, height, scale)
+        let (scene, resume) = self.paint_at(width, height, scale, Instant::now());
+        if resume {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+        scene
     }
 }
 
 impl MapPaint {
-    fn scene(&mut self, width: u32, height: u32, scale: f64) -> Scene {
+    fn new(canvas: Rc<RefCell<Canvas>>, window: Option<Arc<dyn Window>>) -> MapPaint {
+        MapPaint { canvas, cached: None, began: Instant::now(), painted: None, window }
+    }
+
+    /// Whether any line has dashes drifting, with the switch on: the drawing
+    /// says so ([`Drawing::moves`]).
+    fn moves(&self) -> bool {
+        self.canvas.try_borrow().is_ok_and(|canvas| canvas.drawing.moves())
+    }
+
+    /// Whether to ask for redraws at `now`: something moves, and blitz has
+    /// painted the widget within [`STALE`], so it is on screen.
+    fn animating_at(&self, now: Instant) -> bool {
+        self.moves() && self.painted.is_some_and(|at| now.saturating_duration_since(at) < STALE)
+    }
+
+    /// A paint at `now`, and whether it must ask for the next redraw itself
+    /// because it ends a pause.
+    fn paint_at(&mut self, width: u32, height: u32, scale: f64, now: Instant) -> (Scene, bool) {
+        let resume = self.moves() && !self.animating_at(now);
+        let scene = self.scene_at(width, height, scale, now);
+        self.painted = Some(now);
+        (scene, resume)
+    }
+
+    /// The scene at `now`: the dashes wherever the time since [`Self::began`]
+    /// puts them.
+    fn scene_at(&mut self, width: u32, height: u32, scale: f64, now: Instant) -> Scene {
         let Ok(canvas) = self.canvas.try_borrow() else {
             return self.cached.as_ref().map(|(_, layers)| layers.both.clone()).unwrap_or_default();
         };
@@ -210,7 +262,7 @@ impl MapPaint {
         if !canvas.drawing.moves() {
             return layers.both.clone();
         }
-        let travelled = self.began.elapsed().as_secs_f64() * web_layout::DASH_SPEED;
+        let travelled = now.saturating_duration_since(self.began).as_secs_f64() * web_layout::DASH_SPEED;
         let dashes = dash_layer(&canvas.drawing, width, height, scale, travelled);
         let mut scene = layers.lines.clone();
         scene.commands.extend(dashes.commands);
@@ -660,12 +712,13 @@ pub(super) fn RoomMap(local: Arc<PeerStats>, participants: Signal<Vec<Participan
     let mut animate = use_signal(|| Settings::load().animates_map());
     let drawing = drawing_of(&now, &places, &shown, chosen_at, animate());
     let lonely = drawing.dots.iter().any(|dot| dot.lonely);
-    let moves = drawing.moves();
 
+    let window = use_hook(try_consume_context::<Arc<dyn Window>>);
     let canvas = use_hook(|| Rc::new(RefCell::new(Canvas::default())));
     let widget = use_hook({
         let canvas = canvas.clone();
-        move || CustomWidgetAttr::new(MapPaint { canvas, cached: None, began: Instant::now() })
+        let window = window.clone();
+        move || CustomWidgetAttr::new(MapPaint::new(canvas, window))
     });
     if let Ok(mut slot) = canvas.try_borrow_mut() {
         if slot.drawing != drawing {
@@ -675,7 +728,6 @@ pub(super) fn RoomMap(local: Arc<PeerStats>, participants: Signal<Vec<Participan
     }
     // This render is the change; ask for the paint that shows it, as the
     // video does, rather than trust that a render with no DOM change has one.
-    let window = use_hook(try_consume_context::<Arc<dyn Window>>);
     if let Some(window) = &window {
         window.request_redraw();
     }
@@ -732,18 +784,30 @@ pub(super) fn RoomMap(local: Arc<PeerStats>, participants: Signal<Vec<Participan
     let faked = fake.map(|(participants, relays)| format!("A made-up room (--fake-web): {participants} people, {relays} relays."));
 
     rsx! {
-        // Square by its width, up to 400 px: the widget paints whatever box
+        // Square by the pane's width, up to 560 px, and no taller than the
+        // pane leaves under the tab's heading: the widget paints whatever box
         // it gets, but the names over it assume the same square.
+        //
+        // **The height bound is `80vh - 136px`**: the window is 80vh tall
+        // (`mod.rs`), less the pane's padding (48), the heading and a
+        // two-line intro with their margins (88). At its tallest the window
+        // is 680 px, which leaves 544 under a two-line intro and 564 under a
+        // one-line one, which it is at that width: the 560 fits. Worked out
+        // from the classes, not measured. The legend and the details under
+        // the square may scroll; the square itself should not need to.
+        // Never under 160 px, so a very short window still has a map rather
+        // than a widget measuring 0x0, which blitz skips without a word;
+        // `w-full` still keeps it within the pane's width, so it can never
+        // make the pane scroll sideways.
         //
         // **Two boxes, deliberately.** As a flex item, taffy turns `w-full`
         // into a height through the aspect ratio *before* clamping the width
-        // to its maximum, so in a pane wider than 400 px one box would be
-        // 400 wide and as tall as the pane (read in taffy's source, not
+        // to its maximum, so in a pane wider than the maximum one box would
+        // be that wide and as tall as the pane (read in taffy's source, not
         // seen). The outer box takes the clamped width; the square is a
-        // block child of it, where taffy applies the ratio to the maximum
-        // too. A box with no height would be a widget measuring 0x0, which
-        // blitz skips without a word.
-        div { class: "mt-4 w-full max-w-[400px] shrink-0",
+        // block child of it, where taffy applies the ratio to the clamped
+        // width too, whichever of the bounds above clamped it.
+        div { class: "mt-4 w-full max-w-[max(160px,min(560px,80vh_-_136px))] shrink-0",
             div { class: "relative aspect-square w-full overflow-hidden rounded-md bg-neutral-950",
                 // Sized by `inset-0` and, in case the renderer treats it as a
                 // replaced element sized by its content, by `h-full w-full` too.
@@ -818,8 +882,8 @@ pub(super) fn RoomMap(local: Arc<PeerStats>, participants: Signal<Vec<Participan
             }
             div { class: "flex flex-row items-center gap-1.5",
                 div { class: "flex h-[2px] w-6 shrink-0 flex-row bg-neutral-400",
-                    div { class: "ml-[3px] h-[2px] w-[5px] bg-white" }
-                    div { class: "ml-[7px] h-[2px] w-[5px] bg-white" }
+                    div { class: "ml-[2px] h-[2px] w-[6px] bg-white" }
+                    div { class: "ml-[10px] h-[2px] w-[6px] bg-white" }
                 }
                 span { "moving dashes: which way" }
             }
@@ -856,96 +920,6 @@ pub(super) fn RoomMap(local: Arc<PeerStats>, participants: Signal<Vec<Participan
                 }
                 span { "Animate" }
             }
-        }
-        Ticker { on: moves }
-    }
-}
-
-/// Wakes the page every [`FRAME`] while `on`, so the map's dashes drift,
-/// and does nothing at all otherwise: its thread parks while off, and ends
-/// when the component is dropped, which is when the map is (the tab or the
-/// window closes). The wake is this component's own render, which changes
-/// nothing in the document but is work for the virtual DOM, and blitz
-/// redraws after any (as for a video frame, `participant.rs`); it asks the
-/// window for the paint as well, rather than rely on that.
-#[component]
-fn Ticker(on: bool) -> Element {
-    let update = use_hook(dioxus_core::schedule_update);
-    let frames = use_hook(|| Rc::new(Frames::spawn(move || update()).0));
-    use_drop({
-        let frames = frames.clone();
-        move || frames.halt()
-    });
-    frames.want(on);
-    let window = use_hook(try_consume_context::<Arc<dyn Window>>);
-    if on {
-        if let Some(window) = &window {
-            window.request_redraw();
-        }
-    }
-    rsx! {}
-}
-
-/// The thread behind [`Ticker`]: calls `wake` every [`FRAME`] while wanted,
-/// parks while not, and ends once halted. Apart from the component so the
-/// stopping can be tested.
-struct Frames {
-    wanted: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::Thread>,
-}
-
-impl Frames {
-    /// Starts parked. The handle is for a test to join; the component lets
-    /// it go, and the thread ends on its own once halted.
-    fn spawn(wake: impl Fn() + Send + 'static) -> (Frames, Option<std::thread::JoinHandle<()>>) {
-        let wanted = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
-        let spawned = std::thread::Builder::new().name("network-map-frames".into()).spawn({
-            let wanted = wanted.clone();
-            let stop = stop.clone();
-            move || loop {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                if !wanted.load(Ordering::Relaxed) {
-                    // Unparked when wanted again or halted; a spurious
-                    // return only goes round again.
-                    std::thread::park();
-                    continue;
-                }
-                std::thread::sleep(FRAME);
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                if wanted.load(Ordering::Relaxed) {
-                    wake();
-                }
-            }
-        });
-        let handle = match spawned {
-            Ok(handle) => Some(handle),
-            Err(error) => {
-                tracing::warn!("could not spawn the room map's frame ticker: {error}");
-                None
-            }
-        };
-        let thread = handle.as_ref().map(|handle| handle.thread().clone());
-        (Frames { wanted, stop, thread }, handle)
-    }
-
-    fn want(&self, on: bool) {
-        if self.wanted.swap(on, Ordering::Relaxed) != on && on {
-            if let Some(thread) = &self.thread {
-                thread.unpark();
-            }
-        }
-    }
-
-    fn halt(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = &self.thread {
-            thread.unpark();
         }
     }
 }
@@ -1071,8 +1045,8 @@ mod tests {
         let drawing = drawing_of(&web, &places, &shown, None, true);
         assert!(drawing.moves());
         let canvas = Rc::new(RefCell::new(Canvas { generation: 1, drawing }));
-        let mut paint = MapPaint { canvas: canvas.clone(), cached: None, began: Instant::now() };
-        let first = paint.scene(400, 400, 2.0);
+        let mut paint = MapPaint::new(canvas.clone(), None);
+        let first = paint.scene_at(400, 400, 2.0, Instant::now());
         let (lines, nodes) = draw(&canvas.borrow().drawing, 400, 400, 2.0);
         // Lines, then one or two dash widths (lone lanes and paired ones),
         // then nodes.
@@ -1091,40 +1065,95 @@ mod tests {
         assert!(!still.moves() && still.lines.iter().all(|line| !line.moving));
         assert!(dash_layer(&still, 400, 400, 2.0, 3.0).commands.is_empty());
         *canvas.borrow_mut() = Canvas { generation: 2, drawing: still };
-        let frozen = paint.scene(400, 400, 2.0);
+        let frozen = paint.scene_at(400, 400, 2.0, Instant::now());
         let (lines, nodes) = draw(&canvas.borrow().drawing, 400, 400, 2.0);
         assert_eq!(frozen.commands.len(), lines.commands.len() + nodes.commands.len());
-        assert_eq!(paint.scene(400, 400, 2.0), frozen);
+        assert_eq!(paint.scene_at(400, 400, 2.0, Instant::now() + Duration::from_secs(3)), frozen);
     }
 
     #[test]
-    fn the_frames_run_only_while_wanted_and_end_when_halted() {
-        use std::sync::atomic::AtomicUsize;
-        let woken = Arc::new(AtomicUsize::new(0));
-        let (frames, handle) = Frames::spawn({
-            let woken = woken.clone();
-            move || {
-                woken.fetch_add(1, Ordering::Relaxed);
+    fn redraws_are_asked_for_only_while_something_moves_on_screen() {
+        let web = web_layout::fake(6, 1, 0);
+        let places = web_layout::layout(&web, None);
+        let shown = web_layout::shown_edges(&web, None);
+        let moving = drawing_of(&web, &places, &shown, None, true);
+        let still = drawing_of(&web, &places, &shown, None, false);
+        assert!(moving.moves() && !still.moves());
+        let canvas = Rc::new(RefCell::new(Canvas { generation: 1, drawing: moving.clone() }));
+        let mut paint = MapPaint::new(canvas.clone(), None);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+
+        // Never painted (measuring 0x0, or not yet laid out): no redraws.
+        assert!(!paint.animating_at(start));
+        // The first paint asks for the next itself, and from then on blitz
+        // is asked, frame after frame, at whatever rate it paints.
+        assert!(paint.paint_at(400, 400, 2.0, at(0)).1);
+        for frame in 1..=10 {
+            assert!(paint.animating_at(at(frame * 16)));
+            assert!(!paint.paint_at(400, 400, 2.0, at(frame * 16)).1, "no second ask while running");
+        }
+        // A slow frame, at a degraded 20 fps, does not stop it.
+        assert!(paint.animating_at(at(160 + 50)));
+
+        // Not painted for a while (blitz skips a 0x0 widget): it stops asking,
+        // and the paint that brings it back asks for the next.
+        assert!(!paint.animating_at(at(160) + STALE));
+        assert!(paint.paint_at(400, 400, 2.0, at(2_000)).1);
+        assert!(paint.animating_at(at(2_016)));
+
+        // The switch off: nothing moves, nothing is asked for, painted or not.
+        canvas.borrow_mut().drawing = still;
+        assert!(!paint.animating_at(at(2_016)));
+        assert!(!paint.paint_at(400, 400, 2.0, at(2_016)).1);
+        assert!(!paint.animating_at(at(2_032)));
+
+        // Nothing travelling (no line carries): the same.
+        let mut quiet = moving.clone();
+        for line in &mut quiet.lines {
+            line.moving = false;
+        }
+        canvas.borrow_mut().drawing = quiet;
+        assert!(!paint.animating_at(at(2_032)) && !paint.paint_at(400, 400, 2.0, at(2_032)).1);
+
+        // Moving again: the next paint restarts it.
+        canvas.borrow_mut().drawing = moving;
+        assert!(paint.paint_at(400, 400, 2.0, at(5_000)).1);
+        assert!(paint.animating_at(at(5_016)));
+        // While the component is rendering it holds the canvas: no answer
+        // but no, rather than a panic.
+        let held = canvas.borrow_mut();
+        assert!(!paint.animating_at(at(5_016)));
+        drop(held);
+    }
+
+    #[test]
+    fn the_drift_is_wall_time_so_frame_rate_does_not_change_it() {
+        let web = web_layout::fake(6, 1, 0);
+        let places = web_layout::layout(&web, None);
+        let shown = web_layout::shown_edges(&web, None);
+        let drawing = drawing_of(&web, &places, &shown, None, true);
+        let canvas = Rc::new(RefCell::new(Canvas { generation: 1, drawing }));
+        let start = Instant::now();
+        // One painter at 60 fps, one at 20, one that drops frames: at the
+        // same moment all three paint the same picture.
+        let mut painters: Vec<(MapPaint, u64)> = [16u64, 50, 117]
+            .into_iter()
+            .map(|step| {
+                let mut paint = MapPaint::new(canvas.clone(), None);
+                paint.began = start;
+                (paint, step)
+            })
+            .collect();
+        for (paint, step) in &mut painters {
+            let mut ms = 0;
+            while ms < 1_000 {
+                let _ = paint.paint_at(400, 400, 2.0, start + Duration::from_millis(ms));
+                ms += *step;
             }
-        });
-        let handle = handle.expect("spawned");
-        std::thread::sleep(FRAME * 3);
-        assert_eq!(woken.load(Ordering::Relaxed), 0, "parked until wanted");
-        frames.want(true);
-        std::thread::sleep(FRAME * 4);
-        assert!(woken.load(Ordering::Relaxed) >= 2, "{}", woken.load(Ordering::Relaxed));
-        frames.want(false);
-        std::thread::sleep(FRAME * 2);
-        let settled = woken.load(Ordering::Relaxed);
-        std::thread::sleep(FRAME * 3);
-        assert_eq!(woken.load(Ordering::Relaxed), settled, "parked again");
-        frames.halt();
-        handle.join().expect("ended");
-        // Halted while wanted ends too.
-        let (frames, handle) = Frames::spawn(|| {});
-        frames.want(true);
-        std::thread::sleep(FRAME);
-        frames.halt();
-        handle.expect("spawned").join().expect("ended");
+        }
+        let then = start + Duration::from_millis(1_234);
+        let scenes: Vec<Scene> = painters.iter_mut().map(|(paint, _)| paint.scene_at(400, 400, 2.0, then)).collect();
+        assert!(scenes.windows(2).all(|pair| pair[0] == pair[1]));
     }
 }

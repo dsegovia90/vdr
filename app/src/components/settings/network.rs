@@ -1,6 +1,5 @@
-//! The Network tab: the room as a map of who links to whom (`room_map`),
-//! then the last minute of what each outgoing stream sent, against its cap
-//! and its slice of the link.
+//! The Network tab: the last minute of what each outgoing stream sent, against
+//! its cap and its slice of the link.
 //!
 //! **One budget, divided.** The transport's estimate for the whole connection
 //! is split among the microphone, the screen share and the camera, in that
@@ -42,7 +41,6 @@ use std::time::Duration;
 use dioxus_native::prelude::*;
 
 use super::Heading;
-use super::room_map::RoomMap;
 use super::super::SignalBars;
 use crate::channel::use_channel;
 use crate::net::quality::{self, Blame, Link, Quality, Seen};
@@ -51,7 +49,7 @@ use crate::rates::{self, Point, Second, kbps_words as rate};
 
 /// How often the poller looks. The history moves once a second, so faster
 /// would only find the same minute again.
-pub(super) const POLL: Duration = Duration::from_secs(1);
+const POLL: Duration = Duration::from_secs(1);
 
 /// The SVG's own coordinate space. It is stretched to the pane's width and
 /// drawn [`HEIGHT`] px tall, so vertical units are pixels and horizontal ones
@@ -78,13 +76,6 @@ pub fn NetworkTab(
         div { class: "flex flex-col",
             div { class: "text-lg font-semibold text-neutral-100", "Network" }
             p { class: "mt-1 text-sm text-neutral-400",
-                "Everyone in the room and the relays it meets at, as each says it. A white line means media is travelling along it, and moving dashes show which way: two rows of dashes going opposite ways means both ways. A grey line is connected with nothing travelling; a dashed one is only assumed."
-            }
-            if open {
-                RoomMap { local: local.clone(), participants, me: me.clone() }
-            }
-            Heading { text: "What you sent" }
-            p { class: "text-sm text-neutral-400",
                 "What your call sent over the last minute, newest at the right. The link's estimate is divided between your microphone, your screen share and your camera, in that order; each video stream follows its slice, and never goes over its cap."
             }
             if open {

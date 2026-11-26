@@ -15,6 +15,7 @@ mod keyboard;
 mod network;
 mod profile;
 mod room_map;
+mod topology;
 mod updates;
 
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use dioxus_native::prelude::*;
 
 use super::keys::{KeyFocus, SettingsPanel};
-use super::{ChartIcon, CloseIcon, FlaskIcon, InfoIcon, KeyboardIcon, PersonIcon, UpdateIcon};
+use super::{ChartIcon, CloseIcon, FlaskIcon, InfoIcon, KeyboardIcon, PersonIcon, TopologyIcon, UpdateIcon};
 use crate::net::{Metrics, Participant, PeerStats};
 
 pub(super) use keyboard::record;
@@ -35,12 +36,13 @@ pub(crate) enum Tab {
     Keyboard,
     Updates,
     Network,
+    Topology,
     Experimental,
     About,
 }
 
 impl Tab {
-    const ALL: [Tab; 6] = [Tab::Profile, Tab::Keyboard, Tab::Updates, Tab::Network, Tab::Experimental, Tab::About];
+    const ALL: [Tab; 7] = [Tab::Profile, Tab::Keyboard, Tab::Updates, Tab::Network, Tab::Topology, Tab::Experimental, Tab::About];
 
     fn label(self) -> &'static str {
         match self {
@@ -48,6 +50,7 @@ impl Tab {
             Tab::Keyboard => "Keyboard",
             Tab::Updates => "Updates",
             Tab::Network => "Network",
+            Tab::Topology => "Topology",
             Tab::Experimental => "Experimental",
             Tab::About => "About",
         }
@@ -60,13 +63,15 @@ impl Tab {
             Tab::Keyboard => rsx! { KeyboardIcon {} },
             Tab::Updates => rsx! { UpdateIcon {} },
             Tab::Network => rsx! { ChartIcon {} },
+            Tab::Topology => rsx! { TopologyIcon {} },
             Tab::Experimental => rsx! { FlaskIcon {} },
             Tab::About => rsx! { InfoIcon {} },
         }
     }
 
     /// `open` is whether the window is showing: the window stays mounted
-    /// while closed, and the Network tab samples only while it can be seen.
+    /// while closed, and the Network and Topology tabs sample only while they
+    /// can be seen.
     fn body(self, call: Call, open: bool) -> Element {
         let Call { local, metrics, participants, me } = call;
         match self {
@@ -74,6 +79,7 @@ impl Tab {
             Tab::Keyboard => rsx! { keyboard::KeyboardTab {} },
             Tab::Updates => rsx! { updates::UpdatesTab {} },
             Tab::Network => rsx! { network::NetworkTab { metrics, local, participants, me, open } },
+            Tab::Topology => rsx! { topology::TopologyTab { local, participants, me, open } },
             Tab::Experimental => rsx! { experimental::ExperimentalTab { local, me } },
             Tab::About => rsx! { about::AboutTab {} },
         }
@@ -91,7 +97,8 @@ struct Call {
 
 /// The window. `local` is our own entry, which the Profile tab names and the
 /// Experimental tab switches; `metrics` the call's numbers and
-/// `participants` everyone else, which the Network tab draws; `me` our id.
+/// `participants` everyone else, which the Network and Topology tabs draw;
+/// `me` our id.
 #[component]
 pub fn SettingsModal(
     local: Arc<PeerStats>,

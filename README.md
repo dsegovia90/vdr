@@ -127,20 +127,7 @@ call you are already in. Names are not verified: anyone can choose any name,
 and two people can choose the same one. Its *Keyboard* tab lists the
 shortcuts and changes them: click a key, then press the new one; Backspace
 removes it, Esc gives up. Its *Updates* tab is described below. Its
-*Network* tab opens on a map of the room: relays as squares, people as
-circles (a blue ring on anyone who could host), and a line for every link,
-split in the middle. The half next to someone is white when they send media
-along it and grey when they do not, so a line white all along carries both
-ways, white at one end only carries one way from that end, and all grey is
-a link held with nothing on it; this comes from what each person's app says
-about how everyone else's media reaches it, asked for only while the map is
-open. Click someone to dim everything off their paths and read where their
-media goes and comes from, including where what they say and what others
-see disagree; a relay nobody reaches is drawn faint and dashed. Everyone sits on one ring, you at the top and
-the relays together at the bottom, so a line between two people never
-passes through a relay; a line that would brush a node it does not end at
-is drawn curved around it. A direct call is one white line between the two
-of you. Under the map it charts the last minute of a
+*Network* tab charts the last minute of a
 call: what the camera sent against
 its cap and its slice of the link and, while a screen is shared and for a
 minute after, the same for the share plus everything sent together against
@@ -161,6 +148,21 @@ row's (frames a second, and how much later than its best the video arrives),
 coloured by quality; the diagonal is each person's own connection. A row
 mostly poor is marked "their upload?", a column mostly poor "their
 download?"; a single bad cell stays a single cell.
+Its *Topology* tab is a map of the room: relays as squares, people as
+circles (a blue ring on anyone who could host), and a line for every link. A
+white line carries media, and white dashes moving along it show which way,
+two rows going opposite ways when it carries both; a grey line is a link held
+with nothing on it, and a dashed one is only assumed. The directions come
+from what each person's app says about how everyone else's media reaches it,
+asked for only while the tab is open. Click someone to dim everything off
+their paths and read where their media goes and comes from, including where
+what they say and what others see disagree; a relay nobody reaches is drawn
+faint and dashed. Everyone sits on one ring, you at the top and the relays
+together at the bottom, so a line between two people never passes through a
+relay; a line that would brush a node it does not end at is drawn curved
+around it. A direct call is one white line between the two of you. The
+*Animate* switch under it stops the dashes; in a very large room only your
+own paths, or the selected person's, move.
 Its *Experimental* tab has a switch per feature still being tried out. *Connection report*, on by default: with it on, your
 presence tells the room how your connection is doing and what you get from
 each person, and you see what they say. Each video's name label then carries

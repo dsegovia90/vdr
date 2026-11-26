@@ -1,4 +1,4 @@
-//! Where each node of the room's web goes on the Network tab, which lines
+//! Where each node of the room's web goes on the Topology tab, which lines
 //! are drawn and how, and a made-up room to look at (`--fake-web`).
 //!
 //! **Balanced, not simulated.** Positions follow from how many relays and
@@ -61,7 +61,10 @@ use std::collections::BTreeMap;
 use crate::net::web::{self, Hop, Kind, Person, Relay, State, Web};
 
 /// At or under this many nodes everyone is named; over it only we and the
-/// selected node are, since a hundred names on a 400 px square are noise.
+/// selected node are, since a hundred names on the square are noise. Not
+/// raised with the Topology tab's larger square: names have more room on it,
+/// but a small window still lays the map out at about 280 px, where this is
+/// what was judged, and no test checks one name against another.
 pub const NAMED_MAX: usize = 24;
 
 /// Over this many could-flow lines, only the focused node's are drawn: a
@@ -75,7 +78,7 @@ const CENTRE: f64 = 0.5;
 const PERSON_LARGE: f64 = 0.075;
 const RELAY_LARGE: f64 = 0.07;
 /// The smallest circle one ring may give before the second ring is used:
-/// eight pixels on the 400 px square, about ninety nodes. One ring of 150
+/// eight pixels on a 400 px square, about ninety nodes. One ring of 150
 /// gives under five, a dot to aim at rather than a node; only a room too
 /// big for a thin inner ring comes to that. Click targets are larger than
 /// the dot where the neighbours leave room (see [`Place::hit`]).
@@ -94,13 +97,13 @@ pub const NAME_GAP: f64 = 0.008;
 /// leave at three and nine o'clock.
 const SIDE_LABEL: f64 = LABEL_MIN;
 /// How tall a name is: a line of 10 px text, leading-tight, on a square of
-/// about 280 px, the narrowest the Network tab is laid out at; on the full
-/// 400 px it is about two thirds of this.
+/// about 280 px, about the narrowest the Topology tab is laid out at; on the
+/// full 560 px it is half of this.
 pub const NAME_TALL: f64 = 0.045;
 /// Kept clear at the square's edge beyond the names.
 const EDGE_PAD: f64 = 0.004;
 /// The largest a click target gets, and how much bigger than the node it
-/// tries to be: twenty pixels on the 400 px square is easy to hit.
+/// tries to be: twenty pixels on a 400 px square is easy to hit.
 const HIT_MIN: f64 = 0.05;
 const HIT_OVER: f64 = 1.3;
 
@@ -647,17 +650,24 @@ pub fn quiet_alpha(drawn: usize, state: State, selected: bool) -> f32 {
 }
 
 /// How fast a dash drifts, in logical pixels a second, the same on every
-/// line and at every map size, so a long line is not a fast one. Slow
-/// enough to follow with the eye; at the twelve frames a second the map is
-/// woken at, a dash moves under 3 px a frame, well under half of
-/// [`DASH_PERIOD`], so the eye cannot take a step for one backwards.
-pub const DASH_SPEED: f64 = 32.0;
+/// line and at every map size, so a long line is not a fast one: brisk, a
+/// line across the map in about six seconds, and still slow enough to follow.
+///
+/// **It never seems to step backwards** while a frame moves a dash less than
+/// half of [`DASH_PERIOD`] (past half, the nearest dash in the next frame is
+/// the one behind, and the eye takes that one), and it reads as one thing
+/// gliding while a frame moves it less than its own length, so where it was
+/// and where it is overlap. At 90 px/s that is 1.5 px a frame at 60 fps and
+/// 4.5 px at a degraded 20, against 8 and 6
+/// (`dashes_cannot_seem_to_step_backwards`).
+pub const DASH_SPEED: f64 = 90.0;
 /// A dash, and the gap after it, in logical pixels. A dash shorter than its
-/// gap reads as a thing moving rather than as a dashed line. At 14 px from
-/// one to the next, any line with 19 px between its nodes' edges always shows
-/// a whole dash, and one across a 400 px map about twenty.
-pub const DASH_LONG: f64 = 5.0;
-pub const DASH_GAP: f64 = 9.0;
+/// gap reads as a thing moving rather than as a dashed line; 6 px rather
+/// than 5 keeps a dash longer than a 20 fps frame's step at this speed. At
+/// 16 px from one to the next, any line with 22 px between its nodes' edges
+/// always shows a whole dash, and one across a 560 px map about thirty-five.
+pub const DASH_LONG: f64 = 6.0;
+pub const DASH_GAP: f64 = 10.0;
 pub const DASH_PERIOD: f64 = DASH_LONG + DASH_GAP;
 /// How far a two-way link's lanes sit either side of its middle, in logical
 /// pixels: as wide as the thickest line is, so the two read as two rails.
@@ -665,13 +675,15 @@ pub const LANE_APART: f64 = 1.5;
 /// Kept between a dash and a node's edge, in logical pixels.
 pub const DASH_CLEAR: f64 = 2.0;
 /// Over this many carrying lines, only the focus's paths move (the selected
-/// node's, or ours): a hundred-odd lines all moving at once is a shimmer, not
-/// a direction, and in a room with a relay it is about a hundred people,
-/// where a person looks for their own media anyway. It also bounds a frame:
-/// the 150-person fake room's lines average 27 dashes each on a 400 px map,
-/// so at most about 3,300 short strokes, in one path per width. All 228 of
-/// that room's carrying lines' dashes are worked out in about 2 ms in a
-/// debug build (`a_frame_of_the_largest_room_is_bounded`).
+/// node's, or ours). For legibility, not cost: a hundred-odd lines all moving
+/// at once is a shimmer, not a direction, and faster dashes shimmer sooner,
+/// not later; in a room with a relay it is about a hundred people, where a
+/// person looks for their own media anyway. Kept at 120 with the larger map:
+/// the lines all meet at the relay and the same few hosts whatever the size,
+/// so the crowding there is what decides it, and that does not scale with the
+/// square. (What a frame costs is measured anyway: all 228 of the 150-person
+/// fake room's carrying lines' dashes are worked out in a few milliseconds in
+/// a debug build, `a_frame_of_the_largest_room_is_bounded`.)
 pub const MOVING_MAX: usize = 120;
 
 /// Which way along a link a lane's dashes drift: from its `from` end to its
@@ -1174,7 +1186,7 @@ mod tests {
                 let web = fake(participants, relays, 0);
                 for (node, place) in web.nodes.iter().zip(layout(&web, None)) {
                     match node.kind {
-                        // Eight pixels on the 400 px square, or nearly five
+                        // Eight pixels on a 400 px square, or nearly five
                         // for the hundred and fifty of the largest fake room.
                         Kind::Participant => {
                             let least = if web.nodes.len() > 140 { 0.012 } else { RING_FLOOR };
@@ -1419,10 +1431,22 @@ mod tests {
             }
             // Whole dashes (not cut at an edge) are a period apart.
             let whole: Vec<f64> = line.iter().filter(|(a, b)| (b.0 - a.0 - DASH_LONG).abs() < 1e-6).map(|(a, _)| a.0).collect();
-            assert!(whole.len() >= 18, "{}", whole.len());
+            assert!(whole.len() >= 16, "{}", whole.len());
             for pair in whole.windows(2) {
                 assert!((pair[1] - pair[0] - DASH_PERIOD).abs() < 1e-6, "{pair:?}");
             }
+        }
+    }
+
+    #[test]
+    fn dashes_cannot_seem_to_step_backwards() {
+        // At a display's 60 fps and at a degraded 20, a frame's step is under
+        // half the spacing (or the nearest dash next frame is the one behind)
+        // and under a dash's own length (so where it was and is overlap).
+        for fps in [60.0, 20.0] {
+            let step = DASH_SPEED / fps;
+            assert!(step < DASH_PERIOD / 2.0, "{fps} fps: {step} px a frame against a {DASH_PERIOD} px period");
+            assert!(step < DASH_LONG, "{fps} fps: {step} px a frame against a {DASH_LONG} px dash");
         }
     }
 
