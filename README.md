@@ -127,7 +127,11 @@ call you are already in. Names are not verified: anyone can choose any name,
 and two people can choose the same one. Its *Keyboard* tab lists the
 shortcuts and changes them: click a key, then press the new one; Backspace
 removes it, Esc gives up. Its *Updates* tab is described below. Its
-*Network* tab charts the last minute of a call: what the camera sent against
+*Network* tab opens on a map of the room: relays as squares, people as
+circles (a blue ring on anyone who could host), a grey line wherever media
+could flow and a white one where it flows now, as each person says it;
+click a node for its links. Under the map it charts the last minute of a
+call: what the camera sent against
 its cap and its slice of the link and, while a screen is shared and for a
 minute after, the same for the share plus everything sent together against
 the link's whole estimate (video only; audio is not counted). The lines are a

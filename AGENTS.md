@@ -275,6 +275,13 @@ focus.
   **plain colour** on the parent (`text-white`, `text-[rgb(…)]`), because
   `currentColor` becomes the computed colour and Tailwind v4's palette is
   `oklch()`.
+- **The Network tab's map is a widget, not an inline SVG**
+  (`components/settings/room_map.rs`): blitz re-parses an SVG subtree on any
+  change and its children take no clicks. Blitz calls every widget's `paint`
+  on every window paint, so the map caches its `Scene` and rebuilds it only
+  when the drawing or the size changes. Its square is two boxes: on one flex
+  item with `w-full max-w-[…] aspect-square`, taffy derives the height from
+  the unclamped width (read in taffy's source, not seen).
 - **Video tiles are flex rows, not a grid** (`components/layout.rs`), with
   zero-height line breaks per breakpoint. The box *is* the card; the paint code
   crops the sides when a box is narrower than the video.
@@ -370,18 +377,19 @@ focus.
 | `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes, for the log and the host borders on tiles (`read` and `through` are pure) |
 | `net/moves.rs` | moving the call to a host, an experiment: the presence field, which choice wins, the bounce order (pure) |
 | `net/web.rs` | the room as a web of nodes for the Network tab: the `via`/`held` presence fields (wire form, lenient reading, cleaning) and the pure graph built from every entry |
+| `web_layout.rs` | where the Network tab's map puts each node (rings, in a unit square, from counts and order only), which lines it draws, and the made-up room of `--fake-web` |
 | `net/door.rs` | a hosted room's door: its name, the secret guests present as `?door=`, the check (pure) |
 | `net/audio.rs` | the audio half: Opus out, each peer's voice in, echo cancelled |
 | `net/share.rs` | screen sharing: capture and its own broadcast |
 | `net/loopback.rs` | the in-process H.264 round trip |
 | `net/runtime.rs` | the single tokio runtime |
 | `components/` | `call_screen.rs` (the page and its key handler), `layout.rs`, `tile.rs`, `tile_menu.rs`, `participant.rs`, `bar.rs`, `microphone.rs`, `share.rs`, `subroom.rs`, `device_menu.rs`, `connect.rs`, `recent.rs` (the recent rooms list), `keys.rs`, `icons.rs`, `button.rs`, `stats.rs`, `signal.rs` (signal bars) |
-| `components/settings/` | the settings window: a `Tab` variant plus a component per tab (`profile.rs`, `keyboard.rs`, `updates.rs`, `network.rs`, `experimental.rs`, `about.rs`) |
+| `components/settings/` | the settings window: a `Tab` variant plus a component per tab (`profile.rs`, `keyboard.rs`, `updates.rs`, `network.rs`, `experimental.rs`, `about.rs`); `room_map.rs` is the Network tab's map, a blitz `Widget` painting lines and shapes with names and click targets over it |
 
 Frames never touch the DOM:
 `cameras::pump` → `FrameSlot` → `VideoPaintSource` → vello.
 
 `cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`, `rates.rs`, `net/quality.rs`,
 `camera/paint/fit.rs`, `audio/catchup.rs`, `components/layout.rs`,
-`update/release.rs`, `update/verify.rs`, `net/door.rs`, `net/moves.rs`, `net/arrival.rs`, `net/web.rs`) are where
+`update/release.rs`, `update/verify.rs`, `net/door.rs`, `net/moves.rs`, `net/arrival.rs`, `net/web.rs`, `web_layout.rs`) are where
 logic that can be tested without a window belongs.
