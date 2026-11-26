@@ -770,6 +770,23 @@ struct Presence {
     /// costs only itself.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "super::moves::lenient")]
     moved: Option<super::moves::CallOn>,
+    /// Where their media goes now: `"relay"`, `"guests"`, or a host's
+    /// endpoint id (`web` says what each means). Said by every build that
+    /// has it, switch or no switch, for the room's map in the Network tab;
+    /// absent outside a room and from older builds. **Read leniently**: a
+    /// bad value is nothing said.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "super::web::say_via",
+        deserialize_with = "super::web::lenient_via"
+    )]
+    via: Option<arrival::Sending>,
+    /// The hosts they hold a session to, by endpoint id, never a door; at
+    /// most `web::HELD_MAX`. Absent when empty, and read entry by entry as
+    /// leniently as `seen`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "super::web::lenient_held")]
+    held: Vec<String>,
 }
 
 impl Default for Presence {
@@ -787,6 +804,8 @@ impl Default for Presence {
             seen: std::collections::BTreeMap::new(),
             host: None,
             moved: None,
+            via: None,
+            held: Vec::new(),
         }
     }
 }
@@ -819,6 +838,9 @@ impl Presence {
             // The winner we follow, repeated, so a choice outlives whoever
             // made it. Cleaned on the way out too.
             moved: local.followed_move().and_then(super::moves::CallOn::clean),
+            // Cleaned on the way out too, as everything here is.
+            via: super::web::clean_via(local.sending(), ""),
+            held: super::web::clean_held(local.held(), ""),
         }
     }
 }
@@ -1916,6 +1938,7 @@ async fn run(
         local.set_room(None);
         // Out of the room, our media goes nowhere.
         local.set_sending(None);
+        local.set_held(Vec::new());
         local.set_meets_at(None);
         // Aborting the loop above stops the per-participant tasks with it, but
         // the tiles are the interface's and have to be taken down by name.
@@ -2585,8 +2608,10 @@ async fn announce(
         // the link, and is only logged as it starts and stops.
         // A move of the call is in it too: followers act on it as it is said,
         // so it must not wait for the clock refresh.
-        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name, now.link.is_some(), &now.host, &now.moved)
-            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name, said.link.is_some(), &said.host, &said.moved);
+        // Where our media goes and which hosts we hold go at once too: the
+        // room's map would otherwise show a move for up to the clock refresh.
+        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name, now.link.is_some(), &now.host, &now.moved, &now.via, &now.held)
+            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name, said.link.is_some(), &said.host, &said.moved, &said.via, &said.held);
         if changed {
             let asking = match now.requests.len() {
                 0 => String::new(),
@@ -2604,8 +2629,13 @@ async fn announce(
                 Some(on) => format!(", call on {}", super::moves::describe(on.to.as_deref())),
                 None => String::new(),
             };
+            // Hosts by count: `sessions` logs each one as it comes and goes.
+            let held = match now.held.len() {
+                0 => String::new(),
+                n => format!(", holding {n} host session(s)"),
+            };
             tracing::info!(
-                "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}{hosting}{moved}",
+                "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}{hosting}{moved}{held}",
                 on_off(now.camera),
                 on_off(now.mic),
                 room_name(&now.room)
@@ -2795,6 +2825,8 @@ async fn listen(
                     seen,
                     host,
                     moved,
+                    via,
+                    held,
                 })) => {
                     let room = subroom(room);
                     if let Some(clock) = clock {
@@ -2818,6 +2850,10 @@ async fn listen(
                     // claim like a name, and their own id has no place in it.
                     stats.set_link(link.map(Link::clean));
                     stats.set_seen(quality::clean_seen(seen, &id));
+                    // For the room's map: cleaned again with their id, which
+                    // has no place in either.
+                    stats.set_sending(super::web::clean_via(via, &id));
+                    stats.set_held(super::web::clean_held(held, &id));
                     // Read by their audio task on every frame, which is what sets
                     // how loud they are to us.
                     stats.set_room(room.clone());
@@ -3537,6 +3573,8 @@ mod presence_tests {
             seen: Default::default(),
             host: None,
             moved: None,
+            via: None,
+            held: Vec::new(),
         };
         let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
         assert_eq!(heard, said);
@@ -3713,6 +3751,110 @@ mod presence_tests {
         assert_eq!((heard.link, heard.seen.len(), heard.camera), (None, 0, false));
         let heard: Presence = serde_json::from_str(r#"{"state":"here","link":null}"#).unwrap();
         assert_eq!(heard.link, None);
+    }
+
+    /// `Presence` as the build before `via` and `held` declared it, field for
+    /// field, both ways.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Unwoven {
+        state: State,
+        #[serde(default = "super::on")]
+        camera: bool,
+        #[serde(default = "super::on")]
+        mic: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clock: Option<Clock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        room: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        requests: Vec<Request>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        sharing: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "quality::lenient_link")]
+        link: Option<Link>,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "quality::lenient_seen")]
+        seen: std::collections::BTreeMap<String, Seen>,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "door::lenient_offer")]
+        host: Option<door::Offer>,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::net::moves::lenient")]
+        moved: Option<crate::net::moves::CallOn>,
+    }
+
+    /// Our own entry in a room, our media through host `d`, holding `d` and `e`.
+    fn woven() -> crate::net::PeerStats {
+        let local = crate::net::PeerStats::default();
+        local.set_name(Some("Ada".into()));
+        local.set_sending(Some(super::arrival::Sending::Host(id('d'))));
+        local.set_held(vec![id('d'), id('e')]);
+        local
+    }
+
+    #[test]
+    fn where_we_send_and_the_hosts_we_hold_are_said_and_survive_the_round_trip() {
+        let said = Presence::here(&woven());
+        let json = serde_json::to_string(&said).unwrap();
+        assert!(json.contains(&format!(r#""via":"{}""#, id('d'))), "{json}");
+        assert!(json.contains(&format!(r#""held":["{}","{}"]"#, id('d'), id('e'))), "{json}");
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard, said);
+        // The two words, and nothing said outside a room.
+        for (via, word) in [(super::arrival::Sending::Relay, "relay"), (super::arrival::Sending::Guests, "guests")] {
+            let json = serde_json::to_string(&Presence { via: Some(via), ..Presence::default() }).unwrap();
+            assert!(json.contains(&format!(r#""via":"{word}""#)), "{json}");
+        }
+        let json = serde_json::to_string(&Presence::here(&crate::net::PeerStats::default())).unwrap();
+        assert!(!json.contains("via") && !json.contains("held"), "{json}");
+    }
+
+    #[test]
+    fn an_older_peer_says_nowhere_and_holds_nothing() {
+        let old = serde_json::to_string(&Unwoven {
+            state: State::Here,
+            camera: true,
+            mic: false,
+            clock: None,
+            room: None,
+            requests: Vec::new(),
+            sharing: false,
+            name: Some("Ada".into()),
+            link: None,
+            seen: Default::default(),
+            host: None,
+            moved: None,
+        })
+        .unwrap();
+        let heard: Presence = serde_json::from_str(&old).unwrap();
+        assert_eq!((heard.via, heard.held.len()), (None, 0));
+        assert_eq!(heard.name.as_deref(), Some("Ada"));
+        assert!(!heard.mic);
+    }
+
+    #[test]
+    fn an_older_peer_reads_a_document_that_says_where_we_send() {
+        let json = serde_json::to_string(&Presence::here(&woven())).unwrap();
+        let heard: Unwoven = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard.name.as_deref(), Some("Ada"));
+        assert!(heard.camera && heard.mic);
+    }
+
+    #[test]
+    fn garbage_in_via_or_held_costs_only_itself() {
+        for via in ["5", r#""somewhere""#, "[]", r#"{"to":"x"}"#, "null", r#""RELAY""#] {
+            for held in ["7", r#""x""#, r#"{"a":1}"#, "null", r#"[1,"y",null,{}]"#] {
+                let json = format!(r#"{{"state":"here","mic":false,"name":"Ada","via":{via},"held":{held},"sharing":true}}"#);
+                let heard: Presence = serde_json::from_str(&json).unwrap_or_else(|error| panic!("{json}: {error}"));
+                assert_eq!((heard.via, heard.held.len()), (None, 0), "{json}");
+                assert!(!heard.mic && heard.sharing, "{json}");
+                assert_eq!(heard.name.as_deref(), Some("Ada"));
+            }
+        }
+        // One good field beside a bad one keeps the good one.
+        let json = format!(r#"{{"state":"here","via":"relay","held":["{}","no"]}}"#, id('e'));
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard.via, Some(super::arrival::Sending::Relay));
+        assert_eq!(heard.held, vec![id('e')]);
     }
 
     #[test]

@@ -691,8 +691,13 @@ pub struct PeerStats {
     /// Through whom their broadcasts reach us, as last read; `None` before
     /// the first reading and after they leave.
     arrival: std::sync::Mutex<Option<super::arrival::Arrival>>,
-    /// Where our own broadcasts go. Our own entry only; `None` outside a room.
+    /// Where our own broadcasts go, `None` outside a room; on a peer's entry,
+    /// where they say theirs go (`via` in presence), `None` while they say
+    /// nothing.
     sending: std::sync::Mutex<Option<super::arrival::Sending>>,
+    /// The hosts we hold a session to, cleaned and sorted (`web::clean_held`);
+    /// on a peer's entry, the ones they say they hold (`held` in presence).
+    held: std::sync::Mutex<Vec<String>>,
     /// Where the room meets, when it is an endpoint we can name. Our own
     /// entry only; `None` outside a room and in a room on a relay server.
     meets_at: std::sync::Mutex<Option<super::arrival::MeetsAt>>,
@@ -916,6 +921,7 @@ impl Default for PeerStats {
             heard: AtomicBool::new(false),
             arrival: std::sync::Mutex::new(None),
             sending: std::sync::Mutex::new(None),
+            held: std::sync::Mutex::new(Vec::new()),
             meets_at: std::sync::Mutex::new(None),
             offer: std::sync::Mutex::new(None),
             move_calls: AtomicBool::new(false),
@@ -1288,7 +1294,8 @@ impl PeerStats {
         }
     }
 
-    /// Where our own broadcasts go. Meaningful on our own entry.
+    /// Where our own broadcasts go, or on a peer's entry where they say
+    /// theirs go.
     pub fn sending(&self) -> Option<super::arrival::Sending> {
         self.sending.lock().ok().and_then(|slot| slot.clone())
     }
@@ -1297,6 +1304,22 @@ impl PeerStats {
         if let Ok(mut slot) = self.sending.lock() {
             *slot = sending;
         }
+    }
+
+    /// The hosts we hold a session to, or on a peer's entry the ones they
+    /// say they hold. Endpoint ids only, never a door.
+    pub fn held(&self) -> Vec<String> {
+        self.held.lock().map(|held| held.clone()).unwrap_or_default()
+    }
+
+    /// Takes a list already cleaned. Whether it changed, so a caller that
+    /// samples sessions on every pass need not log the same list again.
+    pub(super) fn set_held(&self, held: Vec<String>) -> bool {
+        self.held.lock().is_ok_and(|mut slot| {
+            let changed = *slot != held;
+            *slot = held;
+            changed
+        })
     }
 
     /// Where the room meets, when it is an endpoint. Meaningful on our own

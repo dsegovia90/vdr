@@ -246,12 +246,28 @@ focus.
   are absent, so the document is byte-for-byte an older build's, and no bars or
   People section appear. Both fields are read leniently (`quality::lenient_*`),
   because one parse error in a presence document ends listening to that peer.
+- **`via` and `held` in presence are said always, behind no switch**: where
+  our media goes (`"relay"`, `"guests"`, or a host's endpoint id) and the
+  hosts we hold a session to (ids only, never a door, at most
+  `web::HELD_MAX`). They are what the Network tab's map of the room is built
+  from (`net/web.rs`), so they go out at once when they change, in the
+  announcer's existing poll, not at the clock refresh. Read leniently and
+  cleaned with the sender's id, like `seen`. **"relay" means wherever the room
+  meets**, which in a room hosted with `--host` is its creator: a guest there
+  cannot tell its far side from a relay server, so the map works it out from
+  `meets_at` and who is in the room. The map takes people's word over the
+  routes we see (`arrival`), which name the last hop towards us, not the
+  sender's carrier.
 
 ## Layout, paint and input gotchas
 
 - **A video tile that measures 0×0 never paints**; the widget returns early,
   silently. Check the log for `camera target resized to WxH` (the tile) and
   `source now WxH` (the video), not just the window.
+- **The host colour is one theme token**, `--color-host` in `tailwind.css`
+  (classes `border-host`, `border-host/40`), and `components/colour.rs`
+  holds the same hex for inline SVG and styles, which no class reaches. A
+  test fails if the two differ: change both.
 - **Inline SVG icons need two things** (`components/icons.rs`): an `xmlns`
   attribute on the `<svg>` (blitz hands the subtree to usvg, which rejects a
   root outside the SVG namespace, and logs it only under `blitz_dom`), and a
@@ -352,6 +368,7 @@ focus.
 | `net/sessions.rs` | a join that dials the relay and the room's saved hosts together: which session carries our media, and moving it |
 | `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes, for the log and the host borders on tiles (`read` and `through` are pure) |
 | `net/moves.rs` | moving the call to a host, an experiment: the presence field, which choice wins, the bounce order (pure) |
+| `net/web.rs` | the room as a web of nodes for the Network tab: the `via`/`held` presence fields (wire form, lenient reading, cleaning) and the pure graph built from every entry |
 | `net/door.rs` | a hosted room's door: its name, the secret guests present as `?door=`, the check (pure) |
 | `net/audio.rs` | the audio half: Opus out, each peer's voice in, echo cancelled |
 | `net/share.rs` | screen sharing: capture and its own broadcast |
@@ -365,5 +382,5 @@ Frames never touch the DOM:
 
 `cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`, `rates.rs`, `net/quality.rs`,
 `camera/paint/fit.rs`, `audio/catchup.rs`, `components/layout.rs`,
-`update/release.rs`, `update/verify.rs`, `net/door.rs`, `net/moves.rs`, `net/arrival.rs`) are where
+`update/release.rs`, `update/verify.rs`, `net/door.rs`, `net/moves.rs`, `net/arrival.rs`, `net/web.rs`) are where
 logic that can be tested without a window belongs.

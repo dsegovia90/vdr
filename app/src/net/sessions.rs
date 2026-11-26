@@ -938,6 +938,17 @@ pub(super) fn join(args: Join) -> Peer {
 
                 let states: Vec<State> = members.iter().map(|member| member.state).collect();
                 let holds: Vec<Duration> = members.iter().map(|member| member.hold.hold()).collect();
+                // Which hosts we hold a session to, for our presence: the
+                // announcer says it at once when this changes, so the room's
+                // map follows a host joining or dropping within its poll.
+                // Draining counts, since we still hear through it.
+                local.set_held(super::super::web::clean_held(
+                    members
+                        .iter()
+                        .filter(|member| member.state.up())
+                        .filter_map(|member| member.target.host.clone()),
+                    "",
+                ));
                 // Until the relay has answered or failed once, a host with
                 // nobody else up is still joining, not cut off.
                 let relay_tried = states.first().is_some_and(|state| *state != State::Dialing);

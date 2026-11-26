@@ -155,7 +155,9 @@ cannot carry everything being sent), one red is poor, three hollow grey ones
 is not known yet. A person not reporting has none, and neither does a shared
 screen; the person's menu says it in a line. Turning the switch off stops
 telling the room about your connection and hides everyone else's. The
-thresholds are first guesses.
+thresholds are first guesses. Whatever the switches, your presence says
+where your media goes (the relay or a host) and which hosts you hold a
+connection to, by their ids, never a hosted room's door.
 *Mark hosts on their videos*, off by default, is a debugging aid: everyone
 who could host the room has a faint blue border around their video, and a
 host carrying the call for you, because your video goes through them or
