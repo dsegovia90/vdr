@@ -2675,8 +2675,20 @@ mod socket_tests {
     /// member's own move to the spare asks its encoder for a keyframe, as the
     /// call does, which starts that group at once: about 45 ms measured. The
     /// bound leaves room for a debug build on a busy machine. Without a spare
-    /// the same stop takes 2 s: a retraction, the library's hold, and the
-    /// media asked for again.
+    /// the same stop usually takes 2 s: a retraction, the library's hold, and
+    /// the media asked for again.
+    ///
+    /// **This still fails now and then, and the fault is not the test's.**
+    /// Across the splice the viewer's track is handed the group in flight
+    /// twice, once from each copy, and when both copies of it finish cleanly
+    /// moq-mux's reader (`container::Consumer`, under moq-video's decoder)
+    /// steps its cursor once per copy. It then drops the next group whole as
+    /// "old", and the picture freezes from the end of the first group after
+    /// the splice to the start of the one after: 1 to 2 s, about two seconds
+    /// after the stop. Traced: every group reaches the viewer's track
+    /// complete, and moq-mux logs "skipping old group old=2 current=3". A
+    /// viewer in a call loses the same group. The keyframe asked for at the
+    /// move is not what is missing.
     const SPLICE: Duration = Duration::from_millis(500);
 
     /// The same for media whose sender is not asked for a keyframe when the
@@ -2703,21 +2715,44 @@ mod socket_tests {
         assert!(gap < SPLICE, "video was gone {gap:?} when the relay stopped");
     }
 
-    /// The control: the same stop with the spare switched off is a leave, as
-    /// it always was. Without this the test above could pass for a reason
-    /// that has nothing to do with the spare.
+    /// The control: what the test above rests on is the spare, and with it
+    /// switched off the host holds m only through the relay. Cutting the
+    /// host's own link to the relay, and nothing of m's, takes m from the host
+    /// without a spare and leaves it there with one.
+    ///
+    /// Not the same stop seen as a leave, as this was first written: without a
+    /// spare that stop is usually a leave, but not always. m's media moves to
+    /// the host as soon as m hears the relay go, and when its new offer reaches
+    /// the host before the host has heard the same news for itself, the host's
+    /// route to m changes rather than ending, and the viewer splices to it
+    /// with no retraction (seen once in about twenty runs of the whole suite
+    /// on a loaded machine). That is the app doing well by luck, not a fault,
+    /// and a control that needs it not to happen fails at random.
     #[tokio::test(flavor = "multi_thread")]
-    async fn without_a_spare_the_same_stop_is_a_leave() {
-        let mut w = moving_on(Meeting::older().await, false).await;
-        w.camera.turn_on();
-        w.arrivals.more(30, "no video through the relay").await;
-        let (_watching, retracted) = retractions(&w.v.inbound, &camera_path("m"));
-        let stopped = Instant::now();
-        w.room.relay.stop().await;
-        w.arrivals.more(30, "video never came back through the host").await;
-        let gap = w.arrivals.longest_gap(stopped);
-        assert!(count(&retracted) > 0, "m was never retracted, so the test above proves nothing");
-        assert!(gap > SPLICE, "video was gone only {gap:?} with no spare");
+    async fn without_a_spare_the_host_holds_a_member_only_through_the_relay() {
+        for spare in [false, true] {
+            let w = moving_on(Meeting::older().await, spare).await;
+            let path = camera_path("m");
+            becomes(&w.room.host.origin, &path, true).await;
+            let (_watching, retracted) = retractions(&w.room.host.origin, &path);
+            w.room._to_relay.abort(moq_net::Error::Cancel);
+            let relay = w.room.relay.origin.hop();
+            if spare {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !route_within(&w.room.host.origin, &path).await.is_some_and(|route| !route.hops.as_slice().contains(&relay)) {
+                    assert!(Instant::now() < deadline, "the host never had m but through the relay");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert_eq!(count(&retracted), 0, "the host lost m with a spare there");
+            } else {
+                let deadline = Instant::now() + WITHIN;
+                while count(&retracted) == 0 {
+                    assert!(Instant::now() < deadline, "the host kept m with no spare and no relay");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
     }
 
     /// Moving the call to a host and back, on a relay that speaks moq-lite-05
