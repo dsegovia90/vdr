@@ -1,5 +1,12 @@
 @import "tailwindcss";
 
+/* The host colour, as a theme token so the tile borders get literal classes
+   (`border-host`, `border-host/40`). `src/components/colour.rs` holds the same
+   hex for inline SVG, and a test there fails if the two differ. */
+@theme {
+    --color-host: #38bdf8;
+}
+
 /* Blitz renders into a bare html/body, so the page surface is set here rather
    than with utilities -- there is no element of ours to hang them on. */
 @layer base {

@@ -3,6 +3,7 @@
 mod bar;
 mod button;
 mod call_screen;
+mod colour;
 mod connect;
 mod device_menu;
 mod icons;
