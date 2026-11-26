@@ -33,6 +33,16 @@
 //! most of its lines, and over half the lines of a hundred people bowed,
 //! some by half their length.
 //!
+//! **Names point away from the middle**: above a node at the top, below one
+//! at the bottom, and to the side of one at three or nine o'clock, where a
+//! name above or below sat on the lines running down to the relay. The ring
+//! is pulled in far enough for a side name to fit inside the square.
+//!
+//! **Each line is drawn in two halves**, split at its middle, each white
+//! while the node at its end sends along it ([`halves_fit`] says when a line
+//! is too short for that to be read), and selecting a node dims whatever is
+//! not on its media's paths ([`focus`]).
+//!
 //! **A line never crosses a node it does not end at.** Even on one ring a
 //! node has a size, so a line between two nodes not far apart grazes the
 //! neighbours of either end: in a room of twenty, about one line in five.
@@ -42,7 +52,9 @@
 use std::f64::consts::{FRAC_PI_2, PI, SQRT_2, TAU};
 
 use crate::net::arrival::Sending;
-use crate::net::web::{self, Kind, Person, Relay, State, Web};
+use std::collections::BTreeMap;
+
+use crate::net::web::{self, Hop, Kind, Person, Relay, State, Web};
 
 /// At or under this many nodes everyone is named; over it only we and the
 /// selected node are, since a hundred names on a 400 px square are noise.
@@ -74,6 +86,14 @@ const LABEL_MIN: f64 = 0.12;
 const LABEL_MAX: f64 = 0.3;
 /// Between a node's edge and its name.
 pub const NAME_GAP: f64 = 0.008;
+/// The least room a name beside a node gets: what the ring is pulled in to
+/// leave at three and nine o'clock.
+const SIDE_LABEL: f64 = LABEL_MIN;
+/// The shortest half of a line drawn as a half: eight pixels on the
+/// narrowest square the tab lays out, about 280 px. Under it a line is one
+/// colour, white if either end sends, since a half that short reads as a
+/// node's outline rather than a direction.
+pub const HALF_MIN: f64 = 8.0 / 280.0;
 /// How tall a name is: a line of 10 px text, leading-tight, on a square of
 /// about 280 px, the narrowest the Network tab is laid out at; on the full
 /// 400 px it is about two thirds of this.
@@ -112,28 +132,73 @@ impl Place {
     }
 }
 
-/// Where a node's name goes: outside the ring, above a node in the top half
-/// and below one in the bottom half, so it points away from the middle,
-/// where the lines are.
+/// Which side of its node a name sits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Above,
+    Below,
+    Left,
+    Right,
+}
+
+/// Where a node's name goes: outside it, away from the middle of the
+/// square, where the lines are.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NameBox {
+    pub side: Side,
     pub left: f64,
     pub width: f64,
-    /// Above the node, with its bottom edge at `edge`; otherwise below, its
-    /// top edge there.
-    pub above: bool,
+    /// Above: its bottom edge. Below, left and right: its top edge.
     pub edge: f64,
 }
 
-/// Where `place`'s name goes. Pulled in from the square's sides rather than
-/// cut off by them.
+/// Which way from the middle a node at `x`, `y` lies: to a side when it is
+/// nearer level with the middle than above or below it.
+fn side_of(x: f64, y: f64) -> Side {
+    let (dx, dy) = (x - CENTRE, y - CENTRE);
+    if dx.abs() > dy.abs() {
+        if dx < 0.0 { Side::Left } else { Side::Right }
+    } else if dy < -1e-9 {
+        Side::Above
+    } else {
+        Side::Below
+    }
+}
+
+/// Where `place`'s name goes. Above and below it is centred on the node and
+/// pulled in from the square's sides rather than cut off by them; beside it,
+/// it is as wide as the room to the edge allows, which the ring leaves.
 pub fn name_box(place: &Place, kind: Kind) -> NameBox {
-    let width = place.label.min(1.0);
-    let left = (place.x - width / 2.0).clamp(0.0, 1.0 - width);
     let reach = place.reach(kind);
-    let above = place.y < CENTRE - 1e-9;
-    let edge = if above { place.y - reach - NAME_GAP } else { place.y + reach + NAME_GAP };
-    NameBox { left, width, above, edge }
+    let beside = match side_of(place.x, place.y) {
+        Side::Left => place.x - reach - NAME_GAP - EDGE_PAD,
+        Side::Right => 1.0 - EDGE_PAD - (place.x + reach + NAME_GAP),
+        Side::Above | Side::Below => 0.0,
+    };
+    let side = match side_of(place.x, place.y) {
+        Side::Left | Side::Right if beside < SIDE_LABEL - 1e-9 => {
+            if place.y < CENTRE - 1e-9 { Side::Above } else { Side::Below }
+        }
+        side => side,
+    };
+    match side {
+        side @ (Side::Above | Side::Below) => {
+            let width = place.label.min(1.0);
+            let left = (place.x - width / 2.0).clamp(0.0, 1.0 - width);
+            let edge = if side == Side::Above { place.y - reach - NAME_GAP } else { place.y + reach + NAME_GAP };
+            NameBox { side, left, width, edge }
+        }
+        Side::Left => {
+            let right = place.x - reach - NAME_GAP;
+            let width = place.label.min(right - EDGE_PAD).max(0.0);
+            NameBox { side: Side::Left, left: right - width, width, edge: place.y - NAME_TALL / 2.0 }
+        }
+        Side::Right => {
+            let left = place.x + reach + NAME_GAP;
+            let width = place.label.min(1.0 - EDGE_PAD - left).max(0.0);
+            NameBox { side: Side::Right, left, width, edge: place.y - NAME_TALL / 2.0 }
+        }
+    }
 }
 
 /// The places of `web`'s nodes, in its order. `selected` is named whatever
@@ -303,7 +368,20 @@ fn fit(angles: &[f64], relays: &[usize]) -> (f64, Sizes) {
     // Room at the square's edge for a node and a name above or below it.
     let room = CENTRE - NAME_GAP - NAME_TALL - EDGE_PAD;
     let first = ring_sizes(angles, room);
-    let radius = room - reach_of(first, relays);
+    let reach = reach_of(first, relays);
+    // And beside the nodes whose names go to the side: the one furthest
+    // out sets how far the ring may reach.
+    // Only while everyone is named: in a larger room only we and the
+    // selected node are, and the room would cost every dot a sixth of its
+    // size, so a name that finds no room beside goes above or below.
+    let beside = CENTRE - NAME_GAP - SIDE_LABEL - EDGE_PAD - reach;
+    let named = angles.len() <= NAMED_MAX;
+    let widest = angles
+        .iter()
+        .filter(|angle| matches!(side_of(CENTRE + angle.cos(), CENTRE + angle.sin()), Side::Left | Side::Right))
+        .map(|angle| angle.cos().abs())
+        .fold(0.0, f64::max);
+    let radius = if named && widest > 0.0 { (room - reach).min(beside / widest) } else { room - reach };
     (radius, ring_sizes(angles, radius))
 }
 
@@ -496,6 +574,74 @@ pub fn shown_edges(web: &Web, selected: Option<&str>) -> Shown {
     shown
 }
 
+/// Whether a line between `a` and `b` is long enough to be drawn in halves:
+/// each half, from its node's edge to the middle, at least [`HALF_MIN`]. The
+/// straight distance, which a bowed line only exceeds.
+pub fn halves_fit(kinds: &[Kind], places: &[Place], a: usize, b: usize) -> bool {
+    let (Some(from), Some(to), Some(&from_kind), Some(&to_kind)) = (places.get(a), places.get(b), kinds.get(a), kinds.get(b)) else {
+        return false;
+    };
+    let half = distance(from, to) / 2.0;
+    half - from.reach(from_kind).max(to.reach(to_kind)) >= HALF_MIN
+}
+
+/// What stays at full strength while a node is selected, by index into a
+/// web's nodes and edges: everything on a path of media that passes it
+/// (theirs, out and in, or carried by them), and every link of theirs with
+/// the node at its far end.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Focus {
+    pub nodes: Vec<bool>,
+    pub edges: Vec<bool>,
+}
+
+pub fn focus(web: &Web, selected: usize) -> Focus {
+    let mut nodes = vec![false; web.nodes.len()];
+    let mut edges = vec![false; web.edges.len()];
+    let ends: Vec<(usize, usize)> = web
+        .edges
+        .iter()
+        .map(|edge| (web.index_of(&edge.from).unwrap_or(usize::MAX), web.index_of(&edge.to).unwrap_or(usize::MAX)))
+        .collect();
+    let edge_of = |a: usize, b: usize| ends.binary_search(&(a.min(b), a.max(b))).ok();
+    if let Some(node) = nodes.get_mut(selected) {
+        *node = true;
+    }
+    for flow in web.flows.iter().filter(|flow| flow.path.contains(&selected)) {
+        for &at in &flow.path {
+            nodes[at] = true;
+        }
+        for pair in flow.path.windows(2) {
+            if let Some(at) = edge_of(pair[0], pair[1]) {
+                edges[at] = true;
+            }
+        }
+    }
+    for (at, &(a, b)) in ends.iter().enumerate() {
+        if a == selected || b == selected {
+            edges[at] = true;
+            for end in [a, b] {
+                if let Some(node) = nodes.get_mut(end) {
+                    *node = true;
+                }
+            }
+        }
+    }
+    Focus { nodes, edges }
+}
+
+/// How thick a carrying half is for `streams` people's media: 1.5 for one
+/// to 3 for twenty and more, in steps by order of magnitude, so a busy
+/// link reads at a glance and a count need not be read.
+pub fn stream_width(streams: u32) -> f64 {
+    match streams {
+        0 | 1 => 1.5,
+        2..=4 => 2.0,
+        5..=19 => 2.5,
+        _ => 3.0,
+    }
+}
+
 /// How opaque a could-flow line is, given how many are drawn: fainter as
 /// they crowd, so the flowing ones still stand out. A line of the selected
 /// node is drawn strong whatever the count.
@@ -516,7 +662,27 @@ pub fn quiet_alpha(drawn: usize, state: State, selected: bool) -> f32 {
 /// among them), `relays` relay servers, some hosts, and media that moves
 /// every few seconds of `tick`, so that a change and its repaint are seen.
 /// The same arguments always give the same web.
+///
+/// Everyone but the older builds reports, through the same document a real
+/// room sends ([`web::say_routes`] and back), so the fake also measures it.
+/// It has two-way links (everyone and the relay), one-way ones (some take
+/// hosts' media straight from them while sending elsewhere), a sender whose
+/// receivers see its media arrive through a host while it says the relay,
+/// a relay nobody names, and someone who receives one person not at all.
 pub fn fake(participants: usize, relays: usize, tick: u64) -> Web {
+    let (people, servers, venue, reported) = fake_room(participants, relays, tick);
+    web::build_reported(&people, &servers, venue.as_deref(), &reported)
+}
+
+/// A hop nobody claims: the relay the fake's fourth person goes through.
+const FAKE_UNNAMED: u64 = 9_999;
+/// The meeting place's hop, which every reporter on it claims.
+const FAKE_VENUE: u64 = 7;
+
+/// The fake room's parts, before they are built into a web.
+type FakeRoom = (Vec<Person>, Vec<Relay>, Option<String>, BTreeMap<String, web::Reported>);
+
+fn fake_room(participants: usize, relays: usize, tick: u64) -> FakeRoom {
     // Ids that look like endpoint ids but do not sort in the order made, so
     // us being first is the layout's doing, not the ids'.
     let id = |n: usize| {
@@ -525,8 +691,10 @@ pub fn fake(participants: usize, relays: usize, tick: u64) -> Web {
     };
     let relay_ids: Vec<String> = (0..relays).map(|n| format!("relay-{n:02}")).collect();
     let is_host = |n: usize| n % 5 == 1;
-    let hosts: Vec<String> = (0..participants).filter(|&n| is_host(n)).map(id).collect();
+    let hosts: Vec<usize> = (0..participants).filter(|&n| is_host(n)).collect();
     let phase = (tick / 4) as usize;
+    // Someone on an older build says nothing and reports nothing.
+    let older = |n: usize| n % 11 == 7;
 
     let people: Vec<Person> = (0..participants)
         .map(|n| {
@@ -541,23 +709,21 @@ pub fn fake(participants: usize, relays: usize, tick: u64) -> Web {
             } else if is_host(n) {
                 Some(Sending::Relay)
             } else if !hosts.is_empty() && (n + phase).is_multiple_of(3) {
-                let host = hosts[(n / 3 + phase) % hosts.len()].clone();
-                Some(Sending::Host(host))
+                Some(Sending::Host(id(hosts[(n / 3 + phase) % hosts.len()])))
             } else if relays > 1 && (n + phase) % 5 == 1 {
                 Some(Sending::Host(relay_ids[1 + (n + phase) % (relays - 1)].clone()))
             } else {
                 Some(Sending::Relay)
             };
             if !is_host(n) {
-                for k in 0..hosts.len().min(3) {
-                    held.push(hosts[(n + k) % hosts.len()].clone());
+                for k in 0..hosts.len().min(4) {
+                    held.push(id(hosts[(n + k) % hosts.len()]));
                 }
             }
             if relays > 1 {
                 held.push(relay_ids[1 + n % (relays - 1)].clone());
             }
-            // Someone on an older build says nothing.
-            let (via, held) = if n % 11 == 7 { (None, Vec::new()) } else { (via, held) };
+            let (via, held) = if older(n) { (None, Vec::new()) } else { (via, held) };
             Person {
                 id: id(n),
                 name: if me { None } else { Some(format!("Person {n}")) },
@@ -565,6 +731,7 @@ pub fn fake(participants: usize, relays: usize, tick: u64) -> Web {
                 me,
                 via,
                 held,
+                hop: is_host(n).then_some(1_000 + n as u64),
             }
         })
         .collect();
@@ -574,13 +741,58 @@ pub fn fake(participants: usize, relays: usize, tick: u64) -> Web {
         .map(|(n, id)| Relay { id: id.clone(), name: Some(format!("Relay {}", n + 1)) })
         .collect();
     let venue = match (relay_ids.first(), people.first()) {
-        (Some(relay), _) => Some(relay.as_str()),
-        (None, Some(us)) => Some(us.id.as_str()),
+        (Some(relay), _) => Some(relay.clone()),
+        (None, Some(us)) => Some(us.id.clone()),
         (None, None) => None,
     };
-    web::build(&people, &servers, venue)
-}
 
+    let roster: Vec<&str> = people.iter().map(|person| person.id.as_str()).collect();
+    let gate = |n: usize| 2_000 + n as u64;
+    // Whose media a receiver takes straight from the hosts it holds, while
+    // its own goes elsewhere: the one-way links.
+    let straight_from_hosts = |n: usize| !is_host(n) && (n + phase) % 9 == 2;
+    let mut reported = BTreeMap::new();
+    for (r, receiver) in people.iter().enumerate().filter(|&(r, _)| !older(r)) {
+        let mut paths = BTreeMap::new();
+        for (s, sender) in people.iter().enumerate().filter(|&(s, _)| s != r) {
+            let on_relay = |hops: Vec<Hop>| if relays > 0 { hops } else { Vec::new() };
+            let path = match &sender.via {
+                _ if s % 13 == 5 && r == (s + 1) % participants => None,
+                _ if is_host(s) && receiver.held.contains(&sender.id) && straight_from_hosts(r) => Some(Vec::new()),
+                Some(Sending::Host(host)) if receiver.via.as_ref() == Some(&Sending::Host(host.clone())) => {
+                    Some(vec![Hop::Person(host.clone())])
+                }
+                Some(Sending::Host(host)) if host.starts_with("relay-") => Some(vec![Hop::Unnamed(gate(s)), Hop::Venue]),
+                Some(Sending::Host(host)) => Some(on_relay(vec![Hop::Person(host.clone()), Hop::Unnamed(FAKE_VENUE)])),
+                // Says the relay; arrives through the first host.
+                Some(Sending::Relay) if s == 2 && !hosts.is_empty() => {
+                    Some(on_relay(vec![Hop::Person(id(hosts[0])), Hop::Unnamed(FAKE_VENUE)]))
+                }
+                Some(Sending::Relay) if s == 4 => Some(on_relay(vec![Hop::Unnamed(gate(s)), Hop::Unnamed(FAKE_UNNAMED), Hop::Venue])),
+                // A host has no gates; anyone else's first hop is theirs.
+                Some(Sending::Relay) if is_host(s) => Some(on_relay(vec![Hop::Unnamed(FAKE_VENUE)])),
+                Some(Sending::Relay) => Some(on_relay(vec![Hop::Unnamed(gate(s)), Hop::Unnamed(FAKE_VENUE)])),
+                Some(Sending::Guests) => Some(Vec::new()),
+                // Some older builds' media is reported, so their guessed
+                // line is confirmed; the rest stay guessed.
+                None if s % 22 == 7 => None,
+                None => Some(on_relay(vec![Hop::Venue])),
+            };
+            paths.insert(sender.id.clone(), path);
+        }
+        let routes = web::Routes {
+            origin: 1_000 + r as u64,
+            gates: if is_host(r) { Vec::new() } else { vec![gate(r)] },
+            venue: if relays > 0 { vec![FAKE_VENUE] } else { Vec::new() },
+            paths,
+        };
+        let document = web::say_routes(&routes, &roster);
+        if let Some(report) = web::read_routes(&document, &receiver.id) {
+            reported.insert(receiver.id.clone(), report);
+        }
+    }
+    (people, servers, venue, reported)
+}
 
 #[cfg(test)]
 mod tests {
@@ -691,10 +903,23 @@ mod tests {
                     assert!(place.named);
                     let name = name_box(place, node.kind);
                     assert!(name.left >= 0.0 && name.left + name.width <= 1.0 + 1e-12, "{what}: {name:?}");
-                    let far = if name.above { name.edge - NAME_TALL } else { name.edge + NAME_TALL };
-                    assert!((0.0..=1.0).contains(&name.edge) && (0.0..=1.0).contains(&far), "{what}: {name:?}");
-                    // Away from the middle: above a node in the top half.
-                    assert_eq!(name.above, place.y < CENTRE - 1e-9);
+                    let (top, bottom) = match name.side {
+                        Side::Above => (name.edge - NAME_TALL, name.edge),
+                        Side::Below | Side::Left | Side::Right => (name.edge, name.edge + NAME_TALL),
+                    };
+                    assert!(top >= 0.0 && bottom <= 1.0, "{what}: {name:?}");
+                    // Outside the node, on the side away from the middle.
+                    match name.side {
+                        Side::Above => assert!(name.edge <= place.y - reach && place.y < CENTRE, "{what}: {name:?}"),
+                        Side::Below => assert!(name.edge >= place.y + reach && place.y >= CENTRE - 1e-9, "{what}: {name:?}"),
+                        Side::Left => assert!(name.left + name.width <= place.x - reach && place.x < CENTRE, "{what}: {name:?}"),
+                        Side::Right => assert!(name.left >= place.x + reach && place.x > CENTRE, "{what}: {name:?}"),
+                    }
+                    // A name beside an outer node has at least the room the
+                    // ring was pulled in for.
+                    if matches!(name.side, Side::Left | Side::Right) && rings_of(&places).len() == 1 {
+                        assert!(name.width >= SIDE_LABEL - 1e-9, "{what}: {name:?}");
+                    }
                     for (other, other_place) in web.nodes.iter().zip(&places).skip(a + 1) {
                         let room = distance(place, other_place) - reach - other_place.reach(other.kind);
                         assert!(room > 0.0, "{what}: {} and {} overlap by {}", node.id, other.id, -room);
@@ -917,11 +1142,12 @@ mod tests {
 
     #[test]
     fn everyone_is_named_up_to_the_limit_and_then_only_us_and_the_selection() {
-        let web = fake(NAMED_MAX - 1, 1, 0);
+        // With the relay nobody names that the fake's fifth person uses.
+        let web = fake(NAMED_MAX - 2, 1, 0);
         assert_eq!(web.nodes.len(), NAMED_MAX);
         assert!(layout(&web, None).iter().all(|place| place.named));
 
-        let web = fake(NAMED_MAX, 1, 0);
+        let web = fake(NAMED_MAX - 1, 1, 0);
         let picked = web.nodes.iter().find(|node| !node.me && node.kind == Kind::Participant).unwrap().id.clone();
         let places = layout(&web, Some(&picked));
         for (node, place) in web.nodes.iter().zip(&places) {
@@ -930,11 +1156,11 @@ mod tests {
     }
 
     fn web_with(edges: Vec<Edge>, nodes: Vec<Node>) -> Web {
-        Web { nodes, edges }
+        Web { nodes, edges, flows: Vec::new() }
     }
 
     fn node(id: &str, me: bool) -> Node {
-        Node { kind: Kind::Participant, id: id.to_string(), name: None, can_host: false, me }
+        Node { kind: Kind::Participant, id: id.to_string(), name: None, can_host: false, me, says: None }
     }
 
     #[test]
@@ -956,12 +1182,13 @@ mod tests {
         for a in 0..41 {
             for b in a + 1..41 {
                 if edges.len() < 400 {
-                    edges.push(Edge { from: ids[a].clone(), to: ids[b].clone(), state: State::Held });
+                    edges.push(Edge { from: ids[a].clone(), to: ids[b].clone(), state: State::Held, forth: 0, back: 0 });
                 }
             }
         }
         let flowing = edges.iter().position(|edge| edge.from == "005" && edge.to == "006").unwrap();
         edges[flowing].state = State::Flowing;
+        edges[flowing].forth = 1;
         let web = web_with(edges, nodes);
 
         // Nothing selected: ours, which are the 40 from "000", and the one flowing.
@@ -993,7 +1220,9 @@ mod tests {
     fn the_fake_room_is_the_same_every_time_and_sorted() {
         let web = fake(100, 50, 7);
         assert_eq!(web, fake(100, 50, 7));
-        assert_eq!(web.nodes.len(), 150);
+        // And the relay nobody names.
+        assert_eq!(web.nodes.len(), 151);
+        assert_eq!(web.nodes.iter().filter(|node| web::is_unnamed(&node.id)).count(), 1);
         assert!(web.nodes.windows(2).all(|pair| pair[0].id < pair[1].id));
         assert_eq!(web.nodes.iter().filter(|node| node.me).count(), 1);
         assert!(web.nodes.iter().any(|node| node.can_host));
