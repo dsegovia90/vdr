@@ -19,7 +19,7 @@ use super::{Invites, MicIcon, Names, OwnShare, ParticipantVideo, PersonIcon, Roo
 use crate::audio::Crosstalk;
 use crate::camera::{FrameSlot, Mirror};
 use crate::channel::use_channel;
-use crate::net::arrival::{self, Sending};
+use crate::net::arrival::{self, MeetsAt, Sending};
 use crate::net::{Metrics, PeerStats};
 use crate::net::quality::{self, Quality};
 
@@ -51,21 +51,35 @@ struct Reading {
     /// `None` when they are not reporting or our connection report is off:
     /// no mark at all, rather than an "unknown" one.
     mark: Option<Quality>,
-    // **The four below are only read while the route switch is on**, and
+    // **The two below are only read while the route switch is on**, and
     // stay at their defaults while it is off, so nothing changes and nothing
     // is sent for them then.
-    /// Whether they could host: their presence says they host the room, or,
-    /// on our own tile, we serve it.
-    can_host: bool,
+    /// What the host border is decided from, besides everyone's routes.
+    seat: Seat,
     /// The hosts their media passes through to us, from their route. A
     /// peer's tile only; passed on to the page's [`Through`].
     through: Vec<String>,
-    /// The host our own media goes through, when it is one. Sampled on every
-    /// peer's tile, because it is that host's tile that shows it.
-    sends_through: Option<String>,
+}
+
+/// What a tile's host border is read from, as sampled: each field changes
+/// only when hosting does, never with the figures, so sampling it wakes the
+/// page no more often than the border could change.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Seat {
+    /// Whether they could host: their presence says they host the room, or,
+    /// on our own tile, we serve it.
+    can_host: bool,
+    /// Where our own media goes. Sampled on every peer's tile, because it is
+    /// the tile of whoever carries it that shows it.
+    sending: Option<Sending>,
+    /// Where the room meets, when that is an endpoint rather than a relay
+    /// server.
+    meets_at: Option<MeetsAt>,
     /// Whether we are forwarding other people's media, by the same measure
     /// as the log's "[host] forwarding started". Our own tile only.
     forwarding: bool,
+    /// Whether at least one guest is connected to us. Our own tile only.
+    guests: bool,
 }
 
 impl Default for Reading {
@@ -82,10 +96,8 @@ impl Default for Reading {
             sharing: false,
             share_problem: None,
             mark: None,
-            can_host: false,
+            seat: Seat::default(),
             through: Vec::new(),
-            sends_through: None,
-            forwarding: false,
         }
     }
 }
@@ -230,13 +242,24 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                             (true, false, Some(way)) => arrival::through(&way),
                             _ => Vec::new(),
                         };
-                        let sends_through = match (routes, own, local.sending()) {
-                            (true, false, Some(Sending::Host(id))) => Some(id),
+                        let hosting = match (routes, own) {
+                            (true, true) => metrics.as_ref().and_then(|metrics| metrics.hosting()),
                             _ => None,
                         };
-                        let forwarding = routes
-                            && own
-                            && metrics.as_ref().and_then(|metrics| metrics.hosting()).is_some_and(|hosting| hosting.forwarding);
+                        let seat = if routes {
+                            Seat {
+                                // `hosting` is what our own entry knows,
+                                // serving the room; `hosts_room` what a
+                                // peer's says.
+                                can_host: stats.hosting() || stats.hosts_room(),
+                                sending: if own { None } else { local.sending() },
+                                meets_at: local.meets_at(),
+                                forwarding: hosting.is_some_and(|hosting| hosting.forwarding),
+                                guests: hosting.is_some_and(|hosting| hosting.guests > 0),
+                            }
+                        } else {
+                            Seat::default()
+                        };
                         let next = Reading {
                             // Only the state, which has hysteresis: the
                             // figures move every report, and any change
@@ -252,12 +275,8 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
                             invites: stats.invites(),
                             sharing: stats.sharing(),
                             share_problem: stats.share_problem(),
-                            // `hosting` is what our own entry knows, serving
-                            // the room; `hosts_room` what a peer's says.
-                            can_host: routes && (stats.hosting() || stats.hosts_room()),
+                            seat,
                             through,
-                            sends_through,
-                            forwarding,
                         };
                         // Only a change is sent. Any message wakes the page, and blitz repaints
                         // the whole window whenever the page wakes, changed or not.
@@ -303,14 +322,7 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     // **Their name if they have one, on a peer's tile only**: ours says
     // "You" whatever we are called.
     let shown = shown_label(mine, now.name.as_deref(), &props.label);
-    let host = host_mark(
-        &props.who,
-        mine,
-        now.can_host,
-        now.forwarding,
-        now.sends_through.as_deref(),
-        &through.read(),
-    );
+    let host = host_mark(&props.who, mine, &now.seat, &through.read());
     // Said once per change, so the log tells a developer what the border
     // shows; the routes behind it are logged where they are read.
     let shown_mark = use_hook(|| Rc::new(Cell::new(HostMark::None)));
@@ -318,6 +330,9 @@ pub fn ParticipantTile(props: ParticipantTileProps) -> Element {
     if (was == HostMark::Carrying) != (host == HostMark::Carrying) {
         let who = &props.who;
         match (mine, host == HostMark::Carrying) {
+            (true, true) if now.seat.meets_at == Some(MeetsAt::Us) => {
+                tracing::info!("[tile] we carry the call now: the room meets at us and a guest is here")
+            }
             (true, true) => tracing::info!("[tile] we carry the call now: forwarding for others"),
             (true, false) => tracing::info!("[tile] we no longer carry the call"),
             (false, true) => tracing::info!("[tile] {who} carries the call for us now"),
@@ -479,28 +494,42 @@ impl HostMark {
 /// Whether `who` could host, and whether they carry the call for us now.
 ///
 /// **Carrying is read from our seat**: a peer carries when our own media goes
-/// through them (`sends_through`), or when anyone's media reaches us through
+/// through them (`seat.sending`), or when anyone's media reaches us through
 /// them (`through`, each peer's hosts, from their route). We carry when we
 /// are forwarding other people's media, which is guests actually pulling it
 /// or our bridging it to the relay, not merely guests connected. A host
 /// carrying for someone else, out of our sight, stays quiet here.
 ///
+/// **A room with no relay server meets at its creator's session**, so what
+/// reads as "the relay" from a guest's seat is that person: our media going
+/// "to the relay" goes through them, and they could host while they are in
+/// the room. On the creator's own seat a single guest is enough to carry:
+/// there is nothing of anyone else's to forward, yet everything that guest
+/// receives comes from us. An iroh relay server that is no participant has
+/// no tile, so nothing here marks it.
+///
 /// Carrying wins even without a word of hosting from them: a route through
 /// someone is the stronger evidence, and their presence can lag it.
-fn host_mark(
-    who: &str,
-    mine: bool,
-    can_host: bool,
-    forwarding: bool,
-    sends_through: Option<&str>,
-    through: &BTreeMap<String, Vec<String>>,
-) -> HostMark {
-    let carrying = if mine {
-        forwarding
-    } else {
-        sends_through == Some(who) || through.values().any(|hosts| hosts.iter().any(|host| host == who))
+fn host_mark(who: &str, mine: bool, seat: &Seat, through: &BTreeMap<String, Vec<String>>) -> HostMark {
+    let meets_here = match &seat.meets_at {
+        Some(MeetsAt::Us) => mine,
+        Some(MeetsAt::Endpoint(id)) => !mine && id == who,
+        None => false,
     };
-    match (carrying, can_host) {
+    let carrying = if mine {
+        if meets_here { seat.guests } else { seat.forwarding }
+    } else {
+        let ours = match &seat.sending {
+            Some(Sending::Host(id)) => Some(id),
+            Some(Sending::Relay) => match &seat.meets_at {
+                Some(MeetsAt::Endpoint(id)) => Some(id),
+                _ => None,
+            },
+            Some(Sending::Guests) | None => None,
+        };
+        ours.is_some_and(|id| id == who) || through.values().any(|hosts| hosts.iter().any(|host| host == who))
+    };
+    match (carrying, seat.can_host || meets_here) {
         (true, _) => HostMark::Carrying,
         (false, true) => HostMark::Can,
         (false, false) => HostMark::None,
@@ -608,40 +637,101 @@ mod tests {
             .collect()
     }
 
+    fn seat(can_host: bool, sending: Option<Sending>) -> Seat {
+        Seat { can_host, sending, ..Seat::default() }
+    }
+
+    fn hosts(id: &str) -> Option<Sending> {
+        Some(Sending::Host(id.to_string()))
+    }
+
+    /// Our own seat while hosting, in a room on a relay server.
+    fn ours(forwarding: bool, guests: bool) -> Seat {
+        Seat { can_host: true, forwarding, guests, ..Seat::default() }
+    }
+
     #[test]
     fn nobody_who_cannot_host_and_carries_nothing_is_marked() {
-        assert_eq!(host_mark("h", false, false, false, None, &routes(&[])), HostMark::None);
-        assert_eq!(host_mark("me", true, false, false, None, &routes(&[])), HostMark::None);
+        assert_eq!(host_mark("h", false, &seat(false, None), &routes(&[])), HostMark::None);
+        assert_eq!(host_mark("me", true, &seat(false, None), &routes(&[])), HostMark::None);
     }
 
     #[test]
     fn a_host_carrying_nothing_for_us_is_quiet() {
         let elsewhere = routes(&[("m", &["k"])]);
-        assert_eq!(host_mark("h", false, true, false, Some("k"), &elsewhere), HostMark::Can);
+        assert_eq!(host_mark("h", false, &seat(true, hosts("k")), &elsewhere), HostMark::Can);
+        assert_eq!(host_mark("h", false, &seat(true, Some(Sending::Relay)), &routes(&[])), HostMark::Can);
     }
 
     #[test]
     fn a_host_our_media_goes_through_carries() {
-        assert_eq!(host_mark("h", false, true, false, Some("h"), &routes(&[])), HostMark::Carrying);
+        assert_eq!(host_mark("h", false, &seat(true, hosts("h")), &routes(&[])), HostMark::Carrying);
     }
 
     #[test]
     fn a_host_anyones_media_reaches_us_through_carries_nearest_or_not() {
-        assert_eq!(host_mark("h", false, true, false, None, &routes(&[("m", &["h"])])), HostMark::Carrying);
-        assert_eq!(host_mark("k", false, true, false, None, &routes(&[("m", &["h", "k"])])), HostMark::Carrying);
+        assert_eq!(host_mark("h", false, &seat(true, None), &routes(&[("m", &["h"])])), HostMark::Carrying);
+        assert_eq!(host_mark("k", false, &seat(true, None), &routes(&[("m", &["h", "k"])])), HostMark::Carrying);
     }
 
     #[test]
     fn a_route_through_someone_marks_them_before_their_presence_says_they_host() {
-        assert_eq!(host_mark("h", false, false, false, None, &routes(&[("m", &["h"])])), HostMark::Carrying);
+        assert_eq!(host_mark("h", false, &seat(false, None), &routes(&[("m", &["h"])])), HostMark::Carrying);
     }
 
     #[test]
     fn we_carry_only_while_forwarding_and_others_routes_do_not_mark_us() {
-        assert_eq!(host_mark("me", true, true, false, None, &routes(&[])), HostMark::Can);
-        assert_eq!(host_mark("me", true, true, true, None, &routes(&[])), HostMark::Carrying);
+        assert_eq!(host_mark("me", true, &ours(false, false), &routes(&[])), HostMark::Can);
+        assert_eq!(host_mark("me", true, &ours(true, true), &routes(&[])), HostMark::Carrying);
+        // On a relay server, guests connected but pulling nothing is not carrying.
+        assert_eq!(host_mark("me", true, &ours(false, true), &routes(&[])), HostMark::Can);
         // A peer's own route naming us is not how our tile learns it.
-        assert_eq!(host_mark("me", true, true, false, Some("me"), &routes(&[("m", &["me"])])), HostMark::Can);
+        let named = Seat { sending: hosts("me"), ..ours(false, false) };
+        assert_eq!(host_mark("me", true, &named, &routes(&[("m", &["me"])])), HostMark::Can);
+    }
+
+    /// Our own seat when we created a room with no relay server.
+    fn creator(guests: u32) -> Seat {
+        // Forwarding needs two guests: with one, nothing is anyone else's.
+        Seat { meets_at: Some(MeetsAt::Us), guests: guests > 0, forwarding: guests > 1, ..Seat::default() }
+    }
+
+    #[test]
+    fn the_creator_of_a_room_without_a_relay_carries_once_a_guest_is_here() {
+        assert_eq!(host_mark("me", true, &creator(0), &routes(&[])), HostMark::Can, "said even without a word of hosting");
+        assert_eq!(host_mark("me", true, &creator(1), &routes(&[])), HostMark::Carrying);
+        assert_eq!(host_mark("me", true, &creator(2), &routes(&[])), HostMark::Carrying);
+    }
+
+    /// A guest's seat, joined at `iroh://c/room`, our media going `sending`.
+    fn guest(sending: Option<Sending>) -> Seat {
+        Seat { meets_at: Some(MeetsAt::Endpoint("c".to_string())), sending, ..Seat::default() }
+    }
+
+    #[test]
+    fn a_guest_sees_the_creator_carry_what_goes_to_the_meeting_place() {
+        assert_eq!(host_mark("c", false, &guest(Some(Sending::Relay)), &routes(&[])), HostMark::Carrying);
+        // Another guest arriving through them, from `arrival::read`.
+        assert_eq!(host_mark("c", false, &guest(None), &routes(&[("m", &["c"])])), HostMark::Carrying);
+        // Our media moved to another host: they are still the meeting place.
+        assert_eq!(host_mark("c", false, &guest(hosts("h")), &routes(&[])), HostMark::Can);
+        assert_eq!(host_mark("h", false, &guest(hosts("h")), &routes(&[])), HostMark::Carrying);
+        // Nobody else is the meeting place, and our own tile is not.
+        assert_eq!(host_mark("m", false, &guest(Some(Sending::Relay)), &routes(&[])), HostMark::None);
+        assert_eq!(host_mark("me", true, &guest(Some(Sending::Relay)), &routes(&[])), HostMark::None);
+    }
+
+    #[test]
+    fn an_iroh_relay_that_is_nobody_in_the_room_marks_nobody() {
+        // Joined at `iroh://r/room`, a relay server: no tile is ever `r`.
+        let at = |sending| Seat { meets_at: Some(MeetsAt::Endpoint("r".to_string())), sending, ..Seat::default() };
+        for who in ["m", "h"] {
+            assert_eq!(host_mark(who, false, &at(Some(Sending::Relay)), &routes(&[])), HostMark::None);
+        }
+        assert_eq!(host_mark("me", true, &at(Some(Sending::Relay)), &routes(&[])), HostMark::None);
+        // A host there keeps the relay-room rules.
+        let on = Seat { can_host: true, ..at(hosts("h")) };
+        assert_eq!(host_mark("h", false, &on, &routes(&[])), HostMark::Carrying);
     }
 
     #[test]

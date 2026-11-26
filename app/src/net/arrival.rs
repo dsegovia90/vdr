@@ -67,6 +67,18 @@ pub enum Sending {
     Guests,
 }
 
+/// Where the room meets, when that is a person's own endpoint rather than a
+/// relay server: a room hosted with `--host` has no relay, and its creator's
+/// session is what everyone joined.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MeetsAt {
+    /// We host the room with `--host`: every guest is on our session.
+    Us,
+    /// We joined at `iroh://<id>/room`. A person when `id` turns up in the
+    /// room; an iroh-enabled relay server otherwise, which never does.
+    Endpoint(String),
+}
+
 /// What we know when reading one chain.
 pub(crate) struct Known<'a> {
     /// Their own origin's hop, when they host and say so.

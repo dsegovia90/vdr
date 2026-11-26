@@ -1329,6 +1329,13 @@ async fn run(
             Peering::Host(_) => Some(arrival::Sending::Guests),
             _ => None,
         });
+        // For the host borders: without a relay server, the endpoint the room
+        // meets at is a person, who carries everyone else's media.
+        local.set_meets_at(match &peering {
+            Peering::Host(_) => Some(arrival::MeetsAt::Us),
+            Peering::Join(_) => routing.far.clone().map(arrival::MeetsAt::Endpoint),
+            _ => None,
+        });
         let peer_transport: Peer = match peering {
             Peering::Dial(peer) => {
                 report(RemoteStatus::Dialing {
@@ -1909,6 +1916,7 @@ async fn run(
         local.set_room(None);
         // Out of the room, our media goes nowhere.
         local.set_sending(None);
+        local.set_meets_at(None);
         // Aborting the loop above stops the per-participant tasks with it, but
         // the tiles are the interface's and have to be taken down by name.
         let _ = participants.unbounded_send(ParticipantEvent::Cleared);

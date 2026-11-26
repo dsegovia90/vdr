@@ -693,6 +693,9 @@ pub struct PeerStats {
     arrival: std::sync::Mutex<Option<super::arrival::Arrival>>,
     /// Where our own broadcasts go. Our own entry only; `None` outside a room.
     sending: std::sync::Mutex<Option<super::arrival::Sending>>,
+    /// Where the room meets, when it is an endpoint we can name. Our own
+    /// entry only; `None` outside a room and in a room on a relay server.
+    meets_at: std::sync::Mutex<Option<super::arrival::MeetsAt>>,
     /// What we say about hosting this room, while we are serving it. Our own
     /// entry only; the presence announcer reads it. Carries the door.
     offer: std::sync::Mutex<Option<super::door::Offer>>,
@@ -913,6 +916,7 @@ impl Default for PeerStats {
             heard: AtomicBool::new(false),
             arrival: std::sync::Mutex::new(None),
             sending: std::sync::Mutex::new(None),
+            meets_at: std::sync::Mutex::new(None),
             offer: std::sync::Mutex::new(None),
             move_calls: AtomicBool::new(false),
             spare_route: AtomicBool::new(true),
@@ -1292,6 +1296,18 @@ impl PeerStats {
     pub(super) fn set_sending(&self, sending: Option<super::arrival::Sending>) {
         if let Ok(mut slot) = self.sending.lock() {
             *slot = sending;
+        }
+    }
+
+    /// Where the room meets, when it is an endpoint. Meaningful on our own
+    /// entry.
+    pub fn meets_at(&self) -> Option<super::arrival::MeetsAt> {
+        self.meets_at.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub(super) fn set_meets_at(&self, at: Option<super::arrival::MeetsAt>) {
+        if let Ok(mut slot) = self.meets_at.lock() {
+            *slot = at;
         }
     }
 
