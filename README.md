@@ -128,9 +128,15 @@ and two people can choose the same one. Its *Keyboard* tab lists the
 shortcuts and changes them: click a key, then press the new one; Backspace
 removes it, Esc gives up. Its *Updates* tab is described below. Its
 *Network* tab opens on a map of the room: relays as squares, people as
-circles (a blue ring on anyone who could host), a grey line wherever media
-could flow and a white one where it flows now, as each person says it;
-click a node for its links. Everyone sits on one ring, you at the top and
+circles (a blue ring on anyone who could host), and a line for every link,
+split in the middle. The half next to someone is white when they send media
+along it and grey when they do not, so a line white all along carries both
+ways, white at one end only carries one way from that end, and all grey is
+a link held with nothing on it; this comes from what each person's app says
+about how everyone else's media reaches it, asked for only while the map is
+open. Click someone to dim everything off their paths and read where their
+media goes and comes from, including where what they say and what others
+see disagree; a relay nobody reaches is drawn faint and dashed. Everyone sits on one ring, you at the top and
 the relays together at the bottom, so a line between two people never
 passes through a relay; a line that would brush a node it does not end at
 is drawn curved around it. A direct call is one white line between the two

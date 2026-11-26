@@ -259,6 +259,21 @@ focus.
   `meets_at` and who is in the room. The map takes people's word over the
   routes we see (`arrival`), which name the last hop towards us, not the
   sender's carrier.
+- **Which way media travels on each link comes from `routes.json`**, a
+  track of its own in the control broadcast beside presence, **asked for only
+  while someone has the map open**. Each receiver says the path every other
+  person's media takes to it (from the whole hop chain, `arrival::path_of`),
+  its own origin and gate hops, and the hops it knows to be the meeting
+  place; a viewer names every hop from everyone's claims (`web::build_reported`).
+  Costs nothing unseen, and keep it so: the map's mount sets
+  `PeerStats::set_map_open`, and only then does `attend` keep a
+  `follow_routes` reader per peer; the writer (`publish_routes`) waits on the
+  track's `used()` and writes nothing, and `note_routes` works nothing out,
+  while nobody is subscribed. The log says `following N people's routes` /
+  `following nobody's routes` and `our routes are (no longer) asked for`. An
+  older build neither asks nor publishes, and is drawn from `via`/`held` as
+  before. The document is capped at 16 KB before parsing and read field by
+  field (`web::clean_reported`).
 
 ## Layout, paint and input gotchas
 
@@ -376,8 +391,8 @@ focus.
 | `net/sessions.rs` | a join that dials the relay and the room's saved hosts together: which session carries our media, and moving it |
 | `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes, for the log and the host borders on tiles (`read` and `through` are pure) |
 | `net/moves.rs` | moving the call to a host, an experiment: the presence field, which choice wins, the bounce order (pure) |
-| `net/web.rs` | the room as a web of nodes for the Network tab: the `via`/`held` presence fields (wire form, lenient reading, cleaning) and the pure graph built from every entry |
-| `web_layout.rs` | where the Network tab's map puts each node (one ring with the relays at six o'clock, a thin inner ring for people past about ninety; in a unit square, from counts and order only), which lines it draws, how a line bows round a node it does not end at, and the made-up room of `--fake-web` |
+| `net/web.rs` | the room as a web of nodes for the Network tab: the `via`/`held` presence fields and the `routes.json` document (wire form, lenient reading, cleaning, id prefixes), naming hops from everyone's claims, and the pure graph built from every entry, with each link's streams counted per direction and where a sender's word and its receivers part |
+| `web_layout.rs` | where the Network tab's map puts each node (one ring with the relays at six o'clock, a thin inner ring for people past about ninety; in a unit square, from counts and order only) and its name (radially outside it), which lines it draws, how a line bows round a node it does not end at, when a line is too short to split, what a selection keeps lit, and the made-up room of `--fake-web` (reports included) |
 | `net/door.rs` | a hosted room's door: its name, the secret guests present as `?door=`, the check (pure) |
 | `net/audio.rs` | the audio half: Opus out, each peer's voice in, echo cancelled |
 | `net/share.rs` | screen sharing: capture and its own broadcast |
