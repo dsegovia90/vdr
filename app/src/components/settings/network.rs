@@ -78,7 +78,7 @@ pub fn NetworkTab(
         div { class: "flex flex-col",
             div { class: "text-lg font-semibold text-neutral-100", "Network" }
             p { class: "mt-1 text-sm text-neutral-400",
-                "Everyone in the room and the relays it meets at, as each says it. Every line is split in the middle: the half next to someone turns white when they send media along it, and stays grey when they do not. White all along is both ways; white at one end is one way, from that end; all grey is a link held with nothing on it."
+                "Everyone in the room and the relays it meets at, as each says it. A white line means media is travelling along it, and moving dashes show which way: two rows of dashes going opposite ways means both ways. A grey line is connected with nothing travelling; a dashed one is only assumed."
             }
             if open {
                 RoomMap { local: local.clone(), participants, me: me.clone() }

@@ -38,10 +38,14 @@
 //! name above or below sat on the lines running down to the relay. The ring
 //! is pulled in far enough for a side name to fit inside the square.
 //!
-//! **Each line is drawn in two halves**, split at its middle, each white
-//! while the node at its end sends along it ([`halves_fit`] says when a line
-//! is too short for that to be read), and selecting a node dims whatever is
-//! not on its media's paths ([`focus`]).
+//! **A line is white while media travels on it, either way**, and which way
+//! is shown by motion: short bright dashes drift along it from sender to
+//! receiver ([`dashes`]), in one lane down the middle for a one-way link and
+//! two side by side, each drifting its own way, for a two-way one
+//! ([`lanes`]). A line split into a white and a grey half was tried first
+//! and read as a broken or fading line, not as a direction. Selecting a node
+//! dims whatever is not on its media's paths ([`focus`]), and only what stays
+//! lit moves; in a big room only the focus's paths move ([`moving`]).
 //!
 //! **A line never crosses a node it does not end at.** Even on one ring a
 //! node has a size, so a line between two nodes not far apart grazes the
@@ -89,11 +93,6 @@ pub const NAME_GAP: f64 = 0.008;
 /// The least room a name beside a node gets: what the ring is pulled in to
 /// leave at three and nine o'clock.
 const SIDE_LABEL: f64 = LABEL_MIN;
-/// The shortest half of a line drawn as a half: eight pixels on the
-/// narrowest square the tab lays out, about 280 px. Under it a line is one
-/// colour, white if either end sends, since a half that short reads as a
-/// node's outline rather than a direction.
-pub const HALF_MIN: f64 = 8.0 / 280.0;
 /// How tall a name is: a line of 10 px text, leading-tight, on a square of
 /// about 280 px, the narrowest the Network tab is laid out at; on the full
 /// 400 px it is about two thirds of this.
@@ -574,17 +573,6 @@ pub fn shown_edges(web: &Web, selected: Option<&str>) -> Shown {
     shown
 }
 
-/// Whether a line between `a` and `b` is long enough to be drawn in halves:
-/// each half, from its node's edge to the middle, at least [`HALF_MIN`]. The
-/// straight distance, which a bowed line only exceeds.
-pub fn halves_fit(kinds: &[Kind], places: &[Place], a: usize, b: usize) -> bool {
-    let (Some(from), Some(to), Some(&from_kind), Some(&to_kind)) = (places.get(a), places.get(b), kinds.get(a), kinds.get(b)) else {
-        return false;
-    };
-    let half = distance(from, to) / 2.0;
-    half - from.reach(from_kind).max(to.reach(to_kind)) >= HALF_MIN
-}
-
 /// What stays at full strength while a node is selected, by index into a
 /// web's nodes and edges: everything on a path of media that passes it
 /// (theirs, out and in, or carried by them), and every link of theirs with
@@ -630,7 +618,7 @@ pub fn focus(web: &Web, selected: usize) -> Focus {
     Focus { nodes, edges }
 }
 
-/// How thick a carrying half is for `streams` people's media: 1.5 for one
+/// How thick a carrying line is for `streams` people's media, both ways: 1.5 for one
 /// to 3 for twenty and more, in steps by order of magnitude, so a busy
 /// link reads at a glance and a count need not be read.
 pub fn stream_width(streams: u32) -> f64 {
@@ -656,6 +644,166 @@ pub fn quiet_alpha(drawn: usize, state: State, selected: bool) -> f32 {
         State::Assumed => base * 0.7,
         State::Held | State::Flowing => base,
     }
+}
+
+/// How fast a dash drifts, in logical pixels a second, the same on every
+/// line and at every map size, so a long line is not a fast one. Slow
+/// enough to follow with the eye; at the twelve frames a second the map is
+/// woken at, a dash moves under 3 px a frame, well under half of
+/// [`DASH_PERIOD`], so the eye cannot take a step for one backwards.
+pub const DASH_SPEED: f64 = 32.0;
+/// A dash, and the gap after it, in logical pixels. A dash shorter than its
+/// gap reads as a thing moving rather than as a dashed line. At 14 px from
+/// one to the next, any line with 19 px between its nodes' edges always shows
+/// a whole dash, and one across a 400 px map about twenty.
+pub const DASH_LONG: f64 = 5.0;
+pub const DASH_GAP: f64 = 9.0;
+pub const DASH_PERIOD: f64 = DASH_LONG + DASH_GAP;
+/// How far a two-way link's lanes sit either side of its middle, in logical
+/// pixels: as wide as the thickest line is, so the two read as two rails.
+pub const LANE_APART: f64 = 1.5;
+/// Kept between a dash and a node's edge, in logical pixels.
+pub const DASH_CLEAR: f64 = 2.0;
+/// Over this many carrying lines, only the focus's paths move (the selected
+/// node's, or ours): a hundred-odd lines all moving at once is a shimmer, not
+/// a direction, and in a room with a relay it is about a hundred people,
+/// where a person looks for their own media anyway. It also bounds a frame:
+/// the 150-person fake room's lines average 27 dashes each on a 400 px map,
+/// so at most about 3,300 short strokes, in one path per width. All 228 of
+/// that room's carrying lines' dashes are worked out in about 2 ms in a
+/// debug build (`a_frame_of_the_largest_room_is_bounded`).
+pub const MOVING_MAX: usize = 120;
+
+/// Which way along a link a lane's dashes drift: from its `from` end to its
+/// `to` end, or back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Way {
+    Forth,
+    Back,
+}
+
+/// The lanes a link's dashes drift in, each with how far it sits to the
+/// right of its own direction of travel, in logical pixels. A one-way link
+/// has one, down the middle; a two-way one two, each to its own right, so
+/// they sit either side of the middle; a link with nothing known to travel
+/// on it none. Right of travel is the usual side to pass on, so the two
+/// lanes are where a reader expects them.
+pub fn lanes(forth: u32, back: u32) -> Vec<(Way, f64)> {
+    match (forth > 0, back > 0) {
+        (true, true) => vec![(Way::Forth, LANE_APART), (Way::Back, LANE_APART)],
+        (true, false) => vec![(Way::Forth, 0.0)],
+        (false, true) => vec![(Way::Back, 0.0)],
+        (false, false) => Vec::new(),
+    }
+}
+
+/// A quadratic curve in pixels, from the sender's centre to the receiver's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bend {
+    pub from: (f64, f64),
+    pub control: (f64, f64),
+    pub to: (f64, f64),
+}
+
+/// A dash's two ends, from the sender's side.
+pub type Dash = ((f64, f64), (f64, f64));
+
+/// The dashes on one lane, as the two ends of each, in the same pixels as
+/// the curve `bend`, with each dash kept `clear` (from, to) along the curve
+/// from its two centres, `offset` to the right of travel, and
+/// `travelled` logical pixels along since the drift began. `scale` is device
+/// pixels to the logical pixel the dash sizes are in.
+///
+/// The dashes are spaced [`DASH_PERIOD`] along the curve, measured from the
+/// sender's edge, and move with `travelled` towards the receiver; one a
+/// period further on is the same picture, so the drift wraps without a jump.
+/// A dash entering at the sender's edge or leaving at the receiver's is cut
+/// there rather than drawn over the node. Each dash is drawn straight
+/// between its ends, which on a bow at most a few pixels long is the curve.
+pub fn dashes(bend: Bend, (clear_from, clear_to): (f64, f64), offset: f64, travelled: f64, scale: f64) -> Vec<Dash> {
+    let Bend { from, control, to } = bend;
+    /// Straight pieces the curve is measured in: a bowed line here strays
+    /// from them by well under a pixel.
+    const PIECES: usize = 32;
+    let at = |t: f64| {
+        let u = 1.0 - t;
+        (
+            u * u * from.0 + 2.0 * u * t * control.0 + t * t * to.0,
+            u * u * from.1 + 2.0 * u * t * control.1 + t * t * to.1,
+        )
+    };
+    let mut lengths = [0.0f64; PIECES + 1];
+    let mut last = from;
+    for (piece, length) in lengths.iter_mut().enumerate().skip(1) {
+        let next = at(piece as f64 / PIECES as f64);
+        *length = (next.0 - last.0).hypot(next.1 - last.1);
+        last = next;
+    }
+    for piece in 1..=PIECES {
+        lengths[piece] += lengths[piece - 1];
+    }
+    let total = lengths[PIECES];
+    let usable = total - clear_from - clear_to;
+    if !usable.is_finite() || usable <= 0.0 || scale <= 0.0 {
+        return Vec::new();
+    }
+    // A point `s` along the curve, moved `offset` to the right of travel
+    // (with `y` down, the right of `(dx, dy)` is `(-dy, dx)`).
+    let point = |s: f64| {
+        let piece = lengths.partition_point(|&length| length <= s).clamp(1, PIECES);
+        let (start, end) = (lengths[piece - 1], lengths[piece]);
+        let within = if end > start { (s - start) / (end - start) } else { 0.0 };
+        let t = (piece as f64 - 1.0 + within.clamp(0.0, 1.0)) / PIECES as f64;
+        let (x, y) = at(t);
+        let dx = 2.0 * (1.0 - t) * (control.0 - from.0) + 2.0 * t * (to.0 - control.0);
+        let dy = 2.0 * (1.0 - t) * (control.1 - from.1) + 2.0 * t * (to.1 - control.1);
+        let along = dx.hypot(dy).max(f64::MIN_POSITIVE);
+        (x - dy / along * offset, y + dx / along * offset)
+    };
+    let period = DASH_PERIOD * scale;
+    let long = DASH_LONG * scale;
+    let mut out = Vec::new();
+    // The first dash starts up to a period before the sender's edge, so one
+    // is always on its way in.
+    let mut start = (travelled * scale).rem_euclid(period) - period;
+    while start < usable {
+        let (a, b) = (start.max(0.0), (start + long).min(usable));
+        if b > a {
+            out.push((point(clear_from + a), point(clear_from + b)));
+        }
+        start += period;
+    }
+    out
+}
+
+/// Which of the drawn lines (`shown.edges`, in order) have drifting dashes:
+/// none while the switch is off (`on`); otherwise each carrying line with a
+/// direction known, unless a node is selected and it is off that node's
+/// paths (it is dimmed, and dimmed lines keep still), or the room has over
+/// [`MOVING_MAX`] such lines and it is off the paths of the selected node,
+/// or ours with nothing selected.
+pub fn moving(web: &Web, shown: &Shown, selected: Option<usize>, on: bool) -> Vec<bool> {
+    if !on {
+        return vec![false; shown.edges.len()];
+    }
+    let carrying = |at: usize| {
+        let edge = &web.edges[at];
+        edge.state == State::Flowing && (edge.carries_forth() || edge.carries_back())
+    };
+    let count = shown.edges.iter().filter(|&&at| carrying(at)).count();
+    let me = web.nodes.iter().position(|node| node.me);
+    let lit = match (selected, count > MOVING_MAX) {
+        (Some(at), _) => Some(focus(web, at)),
+        (None, true) => me.map(|at| focus(web, at)),
+        (None, false) => None,
+    };
+    // Over the cap with nobody to focus on, nothing moves.
+    let crowded_and_blind = lit.is_none() && count > MOVING_MAX;
+    shown
+        .edges
+        .iter()
+        .map(|&at| carrying(at) && !crowded_and_blind && lit.as_ref().is_none_or(|lit| lit.edges[at]))
+        .collect()
 }
 
 /// A room to look at without one (`--fake-web`): `participants` people (us
@@ -1243,6 +1391,204 @@ mod tests {
         assert!(quiet_alpha(10, State::Held, false) > quiet_alpha(200, State::Held, false));
         assert!(quiet_alpha(10, State::Assumed, false) < quiet_alpha(10, State::Held, false));
         assert!(quiet_alpha(300, State::Held, true) > quiet_alpha(10, State::Held, false));
+    }
+
+    /// Dashes on a straight line along `x`, 300 px between centres, each
+    /// node 10 px in reach.
+    fn straight(offset: f64, travelled: f64) -> Vec<Dash> {
+        dashes(Bend { from: (0.0, 0.0), control: (150.0, 0.0), to: (300.0, 0.0) }, (10.0, 10.0), offset, travelled, 1.0)
+    }
+
+    fn close(a: &[Dash], b: &[Dash]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                [(x.0.0, y.0.0), (x.0.1, y.0.1), (x.1.0, y.1.0), (x.1.1, y.1.1)].iter().all(|(p, q)| (p - q).abs() < 1e-6)
+            })
+    }
+
+    #[test]
+    fn dashes_are_evenly_spaced_and_stay_between_the_edges() {
+        for travelled in [0.0, 3.3, 7.0, 13.99, 1_000.5] {
+            let line = straight(0.0, travelled);
+            assert!(!line.is_empty());
+            for &((x0, y0), (x1, y1)) in &line {
+                assert!((10.0..=290.0).contains(&x0) && (10.0..=290.0).contains(&x1), "{x0}..{x1}");
+                assert!(x1 > x0, "drawn from the sender's side");
+                assert!(y0.abs() < 1e-9 && y1.abs() < 1e-9);
+                assert!(x1 - x0 <= DASH_LONG + 1e-9);
+            }
+            // Whole dashes (not cut at an edge) are a period apart.
+            let whole: Vec<f64> = line.iter().filter(|(a, b)| (b.0 - a.0 - DASH_LONG).abs() < 1e-6).map(|(a, _)| a.0).collect();
+            assert!(whole.len() >= 18, "{}", whole.len());
+            for pair in whole.windows(2) {
+                assert!((pair[1] - pair[0] - DASH_PERIOD).abs() < 1e-6, "{pair:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dashes_drift_towards_the_receiver_and_wrap_after_a_period() {
+        let now = straight(0.0, 20.0);
+        let later = straight(0.0, 21.0);
+        // Every whole dash one pixel nearer the receiver.
+        let starts = |line: &[Dash]| -> Vec<f64> {
+            line.iter().filter(|(a, b)| (b.0 - a.0 - DASH_LONG).abs() < 1e-6).map(|(a, _)| a.0).collect()
+        };
+        let (now_starts, later_starts) = (starts(&now), starts(&later));
+        for start in &now_starts {
+            assert!(later_starts.iter().any(|later| (later - start - 1.0).abs() < 1e-6), "{start} moved one pixel on");
+        }
+        assert!(close(&straight(0.0, 20.0), &straight(0.0, 20.0 + DASH_PERIOD)));
+        assert!(close(&straight(1.5, 3.0), &straight(1.5, 3.0 + 7.0 * DASH_PERIOD)));
+        // Device pixels: twice the scale, twice the spacing.
+        let doubled = dashes(Bend { from: (0.0, 0.0), control: (300.0, 0.0), to: (600.0, 0.0) }, (20.0, 20.0), 0.0, 20.0, 2.0);
+        assert_eq!(doubled.len(), now.len());
+    }
+
+    #[test]
+    fn a_two_way_link_has_two_lanes_moving_apart() {
+        assert_eq!(lanes(0, 0), []);
+        assert_eq!(lanes(3, 0), [(Way::Forth, 0.0)]);
+        assert_eq!(lanes(0, 1), [(Way::Back, 0.0)]);
+        let both = lanes(2, 5);
+        assert_eq!(both.len(), 2);
+        // Each lane is drawn from its own sender: forth from (0, 0), back
+        // from (300, 0), each to its own right.
+        let (a, b, middle) = ((0.0, 0.0), (300.0, 0.0), (150.0, 0.0));
+        let lane = |way: Way, offset: f64, travelled: f64| match way {
+            Way::Forth => dashes(Bend { from: a, control: middle, to: b }, (10.0, 10.0), offset, travelled, 1.0),
+            Way::Back => dashes(Bend { from: b, control: middle, to: a }, (10.0, 10.0), offset, travelled, 1.0),
+        };
+        let ys: Vec<f64> = both.iter().map(|&(way, offset)| lane(way, offset, 2.0)[0].0.1).collect();
+        assert!(ys[0] > 0.0 && ys[1] < 0.0, "either side of the middle: {ys:?}");
+        assert!((ys[0] + ys[1]).abs() < 1e-9 && (ys[0] - LANE_APART).abs() < 1e-9);
+        // A little later, the forth lane's whole dashes are further along x
+        // and the back lane's further back: compare one dash each.
+        for &(way, offset) in &both {
+            let now = lane(way, offset, 2.0);
+            let later = lane(way, offset, 3.0);
+            let step = later[1].0.0 - now[1].0.0;
+            match way {
+                Way::Forth => assert!((step - 1.0).abs() < 1e-6, "{step}"),
+                Way::Back => assert!((step + 1.0).abs() < 1e-6, "{step}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dashes_follow_a_bow_and_stay_off_the_nodes() {
+        let (from, control, to) = ((0.0, 0.0), (100.0, 60.0), (200.0, 0.0));
+        let line = dashes(Bend { from, control, to }, (8.0, 12.0), 0.0, 5.0, 1.0);
+        assert!(line.len() > 10);
+        let on_curve = |(x, y): (f64, f64)| {
+            // y of the curve at this x: x = 200t, y = 60t(1 - t)·2.
+            let t = x / 200.0;
+            (y - 120.0 * t * (1.0 - t)).abs() < 0.5
+        };
+        for &(p, q) in &line {
+            assert!(on_curve(p) && on_curve(q), "{p:?} {q:?}");
+            // Measured along the curve, so straight across a hair less.
+            assert!(p.0.hypot(p.1) >= 8.0 - 0.2 && (q.0 - 200.0).hypot(q.1) >= 12.0 - 0.2);
+        }
+        // Nothing to draw between nodes that touch, or for a degenerate one.
+        assert!(dashes(Bend { from, control: from, to: (15.0, 0.0) }, (8.0, 8.0), 0.0, 0.0, 1.0).is_empty());
+        assert!(dashes(Bend { from, control: from, to: from }, (0.0, 0.0), 0.0, 0.0, 1.0).is_empty());
+        assert!(dashes(Bend { from, control, to }, (0.0, 0.0), 0.0, f64::NAN, 1.0).is_empty(), "a broken clock draws nothing");
+    }
+
+    #[test]
+    fn only_carrying_lines_move_and_none_with_the_switch_off() {
+        let web = fake(20, 3, 0);
+        let shown = shown_edges(&web, None);
+        let off = moving(&web, &shown, None, false);
+        assert!(off.iter().all(|&moves| !moves));
+        let on = moving(&web, &shown, None, true);
+        assert!(on.iter().any(|&moves| moves));
+        // The fake room has lines of one lane and of two.
+        let lanes_of = |at: usize| lanes(web.edges[at].forth, web.edges[at].back).len();
+        let moving_at: Vec<usize> = shown.edges.iter().zip(&on).filter(|(_, moves)| **moves).map(|(&at, _)| at).collect();
+        assert!(moving_at.iter().any(|&at| lanes_of(at) == 1) && moving_at.iter().any(|&at| lanes_of(at) == 2));
+        for (&at, &moves) in shown.edges.iter().zip(&on) {
+            let edge = &web.edges[at];
+            let carrying = edge.state == State::Flowing && (edge.forth > 0 || edge.back > 0);
+            assert_eq!(moves, carrying, "{edge:?}");
+        }
+        assert!(shown.edges.iter().zip(&on).any(|(&at, &moves)| web.edges[at].state != State::Flowing && !moves));
+    }
+
+    #[test]
+    fn a_selection_keeps_only_its_paths_moving() {
+        let web = fake(20, 3, 0);
+        let shown = shown_edges(&web, None);
+        let me = me_of(&web);
+        let lit = focus(&web, me);
+        let moves = moving(&web, &shown, Some(me), true);
+        for (&at, &moves) in shown.edges.iter().zip(&moves) {
+            if moves {
+                assert!(lit.edges[at], "a dimmed line keeps still");
+            }
+        }
+        assert!(moves.iter().any(|&moves| moves));
+        let all = moving(&web, &shown, None, true);
+        assert!(all.iter().filter(|&&m| m).count() > moves.iter().filter(|&&m| m).count());
+    }
+
+    #[test]
+    fn in_a_big_room_only_the_focus_moves() {
+        let web = fake(150, 3, 0);
+        let shown = shown_edges(&web, None);
+        let carrying = shown
+            .edges
+            .iter()
+            .filter(|&&at| web.edges[at].state == State::Flowing && (web.edges[at].forth > 0 || web.edges[at].back > 0))
+            .count();
+        assert!(carrying > MOVING_MAX, "{carrying}");
+        let me = me_of(&web);
+        let ours = focus(&web, me);
+        let moves = moving(&web, &shown, None, true);
+        let count = moves.iter().filter(|&&m| m).count();
+        assert!(count > 0 && count < carrying, "{count} of {carrying}");
+        for (&at, &moves) in shown.edges.iter().zip(&moves) {
+            if moves {
+                assert!(ours.edges[at]);
+            }
+        }
+        // Selecting someone else moves theirs instead.
+        let other = web.nodes.iter().position(|node| !node.me && node.kind == Kind::Participant).unwrap();
+        let theirs = focus(&web, other);
+        for (&at, &moves) in shown.edges.iter().zip(&moving(&web, &shown, Some(other), true)) {
+            if moves {
+                assert!(theirs.edges[at]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_frame_of_the_largest_room_is_bounded() {
+        // Every carrying line of the 150-person fake room as if all moved,
+        // on a 400 px square: what a frame costs at the worst the cap allows
+        // and then some.
+        let web = fake(150, 3, 0);
+        let places = layout(&web, None);
+        let index_of = |id: &str| web.index_of(id).unwrap();
+        let started = std::time::Instant::now();
+        let mut total = 0;
+        let mut lines = 0;
+        for edge in web.edges.iter().filter(|edge| edge.state == State::Flowing) {
+            let (a, b) = (&places[index_of(&edge.from)], &places[index_of(&edge.to)]);
+            let (from, to) = ((a.x * 400.0, a.y * 400.0), (b.x * 400.0, b.y * 400.0));
+            let middle = ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0);
+            for (way, offset) in lanes(edge.forth, edge.back) {
+                let (start, end) = if way == Way::Forth { (from, to) } else { (to, from) };
+                total += dashes(Bend { from: start, control: middle, to: end }, (6.0, 6.0), offset, 0.0, 1.0).len();
+            }
+            lines += 1;
+        }
+        let took = started.elapsed();
+        assert!(lines > MOVING_MAX);
+        // Per line, at most a two-way line's worth across the square.
+        assert!(total < lines * 2 * (400.0 / DASH_PERIOD) as usize, "{total} dashes on {lines} lines");
+        eprintln!("{total} dashes on {lines} lines in {took:?}");
     }
 
     #[test]

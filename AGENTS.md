@@ -297,6 +297,17 @@ focus.
   when the drawing or the size changes. Its square is two boxes: on one flex
   item with `w-full max-w-[…] aspect-square`, taffy derives the height from
   the unclamped width (read in taffy's source, not seen).
+- **The map shows direction by motion**: a carrying line is one light line
+  and white dashes drift along it from sender to receiver, two lanes for a
+  link carrying both ways (`web_layout::dashes`, `lanes`). Half-white,
+  half-grey lines were tried and read as broken lines. The lines and nodes
+  stay cached; only the dash layer is built per frame, between them. Frames
+  come from a `Ticker` component in `room_map.rs` whose thread calls
+  `schedule_update` every 83 ms (about 12 fps), the same wake a video frame
+  uses; its thread **parks** while the map's Animate switch is off
+  (`Settings::animate_map`) or no line moves, and ends when the map is
+  dropped. Over `web_layout::MOVING_MAX` carrying lines only the focus's
+  paths move. Keep `requires_redraw` false here too.
 - **Video tiles are flex rows, not a grid** (`components/layout.rs`), with
   zero-height line breaks per breakpoint. The box *is* the card; the paint code
   crops the sides when a box is narrower than the video.
@@ -329,7 +340,11 @@ focus.
   `VideoPaintSource::requires_redraw` is `false`; a `FrameSlot` watcher wakes
   the tile when a frame is published or cleared (`components/participant.rs`).
   Returning `true` there repaints at the display's refresh rate with no video
-  on screen.
+  on screen. Anything that moves is driven the same way, from a thread that
+  wakes one component at the rate it needs and parks when nothing moves (the
+  room map's `Ticker`). A wake of one component still repaints the whole
+  window: blitz-shell's `redraw` resolves the document, calls every widget's
+  `paint` and renders the one scene (read in the source).
 - **`overflow-y-auto` makes the other axis scroll too**, and scrollbar thumbs
   are always visible here, so a pane a pixel too narrow for its content grows
   a bar along the bottom. Add `overflow-x-hidden` to a pane that should only
@@ -392,7 +407,7 @@ focus.
 | `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes, for the log and the host borders on tiles (`read` and `through` are pure) |
 | `net/moves.rs` | moving the call to a host, an experiment: the presence field, which choice wins, the bounce order (pure) |
 | `net/web.rs` | the room as a web of nodes for the Network tab: the `via`/`held` presence fields and the `routes.json` document (wire form, lenient reading, cleaning, id prefixes), naming hops from everyone's claims, and the pure graph built from every entry, with each link's streams counted per direction and where a sender's word and its receivers part |
-| `web_layout.rs` | where the Network tab's map puts each node (one ring with the relays at six o'clock, a thin inner ring for people past about ninety; in a unit square, from counts and order only) and its name (radially outside it), which lines it draws, how a line bows round a node it does not end at, when a line is too short to split, what a selection keeps lit, and the made-up room of `--fake-web` (reports included) |
+| `web_layout.rs` | where the Network tab's map puts each node (one ring with the relays at six o'clock, a thin inner ring for people past about ninety; in a unit square, from counts and order only) and its name (radially outside it), which lines it draws, how a line bows round a node it does not end at, where its drifting dashes are and which lines have them, what a selection keeps lit, and the made-up room of `--fake-web` (reports included) |
 | `net/door.rs` | a hosted room's door: its name, the secret guests present as `?door=`, the check (pure) |
 | `net/audio.rs` | the audio half: Opus out, each peer's voice in, echo cancelled |
 | `net/share.rs` | screen sharing: capture and its own broadcast |

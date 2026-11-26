@@ -1,9 +1,10 @@
 //! The room as a picture, at the top of the Network tab: relays as squares,
 //! people as circles (a host-coloured ring on those who can host), and a
-//! line for every link, split at its middle: the half at a node is white
-//! while that node sends media along it, grey while it does not. A link
-//! white all along carries both ways; white at one end only, one way, from
-//! the white end. A line all grey is a session held with nothing on it.
+//! line for every link: white while media travels on it, either way, grey
+//! while it is held with nothing on it, dashed while it is only assumed.
+//! Which way media travels is shown by motion: short white dashes drift
+//! along a carrying line from sender to receiver, two lanes side by side on
+//! a link that carries both ways (see `web_layout::dashes`).
 //!
 //! **Painted by a widget, not an inline SVG.** Blitz re-serialises an inline
 //! SVG's subtree and hands it to usvg again on any change, then replays it as
@@ -11,6 +12,24 @@
 //! returns a recorded `Scene`, which is cached here and rebuilt only when the
 //! picture or the size it is painted at changes. Names and click targets are
 //! ordinary elements over it, placed in percentages of the same square.
+//!
+//! **The dashes are the only thing redrawn per frame.** The lines and the
+//! nodes are two cached scenes; a frame is their commands copied with the
+//! dashes between them (one path per dash width), which is all
+//! `Scene::append_scene` would do too: a recorded scene is a list of
+//! commands, so there is nothing cheaper to append. The drift is worked out
+//! from the time of the paint, so whatever repaints the window shows the
+//! dashes where they should be.
+//!
+//! **Woken at twelve frames a second, and only while something moves.**
+//! `requires_redraw` stays `false`: true makes blitz repaint at the
+//! display's refresh rate for as long as the map is mounted. Instead a
+//! [`Ticker`] thread wakes one empty component, as a video frame wakes its
+//! tile; the render that follows is the redraw. Every wake repaints the whole
+//! window, as any wake does (blitz-shell's `redraw` resolves the document and
+//! paints every node and widget into one scene; read in its source), so the
+//! ticker parks, not sleeps, while the switch is off or no line moves, and
+//! stops when the map is dropped.
 //!
 //! **No work while it cannot be seen.** It is mounted only while the window
 //! is open on this tab; its poller stops when it is dropped, builds the model
@@ -29,13 +48,14 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyrender::{PaintScene, RenderContext, Scene};
 use blitz_dom::node::ComputedStyles;
 use dioxus_native::prelude::*;
 use dioxus_native::winit::window::Window;
 use dioxus_native::{CustomWidgetAttr, Widget};
-use peniko::kurbo::{Affine, BezPath, Circle, Point, Rect, Stroke};
+use peniko::kurbo::{Affine, BezPath, Circle, Point, Rect, Stroke, Vec2};
 use peniko::{Color, Fill};
 
 use super::super::colour;
@@ -44,7 +64,13 @@ use crate::channel::use_channel;
 use crate::net::arrival::Arrival;
 use crate::net::web::{self, Kind, State, Web};
 use crate::net::{Participant, PeerStats};
-use crate::web_layout::{self, Place, Side};
+use crate::settings::Settings;
+use crate::web_layout::{self, Place, Side, Way};
+
+/// How often the dashes are redrawn while they move: about twelve frames a
+/// second, smooth enough at [`web_layout::DASH_SPEED`] (under 3 px a frame)
+/// and a fifth of what a 60 Hz display would ask.
+const FRAME: Duration = Duration::from_millis(83);
 
 /// What the widget paints, worked out on the interface's side so the paint
 /// only turns it into shapes.
@@ -54,6 +80,13 @@ struct Drawing {
     lines: Vec<Line>,
     /// Which dot is selected, by index.
     selected: Option<usize>,
+}
+
+impl Drawing {
+    /// Whether any line has dashes to drift, which is when the ticker runs.
+    fn moves(&self) -> bool {
+        self.lines.iter().any(|line| line.moving)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,10 +111,10 @@ struct Line {
     /// Streams from `a` to `b`, and from `b` to `a`.
     forth: u32,
     back: u32,
-    /// Too short for halves: one colour all along ([`web_layout::halves_fit`]).
-    whole: bool,
     /// Off the selected node's paths: drawn faint.
     dim: bool,
+    /// Has dashes drifting along it ([`web_layout::moving`]).
+    moving: bool,
 }
 
 /// The drawing and a count that moves whenever it changes, shared between
@@ -104,121 +137,192 @@ const RELAY: Color = Color::from_rgb8(64, 64, 64);
 const RELAY_EDGE: Color = Color::from_rgb8(212, 212, 212);
 const QUIET: Color = Color::from_rgb8(120, 120, 120);
 const FLOWING: Color = Color::from_rgb8(245, 245, 245);
+/// A carrying line under moving dashes: a light grey, so the pure white
+/// dashes stand out from it. White dashes over grey rather than dark gaps
+/// over white, because on the near-black square the eye follows the
+/// brightest thing, and that should be what moves; the line stays well
+/// above a held line's grey, so carrying still reads as carrying.
+const UNDER: Color = Color::from_rgb8(150, 150, 150);
+const DASH: Color = Color::from_rgb8(255, 255, 255);
 const SELECTED: Color = Color::from_rgb8(255, 255, 255);
 /// How much of its strength anything off the selected node's paths keeps.
 const DIMMED: f32 = 0.25;
 
-/// How a piece of line is drawn: one path for each, rather than one per
-/// line, which keeps a full room's scene small.
+/// How a line is drawn: one path for each, rather than one per line, which
+/// keeps a full room's scene small.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Look {
     /// A link with a session and nothing on it.
     Held { strong: bool },
     /// Someone who says nothing, guessed onto the meeting place.
     Assumed { strong: bool },
-    /// The half of a carrying link whose node does not send along it.
-    Idle,
-    /// A half whose node sends along it, by [`web_layout::stream_width`].
-    Carrying { width: u8 },
+    /// A link media travels on, by [`web_layout::stream_width`] of every
+    /// stream on it, light grey under dashes and white without.
+    Carrying { width: u8, under: bool },
+}
+
+/// The cached picture: the lines and the nodes apart, so a frame can put
+/// the dashes between them, and the two together for a paint with none.
+struct Layers {
+    lines: Scene,
+    nodes: Scene,
+    both: Scene,
 }
 
 /// Paints a [`Drawing`] into whatever square fits the box it is given.
 struct MapPaint {
     canvas: Rc<RefCell<Canvas>>,
-    /// The last scene, and what it was painted for: generation, width,
+    /// The last layers, and what they were painted for: generation, width,
     /// height, scale. Blitz asks every widget to paint on every window
     /// paint, so this is what keeps an unchanged map from being redrawn.
-    cached: Option<((u64, u32, u32, u64), Scene)>,
+    cached: Option<((u64, u32, u32, u64), Layers)>,
+    /// When the drift began: a dash's place is the time since, at
+    /// [`web_layout::DASH_SPEED`].
+    began: Instant,
 }
 
 impl Widget for MapPaint {
-    /// `false`: nothing moves between changes, and each change comes with a
-    /// render of the component, which is itself a repaint.
+    /// `false`, always: `true` repaints the window at the display's refresh
+    /// rate. The [`Ticker`] wakes the page instead, at [`FRAME`], and only
+    /// while dashes move.
     fn requires_redraw(&self) -> bool {
         false
     }
 
     fn paint(&mut self, _render_ctx: &mut dyn RenderContext, _styles: &ComputedStyles, width: u32, height: u32, scale: f64) -> Scene {
+        self.scene(width, height, scale)
+    }
+}
+
+impl MapPaint {
+    fn scene(&mut self, width: u32, height: u32, scale: f64) -> Scene {
         let Ok(canvas) = self.canvas.try_borrow() else {
-            return self.cached.as_ref().map(|(_, scene)| scene.clone()).unwrap_or_default();
+            return self.cached.as_ref().map(|(_, layers)| layers.both.clone()).unwrap_or_default();
         };
         let key = (canvas.generation, width, height, scale.to_bits());
-        if let Some((cached, scene)) = &self.cached {
-            if *cached == key {
-                return scene.clone();
-            }
+        if self.cached.as_ref().is_none_or(|(cached, _)| *cached != key) {
+            let (lines, nodes) = draw(&canvas.drawing, width, height, scale);
+            let mut both = lines.clone();
+            both.commands.extend(nodes.commands.iter().cloned());
+            self.cached = Some((key, Layers { lines, nodes, both }));
         }
-        let scene = draw(&canvas.drawing, width, height, scale);
-        self.cached = Some((key, scene.clone()));
+        let Some((_, layers)) = &self.cached else { return Scene::new() };
+        if !canvas.drawing.moves() {
+            return layers.both.clone();
+        }
+        let travelled = self.began.elapsed().as_secs_f64() * web_layout::DASH_SPEED;
+        let dashes = dash_layer(&canvas.drawing, width, height, scale, travelled);
+        let mut scene = layers.lines.clone();
+        scene.commands.extend(dashes.commands);
+        scene.commands.extend(layers.nodes.commands.iter().cloned());
         scene
     }
 }
 
-/// The shapes of `drawing` in a `width` × `height` box of device pixels, the
-/// unit square centred in it at its shorter side.
-fn draw(drawing: &Drawing, width: u32, height: u32, scale: f64) -> Scene {
-    let mut scene = Scene::new();
+/// Where the unit square sits in a `width` × `height` box: its side, and its
+/// top left corner.
+fn square(width: u32, height: u32) -> (f64, Point) {
     let side = f64::from(width.min(height));
-    let left = (f64::from(width) - side) / 2.0;
-    let top = (f64::from(height) - side) / 2.0;
-    let at = |place: &Place| Point::new(left + place.x * side, top + place.y * side);
+    (side, Point::new((f64::from(width) - side) / 2.0, (f64::from(height) - side) / 2.0))
+}
+
+/// A line's ends and the control point of its bow, in the box's pixels: off
+/// the middle along the normal `web_layout::bows` measures from, the middle
+/// itself when straight.
+fn curve(drawing: &Drawing, line: &Line, side: f64, corner: Point) -> Option<(Point, Point, Point)> {
+    let (a, b) = (drawing.dots.get(line.a)?, drawing.dots.get(line.b)?);
+    let at = |place: &Place| Point::new(corner.x + place.x * side, corner.y + place.y * side);
+    let (from, to) = (at(&a.place), at(&b.place));
+    let along = to - from;
+    let normal = Vec2::new(-along.y, along.x) / along.hypot().max(f64::MIN_POSITIVE);
+    Some((from, from.midpoint(to) + normal * (line.bow * side), to))
+}
+
+/// The dashes of every moving line at `travelled` logical pixels of drift:
+/// one path per width, pure white.
+fn dash_layer(drawing: &Drawing, width: u32, height: u32, scale: f64, travelled: f64) -> Scene {
+    let mut scene = Scene::new();
+    let (side, corner) = square(width, height);
+    let mut paths: Vec<(u8, BezPath)> = Vec::new();
+    for line in drawing.lines.iter().filter(|line| line.moving) {
+        let Some((from, control, to)) = curve(drawing, line, side, corner) else { continue };
+        let clear = |dot: usize| {
+            drawing.dots.get(dot).map_or(0.0, |dot| dot.place.reach(dot.kind) * side) + web_layout::DASH_CLEAR * scale
+        };
+        let base = web_layout::stream_width(line.forth + line.back);
+        for (way, offset) in web_layout::lanes(line.forth, line.back) {
+            let (start, end, clear_start, clear_end) = match way {
+                Way::Forth => (from, to, clear(line.a), clear(line.b)),
+                Way::Back => (to, from, clear(line.b), clear(line.a)),
+            };
+            // A lone lane covers its line; two side by side are each thin
+            // enough to leave a sliver of the line between them.
+            let thick = if offset == 0.0 { base + 0.5 } else { web_layout::LANE_APART };
+            let key = (thick * 2.0) as u8;
+            let at = match paths.iter().position(|(seen, _)| *seen == key) {
+                Some(at) => at,
+                None => {
+                    paths.push((key, BezPath::new()));
+                    paths.len() - 1
+                }
+            };
+            let path = &mut paths[at].1;
+            let bend = web_layout::Bend { from: (start.x, start.y), control: (control.x, control.y), to: (end.x, end.y) };
+            let dashes = web_layout::dashes(bend, (clear_start, clear_end), offset * scale, travelled, scale);
+            for ((x0, y0), (x1, y1)) in dashes {
+                path.move_to((x0, y0));
+                path.line_to((x1, y1));
+            }
+        }
+    }
+    for (key, path) in &paths {
+        scene.stroke(&Stroke::new(f64::from(*key) / 2.0 * scale), Affine::IDENTITY, DASH, None, path);
+    }
+    scene
+}
+
+/// The shapes of `drawing` in a `width` × `height` box of device pixels, the
+/// unit square centred in it at its shorter side: the lines, and the nodes
+/// to go over them.
+fn draw(drawing: &Drawing, width: u32, height: u32, scale: f64) -> (Scene, Scene) {
+    let mut scene = Scene::new();
+    let (side, corner) = square(width, height);
+    let at = |place: &Place| Point::new(corner.x + place.x * side, corner.y + place.y * side);
 
     // Lines first, under the nodes: a path per look and strength.
     let quiet = drawing.lines.iter().filter(|line| line.state != State::Flowing).count();
     let mut paths: Vec<((Look, bool), BezPath)> = Vec::new();
-    let mut path_for = |look: Look, dim: bool| -> usize {
-        match paths.iter().position(|(seen, _)| *seen == (look, dim)) {
+    for line in &drawing.lines {
+        let Some((from, control, to)) = curve(drawing, line, side, corner) else { continue };
+        let touches = drawing.selected.is_some_and(|selected| selected == line.a || selected == line.b);
+        let look = match line.state {
+            State::Held => Look::Held { strong: touches },
+            State::Assumed => Look::Assumed { strong: touches },
+            State::Flowing => Look::Carrying {
+                width: (web_layout::stream_width(line.forth + line.back) * 2.0) as u8,
+                under: line.moving,
+            },
+        };
+        let at = match paths.iter().position(|(seen, _)| *seen == (look, line.dim)) {
             Some(at) => at,
             None => {
-                paths.push(((look, dim), BezPath::new()));
+                paths.push(((look, line.dim), BezPath::new()));
                 paths.len() - 1
             }
-        }
-    };
-    let mut pieces: Vec<(usize, Point, Point, Point)> = Vec::new();
-    for line in &drawing.lines {
-        let (Some(a), Some(b)) = (drawing.dots.get(line.a), drawing.dots.get(line.b)) else { continue };
-        let (from, to) = (at(&a.place), at(&b.place));
-        // The control point, off the middle along the normal
-        // `web_layout::bows` measures from; the middle itself when straight.
-        let along = to - from;
-        let normal = peniko::kurbo::Vec2::new(-along.y, along.x) / along.hypot().max(f64::MIN_POSITIVE);
-        let control = from.midpoint(to) + normal * (line.bow * side);
-        let touches = drawing.selected.is_some_and(|selected| selected == line.a || selected == line.b);
-        let carrying = |streams: u32| Look::Carrying { width: (web_layout::stream_width(streams) * 2.0) as u8 };
-        let (first, second) = match line.state {
-            State::Held => (Look::Held { strong: touches }, Look::Held { strong: touches }),
-            State::Assumed => (Look::Assumed { strong: touches }, Look::Assumed { strong: touches }),
-            State::Flowing if line.whole => {
-                let look = carrying(line.forth.max(line.back));
-                (look, look)
-            }
-            State::Flowing => (
-                if line.forth > 0 { carrying(line.forth) } else { Look::Idle },
-                if line.back > 0 { carrying(line.back) } else { Look::Idle },
-            ),
         };
-        // Split at the curve's own middle (de Casteljau at a half), so a
-        // bowed line's halves meet where it is furthest out.
-        let middle = Point::new(
-            0.25 * from.x + 0.5 * control.x + 0.25 * to.x,
-            0.25 * from.y + 0.5 * control.y + 0.25 * to.y,
-        );
-        pieces.push((path_for(first, line.dim), from, from.midpoint(control), middle));
-        pieces.push((path_for(second, line.dim), middle, control.midpoint(to), to));
-    }
-    for (at, start, control, end) in pieces {
         let path = &mut paths[at].1;
-        path.move_to(start);
-        path.quad_to(control, end);
+        path.move_to(from);
+        path.quad_to(control, to);
     }
     // Grey under white, and the faint under the strong.
     paths.sort_by_key(|((look, dim), _)| (!*dim, *look));
     for ((look, dim), path) in &paths {
         let faded = |alpha: f32| if *dim { alpha * DIMMED } else { alpha };
         let (stroke, colour) = match *look {
-            Look::Carrying { width } => (Stroke::new(f64::from(width) / 2.0 * scale), FLOWING.with_alpha(faded(0.95))),
-            Look::Idle => (Stroke::new(scale), QUIET.with_alpha(faded(0.8))),
+            Look::Carrying { width, under } => (
+                Stroke::new(f64::from(width) / 2.0 * scale),
+                if under { UNDER.with_alpha(faded(1.0)) } else { FLOWING.with_alpha(faded(0.95)) },
+            ),
             Look::Held { strong } => {
                 (Stroke::new(scale), QUIET.with_alpha(faded(web_layout::quiet_alpha(quiet, State::Held, strong))))
             }
@@ -229,6 +333,7 @@ fn draw(drawing: &Drawing, width: u32, height: u32, scale: f64) -> Scene {
         };
         scene.stroke(&stroke, Affine::IDENTITY, colour, None, path);
     }
+    let lines = std::mem::take(&mut scene);
 
     let host = colour::rgb(colour::HOST).map_or(SELECTED, |[r, g, b]| Color::from_rgb8(r, g, b));
     for (index, dot) in drawing.dots.iter().enumerate() {
@@ -267,7 +372,7 @@ fn draw(drawing: &Drawing, width: u32, height: u32, scale: f64) -> Scene {
             scene.stroke(&Stroke::new(1.5 * scale), Affine::IDENTITY, SELECTED, None, &around);
         }
     }
-    scene
+    (lines, scene)
 }
 
 /// The room as we see it: us from `local`, everyone else from their entry,
@@ -418,9 +523,9 @@ fn details(now: &Web, at: usize) -> Details {
 }
 
 /// The map's drawing for one render: dots and the shown lines, dimmed for a
-/// selection, and whether any line was too short for halves while carrying
-/// one way only (the legend says so then).
-fn drawing_of(now: &Web, places: &[Place], shown: &web_layout::Shown, chosen: Option<usize>) -> (Drawing, bool) {
+/// selection, and which lines have dashes drifting (`animate` is the
+/// switch).
+fn drawing_of(now: &Web, places: &[Place], shown: &web_layout::Shown, chosen: Option<usize>, animate: bool) -> Drawing {
     let focus = chosen.map(|at| web_layout::focus(now, at));
     let kinds: Vec<Kind> = now.nodes.iter().map(|node| node.kind).collect();
     let ends: Vec<(usize, usize, usize)> = shown
@@ -433,14 +538,13 @@ fn drawing_of(now: &Web, places: &[Place], shown: &web_layout::Shown, chosen: Op
         .collect();
     let pairs: Vec<(usize, usize)> = ends.iter().map(|&(_, a, b)| (a, b)).collect();
     let bent = web_layout::bows(&kinds, places, &pairs);
-    let mut short = false;
+    let moving: BTreeMap<usize, bool> =
+        shown.edges.iter().copied().zip(web_layout::moving(now, shown, chosen, animate)).collect();
     let lines: Vec<Line> = ends
         .iter()
         .zip(&bent)
         .map(|(&(at, a, b), &bow)| {
             let edge = &now.edges[at];
-            let whole = !web_layout::halves_fit(&kinds, places, a, b);
-            short |= whole && edge.carries_forth() != edge.carries_back();
             Line {
                 a,
                 b,
@@ -448,8 +552,8 @@ fn drawing_of(now: &Web, places: &[Place], shown: &web_layout::Shown, chosen: Op
                 bow,
                 forth: edge.forth,
                 back: edge.back,
-                whole,
                 dim: focus.as_ref().is_some_and(|focus| !focus.edges[at]),
+                moving: moving.get(&at).copied().unwrap_or(false),
             }
         })
         .collect();
@@ -478,7 +582,7 @@ fn drawing_of(now: &Web, places: &[Place], shown: &web_layout::Shown, chosen: Op
             lonely: node.kind == Kind::Relay && !linked[at],
         })
         .collect();
-    (Drawing { dots, lines, selected: chosen }, short)
+    Drawing { dots, lines, selected: chosen }
 }
 
 #[component]
@@ -553,13 +657,15 @@ pub(super) fn RoomMap(local: Arc<PeerStats>, participants: Signal<Vec<Participan
     let places = web_layout::layout(&now, chosen.as_deref());
     let shown = web_layout::shown_edges(&now, chosen.as_deref());
     let chosen_at = chosen.as_deref().and_then(|id| now.index_of(id));
-    let (drawing, short) = drawing_of(&now, &places, &shown, chosen_at);
+    let mut animate = use_signal(|| Settings::load().animates_map());
+    let drawing = drawing_of(&now, &places, &shown, chosen_at, animate());
     let lonely = drawing.dots.iter().any(|dot| dot.lonely);
+    let moves = drawing.moves();
 
     let canvas = use_hook(|| Rc::new(RefCell::new(Canvas::default())));
     let widget = use_hook({
         let canvas = canvas.clone();
-        move || CustomWidgetAttr::new(MapPaint { canvas, cached: None })
+        move || CustomWidgetAttr::new(MapPaint { canvas, cached: None, began: Instant::now() })
     });
     if let Ok(mut slot) = canvas.try_borrow_mut() {
         if slot.drawing != drawing {
@@ -707,19 +813,23 @@ pub(super) fn RoomMap(local: Arc<PeerStats>, participants: Signal<Vec<Participan
                 span { "can host" }
             }
             div { class: "flex flex-row items-center gap-1.5",
-                div { class: "h-px w-4 shrink-0 bg-neutral-600" }
-                span { "held, nothing on it" }
-            }
-            div { class: "flex flex-row items-center gap-1.5",
-                div { class: "flex h-[2px] w-6 shrink-0 flex-row",
-                    div { class: "h-[2px] w-3 bg-neutral-100" }
-                    div { class: "mt-[0.5px] h-px w-3 bg-neutral-600" }
-                }
-                span { "one way, from the white end" }
-            }
-            div { class: "flex flex-row items-center gap-1.5",
                 div { class: "h-[2px] w-6 shrink-0 bg-neutral-100" }
-                span { "both ways" }
+                span { "media travelling" }
+            }
+            div { class: "flex flex-row items-center gap-1.5",
+                div { class: "flex h-[2px] w-6 shrink-0 flex-row bg-neutral-400",
+                    div { class: "ml-[3px] h-[2px] w-[5px] bg-white" }
+                    div { class: "ml-[7px] h-[2px] w-[5px] bg-white" }
+                }
+                span { "moving dashes: which way" }
+            }
+            div { class: "flex flex-row items-center gap-1.5",
+                div { class: "h-px w-6 shrink-0 bg-neutral-600" }
+                span { "grey: connected, nothing travelling" }
+            }
+            div { class: "flex flex-row items-center gap-1.5",
+                div { class: "h-0 w-6 shrink-0 border-t border-dashed border-neutral-600" }
+                span { "dashed: assumed" }
             }
             if lonely {
                 div { class: "flex flex-row items-center gap-1.5",
@@ -727,11 +837,115 @@ pub(super) fn RoomMap(local: Arc<PeerStats>, participants: Signal<Vec<Participan
                     span { "relay nobody reaches" }
                 }
             }
-        }
-        if short {
-            p { class: "mt-1 text-xs text-neutral-500",
-                "Lines too short to split are white all along when either end sends."
+            // Freezes the dashes: the map is then the still picture, and
+            // nothing wakes the window between changes.
+            div {
+                class: "flex cursor-pointer flex-row items-center gap-1.5 text-neutral-300",
+                onclick: move |_| {
+                    let next = !*animate.peek();
+                    animate.set(next);
+                    tracing::info!("room map animation {}", if next { "on" } else { "off" });
+                    Settings::update(move |settings| settings.animate_map = Some(next));
+                },
+                div {
+                    class: if animate() {
+                        "h-3 w-3 shrink-0 rounded-sm border border-blue-500 bg-blue-600"
+                    } else {
+                        "h-3 w-3 shrink-0 rounded-sm border border-neutral-500 bg-neutral-900"
+                    },
+                }
+                span { "Animate" }
             }
+        }
+        Ticker { on: moves }
+    }
+}
+
+/// Wakes the page every [`FRAME`] while `on`, so the map's dashes drift,
+/// and does nothing at all otherwise: its thread parks while off, and ends
+/// when the component is dropped, which is when the map is (the tab or the
+/// window closes). The wake is this component's own render, which changes
+/// nothing in the document but is work for the virtual DOM, and blitz
+/// redraws after any (as for a video frame, `participant.rs`); it asks the
+/// window for the paint as well, rather than rely on that.
+#[component]
+fn Ticker(on: bool) -> Element {
+    let update = use_hook(dioxus_core::schedule_update);
+    let frames = use_hook(|| Rc::new(Frames::spawn(move || update()).0));
+    use_drop({
+        let frames = frames.clone();
+        move || frames.halt()
+    });
+    frames.want(on);
+    let window = use_hook(try_consume_context::<Arc<dyn Window>>);
+    if on {
+        if let Some(window) = &window {
+            window.request_redraw();
+        }
+    }
+    rsx! {}
+}
+
+/// The thread behind [`Ticker`]: calls `wake` every [`FRAME`] while wanted,
+/// parks while not, and ends once halted. Apart from the component so the
+/// stopping can be tested.
+struct Frames {
+    wanted: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::Thread>,
+}
+
+impl Frames {
+    /// Starts parked. The handle is for a test to join; the component lets
+    /// it go, and the thread ends on its own once halted.
+    fn spawn(wake: impl Fn() + Send + 'static) -> (Frames, Option<std::thread::JoinHandle<()>>) {
+        let wanted = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawned = std::thread::Builder::new().name("network-map-frames".into()).spawn({
+            let wanted = wanted.clone();
+            let stop = stop.clone();
+            move || loop {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if !wanted.load(Ordering::Relaxed) {
+                    // Unparked when wanted again or halted; a spurious
+                    // return only goes round again.
+                    std::thread::park();
+                    continue;
+                }
+                std::thread::sleep(FRAME);
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if wanted.load(Ordering::Relaxed) {
+                    wake();
+                }
+            }
+        });
+        let handle = match spawned {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                tracing::warn!("could not spawn the room map's frame ticker: {error}");
+                None
+            }
+        };
+        let thread = handle.as_ref().map(|handle| handle.thread().clone());
+        (Frames { wanted, stop, thread }, handle)
+    }
+
+    fn want(&self, on: bool) {
+        if self.wanted.swap(on, Ordering::Relaxed) != on && on {
+            if let Some(thread) = &self.thread {
+                thread.unpark();
+            }
+        }
+    }
+
+    fn halt(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = &self.thread {
+            thread.unpark();
         }
     }
 }
@@ -787,15 +1001,18 @@ mod tests {
         let web = web_layout::fake(20, 3, 0);
         let places = web_layout::layout(&web, None);
         let shown = web_layout::shown_edges(&web, None);
-        let (plain, _) = drawing_of(&web, &places, &shown, None);
+        let plain = drawing_of(&web, &places, &shown, None, true);
         assert!(plain.dots.iter().all(|dot| !dot.dim) && plain.lines.iter().all(|line| !line.dim));
         let me = web.nodes.iter().position(|node| node.me).unwrap();
-        let (chosen, _) = drawing_of(&web, &places, &shown, Some(me));
+        let chosen = drawing_of(&web, &places, &shown, Some(me), true);
         assert!(!chosen.dots[me].dim);
         assert!(chosen.dots.iter().any(|dot| dot.dim), "someone is off our paths");
         assert!(chosen.lines.iter().any(|line| line.dim) && chosen.lines.iter().any(|line| !line.dim));
         // Every line of ours stays strong.
         assert!(chosen.lines.iter().filter(|line| line.a == me || line.b == me).all(|line| !line.dim));
+        // Only what stays lit moves.
+        assert!(chosen.lines.iter().any(|line| line.moving));
+        assert!(chosen.lines.iter().filter(|line| line.dim).all(|line| !line.moving));
     }
 
     #[test]
@@ -807,7 +1024,7 @@ mod tests {
         ];
         let web = web::build(&people, &relays, Some(web::RELAY_ID));
         let places = web_layout::layout(&web, None);
-        let (drawing, _) = drawing_of(&web, &places, &web_layout::shown_edges(&web, None), None);
+        let drawing = drawing_of(&web, &places, &web_layout::shown_edges(&web, None), None, true);
         let lonely: Vec<&str> = web.nodes.iter().zip(&drawing.dots).filter(|(_, dot)| dot.lonely).map(|(node, _)| node.id.as_str()).collect();
         assert_eq!(lonely, ["spare"]);
     }
@@ -824,51 +1041,90 @@ mod tests {
             dim: false,
             lonely: false,
         };
-        let line = |a, b, state, forth, back| Line { a, b, state, bow: 0.05, forth, back, whole: false, dim: false };
+        let line = |a, b, state, forth, back, moving| Line { a, b, state, bow: 0.05, forth, back, dim: false, moving };
         let drawing = Drawing {
             dots: web.nodes.iter().zip(&places).map(dot).collect(),
             lines: vec![
-                // One way: a white half and an idle one.
-                line(0, 1, State::Flowing, 1, 0),
-                // Both ways, busier one way: two widths of white.
-                line(1, 2, State::Flowing, 1, 30),
-                line(1, 3, State::Assumed, 0, 0),
-                line(2, 3, State::Held, 0, 0),
+                // One way, still.
+                line(0, 1, State::Flowing, 1, 0, false),
+                // Both ways, busier one way: another width, under dashes.
+                line(1, 2, State::Flowing, 1, 30, true),
+                line(1, 3, State::Assumed, 0, 0, false),
+                line(2, 3, State::Held, 0, 0, false),
             ],
             selected: Some(1),
         };
-        let scene = draw(&drawing, 400, 300, 2.0);
-        // Five looks (held, assumed, idle, two widths), every node filled
-        // and outlined, and the selection.
-        assert_eq!(scene.commands.len(), 5 + 2 * drawing.dots.len() + 1);
+        let (lines, nodes) = draw(&drawing, 400, 300, 2.0);
+        // Four looks (held, assumed, two carrying), every node filled and
+        // outlined, and the selection.
+        assert_eq!(lines.commands.len(), 4);
+        assert_eq!(nodes.commands.len(), 2 * drawing.dots.len() + 1);
         // A degenerate box paints nothing that could go wrong.
         let _ = draw(&drawing, 0, 0, 1.0);
     }
 
     #[test]
-    fn a_line_too_short_for_halves_is_white_all_along_and_said() {
-        // Two people a hair apart, one sending to the other.
-        let at = |x: f64| Place { x, y: 0.5, size: 0.02, named: false, label: 0.12, hit: 0.02 };
-        let kinds = [Kind::Participant; 2];
-        assert!(!web_layout::halves_fit(&kinds, &[at(0.5), at(0.53)], 0, 1));
-        assert!(web_layout::halves_fit(&kinds, &[at(0.2), at(0.8)], 0, 1));
-        let mut web = web::direct(
-            web::build(
-                &[
-                    web::Person { id: "a".repeat(64), me: true, ..web::Person::default() },
-                    web::Person { id: "b".repeat(64), ..web::Person::default() },
-                ],
-                &[],
-                None,
-            ),
-            &"a".repeat(64),
-            &[&"b".repeat(64)],
-        );
-        web.edges[0].back = 0;
+    fn a_frame_is_the_cached_layers_with_the_dashes_between() {
+        let web = web_layout::fake(6, 1, 0);
+        let places = web_layout::layout(&web, None);
         let shown = web_layout::shown_edges(&web, None);
-        let (drawing, short) = drawing_of(&web, &[at(0.5), at(0.53)], &shown, None);
-        assert!(drawing.lines[0].whole && short);
-        let (drawing, short) = drawing_of(&web, &[at(0.2), at(0.8)], &shown, None);
-        assert!(!drawing.lines[0].whole && !short);
+        let drawing = drawing_of(&web, &places, &shown, None, true);
+        assert!(drawing.moves());
+        let canvas = Rc::new(RefCell::new(Canvas { generation: 1, drawing }));
+        let mut paint = MapPaint { canvas: canvas.clone(), cached: None, began: Instant::now() };
+        let first = paint.scene(400, 400, 2.0);
+        let (lines, nodes) = draw(&canvas.borrow().drawing, 400, 400, 2.0);
+        // Lines, then one or two dash widths (lone lanes and paired ones),
+        // then nodes.
+        let dashed = first.commands.len() - lines.commands.len() - nodes.commands.len();
+        assert!((1..=4).contains(&dashed), "{dashed}");
+        assert_eq!(first.commands[..lines.commands.len()], lines.commands[..]);
+        assert_eq!(first.commands[first.commands.len() - nodes.commands.len()..], nodes.commands[..]);
+        // The dash layer moves with time and nothing else does.
+        let later = dash_layer(&canvas.borrow().drawing, 400, 400, 2.0, 5.0);
+        let sooner = dash_layer(&canvas.borrow().drawing, 400, 400, 2.0, 0.0);
+        assert_ne!(later, sooner);
+        assert_eq!(dash_layer(&canvas.borrow().drawing, 400, 400, 2.0, web_layout::DASH_PERIOD).commands.len(), sooner.commands.len());
+
+        // With the switch off nothing moves, and a paint is the still layers.
+        let still = drawing_of(&web, &places, &shown, None, false);
+        assert!(!still.moves() && still.lines.iter().all(|line| !line.moving));
+        assert!(dash_layer(&still, 400, 400, 2.0, 3.0).commands.is_empty());
+        *canvas.borrow_mut() = Canvas { generation: 2, drawing: still };
+        let frozen = paint.scene(400, 400, 2.0);
+        let (lines, nodes) = draw(&canvas.borrow().drawing, 400, 400, 2.0);
+        assert_eq!(frozen.commands.len(), lines.commands.len() + nodes.commands.len());
+        assert_eq!(paint.scene(400, 400, 2.0), frozen);
+    }
+
+    #[test]
+    fn the_frames_run_only_while_wanted_and_end_when_halted() {
+        use std::sync::atomic::AtomicUsize;
+        let woken = Arc::new(AtomicUsize::new(0));
+        let (frames, handle) = Frames::spawn({
+            let woken = woken.clone();
+            move || {
+                woken.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let handle = handle.expect("spawned");
+        std::thread::sleep(FRAME * 3);
+        assert_eq!(woken.load(Ordering::Relaxed), 0, "parked until wanted");
+        frames.want(true);
+        std::thread::sleep(FRAME * 4);
+        assert!(woken.load(Ordering::Relaxed) >= 2, "{}", woken.load(Ordering::Relaxed));
+        frames.want(false);
+        std::thread::sleep(FRAME * 2);
+        let settled = woken.load(Ordering::Relaxed);
+        std::thread::sleep(FRAME * 3);
+        assert_eq!(woken.load(Ordering::Relaxed), settled, "parked again");
+        frames.halt();
+        handle.join().expect("ended");
+        // Halted while wanted ends too.
+        let (frames, handle) = Frames::spawn(|| {});
+        frames.want(true);
+        std::thread::sleep(FRAME);
+        frames.halt();
+        handle.expect("spawned").join().expect("ended");
     }
 }
