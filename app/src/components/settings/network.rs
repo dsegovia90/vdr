@@ -187,33 +187,55 @@ fn Charts(metrics: Arc<Metrics>) -> Element {
         }
         if has_hosting {
             Heading { text: "Hosting" }
-            p { class: "font-mono text-xs text-neutral-300", "{hosting_now}" }
+            // Sentences, so not in the monospace the charts' figures use.
+            p { class: "text-xs text-neutral-300", "{hosting_now}" }
             Chart { points: forwarded, draw_cap: false, link: ESTIMATE, sent_label: "forwarded" }
             p { class: "mt-1 text-xs text-neutral-500",
-                "Other people's media you pass on to your guests and the relay. Guests' connections share your uplink but are estimated separately."
+                "The line is other people's media that you pass on, to your guests and to the relay. Each guest's connection shares your upload, but its speed is estimated on its own."
             }
         }
     }
 }
 
-/// The hosting section's line for the latest second.
+/// The hosting section's words for the latest second: who is connected, who
+/// receives from us, what we pass on, and what it comes to against the link.
+///
+/// **Plain sentences, not figures in brackets**: "0 kbps forwarded for 1
+/// guest (1 pulling)" was read as a fault, when with one guest there is
+/// simply nobody else's media to pass on.
 fn hosting_words(second: Option<&Second>) -> String {
     let Some((hosting, estimate)) = second.and_then(|second| second.hosting.map(|hosting| (hosting, second.estimate))) else {
         return "Not hosting now.".to_string();
     };
-    let guests = if hosting.guests == 1 { "guest" } else { "guests" };
-    let total = hosting.forwarded.saturating_add(hosting.own);
-    let link = match estimate {
-        Some(estimate) => format!("{} of a {} link estimate", rate(total), rate(estimate)),
-        None => format!("{} in all; no link estimate", rate(total)),
+    let guests = hosting.guests;
+    // A guest that left this second can still have been sent something.
+    let receiving = hosting.pulling.min(guests);
+    let connected = match (guests, receiving) {
+        (0, _) => "No guests are connected to you.".to_string(),
+        (1, 0) => "1 guest is connected, receiving nothing from you yet.".to_string(),
+        (1, _) => "1 guest is connected and receiving from you.".to_string(),
+        (n, 0) => format!("{n} guests are connected, none receiving from you yet."),
+        (n, r) if r == n => format!("{n} guests are connected, all receiving from you."),
+        (n, r) => format!("{n} guests are connected, {r} of them receiving from you."),
     };
-    format!(
-        "Forwarding {} for {} {guests} ({} pulling). With your own {}, {link}.",
-        rate(hosting.forwarded),
-        hosting.guests,
-        hosting.pulling,
-        rate(hosting.own),
-    )
+    let passed = match (hosting.forwarded, guests) {
+        (0, 0) => "There is nobody else's media to pass on.".to_string(),
+        (0, 1) => "With one guest, there is nobody else's media to pass on.".to_string(),
+        (0, _) => "You are not passing on anyone else's media right now.".to_string(),
+        (kbps, _) => format!("You pass on {} of other people's media.", rate(kbps)),
+    };
+    let own = match hosting.own {
+        0 => "You send nothing of your own".to_string(),
+        kbps => format!("You send {} of your own", rate(kbps)),
+    };
+    // The total only when it differs from our own, which it is otherwise.
+    let total = hosting.forwarded.saturating_add(hosting.own);
+    let all = if hosting.forwarded == 0 { String::new() } else { format!("; {} in all", rate(total)) };
+    let link = match estimate {
+        Some(estimate) => format!(", of a {} link estimate", rate(estimate)),
+        None => ", with no link estimate yet".to_string(),
+    };
+    format!("{connected} {passed} {own}{all}{link}.")
 }
 
 /// What a chart's filled line is, unless it says otherwise.
@@ -801,24 +823,41 @@ mod tests {
     }
 
     #[test]
-    fn hosting_is_said_against_the_link() {
+    fn hosting_is_said_in_plain_sentences() {
         use crate::rates::Hosting;
-        let second = Second {
-            hosting: Some(Hosting { forwarded: 340, own: 60, guests: 2, pulling: 1, forwarding: true }),
-            estimate: Some(3000),
-            ..Second::default()
+        let said = |hosting: Hosting, estimate: Option<u32>| {
+            hosting_words(Some(&Second { hosting: Some(hosting), estimate, ..Second::default() }))
         };
+        let of = |forwarded, own, guests, pulling| Hosting { forwarded, own, guests, pulling, forwarding: false };
         assert_eq!(
-            hosting_words(Some(&second)),
-            "Forwarding 340 kbps for 2 guests (1 pulling). With your own 60 kbps, 400 kbps of a 3000 kbps link estimate."
+            said(of(340, 60, 2, 1), Some(3000)),
+            "2 guests are connected, 1 of them receiving from you. You pass on 340 kbps of other people's media. \
+             You send 60 kbps of your own; 400 kbps in all, of a 3000 kbps link estimate."
         );
-        let alone = Second {
-            hosting: Some(Hosting { guests: 1, ..Hosting::default() }),
-            ..Second::default()
-        };
         assert_eq!(
-            hosting_words(Some(&alone)),
-            "Forwarding 0 kbps for 1 guest (0 pulling). With your own 0 kbps, 0 kbps in all; no link estimate."
+            said(of(0, 215, 1, 1), Some(58_700)),
+            "1 guest is connected and receiving from you. With one guest, there is nobody else's media to pass on. \
+             You send 215 kbps of your own, of a 58.7 Mbps link estimate."
+        );
+        assert_eq!(
+            said(of(0, 215, 0, 0), Some(58_700)),
+            "No guests are connected to you. There is nobody else's media to pass on. \
+             You send 215 kbps of your own, of a 58.7 Mbps link estimate."
+        );
+        assert_eq!(
+            said(of(0, 0, 1, 0), None),
+            "1 guest is connected, receiving nothing from you yet. With one guest, there is nobody else's media to pass on. \
+             You send nothing of your own, with no link estimate yet."
+        );
+        assert_eq!(
+            said(of(500, 120, 3, 3), Some(3000)),
+            "3 guests are connected, all receiving from you. You pass on 500 kbps of other people's media. \
+             You send 120 kbps of your own; 620 kbps in all, of a 3000 kbps link estimate."
+        );
+        assert_eq!(
+            said(of(0, 120, 2, 0), Some(3000)),
+            "2 guests are connected, none receiving from you yet. You are not passing on anyone else's media right now. \
+             You send 120 kbps of your own, of a 3000 kbps link estimate."
         );
         assert_eq!(hosting_words(Some(&Second::default())), "Not hosting now.");
     }
