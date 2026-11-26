@@ -2715,10 +2715,10 @@ mod socket_tests {
         assert!(gap < SPLICE, "video was gone {gap:?} when the relay stopped");
     }
 
-    /// The control: what the test above rests on is the spare, and with it
-    /// switched off the host holds m only through the relay. Cutting the
-    /// host's own link to the relay, and nothing of m's, takes m from the host
-    /// without a spare and leaves it there with one.
+    /// The control: with the spare switched off, the host holds m only
+    /// through the relay, so once the relay is gone nothing there could carry
+    /// m on and the test above could not pass. Cutting the host's own link to
+    /// the relay, and nothing of m's, takes m from the host.
     ///
     /// Not the same stop seen as a leave, as this was first written: without a
     /// spare that stop is usually a leave, but not always. m's media moves to
@@ -2727,31 +2727,20 @@ mod socket_tests {
     /// route to m changes rather than ending, and the viewer splices to it
     /// with no retraction (seen once in about twenty runs of the whole suite
     /// on a loaded machine). That is the app doing well by luck, not a fault,
-    /// and a control that needs it not to happen fails at random.
+    /// and a control that needs it not to happen fails at random. Nor the
+    /// converse with the spare on: nothing outside m shows when its spare has
+    /// reached the host, so a cut can beat it there.
     #[tokio::test(flavor = "multi_thread")]
     async fn without_a_spare_the_host_holds_a_member_only_through_the_relay() {
-        for spare in [false, true] {
-            let w = moving_on(Meeting::older().await, spare).await;
-            let path = camera_path("m");
-            becomes(&w.room.host.origin, &path, true).await;
-            let (_watching, retracted) = retractions(&w.room.host.origin, &path);
-            w.room._to_relay.abort(moq_net::Error::Cancel);
-            let relay = w.room.relay.origin.hop();
-            if spare {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !route_within(&w.room.host.origin, &path).await.is_some_and(|route| !route.hops.as_slice().contains(&relay)) {
-                    assert!(Instant::now() < deadline, "the host never had m but through the relay");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                assert_eq!(count(&retracted), 0, "the host lost m with a spare there");
-            } else {
-                let deadline = Instant::now() + WITHIN;
-                while count(&retracted) == 0 {
-                    assert!(Instant::now() < deadline, "the host kept m with no spare and no relay");
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            }
+        let w = moving_on(Meeting::older().await, false).await;
+        let path = camera_path("m");
+        becomes(&w.room.host.origin, &path, true).await;
+        let (_watching, retracted) = retractions(&w.room.host.origin, &path);
+        w.room._to_relay.abort(moq_net::Error::Cancel);
+        let deadline = Instant::now() + WITHIN;
+        while count(&retracted) == 0 {
+            assert!(Instant::now() < deadline, "the host kept m with no spare and no relay");
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
