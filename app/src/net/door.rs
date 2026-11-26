@@ -214,8 +214,30 @@ pub(crate) fn lenient_offer<'de, D: serde::Deserializer<'de>>(deserializer: D) -
 /// saved keep working across launches, and it is the only writer of that
 /// file. It puts the door here before it sends the decision to join, so the
 /// call finds it waiting.
+///
+/// **It also carries the room's hosts the same way**: the ones `rooms.json`
+/// keeps for it and the ones its invite listed, put here by the interface
+/// with the decision, so a join can dial them beside the relay without the
+/// call ever reading the file.
 #[derive(Default)]
-pub(crate) struct Doors(std::sync::Mutex<std::collections::HashMap<String, String>>);
+pub(crate) struct Doors {
+    ours: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    hosts: std::sync::Mutex<std::collections::HashMap<String, Vec<Known>>>,
+}
+
+/// A host the room can meet at: its endpoint id and the door to present.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Known {
+    pub(crate) id: String,
+    pub(crate) door: String,
+}
+
+/// By hand: the door must not reach a log through a stray `{:?}`.
+impl std::fmt::Debug for Known {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Known").field("id", &self.id).finish_non_exhaustive()
+    }
+}
 
 /// By hand: the values are doors.
 impl std::fmt::Debug for Doors {
@@ -226,7 +248,7 @@ impl std::fmt::Debug for Doors {
 
 impl Doors {
     pub(crate) fn issue(&self, room: String, door: String) {
-        if let Ok(mut doors) = self.0.lock() {
+        if let Ok(mut doors) = self.ours.lock() {
             doors.insert(room, door);
         }
     }
@@ -234,13 +256,25 @@ impl Doors {
     /// Takes back a room's door: joined with hosting off, it must not be
     /// kept with the room, and the call will not serve it.
     pub(crate) fn withdraw(&self, room: &str) {
-        if let Ok(mut doors) = self.0.lock() {
+        if let Ok(mut doors) = self.ours.lock() {
             doors.remove(room);
         }
     }
 
     pub(crate) fn get(&self, room: &str) -> Option<String> {
-        self.0.lock().ok().and_then(|doors| doors.get(room).cloned())
+        self.ours.lock().ok().and_then(|doors| doors.get(room).cloned())
+    }
+
+    /// Replaces what the room's hosts are, for the join about to start.
+    pub(crate) fn set_hosts(&self, room: String, hosts: Vec<Known>) {
+        if let Ok(mut known) = self.hosts.lock() {
+            known.insert(room, hosts);
+        }
+    }
+
+    /// The room's hosts, as the interface last put them here.
+    pub(crate) fn hosts(&self, room: &str) -> Vec<Known> {
+        self.hosts.lock().ok().and_then(|known| known.get(room).cloned()).unwrap_or_default()
     }
 }
 

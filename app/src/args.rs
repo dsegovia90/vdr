@@ -31,6 +31,7 @@
 //! vdr --no-catchup                        # measure audio sync, never speed it up
 //! vdr --loopback --audio-stall 800        # hold audio back once, to make a backlog
 //! vdr --ephemeral --no-audio              # opens neither microphone nor speaker
+//! vdr --profile /tmp/vdr-a                # a test instance's own lasting folder and key
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry is a second
@@ -250,6 +251,11 @@ pub struct Args {
     /// the person at it: each would otherwise take the microphone and play
     /// the others through the speakers.
     pub no_audio: bool,
+    /// Host the rooms joined in this run, as the Experimental switch does,
+    /// without saving it (`--host-rooms`). An `--ephemeral` instance starts
+    /// from empty settings and nobody is there to click the switch, so a
+    /// scripted test has no other way to be a host.
+    pub host_rooms: bool,
 }
 
 impl Args {
@@ -285,6 +291,7 @@ impl Args {
         let mut no_catchup = false;
         let mut audio_stall = None;
         let mut no_audio = false;
+        let mut host_rooms = false;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -338,6 +345,14 @@ impl Args {
                 },
                 "--no-catchup" => no_catchup = true,
                 "--no-audio" => no_audio = true,
+                "--host-rooms" => host_rooms = true,
+                // Read by `settings::data_dir` from the raw arguments, since
+                // the log opens before this parser runs; only skipped here.
+                "--profile" => {
+                    if args.next().is_none() {
+                        tracing::error!("--profile needs a folder; this run uses a throwaway one");
+                    }
+                }
                 "--audio-stall" => match args.next().as_deref().map(str::parse::<u64>) {
                     Some(Ok(ms)) => audio_stall = Some(std::time::Duration::from_millis(ms)),
                     Some(Err(error)) => tracing::error!("--audio-stall is not a number: {error}"),
@@ -358,6 +373,7 @@ impl Args {
             no_catchup,
             audio_stall,
             no_audio,
+            host_rooms,
         }
     }
 }

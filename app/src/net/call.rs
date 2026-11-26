@@ -19,6 +19,10 @@
 //! [`super::door`]); and it is a room, not a call with one peer. Its guests
 //! join it as they would a relay's room, which is why they need nothing new.
 //!
+//! **A join with somewhere else to meet holds several sessions**: the relay
+//! and the room's hosts together, through [`sessions`]. A join with no hosts
+//! and hosting off is the one session through [`connect`] it always was.
+//!
 //! Every arm converges on [`Peer`], so the claim above is structural rather
 //! than a description: anything per-connection is reached the same way
 //! whichever side established it.
@@ -39,6 +43,9 @@ use std::sync::Arc;
 use futures_channel::mpsc::UnboundedSender;
 use futures_util::StreamExt as _;
 use moq_mux::catalog::Stream as _;
+
+#[path = "sessions.rs"]
+mod sessions;
 
 use super::adapt;
 use super::audio;
@@ -213,6 +220,7 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
         .init()
         .map_err(|error| format!("could not build a client: {error:#}"))?
         .with_iroh(endpoint.clone());
+    let mut refusals = Refusals::for_url(&url);
     let mut session = client
         .with_publisher(outbound)
         .with_subscriber(inbound)
@@ -239,6 +247,9 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
             loop {
                 match session.status().await {
                     Ok(moq_tokio::Status::Connected) => {
+                        if let Some(refusals) = refusals.as_mut() {
+                            refusals.connected(std::time::Instant::now());
+                        }
                         if connected {
                             tracing::info!("reconnected to {label}");
                             keyframe.ask();
@@ -246,7 +257,7 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
                             tracing::info!("joined {label}");
                         }
                         let next = match &room {
-                            Some(room) => Some(RemoteStatus::InRoom { room: room.clone() }),
+                            Some(room) => Some(RemoteStatus::InRoom { room: room.clone(), via: None }),
                             None if connected => Some(RemoteStatus::Connected {
                                 peer: Some(label.clone()),
                             }),
@@ -258,6 +269,10 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
                         connected = true;
                     }
                     Ok(moq_tokio::Status::Disconnected) => {
+                        if refusals.as_mut().is_some_and(|refusals| refusals.dropped(std::time::Instant::now())) {
+                            tracing::warn!("{label} turned us away: the session ended as it began, twice");
+                            return TURNED_AWAY.to_string();
+                        }
                         tracing::warn!("the session dropped; redialling {label}");
                         let _ = status.unbounded_send(RemoteStatus::Reconnecting);
                     }
@@ -271,6 +286,59 @@ fn connect(args: Connect<'_>) -> Result<Peer, String> {
         bandwidth,
         stats,
     })
+}
+
+/// How a session that was turned away ends, in place of the transport's
+/// words; [`explain`] says it to the person.
+const TURNED_AWAY: &str = "turned away: the session ended as soon as it began";
+
+/// How briefly a session must last to look turned away: the stack's own bar
+/// for a session that counts as healthy, its first backoff delay.
+const BRIEF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// **A heuristic for a refusal over iroh**, where the stack cannot see one.
+///
+/// A host that turns a guest away closes the session with the protocol's
+/// "unauthorized" code, which the client is meant to treat as final. Over raw
+/// QUIC it does. Over iroh the code is lost on the way up (web-transport-iroh
+/// 0.7 reports any application close as a bare connection error), so the
+/// client takes the refusal for a drop and redials it for the whole retry
+/// budget: thirty seconds of "reconnected" and "dropped" before a failure that
+/// never says refused.
+///
+/// So this reads the shape instead: the session came up (the host is there
+/// and answered) and ended within [`BRIEF`], twice running. **What it can
+/// misread**: a host that crashes or quits within a second of accepting us,
+/// twice, or a link that dies the instant it forms, twice; either way that
+/// host was not going to carry a call. A session that lasted is never counted,
+/// and one that lasts resets the count. Only for `iroh://`: every other
+/// transport reports the code, and the stack's own answer is better than this.
+#[derive(Debug, Default)]
+pub(super) struct Refusals {
+    since: Option<std::time::Instant>,
+    brief: u8,
+}
+
+impl Refusals {
+    /// The rule for sessions to `url`: `None` where the stack sees refusals.
+    pub(super) fn for_url(url: &url::Url) -> Option<Self> {
+        (url.scheme() == "iroh").then(Self::default)
+    }
+
+    pub(super) fn connected(&mut self, now: std::time::Instant) {
+        self.since = Some(now);
+    }
+
+    /// Whether this drop makes the session one that was turned away.
+    pub(super) fn dropped(&mut self, now: std::time::Instant) -> bool {
+        match self.since.take() {
+            Some(since) if now.duration_since(since) < BRIEF => self.brief += 1,
+            Some(_) => self.brief = 0,
+            // A drop without a connection is not a session that began.
+            None => {}
+        }
+        self.brief >= 2
+    }
 }
 
 /// Everything [`serve`] needs, named rather than positional.
@@ -423,11 +491,17 @@ pub(crate) fn redacted(url: &url::Url) -> String {
 /// reaches us is then the bare word (seen in this module's local-socket test).
 /// What reaches us at the end is transport text; this says what to do.
 fn explain(error: String) -> String {
-    if error.contains("reason=unauthorized") || error.trim() == "unauthorized" {
+    if is_refusal(&error) {
         "the room refused this link: its token or door is missing, expired, or for another room".to_string()
     } else {
         error
     }
+}
+
+/// Whether a call's final error is a refusal: a token or a door not taken,
+/// which no amount of redialling changes.
+fn is_refusal(error: &str) -> bool {
+    error.contains("reason=unauthorized") || error.trim() == "unauthorized" || error == TURNED_AWAY
 }
 
 /// How a room reads in the status line: its path, and the relay it is on.
@@ -1101,6 +1175,15 @@ async fn run(
         let host_rooms = local.host_rooms();
         let shared = shares_origin(&peering, host_rooms);
         let inbound = inbound_for(&outbound, shared);
+        // Where else the room can meet, as the interface put it with the
+        // decision. A join with somewhere else to go, or one we host, holds
+        // several sessions (see `sessions`); any other is the one session it
+        // always was.
+        let known = match &peering {
+            Peering::Join(url) => doors.hosts(&crate::recent::identity(url)),
+            _ => Vec::new(),
+        };
+        let several = dials_several(&peering, host_rooms, !known.is_empty());
         // Where what we hear about hosts goes: only a join has a remembered
         // room to keep them with.
         let news = match &peering {
@@ -1120,7 +1203,7 @@ async fn run(
         // over plain QUIC, and the endpoint's counters would only ever say
         // "nothing moved".
         let over_iroh = match &peering {
-            Peering::Join(url) => url.scheme() == "iroh",
+            Peering::Join(url) => url.scheme() == "iroh" || several,
             Peering::Dial(_) | Peering::Listen | Peering::Host(_) => true,
             Peering::Loopback | Peering::Idle => false,
         };
@@ -1147,11 +1230,11 @@ async fn run(
                     keyframe: keyframe.clone(),
                 })?
             }
-            Peering::Join(ref url) => {
+            Peering::Join(ref url) if !several => {
                 let room = room_label(url);
                 report(RemoteStatus::Joining { room: room.clone() });
                 tracing::info!("joining {room} at {}", redacted(url));
-                let joined = connect(Connect {
+                connect(Connect {
                     config: &client_config,
                     endpoint: &endpoint,
                     outbound: &outbound,
@@ -1161,7 +1244,16 @@ async fn run(
                     room: Some(room),
                     status: status.clone(),
                     keyframe: keyframe.clone(),
-                })?;
+                })?
+            }
+            Peering::Join(ref url) => {
+                let room = room_label(url);
+                report(RemoteStatus::Joining { room: room.clone() });
+                tracing::info!("joining {room} at {}", redacted(url));
+                // Serving first, so its guests' links are there to fall back
+                // on, and so a relay that is down cannot hold it up.
+                let guests = moq_net::bandwidth::Producer::new();
+                let guests_link = guests.consume();
                 if shared {
                     alongside = host_alongside(Alongside {
                         config: &client_config,
@@ -1169,12 +1261,31 @@ async fn run(
                         shared: outbound.clone(),
                         url,
                         doors: &doors,
-                        metrics: metrics.clone(),
+                        estimates: adapt::Estimates::new(guests),
                         local: local.clone(),
                     })
                     .await;
                 }
-                joined
+                let client = client_config
+                    .clone()
+                    .init()
+                    .map_err(|error| format!("could not build a client: {error:#}"))?
+                    .with_iroh(endpoint.clone());
+                sessions::join(sessions::Join {
+                    client,
+                    me: me.to_string(),
+                    targets: sessions::targets(url, &known, &me.to_string(), alongside.is_some()),
+                    outbound: outbound.clone(),
+                    inbound: inbound.clone(),
+                    hosting: shared,
+                    estimate: estimate.clone(),
+                    guests: alongside.is_some().then_some(guests_link),
+                    metrics: metrics.clone(),
+                    local: local.clone(),
+                    status: status.clone(),
+                    keyframe: keyframe.clone(),
+                    room,
+                })
             }
             Peering::Listen => {
                 report(RemoteStatus::Listening { me: me.to_string() });
@@ -1283,7 +1394,7 @@ async fn run(
                     hosting.invite(&me.to_string())
                 );
                 tracing::info!("hosting {}; the invite went to stdout, not to this log", hosting.room());
-                report(RemoteStatus::InRoom { room });
+                report(RemoteStatus::InRoom { room, via: None });
                 Peer {
                     // Guests coming and going is the room's ordinary life,
                     // not the call's: it ends only when we stop serving.
@@ -1889,6 +2000,17 @@ async fn attend(
             }
         };
         let path = update.prefix.as_str().to_string();
+        // Our own broadcasts come back to us on a join over several sessions,
+        // through whoever bridges them: each session offers from a gate with a
+        // hop of its own (see `sessions::Gate`), so a session's split horizon
+        // no longer hides them. Skipped before asking for the broadcast, so
+        // reading them back opens nothing.
+        let owner = controller_of(&path)
+            .or_else(|| sharer_of(&path))
+            .or_else(|| participant_of(&path));
+        if owner == Some(me.as_str()) {
+            continue;
+        }
         // An announcement names a path; the broadcast is asked for by that path.
         // A re-priced route changes nothing we act on, and a retraction is the
         // goodbye, carried as `None` the way the old cursor carried it.
@@ -2406,6 +2528,13 @@ fn heard_hosting(
     }
 }
 
+/// Whether a join holds several sessions: when the room has hosts to dial
+/// beside its relay, or when we host it. Never anything else, and never a
+/// join with neither, which stays the one session it always was.
+fn dials_several(peering: &Peering, host_rooms: bool, has_hosts: bool) -> bool {
+    matches!(peering, Peering::Join(_)) && (host_rooms || has_hosts)
+}
+
 /// Whether an attempt's inbound is its outbound: always for a room hosted
 /// here, for a join only with hosting on as it starts, never otherwise.
 fn shares_origin(peering: &Peering, host_rooms: bool) -> bool {
@@ -2431,7 +2560,9 @@ struct Alongside<'a> {
     /// The room on the relay; its path is the room we host.
     url: &'a url::Url,
     doors: &'a door::Doors,
-    metrics: Arc<Metrics>,
+    /// Where the guests' links are gathered, for when nothing else carries
+    /// our media.
+    estimates: Arc<adapt::Estimates>,
     local: Arc<PeerStats>,
 }
 
@@ -2439,11 +2570,12 @@ struct Alongside<'a> {
 /// and says so in presence, until hosting is switched off or the attempt
 /// ends. `None` when it cannot: logged, and the join goes on regardless.
 ///
-/// **The guests' links do not steer what we send.** Our encoding follows the
-/// relay link's estimate, as a join's always has; feeding the guests'
-/// sessions into it too would give the estimate two writers and let their
-/// connection figures overwrite the relay's in the Network tab. Following
-/// whichever session carries the media is for when a join holds several.
+/// **The guests' links steer what we send only when nothing else carries
+/// it.** They are gathered apart from the call's estimate, and the join
+/// follows the session carrying our media; only a host with no outgoing
+/// session left follows its guests instead (see `sessions`). Their
+/// connection figures never reach the Network tab, so that it always shows
+/// one link.
 ///
 /// Switching hosting off ends this at once and every guest's session with
 /// it; switching it on again takes effect from the next join, because the
@@ -2455,7 +2587,7 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         shared,
         url,
         doors,
-        metrics,
+        estimates,
         local,
     } = args;
     let room = url.path().trim_matches('/').to_string();
@@ -2474,8 +2606,10 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         publisher: shared.consume(),
         subscriber: shared.clone(),
         door: Some(hosting.clone()),
-        estimates: None,
-        metrics,
+        estimates: Some(estimates),
+        // The guests' figures stay out of the Network tab, which shows the
+        // link carrying our media; see the doc above.
+        metrics: Arc::new(Metrics::default()),
     })
     .await;
     let (accepting, mut events) = match served {
@@ -2785,7 +2919,7 @@ mod path_tests {
 
 #[cfg(test)]
 mod presence_tests {
-    use super::{HostNews, Link, Presence, RoomNews, Seen, State, asked_of, door, heard_hosting, honour, inbound_for, quality, shares_origin, subroom};
+    use super::{HostNews, Link, Presence, RoomNews, Seen, State, asked_of, dials_several, door, heard_hosting, honour, inbound_for, quality, shares_origin, subroom};
     use crate::args::Peering;
     use crate::net::metrics::{Ask, Clock, Request};
     use crate::net::quality::Quality;
@@ -3193,6 +3327,9 @@ mod presence_tests {
         assert_eq!(Presence::here(&local).host, None, "cleaned on the way out too");
     }
 
+    /// The wiring table: whether the origins are shared, and whether a join
+    /// holds several sessions. A join with no hosts and hosting off is the
+    /// one session over two origins it always was.
     #[test]
     fn only_a_hosting_join_or_a_hosted_room_shares_one_origin() {
         let url: url::Url = "https://relay.example.com/team".parse().unwrap();
@@ -3202,6 +3339,16 @@ mod presence_tests {
             assert_eq!(shares_origin(&Peering::Join(url.clone()), host_rooms), host_rooms);
             for other in [Peering::Dial(peer), Peering::Listen, Peering::Loopback, Peering::Idle] {
                 assert!(!shares_origin(&other, host_rooms), "{other:?}");
+            }
+        }
+        let join = Peering::Join(url);
+        assert!(!dials_several(&join, false, false), "no hosts, not hosting: as before");
+        assert!(dials_several(&join, false, true), "a room with hosts");
+        assert!(dials_several(&join, true, false), "a room we host");
+        assert!(dials_several(&join, true, true));
+        for other in [Peering::Host("team".into()), Peering::Dial(peer), Peering::Listen, Peering::Loopback, Peering::Idle] {
+            for (host_rooms, has_hosts) in [(false, false), (true, true)] {
+                assert!(!dials_several(&other, host_rooms, has_hosts), "{other:?}");
             }
         }
     }
@@ -3257,7 +3404,40 @@ mod presence_tests {
 
 #[cfg(test)]
 mod room_tests {
-    use super::{explain, redacted, room_label};
+    use super::{Refusals, TURNED_AWAY, explain, redacted, room_label};
+
+    fn iroh() -> Refusals {
+        Refusals::for_url(&format!("iroh://{}/team", "a".repeat(64)).parse().unwrap()).expect("iroh is judged")
+    }
+
+    #[test]
+    fn only_an_iroh_session_is_judged_by_its_shape() {
+        for other in ["http://localhost:4443/team", "https://relay.example.com/team", "moqt://localhost:1/team"] {
+            assert!(Refusals::for_url(&other.parse().unwrap()).is_none(), "{other}");
+        }
+    }
+
+    #[test]
+    fn two_brief_sessions_running_are_a_refusal_and_one_that_lasted_resets_it() {
+        let start = std::time::Instant::now();
+        let at = |ms: u64| start + std::time::Duration::from_millis(ms);
+        let mut refusals = iroh();
+        refusals.connected(at(0));
+        assert!(!refusals.dropped(at(200)), "one brief session is a blip");
+        refusals.connected(at(1500));
+        assert!(refusals.dropped(at(1700)), "two running are the door");
+
+        let mut refusals = iroh();
+        refusals.connected(at(0));
+        assert!(!refusals.dropped(at(200)));
+        refusals.connected(at(1000));
+        assert!(!refusals.dropped(at(5000)), "a session that lasted is not a refusal");
+        refusals.connected(at(6000));
+        assert!(!refusals.dropped(at(6100)), "and it reset the count");
+        assert!(!refusals.dropped(at(9000)), "a drop with no session is not counted");
+        refusals.connected(at(9500));
+        assert!(refusals.dropped(at(9600)));
+    }
 
     #[test]
     fn a_token_never_reaches_the_log() {
@@ -3274,7 +3454,7 @@ mod room_tests {
         let shown = redacted(&url);
         assert!(!shown.contains(door), "{shown}");
         assert!(shown.contains("door=redacted") && shown.contains("x=1"), "{shown}");
-        let status = crate::net::RemoteStatus::InRoom { room: room_label(&url) }.to_string();
+        let status = crate::net::RemoteStatus::InRoom { room: room_label(&url), via: None }.to_string();
         assert!(!status.contains(door), "{status}");
     }
 
@@ -3291,6 +3471,11 @@ mod room_tests {
     fn a_url_without_a_token_is_left_alone() {
         let url: url::Url = "http://localhost:4443/test".parse().unwrap();
         assert_eq!(redacted(&url), "http://localhost:4443/test");
+    }
+
+    #[test]
+    fn a_door_that_turned_us_away_over_iroh_is_said_as_refused() {
+        assert!(explain(TURNED_AWAY.to_string()).starts_with("the room refused this link"));
     }
 
     #[test]

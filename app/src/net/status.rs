@@ -56,6 +56,9 @@ pub enum RemoteStatus {
     InRoom {
         /// Which room, and on which relay.
         room: String,
+        /// Which ways in are up, for a join that holds several; `None` for
+        /// one that holds just the one.
+        via: Option<Via>,
     },
     /// Connected: the peer's catalog has arrived (their video, if any, follows).
     Connected {
@@ -146,6 +149,37 @@ impl RemoteStatus {
     }
 }
 
+/// Which ways into a room are up: the relay, how many hosts, and whether we
+/// serve it ourselves. Only counts and ids-free words, so nothing secret can
+/// reach the status line through it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Via {
+    pub relay: bool,
+    pub hosts: usize,
+    pub hosting: bool,
+}
+
+/// Said after the room's name: ", on the relay and 1 host, hosting".
+impl fmt::Display for Via {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let hosts = match self.hosts {
+            1 => "1 host".to_string(),
+            n => format!("{n} hosts"),
+        };
+        match (self.relay, self.hosts) {
+            (true, 0) => write!(f, ", on the relay")?,
+            (true, _) => write!(f, ", on the relay and {hosts}")?,
+            (false, 0) => write!(f, "; the relay is unreachable")?,
+            (false, 1) => write!(f, ", through a host; the relay is unreachable")?,
+            (false, _) => write!(f, ", through {hosts}; the relay is unreachable")?,
+        }
+        if self.hosting {
+            write!(f, ", hosting")?;
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Display for RemoteStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -157,12 +191,36 @@ impl fmt::Display for RemoteStatus {
             Self::Listening { me } => write!(f, "Waiting for a call. Your key: {me}"),
             Self::Dialing { peer } => write!(f, "Dialing {peer}..."),
             Self::Joining { room } => write!(f, "Joining {room}..."),
-            Self::InRoom { room } => write!(f, "In {room}"),
+            Self::InRoom { room, via: None } => write!(f, "In {room}"),
+            Self::InRoom { room, via: Some(via) } => write!(f, "In {room}{via}"),
             Self::Connected { peer: Some(peer) } => write!(f, "Connected to {peer}"),
             Self::Connected { peer: None } => write!(f, "Connected"),
             Self::Reconnecting => write!(f, "Connection lost. Reconnecting..."),
             Self::Ended => write!(f, "Call ended"),
             Self::Failed { error } => write!(f, "Call failed: {error}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn said(relay: bool, hosts: usize, hosting: bool) -> String {
+        RemoteStatus::InRoom {
+            room: "room team on localhost".to_string(),
+            via: Some(Via { relay, hosts, hosting }),
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn a_room_says_which_ways_in_are_up() {
+        assert_eq!(said(true, 0, false), "In room team on localhost, on the relay");
+        assert_eq!(said(true, 2, true), "In room team on localhost, on the relay and 2 hosts, hosting");
+        assert_eq!(said(false, 1, false), "In room team on localhost, through a host; the relay is unreachable");
+        assert_eq!(said(false, 0, true), "In room team on localhost; the relay is unreachable, hosting");
+        let one = RemoteStatus::InRoom { room: "room team on localhost".to_string(), via: None };
+        assert_eq!(one.to_string(), "In room team on localhost", "a single session reads as it always has");
     }
 }
