@@ -200,24 +200,42 @@ struct Connect<'a> {
     keyframe: Arc<Keyframes>,
 }
 
-/// Set when a session comes back, read by the encode loops: a subscriber that
-/// rejoins mid-stream cannot decode until a keyframe arrives.
+/// What a change of route asks of what we publish, read by the encode loops
+/// and our catalogs' writers.
+///
+/// A session that comes back asks for a keyframe: a subscriber that rejoins
+/// mid-stream cannot decode until one arrives. Every change that can move
+/// our offer, that one included, also has our catalogs written again
+/// (`fresh.rs`), counted in `routes`.
 ///
 /// **One flag per encode loop.** Each loop `swap`s its flag back to false as
 /// it acts on it, so a single flag read by the camera and the screen would
 /// give the keyframe to whichever loop looked first and leave the other
-/// frozen.
+/// frozen. The count is only read, never taken, so any number of catalogs
+/// can follow it.
 #[derive(Default)]
 pub(super) struct Keyframes {
     pub camera: std::sync::atomic::AtomicBool,
     pub screen: std::sync::atomic::AtomicBool,
+    routes: std::sync::atomic::AtomicU64,
 }
 
 impl Keyframes {
-    /// Asks every loop for a keyframe.
+    /// Asks every loop for a keyframe, and every catalog to be written again.
     fn ask(&self) {
         self.camera.store(true, std::sync::atomic::Ordering::Relaxed);
         self.screen.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.rerouted();
+    }
+
+    /// Says our offer may have moved, so every catalog is written again.
+    pub(super) fn rerouted(&self) {
+        self.routes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many changes of route have been said so far.
+    pub(super) fn routes(&self) -> u64 {
+        self.routes.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -894,8 +912,8 @@ pub(super) async fn video_track(
     broadcast: &mut moq_net::broadcast::Producer,
     config: &mut moq_video::encode::Config,
     priority: u8,
-) -> Result<(moq_mux::catalog::Producer, moq_video::encode::Producer), String> {
-    let catalog = moq_mux::catalog::Producer::new(broadcast, Default::default())
+) -> Result<(super::fresh::Catalog, super::fresh::Video), String> {
+    let catalog = super::fresh::catalog(broadcast)
         .map_err(|error| format!("could not create a catalog: {error:#}"))?;
     let producer = add_video(broadcast, &catalog, config, priority).await?;
     Ok((catalog, producer))
@@ -906,10 +924,10 @@ pub(super) async fn video_track(
 /// arrives, after the microphone and possibly mid-call.
 async fn add_video(
     broadcast: &moq_net::broadcast::Producer,
-    catalog: &moq_mux::catalog::Producer,
+    catalog: &super::fresh::Catalog,
     config: &mut moq_video::encode::Config,
     priority: u8,
-) -> Result<moq_video::encode::Producer, String> {
+) -> Result<super::fresh::Video, String> {
     config.kind = encoder_kind();
     let rendition = match config.probe().await {
         Ok(rendition) => rendition,
@@ -926,7 +944,7 @@ async fn add_video(
     let track = broadcast
         .create_track(TRACK, catalog.track_info(priority))
         .map_err(|error| format!("could not create a track: {error:#}"))?;
-    moq_video::encode::Producer::with_track(track, catalog.clone(), rendition)
+    super::fresh::Video::with_track(track, catalog.clone(), rendition)
         .map_err(|error| format!("could not publish video: {error:#}"))
 }
 
@@ -1176,8 +1194,11 @@ async fn run(
             .create_broadcast(camera_path(&me.to_string()))
             .map_err(|error| format!("could not create a broadcast: {error:#}"))?;
         // One catalog for the microphone now and the camera whenever it comes.
-        let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default())
+        let catalog = super::fresh::catalog(&mut broadcast)
             .map_err(|error| format!("could not create a catalog: {error:#}"))?;
+        // Written again as our routes change and every few seconds, so
+        // someone who joins after a move is not left without it.
+        let _freshening = Abort(tokio::spawn(super::fresh::keep(catalog.clone(), keyframe.clone())));
 
         // Announced beside the camera, and said before anything is shown: the
         // peer knows we are here whether or not a frame ever arrives.
@@ -1186,9 +1207,7 @@ async fn run(
             .map_err(|error| format!("could not create a control broadcast: {error:#}"))?;
         let presence = control
             .create_track(PRESENCE, None)
-            .map(|track| {
-                moq_json::snapshot::Producer::new(track, presence_config())
-            })
+            .map(Said::new)
             .map_err(|error| format!("could not create a presence track: {error:#}"))?;
         // Shared with the announcer below and with the leave sequence. A plain
         // mutex: every use is a quick update, never held across an await.
@@ -1971,7 +1990,7 @@ fn demotes(outcome: &Result<(), Stopped>, encoder: &str) -> bool {
 fn encode(
     feed: &mut FrameFeed,
     encoder: &mut moq_video::encode::Encoder,
-    producer: &mut moq_video::encode::Producer,
+    producer: &mut super::fresh::Video,
     steering: Steering<'_>,
 ) -> Result<(), Stopped> {
     let Steering {
@@ -2485,24 +2504,55 @@ fn note_routes(
     }
 }
 
-/// How our presence track is written: **every document a group of its own**,
-/// as the library writes its catalogs, never a snapshot followed by deltas.
-/// The library carries a subscription across a change of route at a group
-/// boundary; a group held open for deltas has none, and a reader of one was
-/// seen to stall for good, with no error, at the first move of the call --
-/// every move changes routes. Readers of either shape read this one.
+/// The moq-json shape [`Said`] writes, for tests that stand in for a peer:
+/// every document a group of its own, plain JSON, no deltas.
+#[cfg(test)]
 fn presence_config() -> moq_json::snapshot::Config {
     moq_json::snapshot::Config::default().with_delta_ratio(0)
 }
 
+/// Our presence track: **every document a group of its own**, as the library
+/// writes its catalogs, never a snapshot followed by deltas. The library
+/// carries a subscription across a change of route at a group boundary; a
+/// group held open for deltas has none, and a reader of one was seen to stall
+/// for good, with no error, at the first move of the call -- every move
+/// changes routes.
+///
+/// **And every document said is written, changed or not.** moq-json's own
+/// producer writes nothing for a value equal to the last, and with the camera
+/// off and nothing else happening every document is the same. A reader
+/// carried across a change of route waits for the next group, and a relay
+/// holding such a read attaches anyone who asks later to it (`fresh.rs`), so
+/// someone joining after a move could go without our presence -- our name,
+/// our camera, where the call is -- until we next changed something. Written
+/// each time, the announcer's re-saying every [`CLOCK_EVERY`] bounds that.
+///
+/// The bytes are what moq-json writes for one document with no deltas and no
+/// compression, so every reader, an older build's included, reads them as it
+/// always has.
+struct Said(moq_net::track::Producer);
+
+impl Said {
+    fn new(track: moq_net::track::Producer) -> Self {
+        Self(track)
+    }
+
+    fn write(&mut self, presence: &Presence) -> Result<(), String> {
+        let document = serde_json::to_vec(presence).map_err(|error| format!("{error:#}"))?;
+        self.0
+            .write_frame(moq_net::Timestamp::now(), document)
+            .map_err(|error| format!("{error:#}"))
+    }
+}
+
 /// Publishes one presence document, logging rather than failing: a word that
 /// does not get out is a degraded call, not a broken one.
-fn say(presence: &std::sync::Mutex<moq_json::snapshot::Producer<Presence>>, now: Presence) {
+fn say(presence: &std::sync::Mutex<Said>, now: Presence) {
     let Ok(mut presence) = presence.lock() else {
         return;
     };
-    if let Err(error) = presence.update(&now) {
-        tracing::warn!("could not publish our presence: {error:#}");
+    if let Err(error) = presence.write(&now) {
+        tracing::warn!("could not publish our presence: {error}");
     }
 }
 
@@ -2513,7 +2563,7 @@ fn say(presence: &std::sync::Mutex<moq_json::snapshot::Producer<Presence>>, now:
 /// a notification channel, and a quarter-second lag on "camera off" is not
 /// something anyone can see. Runs until the call aborts it.
 async fn announce(
-    presence: Arc<std::sync::Mutex<moq_json::snapshot::Producer<Presence>>>,
+    presence: Arc<std::sync::Mutex<Said>>,
     local: Arc<PeerStats>,
 ) {
     let mut said = Presence::here(&local);
@@ -4415,5 +4465,33 @@ mod encode_tests {
             let encoded = encode(10 + n, rising.stamp(n * 33_333));
             producer.publish(&encoded).unwrap_or_else(|error| panic!("frame {n} after the restart: {error:#}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod said_tests {
+    use super::*;
+
+    /// The same document said twice is two groups, each read whole by the
+    /// reader every build uses.
+    #[tokio::test]
+    async fn an_unchanged_presence_is_written_again() {
+        let origin = moq_tokio::origin::spawn();
+        let control = origin.create_broadcast(control_path("someone")).unwrap();
+        let presence = std::sync::Mutex::new(Said::new(control.create_track(PRESENCE, None).unwrap()));
+        control.announce(moq_net::origin::Route::default()).unwrap();
+        let said = Presence {
+            name: Some("Someone".into()),
+            ..Presence::default()
+        };
+        say(&presence, said.clone());
+        let broadcast = origin.consume().request_broadcast(control_path("someone").as_str()).await.unwrap();
+        let mut reading = subscribe_presence(&broadcast).await.unwrap();
+        let wait = std::time::Duration::from_secs(2);
+        let first = tokio::time::timeout(wait, reading.next()).await.expect("the first document");
+        assert_eq!(first.unwrap(), Some(said.clone()));
+        say(&presence, said.clone());
+        let again = tokio::time::timeout(wait, reading.next()).await.expect("said again, unchanged");
+        assert_eq!(again.unwrap(), Some(said));
     }
 }

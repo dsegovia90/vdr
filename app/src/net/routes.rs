@@ -534,3 +534,47 @@ async fn a_withdrawn_offer_keeps_its_tracks_in_flight() {
     let stopped = upload(&call.p_a, Duration::from_millis(500)).await;
     assert!(stopped * 5 < uploading, "once nobody reads, it stops: {stopped} B/s, was {uploading} B/s");
 }
+
+/// A track that is written once and then left alone, as a catalog is, read
+/// across a move of the offer, and then asked for afresh: at the viewer's own
+/// origin where the read was carried across, and by a viewer who joins the
+/// relay the offer moved to afterwards. Every one of them gets the group
+/// the publisher has, with moq-net 0.3 at every node.
+///
+/// Pinned because the production relay runs an older moq-net, behind which a
+/// later reader was seen to get nothing until the publisher wrote again;
+/// this says the carried-over read alone does not cause that here, so the
+/// publisher's rewrite (`fresh.rs`) is for the older relay, and for whatever
+/// changes this.
+#[tokio::test]
+async fn a_later_reader_of_a_quiet_track_carried_across_a_move_gets_its_group() {
+    const QUIET: &str = "catalog.json";
+    let call = Offering::new().await;
+    let mut quiet = call.publishing.broadcast.create_track(QUIET, None).unwrap();
+    quiet.write_frame(Timestamp::from_millis(1).unwrap(), FRAME.as_slice()).unwrap();
+    let offer_a = call.gate_a.offer(&call.publishing.broadcast);
+
+    let mut announced = call.inbound.consume().announced();
+    update_within(&mut announced, PATIENCE).await.expect("announced");
+    let broadcast = call.inbound.consume().routed_broadcast(PATH).await.unwrap();
+    let mut first = broadcast.track(QUIET).unwrap().subscribe(None).await.unwrap();
+    let group = tokio::time::timeout(PATIENCE, first.recv_group()).await.expect("in time").unwrap();
+    assert_eq!(group.map(|group| group.sequence), Some(0));
+
+    let _offer_b = call.gate_b.offer(&call.publishing.broadcast);
+    drop(offer_a);
+    let update = update_within(&mut announced, PATIENCE).await.expect("the route moves");
+    assert_eq!(through(&update.route), call.b.hop());
+
+    let later = call.inbound.consume().routed_broadcast(PATH).await.unwrap();
+    let mut second = later.track(QUIET).unwrap().subscribe(None).await.unwrap();
+    let group = tokio::time::timeout(PATIENCE, second.recv_group()).await.expect("the later reader here gets a group");
+    assert_eq!(group.unwrap().map(|group| group.sequence), Some(0));
+
+    let theirs = moq_tokio::origin::spawn();
+    let _joined = established(client(&[]).with_subscriber(theirs.clone()).connect(call.b.url())).await;
+    let broadcast = tokio::time::timeout(PATIENCE, theirs.consume().routed_broadcast(PATH)).await.expect("in time").unwrap();
+    let mut third = broadcast.track(QUIET).unwrap().subscribe(None).await.unwrap();
+    let group = tokio::time::timeout(PATIENCE, third.recv_group()).await.expect("a later viewer at the relay gets a group");
+    assert_eq!(group.unwrap().map(|group| group.sequence), Some(0));
+}

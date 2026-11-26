@@ -110,10 +110,10 @@ pub(super) async fn open_playback(controls: &Controls) -> Option<playback::Engin
 /// the microphone is published plain.
 pub(super) fn publish(
     broadcast: moq_net::broadcast::Producer,
-    catalog: moq_mux::catalog::Producer,
+    catalog: super::fresh::Catalog,
     engine: Option<&playback::Engine>,
     bandwidth: moq_net::bandwidth::Allocator,
-) -> Result<(encode::Publication, encode::Driver, Option<moq_audio::aec::Control>), String> {
+) -> Result<(encode::Publication, encode::Driver<super::fresh::Ext>, Option<moq_audio::aec::Control>), String> {
     // Opus at 20 ms, the system default input.
     let mut options = encode::PublicationOptions::default();
     // The call's send budget. moq-audio reserves its bitrate against it, at
@@ -217,7 +217,7 @@ const AEC_REPORT_EVERY: Duration = Duration::from_secs(5);
 ///
 /// Ends when the last [`Publication`](encode::Publication) clone drops, which is
 /// what the call does when the attempt finishes.
-pub(super) fn drive(driver: encode::Driver) {
+pub(super) fn drive(driver: encode::Driver<super::fresh::Ext>) {
     let spawned = std::thread::Builder::new()
         .name("microphone".into())
         .spawn(move || {

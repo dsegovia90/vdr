@@ -25,7 +25,18 @@
 //!
 //! What a player does with what it reads is its own: video stays newest-wins
 //! and audio stays buffered (`audio.rs`), and a player that is replaced
-//! starts as a new subscriber of either kind would.
+//! starts as a new subscriber of either kind would. A catalog that arrives
+//! again unchanged, as a publisher writes it after a change of route
+//! (`fresh.rs`), is the same renditions and replaces nobody.
+//!
+//! **A read that hears no catalog at all is asked for again too.** A
+//! catalog's newest group is there for any new reader, so a first one that
+//! has not come within [`PATIENCE`] is not coming on this read: the route
+//! it was given is waiting on a group that does not exist yet, as one
+//! carried across a change of route does. Asking again may be answered by a
+//! better route; the publisher writing its catalog again ends the wait
+//! either way. Only the first catalog of a read is waited for like this:
+//! after it, a catalog that is quiet has simply not changed.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -43,6 +54,41 @@ pub(in crate::net) const AGAIN: Duration = Duration::from_millis(250);
 /// a moment's freeze, not a blank tile; short enough that a picture is never
 /// mistaken for live.
 const HOLD: Duration = Duration::from_millis(2500);
+
+/// How long a read waits for its first catalog before asking again. A
+/// catalog that is there arrives in a round trip, well under a second even
+/// through a relay, so three seconds of nothing means it is not there on
+/// this route. Shorter than the publisher's own rewrite (`fresh.rs`), so a
+/// better route, if asking again finds one, is not left waiting on it.
+pub(in crate::net) const PATIENCE: Duration = Duration::from_secs(3);
+
+/// Whether the first catalog of a read is late, and whether that has been
+/// said: once an outage, however many reads it takes.
+#[derive(Debug, Default)]
+struct Overdue {
+    /// When the current read is given up on, while it has heard nothing.
+    due: Option<tokio::time::Instant>,
+    said: bool,
+}
+
+impl Overdue {
+    /// A read began at `now`.
+    fn began(&mut self, now: tokio::time::Instant) {
+        self.due = Some(now + PATIENCE);
+    }
+
+    /// Its catalog arrived: nothing is due, and a later outage is said anew.
+    fn heard(&mut self) {
+        self.due = None;
+        self.said = false;
+    }
+
+    /// The read was given up on: whether to say so.
+    fn lapsed(&mut self) -> bool {
+        self.due = None;
+        !std::mem::replace(&mut self.said, true)
+    }
+}
 
 /// A peer's catalog, as the library reads it.
 pub(in crate::net) type Catalog = moq_mux::catalog::hang::Catalog<()>;
@@ -144,6 +190,9 @@ pub(in crate::net) async fn follow<R: Reader>(
     let mut failed: Option<Rendition> = None;
     // When a picture left up by a player that ended comes down.
     let mut held: Option<tokio::time::Instant> = None;
+    // Only with somewhere to ask again: the loopback's catalog is in this
+    // process and has no route to wait on.
+    let mut overdue = Overdue::default();
     loop {
         let broadcast = match next.take() {
             Some(broadcast) => broadcast,
@@ -165,14 +214,27 @@ pub(in crate::net) async fn follow<R: Reader>(
                 }
             }
         };
-        let mut catalog =
-            match moq_mux::catalog::Consumer::<()>::new(&broadcast, moq_mux::catalog::CatalogFormat::Hang).await {
-                Ok(catalog) => catalog,
-                Err(error) => {
-                    lose(&mut lost, &peer, what, &format!("no catalog: {error:#}"));
-                    continue;
-                }
-            };
+        if asking.is_some() {
+            overdue.began(tokio::time::Instant::now());
+        }
+        // The subscribe is waited on with the same patience as what it
+        // brings: a route with nothing behind it can hold either.
+        let subscribing = moq_mux::catalog::Consumer::<()>::new(&broadcast, moq_mux::catalog::CatalogFormat::Hang);
+        let subscribed = match overdue.due {
+            Some(due) => tokio::time::timeout_at(due, subscribing).await.ok(),
+            None => Some(subscribing.await),
+        };
+        let mut catalog = match subscribed {
+            Some(Ok(catalog)) => catalog,
+            Some(Err(error)) => {
+                lose(&mut lost, &peer, what, &format!("no catalog: {error:#}"));
+                continue;
+            }
+            None => {
+                late(&mut overdue, &mut lost, &peer, what);
+                continue;
+            }
+        };
         loop {
             let ended = async {
                 match playing.as_mut() {
@@ -186,9 +248,16 @@ pub(in crate::net) async fn follow<R: Reader>(
                     None => std::future::pending().await,
                 }
             };
+            let due = async {
+                match overdue.due {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 snapshot = catalog.next() => match snapshot {
                     Ok(Some(snapshot)) => {
+                        overdue.heard();
                         if std::mem::take(&mut lost) {
                             tracing::info!("{peer}'s {what} is back");
                         }
@@ -250,6 +319,10 @@ pub(in crate::net) async fn follow<R: Reader>(
                         reader.stopped();
                     }
                 }
+                _ = due => {
+                    late(&mut overdue, &mut lost, &peer, what);
+                    break;
+                }
             }
         }
     }
@@ -260,6 +333,15 @@ fn lose(lost: &mut bool, peer: &str, what: &str, why: &str) {
     if !std::mem::replace(lost, true) {
         tracing::info!("lost {peer}'s {what} ({why}); asking again");
     }
+}
+
+/// Says, once an outage, that a read's first catalog did not come, and
+/// counts it as lost, so its return is said as any other.
+fn late(overdue: &mut Overdue, lost: &mut bool, peer: &str, what: &str) {
+    if overdue.lapsed() {
+        tracing::info!("no catalog for {peer}'s {what} within {}s; asking again", PATIENCE.as_secs());
+    }
+    *lost = true;
 }
 
 /// A player's task, aborted when dropped: replacing or ending the follower
@@ -274,8 +356,110 @@ impl Drop for Task {
 
 #[cfg(test)]
 mod tests {
-    use super::Rendition;
+    use super::{Overdue, Rendition, PATIENCE};
     use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn a_read_is_due_its_catalog_within_patience_of_beginning() {
+        let mut overdue = Overdue::default();
+        assert_eq!(overdue.due, None, "nothing is due before a read");
+        let start = tokio::time::Instant::now();
+        overdue.began(start);
+        assert_eq!(overdue.due, Some(start + PATIENCE));
+        overdue.heard();
+        assert_eq!(overdue.due, None, "a read that has heard is never late");
+    }
+
+    #[test]
+    fn a_late_catalog_is_said_once_an_outage() {
+        let mut overdue = Overdue::default();
+        let start = tokio::time::Instant::now();
+        overdue.began(start);
+        assert!(overdue.lapsed(), "the first lapse is said");
+        assert_eq!(overdue.due, None);
+        // Asked again, and late again: quiet.
+        overdue.began(start + PATIENCE + Duration::from_millis(250));
+        assert!(!overdue.lapsed());
+        overdue.began(start + PATIENCE * 2);
+        assert!(!overdue.lapsed());
+        // Back, then lost again later: said again.
+        overdue.began(start + PATIENCE * 3);
+        overdue.heard();
+        overdue.began(start + PATIENCE * 10);
+        assert!(overdue.lapsed());
+    }
+
+    #[test]
+    fn asking_again_is_paced() {
+        // The longest a read waits plus the pause before the next ask: what
+        // keeps a route with nothing behind it from being asked in a spin.
+        assert!(PATIENCE + super::AGAIN >= Duration::from_secs(3));
+        assert!(PATIENCE < super::super::fresh::HEARTBEAT, "asked again before a heartbeat would end the wait");
+    }
+
+    /// A player's starts and a reader's catalogs, counted.
+    #[derive(Clone, Default)]
+    struct Counted {
+        plays: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        heard: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl super::Reader for Counted {
+        const WHAT: &'static str = "video";
+
+        fn pick(&self, catalog: &super::Catalog) -> Option<Rendition> {
+            let (name, config) = catalog.video.renditions.iter().next()?;
+            Some(Rendition::new(name, config))
+        }
+
+        fn play(&mut self, _: &moq_net::broadcast::Consumer, _: &super::Catalog, _: &Rendition) -> super::Playing {
+            self.plays.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(std::future::pending())
+        }
+
+        fn heard(&mut self, _first: bool, _offered: bool) {
+            self.heard.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Our catalog written again after a change of route reaches the
+    /// follower each time, and never restarts the player it already has.
+    #[tokio::test]
+    async fn a_catalog_written_again_restarts_no_player() {
+        let origin = moq_tokio::origin::spawn();
+        let mut broadcast = origin.create_broadcast("again").unwrap();
+        let mut catalog = super::super::fresh::catalog(&mut broadcast).unwrap();
+        let mut config = moq_video::encode::Config::new(160, 90, moq_video::Rate::new(30, 1).unwrap());
+        config.kind = moq_video::encode::Kind::Software;
+        let rendition = config.probe().await.unwrap();
+        let track = broadcast.create_track("video.avc3", catalog.track_info(60)).unwrap();
+        let _video = super::super::fresh::Video::with_track(track, catalog.clone(), rendition).unwrap();
+        broadcast.announce(moq_net::origin::Route::default()).unwrap();
+
+        let reading = origin.consume().request_broadcast("again").await.unwrap();
+        let counted = Counted::default();
+        let following = tokio::spawn(super::follow(None, reading, "someone".into(), counted.clone()));
+        let heard = |count: usize| {
+            let counted = counted.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while counted.heard.load(std::sync::atomic::Ordering::Relaxed) < count {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("catalog {count} never reached the follower"));
+            }
+        };
+        heard(1).await;
+        for count in 2..=4 {
+            assert!(super::super::fresh::rewrite(&mut catalog));
+            heard(count).await;
+        }
+        assert_eq!(counted.plays.load(std::sync::atomic::Ordering::Relaxed), 1, "one player, never replaced");
+        following.abort();
+    }
 
     #[test]
     fn what_rate_control_rewrites_is_the_same_rendition() {

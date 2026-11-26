@@ -23,6 +23,7 @@ mod call;
 mod codec_check;
 mod follow;
 mod forwarded;
+mod fresh;
 pub(crate) mod door;
 mod metrics;
 mod loopback;

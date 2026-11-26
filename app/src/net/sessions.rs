@@ -868,6 +868,10 @@ pub(super) fn join(args: Join) -> Peer {
                                 }
                             }
                         }
+                        // A session coming, going or changing its price can
+                        // move a route to us, here or at whoever reads us
+                        // through it, so our catalogs are written again.
+                        keyframe.rerouted();
                     }
                     _ = ticker.tick() => {}
                 }
@@ -992,7 +996,9 @@ pub(super) fn join(args: Join) -> Peer {
                     let spare_at = keeps_spare(hosting, local.spare_route())
                         .then(|| spare(&states, &priced, next, chosen))
                         .flatten();
-                    arrange(&mut members, next, spare_at, &outbound, &me, &relay_label);
+                    if arrange(&mut members, next, spare_at, &outbound, &me, &relay_label) {
+                        keyframe.rerouted();
+                    }
                 }
                 if next.is_some() && next != carrier {
                     let index = next.unwrap_or_default();
@@ -1052,7 +1058,8 @@ pub(super) fn join(args: Join) -> Peer {
 }
 
 /// Puts each session's offer where it should be: the carrier's at no price,
-/// the spare's at [`SPARE_COST`], the rest withdrawn.
+/// the spare's at [`SPARE_COST`], the rest withdrawn. Whether any offer
+/// changed.
 ///
 /// **Make before break, and re-price rather than withdraw.** A session that
 /// keeps an offer, changing only what it is for, is re-priced in place, so a
@@ -1067,7 +1074,8 @@ fn arrange(
     outbound: &moq_net::origin::Producer,
     me: &str,
     relay: &str,
-) {
+) -> bool {
+    let mut changed = false;
     for (index, member) in members.iter_mut().enumerate() {
         let want = if index == carrier {
             Some(Role::Carrier)
@@ -1085,6 +1093,7 @@ fn arrange(
             (None, Some(role)) => {
                 let Some(gate) = &member.gate else { continue };
                 member.offer = Some((gate.offer(outbound, me, role.price()), role));
+                changed = true;
                 if role == Role::Spare {
                     tracing::info!("a spare offer on {name}");
                 }
@@ -1094,6 +1103,7 @@ fn arrange(
                     offer.reprice(role.price());
                     *held = role;
                 }
+                changed = true;
                 match role {
                     Role::Carrier => tracing::info!("the spare on {name} now carries our media"),
                     Role::Spare => tracing::info!("our offer on {name} is the spare now"),
@@ -1106,6 +1116,7 @@ fn arrange(
                         drop(old);
                     });
                 }
+                changed = true;
                 if was == Role::Spare {
                     tracing::info!("the spare on {name} is closed");
                 }
@@ -1113,6 +1124,7 @@ fn arrange(
             (None, None) => {}
         }
     }
+    changed
 }
 
 /// Which session goes to the host the call has been moved to, if we follow
@@ -1989,10 +2001,10 @@ mod socket_tests {
     /// Our control broadcast on `outbound`, kept said by the call's own
     /// announcer from `local`.
     fn saying(me: &str, outbound: &moq_net::origin::Producer, local: &Arc<PeerStats>) -> (moq_net::broadcast::Producer, Abort) {
-        use super::super::{Presence, announce, control_path, presence_config, say, PRESENCE};
+        use super::super::{Presence, Said, announce, control_path, say, PRESENCE};
         let control = outbound.create_broadcast(control_path(me)).unwrap();
         let track = control.create_track(PRESENCE, None).unwrap();
-        let presence = Arc::new(std::sync::Mutex::new(moq_json::snapshot::Producer::new(track, presence_config())));
+        let presence = Arc::new(std::sync::Mutex::new(Said::new(track)));
         say(&presence, Presence::here(local));
         control.announce(moq_net::origin::Route::default()).unwrap();
         (control, Abort(tokio::spawn(announce(presence, local.clone()))))
@@ -2288,7 +2300,7 @@ mod socket_tests {
     /// cuts a keyframe when asked.
     struct Camera {
         broadcast: moq_net::broadcast::Producer,
-        catalog: moq_mux::catalog::Producer,
+        catalog: super::super::super::fresh::Catalog,
         encoding: Option<Encoding>,
         keyframe: Arc<Keyframes>,
     }
@@ -2314,7 +2326,7 @@ mod socket_tests {
     /// Our camera on `outbound`, switched off.
     fn camera(me: &str, outbound: &moq_net::origin::Producer) -> Camera {
         let mut broadcast = outbound.create_broadcast(camera_path(me)).unwrap();
-        let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+        let catalog = super::super::super::fresh::catalog(&mut broadcast).unwrap();
         broadcast.announce(moq_net::origin::Route::default()).unwrap();
         Camera {
             broadcast,
