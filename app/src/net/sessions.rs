@@ -941,12 +941,15 @@ pub(super) fn join(args: Join) -> Peer {
                 // Which hosts we hold a session to, for our presence: the
                 // announcer says it at once when this changes, so the room's
                 // map follows a host joining or dropping within its poll.
-                // Draining counts, since we still hear through it.
+                // Draining counts, since we still hear through it. The
+                // session to where the room meets is said as the word, as in
+                // `via`: without it, someone whose media goes through a host
+                // shows no line to the relay they also hold.
                 local.set_held(super::super::web::clean_held(
                     members
                         .iter()
                         .filter(|member| member.state.up())
-                        .filter_map(|member| member.target.host.clone()),
+                        .map(|member| member.target.host.clone().unwrap_or_else(|| super::super::web::HELD_RELAY.to_string())),
                     "",
                 ));
                 // Until the relay has answered or failed once, a host with

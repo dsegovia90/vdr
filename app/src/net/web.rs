@@ -13,9 +13,12 @@
 //!   cut off from the relay). Those words cannot be mistaken for an id, which
 //!   is 64 lowercase hex.
 //! - `held`: the hosts we hold a session to, by endpoint id, **never their
-//!   doors**. A host dials only the hosts whose id sorts below its own, so a
-//!   session between two hosts is said by one of them; that is enough, since
-//!   an edge has no direction here.
+//!   doors**, and `"relay"` while our session to where the room meets is up,
+//!   meaning the same place as in `via`. Without the word, someone whose
+//!   media goes through a host showed no line to the relay they also hold. A
+//!   host dials only the hosts whose id sorts below its own, so a session
+//!   between two hosts is said by one of them; that is enough, since an edge
+//!   has no direction here.
 //!
 //! **What people say is the source of truth, and how their media reaches us
 //! (`arrival`) is not used.** An arrival names the last hop towards *us*, not
@@ -50,6 +53,8 @@ pub(crate) const HELD_MAX: usize = 16;
 
 /// `via` on the wire for the place the room meets.
 const VIA_RELAY: &str = "relay";
+/// The same place in a `held` list: our session to it is up.
+pub(crate) const HELD_RELAY: &str = VIA_RELAY;
 /// `via` on the wire for a host that sends only to its own guests.
 const VIA_GUESTS: &str = "guests";
 
@@ -102,12 +107,14 @@ pub(crate) fn clean_via(via: Option<Sending>, sender: &str) -> Option<Sending> {
     }
 }
 
-/// A `held` list as we keep or send it: well-formed ids other than the
-/// sender's own, sorted, once each, at most [`HELD_MAX`]. Sorted so that the
-/// same sessions are always the same document, and a re-say is a real change.
+/// A `held` list as we keep or send it: [`HELD_RELAY`] and well-formed ids
+/// other than the sender's own, sorted, once each, at most [`HELD_MAX`].
+/// Sorted so that the same sessions are always the same document, and a
+/// re-say is a real change; the word first, so the cap never drops it.
 pub(crate) fn clean_held(held: impl IntoIterator<Item = String>, sender: &str) -> Vec<String> {
-    let mut held: Vec<String> = held.into_iter().filter(|id| valid_id(id) && id != sender).collect();
-    held.sort();
+    let mut held: Vec<String> =
+        held.into_iter().filter(|id| *id == HELD_RELAY || (valid_id(id) && id != sender)).collect();
+    held.sort_by(|a, b| (a != HELD_RELAY, a).cmp(&(b != HELD_RELAY, b)));
     held.dedup();
     held.truncate(HELD_MAX);
     held
@@ -177,7 +184,8 @@ pub struct Person {
     /// Where their media goes, as they say (ours, as `sessions` set it).
     /// `None` on a peer is someone who says nothing.
     pub via: Option<Sending>,
-    /// The hosts they hold a session to, cleaned.
+    /// The hosts they hold a session to, cleaned, and [`HELD_RELAY`] for the
+    /// meeting place.
     pub held: Vec<String>,
 }
 
@@ -280,7 +288,13 @@ pub fn build<'p>(people: &'p [Person], relays: &'p [Relay], venue: Option<&'p st
     };
     for person in people {
         for host in &person.held {
-            add(&person.id, host, State::Held);
+            if host == HELD_RELAY {
+                if let Some(venue) = venue {
+                    add(&person.id, venue, State::Held);
+                }
+            } else {
+                add(&person.id, host, State::Held);
+            }
         }
         match &person.via {
             Some(Sending::Relay) => {
@@ -486,6 +500,44 @@ mod tests {
         // Saying anything at all ends the guess, and so does being us.
         let people = vec![Person { me: true, ..says(&id('a'), None, &[]) }, says(&id('b'), None, &[&id('a')])];
         assert_eq!(build(&people, &server(), Some(RELAY_ID)).edges, vec![edge(&id('a'), &id('b'), State::Held)]);
+    }
+
+    #[test]
+    fn held_carries_the_word_for_the_meeting_place_first_and_never_capped_away() {
+        let json = format!(r#"{{"held":["{b}","relay","Relay","{a}","relay"]}}"#, a = id('a'), b = id('b'));
+        assert_eq!(read(&json).held, vec![HELD_RELAY.to_string(), id('a'), id('b')]);
+        let mut many: Vec<String> = (0..100).map(numbered).collect();
+        many.push(HELD_RELAY.to_string());
+        let held = clean_held(many, "");
+        assert_eq!(held.len(), HELD_MAX);
+        assert_eq!(held[0], HELD_RELAY);
+        // `guests` is a `via` word only.
+        assert!(clean_held(["guests".to_string()], "").is_empty());
+    }
+
+    #[test]
+    fn someone_through_a_host_who_holds_the_relay_has_a_grey_line_to_it() {
+        let h = id('d');
+        let people = vec![
+            Person { can_host: true, ..says(&h, Some(Sending::Relay), &[HELD_RELAY]) },
+            says(&id('a'), host(&h), &[HELD_RELAY, &h]),
+        ];
+        let web = build(&people, &server(), Some(RELAY_ID));
+        assert_eq!(
+            web.edges,
+            vec![
+                edge(&id('a'), &h, State::Flowing),
+                edge(&id('a'), RELAY_ID, State::Held),
+                edge(&h, RELAY_ID, State::Flowing),
+            ]
+        );
+        // The same in a room meeting at an iroh relay server, whose id is not
+        // the word.
+        let at = meeting(Some(&MeetsAt::Endpoint(id('e'))), &id('a'), &people);
+        let web = build(&people, &[at.relay.clone().unwrap()], Some(&at.venue));
+        assert!(web.edges.contains(&edge(&id('a'), &id('e'), State::Held)));
+        // And in a direct call, with no meeting place, the word draws nothing.
+        assert_eq!(build(&[says(&id('a'), None, &[HELD_RELAY])], &[], None).edges, vec![]);
     }
 
     #[test]

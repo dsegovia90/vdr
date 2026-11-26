@@ -248,8 +248,9 @@ focus.
   because one parse error in a presence document ends listening to that peer.
 - **`via` and `held` in presence are said always, behind no switch**: where
   our media goes (`"relay"`, `"guests"`, or a host's endpoint id) and the
-  hosts we hold a session to (ids only, never a door, at most
-  `web::HELD_MAX`). They are what the Network tab's map of the room is built
+  sessions we hold (hosts by id only, never a door, plus `"relay"` while the
+  session to where the room meets is up; at most `web::HELD_MAX`). A peer
+  that says neither is drawn with an assumed line to the meeting place. They are what the Network tab's map of the room is built
   from (`net/web.rs`), so they go out at once when they change, in the
   announcer's existing poll, not at the clock refresh. Read leniently and
   cleaned with the sender's id, like `seen`. **"relay" means wherever the room
