@@ -113,6 +113,10 @@ fn install_crypto() {
 fn client(versions: &[Version]) -> moq_tokio::Client {
     install_crypto();
     let mut config = moq_tokio::client::Config::default();
+    // On the loopback address as the servers are: a dual-stack port can
+    // share its number with another test's server, which then takes this
+    // client's answers (see `sessions`' socket tests).
+    config.connect.bind = Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     config.connect.tls.insecure = Some(true);
     config.connect.version = versions.to_vec();
     config.init().expect("client config").with_reconnect(false)
@@ -335,6 +339,36 @@ async fn a_lite05_route_outranks_a_lite06_one_of_the_same_length() {
     assert_eq!(route.cost.warm, 0, "{:?}", route.cost);
 }
 
+/// A moq-lite-06 link priced at zero beats a moq-lite-05 route of the same
+/// length: both are free to reach, but the older one's path is of unknown
+/// price and ranks last on that, where the newer one's is known to be free.
+/// This is what moving the call to a host rests on: a member dials the chosen
+/// host free, and everyone's media then flows through it rather than through
+/// the older relay.
+#[tokio::test]
+async fn a_free_lite06_route_beats_a_lite05_one_of_the_same_length() {
+    let older = Relay::start(&[lite("moq-lite-05")]).await;
+    let current = Relay::start(&[]).await;
+
+    let outbound = moq_tokio::origin::spawn();
+    let _publishing = publish(&outbound, true);
+    let publisher = client(&[]).with_publisher(&outbound);
+    let _p_older = established(publisher.clone().connect(older.url())).await;
+    let _p_current = established(publisher.with_cost(0).connect(current.url())).await;
+
+    let inbound = moq_tokio::origin::spawn();
+    let viewer = client(&[]).with_subscriber(inbound.clone());
+    let _v_older = established(viewer.clone().connect(older.url())).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _v_current = established(viewer.with_cost(0).connect(current.url())).await;
+
+    let mut announced = inbound.consume().announced();
+    let updates = settle(&mut announced, Duration::from_millis(800)).await;
+    let route = &updates.last().expect("announced").route;
+    assert_eq!(through(route), current.hop(), "{updates:?}");
+    assert_eq!(route.cost.warm, 0, "{:?}", route.cost);
+}
+
 /// What one session offers of ours: an origin of its own, sharing our
 /// publishing identity so every route to us still names one publisher, into
 /// which our broadcast is offered or from which it is withdrawn.
@@ -499,4 +533,48 @@ async fn a_withdrawn_offer_keeps_its_tracks_in_flight() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let stopped = upload(&call.p_a, Duration::from_millis(500)).await;
     assert!(stopped * 5 < uploading, "once nobody reads, it stops: {stopped} B/s, was {uploading} B/s");
+}
+
+/// A track that is written once and then left alone, as a catalog is, read
+/// across a move of the offer, and then asked for afresh: at the viewer's own
+/// origin where the read was carried across, and by a viewer who joins the
+/// relay the offer moved to afterwards. Every one of them gets the group
+/// the publisher has, with moq-net 0.3 at every node.
+///
+/// Pinned because the production relay runs an older moq-net, behind which a
+/// later reader was seen to get nothing until the publisher wrote again;
+/// this says the carried-over read alone does not cause that here, so the
+/// publisher's rewrite (`fresh.rs`) is for the older relay, and for whatever
+/// changes this.
+#[tokio::test]
+async fn a_later_reader_of_a_quiet_track_carried_across_a_move_gets_its_group() {
+    const QUIET: &str = "catalog.json";
+    let call = Offering::new().await;
+    let mut quiet = call.publishing.broadcast.create_track(QUIET, None).unwrap();
+    quiet.write_frame(Timestamp::from_millis(1).unwrap(), FRAME.as_slice()).unwrap();
+    let offer_a = call.gate_a.offer(&call.publishing.broadcast);
+
+    let mut announced = call.inbound.consume().announced();
+    update_within(&mut announced, PATIENCE).await.expect("announced");
+    let broadcast = call.inbound.consume().routed_broadcast(PATH).await.unwrap();
+    let mut first = broadcast.track(QUIET).unwrap().subscribe(None).await.unwrap();
+    let group = tokio::time::timeout(PATIENCE, first.recv_group()).await.expect("in time").unwrap();
+    assert_eq!(group.map(|group| group.sequence), Some(0));
+
+    let _offer_b = call.gate_b.offer(&call.publishing.broadcast);
+    drop(offer_a);
+    let update = update_within(&mut announced, PATIENCE).await.expect("the route moves");
+    assert_eq!(through(&update.route), call.b.hop());
+
+    let later = call.inbound.consume().routed_broadcast(PATH).await.unwrap();
+    let mut second = later.track(QUIET).unwrap().subscribe(None).await.unwrap();
+    let group = tokio::time::timeout(PATIENCE, second.recv_group()).await.expect("the later reader here gets a group");
+    assert_eq!(group.unwrap().map(|group| group.sequence), Some(0));
+
+    let theirs = moq_tokio::origin::spawn();
+    let _joined = established(client(&[]).with_subscriber(theirs.clone()).connect(call.b.url())).await;
+    let broadcast = tokio::time::timeout(PATIENCE, theirs.consume().routed_broadcast(PATH)).await.expect("in time").unwrap();
+    let mut third = broadcast.track(QUIET).unwrap().subscribe(None).await.unwrap();
+    let group = tokio::time::timeout(PATIENCE, third.recv_group()).await.expect("a later viewer at the relay gets a group");
+    assert_eq!(group.unwrap().map(|group| group.sequence), Some(0));
 }

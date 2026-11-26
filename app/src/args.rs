@@ -23,6 +23,7 @@
 //! vdr --loopback                         # no network; the codec round trip
 //! vdr --camera facetime                   # picks a camera by name
 //! vdr --listen --camera-off               # starts with video off
+//! vdr --test-pattern                      # generated video in place of the camera; opens no camera
 //! vdr --quality high                      # 720p rung; low | mid | high, mid by default
 //! vdr --encoder software                  # auto | hardware | software, auto by default
 //! vdr --ephemeral                         # a throwaway key and data folder
@@ -31,7 +32,13 @@
 //! vdr --no-catchup                        # measure audio sync, never speed it up
 //! vdr --loopback --audio-stall 800        # hold audio back once, to make a backlog
 //! vdr --ephemeral --no-audio              # opens neither microphone nor speaker
+//! vdr --ephemeral --name guest            # a display name for this run only
 //! vdr --profile /tmp/vdr-a                # a test instance's own lasting folder and key
+//! vdr --move-calls                       # follow the call when someone moves it
+//! vdr --move-call relay                   # move the call as the join starts: relay or a host's id
+//! vdr --bounce 30                         # move it round the relay and the hosts every 30 s (10 at least)
+//! vdr --show-routes                       # border hosts' videos, brighter while they carry the call
+//! vdr --no-spare-route                    # no spare offer beside the one in use (--spare-route: one)
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry is a second
@@ -220,6 +227,12 @@ pub struct Args {
     /// had been pressed before anything opened. The scriptable way to place a
     /// call with no video on a machine that has a working camera.
     pub camera_off: bool,
+    /// Generated frames in place of the camera (`--test-pattern`): a moving
+    /// picture with a frame counter, fed in where a camera's frames are, so
+    /// the encoder, rate control, publishing and the local tile run as with
+    /// a camera. No camera is enumerated or opened. Combines with
+    /// `--camera-off`, which starts it switched off.
+    pub test_pattern: bool,
     /// Which rung the encoder runs at. Everyone defaults to the same one.
     pub quality: Quality,
     /// Hardware, software, or whichever this machine has (`--encoder`).
@@ -251,11 +264,34 @@ pub struct Args {
     /// the person at it: each would otherwise take the microphone and play
     /// the others through the speakers.
     pub no_audio: bool,
+    /// What this run calls itself, without saving it (`--name <name>`). Test
+    /// instances start from empty settings, so their tiles show an id each;
+    /// a name says which window is which.
+    pub name: Option<String>,
     /// Host the rooms joined in this run, as the Experimental switch does,
     /// without saving it (`--host-rooms`). An `--ephemeral` instance starts
     /// from empty settings and nobody is there to click the switch, so a
     /// scripted test has no other way to be a host.
     pub host_rooms: bool,
+    /// Follow and say where the call is moved, as the Experimental switch
+    /// does, without saving it (`--move-calls`; implied by the two below).
+    pub move_calls: bool,
+    /// Move the call as a join starts (`--move-call relay|<host id>`):
+    /// `Some(None)` is the relay.
+    pub move_call: Option<Option<String>>,
+    /// Move the call round the relay and every host this often
+    /// (`--bounce <secs>`), so a scripted run can judge moves from logs.
+    pub bounce: Option<std::time::Duration>,
+    /// Border the videos of people who could host, brighter while they
+    /// carry the call, as the Experimental switch does, without saving it
+    /// (`--show-routes`). For looking at a scripted
+    /// run; the routes are logged whether or not this is on.
+    pub show_routes: bool,
+    /// Keep a spare offer of our media on a second session, or not, for
+    /// this run, without saving it (`--spare-route`, `--no-spare-route`).
+    /// `None` leaves it to the setting, which is on by default; a scripted
+    /// run compares the two.
+    pub spare_route: Option<bool>,
 }
 
 impl Args {
@@ -283,6 +319,7 @@ impl Args {
         let mut peering = Peering::Idle;
         let mut camera = None;
         let mut camera_off = false;
+        let mut test_pattern = false;
         let mut quality = Quality::default();
         let mut encoder = EncoderChoice::default();
         let mut ephemeral = false;
@@ -291,7 +328,13 @@ impl Args {
         let mut no_catchup = false;
         let mut audio_stall = None;
         let mut no_audio = false;
+        let mut name = None;
         let mut host_rooms = false;
+        let mut move_calls = false;
+        let mut move_call = None;
+        let mut bounce = None;
+        let mut show_routes = false;
+        let mut spare_route = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -323,6 +366,7 @@ impl Args {
                     None => tracing::error!("--camera needs part of a device name"),
                 },
                 "--camera-off" => camera_off = true,
+                "--test-pattern" => test_pattern = true,
                 "--quality" => match args.next().as_deref().map(Quality::parse) {
                     Some(Some(chosen)) => quality = chosen,
                     Some(None) => tracing::error!("--quality is one of low, mid, high"),
@@ -345,7 +389,31 @@ impl Args {
                 },
                 "--no-catchup" => no_catchup = true,
                 "--no-audio" => no_audio = true,
+                "--name" => match args.next() {
+                    Some(wanted) => name = Some(wanted),
+                    None => tracing::error!("--name needs a name"),
+                },
                 "--host-rooms" => host_rooms = true,
+                "--move-calls" => move_calls = true,
+                "--move-call" => match args.next().as_deref().map(crate::net::moves::parse_target) {
+                    Some(Ok(to)) => {
+                        move_calls = true;
+                        move_call = Some(to);
+                    }
+                    Some(Err(error)) => tracing::error!("--move-call {error}"),
+                    None => tracing::error!("--move-call needs relay or a host's endpoint id"),
+                },
+                "--bounce" => {
+                    let secs = args.next().as_deref().map(str::parse::<u64>);
+                    if !matches!(secs, Some(Ok(_))) {
+                        tracing::error!("--bounce needs a number of seconds; bouncing every {}s", crate::net::moves::BOUNCE_DEFAULT.as_secs());
+                    }
+                    move_calls = true;
+                    bounce = Some(crate::net::moves::bounce_every(secs.and_then(Result::ok)));
+                }
+                "--show-routes" => show_routes = true,
+                "--spare-route" => spare_route = Some(true),
+                "--no-spare-route" => spare_route = Some(false),
                 // Read by `settings::data_dir` from the raw arguments, since
                 // the log opens before this parser runs; only skipped here.
                 "--profile" => {
@@ -365,6 +433,7 @@ impl Args {
             peering,
             camera,
             camera_off,
+            test_pattern,
             quality,
             encoder,
             ephemeral,
@@ -373,7 +442,13 @@ impl Args {
             no_catchup,
             audio_stall,
             no_audio,
+            name,
             host_rooms,
+            move_calls,
+            move_call,
+            bounce,
+            show_routes,
+            spare_route,
         }
     }
 }

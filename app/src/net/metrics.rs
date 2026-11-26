@@ -190,6 +190,9 @@ pub struct Metrics {
     /// meter and once a second by the tab while it is open, never on an
     /// encode thread.
     history: std::sync::Mutex<History>,
+    /// What we forward for others while hosting, as of the last second;
+    /// `None` while not hosting. Written by the same once-a-second meter.
+    hosting: std::sync::Mutex<Option<crate::rates::Hosting>>,
 }
 
 /// One outgoing stream's cap, and the bytes it actually handed the transport.
@@ -510,6 +513,7 @@ impl Metrics {
             camera_slice: self.camera_slice_kbps(),
             share_slice: self.share_slice_kbps(),
             estimate: self.estimate_kbps(),
+            hosting: self.hosting(),
         };
         if let Ok(mut history) = self.history.lock() {
             history.push(second);
@@ -543,6 +547,17 @@ impl Metrics {
         }
     }
 
+    /// What we forwarded and sent over the last second while hosting.
+    pub fn hosting(&self) -> Option<crate::rates::Hosting> {
+        self.hosting.lock().ok().and_then(|hosting| *hosting)
+    }
+
+    pub(super) fn set_hosting(&self, hosting: Option<crate::rates::Hosting>) {
+        if let Ok(mut slot) = self.hosting.lock() {
+            *slot = hosting;
+        }
+    }
+
     /// The echo canceller's latest numbers.
     pub fn aec(&self) -> Option<AecStats> {
         self.aec.lock().ok().and_then(|aec| *aec)
@@ -563,6 +578,7 @@ impl Metrics {
             *codecs = (None, None);
         }
         self.set_path(Path::Unknown);
+        self.set_hosting(None);
         self.camera.clear();
         self.share.clear();
         self.camera_slice.set(None);
@@ -663,9 +679,39 @@ pub struct PeerStats {
     /// Whether we host the rooms we join. Our own entry only; the
     /// Experimental tab sets it, and a join reads it as it starts.
     host_rooms: AtomicBool,
+    /// Whether tiles of people who could host have a border, brighter while
+    /// they carry the call. Our own entry only; the Experimental tab sets it.
+    show_routes: AtomicBool,
+    /// Their origin's hop while they say they host, as cleaned on arrival;
+    /// zero when they do not. Names them in a route's hop chain.
+    host_hop: AtomicU64,
+    /// Whether any presence document of theirs has arrived, so a route is
+    /// not read before we could know they host.
+    heard: AtomicBool,
+    /// Through whom their broadcasts reach us, as last read; `None` before
+    /// the first reading and after they leave.
+    arrival: std::sync::Mutex<Option<super::arrival::Arrival>>,
+    /// Where our own broadcasts go. Our own entry only; `None` outside a room.
+    sending: std::sync::Mutex<Option<super::arrival::Sending>>,
+    /// Where the room meets, when it is an endpoint we can name. Our own
+    /// entry only; `None` outside a room and in a room on a relay server.
+    meets_at: std::sync::Mutex<Option<super::arrival::MeetsAt>>,
     /// What we say about hosting this room, while we are serving it. Our own
     /// entry only; the presence announcer reads it. Carries the door.
     offer: std::sync::Mutex<Option<super::door::Offer>>,
+    /// Whether we follow and say where the call is moved. Our own entry
+    /// only; the Experimental tab sets it.
+    move_calls: AtomicBool,
+    /// Whether a join over several sessions keeps a spare offer of our media
+    /// on a second one. Our own entry only; the Experimental tab sets it,
+    /// and a join reads it as it goes.
+    spare_route: AtomicBool,
+    /// Where the call is, as the winning choice we heard or made; repeated
+    /// in our presence while `move_calls` is on. Our own entry only.
+    call_on: std::sync::Mutex<Option<super::moves::CallOn>>,
+    /// Whether they say they host the room, from their presence; what puts
+    /// "Move the call here" on their tile.
+    hosts_room: AtomicBool,
     /// Their report on their own link, as cleaned on arrival; for our own
     /// entry, the report we would send. `None` is not reporting.
     link: std::sync::Mutex<Option<Link>>,
@@ -865,7 +911,17 @@ impl Default for PeerStats {
             late_median: AtomicU32::new(UNKNOWN),
             connection_report: AtomicBool::new(true),
             host_rooms: AtomicBool::new(false),
+            show_routes: AtomicBool::new(false),
+            host_hop: AtomicU64::new(0),
+            heard: AtomicBool::new(false),
+            arrival: std::sync::Mutex::new(None),
+            sending: std::sync::Mutex::new(None),
+            meets_at: std::sync::Mutex::new(None),
             offer: std::sync::Mutex::new(None),
+            move_calls: AtomicBool::new(false),
+            spare_route: AtomicBool::new(true),
+            call_on: std::sync::Mutex::new(None),
+            hosts_room: AtomicBool::new(false),
             link: std::sync::Mutex::new(None),
             seen: std::sync::Mutex::new(BTreeMap::new()),
             reports: std::sync::Mutex::new(Reports::default()),
@@ -1186,6 +1242,75 @@ impl PeerStats {
         self.host_rooms.store(on, Ordering::Relaxed);
     }
 
+    /// Whether tiles show host borders. Meaningful on our own entry.
+    pub fn show_routes(&self) -> bool {
+        self.show_routes.load(Ordering::Relaxed)
+    }
+
+    pub fn set_show_routes(&self, on: bool) {
+        self.show_routes.store(on, Ordering::Relaxed);
+    }
+
+    /// Their origin's hop while they host, or `None`.
+    pub(super) fn host_hop(&self) -> Option<u64> {
+        match self.host_hop.load(Ordering::Relaxed) {
+            0 => None,
+            hop => Some(hop),
+        }
+    }
+
+    pub(super) fn set_host_hop(&self, hop: Option<u64>) {
+        self.host_hop.store(hop.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Whether they host the room, as they last said; for our own entry,
+    /// whether we serve it now.
+    pub fn hosting(&self) -> bool {
+        self.host_hop().is_some() || self.offer().is_some()
+    }
+
+    pub(super) fn heard(&self) -> bool {
+        self.heard.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set_heard(&self) {
+        self.heard.store(true, Ordering::Relaxed);
+    }
+
+    /// Through whom their broadcasts reach us.
+    pub fn arrival(&self) -> Option<super::arrival::Arrival> {
+        self.arrival.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub(super) fn set_arrival(&self, arrival: Option<super::arrival::Arrival>) {
+        if let Ok(mut slot) = self.arrival.lock() {
+            *slot = arrival;
+        }
+    }
+
+    /// Where our own broadcasts go. Meaningful on our own entry.
+    pub fn sending(&self) -> Option<super::arrival::Sending> {
+        self.sending.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub(super) fn set_sending(&self, sending: Option<super::arrival::Sending>) {
+        if let Ok(mut slot) = self.sending.lock() {
+            *slot = sending;
+        }
+    }
+
+    /// Where the room meets, when it is an endpoint. Meaningful on our own
+    /// entry.
+    pub fn meets_at(&self) -> Option<super::arrival::MeetsAt> {
+        self.meets_at.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub(super) fn set_meets_at(&self, at: Option<super::arrival::MeetsAt>) {
+        if let Ok(mut slot) = self.meets_at.lock() {
+            *slot = at;
+        }
+    }
+
     /// What we say about hosting the room we are in, while we serve it.
     pub(super) fn offer(&self) -> Option<super::door::Offer> {
         self.offer.lock().ok().and_then(|offer| offer.clone())
@@ -1195,6 +1320,73 @@ impl PeerStats {
         if let Ok(mut slot) = self.offer.lock() {
             *slot = offer;
         }
+    }
+
+    /// Whether we follow and say where the call is moved. Meaningful on our
+    /// own entry.
+    pub fn move_calls(&self) -> bool {
+        self.move_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn set_move_calls(&self, on: bool) {
+        self.move_calls.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether we keep a spare offer of our media beside the one in use.
+    /// Meaningful on our own entry; on unless turned off, as the setting is.
+    pub fn spare_route(&self) -> bool {
+        self.spare_route.load(Ordering::Relaxed)
+    }
+
+    pub fn set_spare_route(&self, on: bool) {
+        self.spare_route.store(on, Ordering::Relaxed);
+    }
+
+    /// Where the call is, as we follow it: the host's endpoint id, `None`
+    /// for the relay. `None` too while the switch is off, so turning it off
+    /// puts our media back in the automatic order at once.
+    pub fn call_host(&self) -> Option<String> {
+        self.followed_move().and_then(|on| on.to)
+    }
+
+    /// The choice we follow, while the switch is on.
+    pub(crate) fn followed_move(&self) -> Option<super::moves::CallOn> {
+        if !self.move_calls() {
+            return None;
+        }
+        self.call_on.lock().ok().and_then(|on| on.clone())
+    }
+
+    /// Takes in a choice someone said; true when it is now the one we follow.
+    pub(crate) fn hear_move(&self, heard: super::moves::CallOn) -> bool {
+        self.call_on.lock().is_ok_and(|mut on| super::moves::hear(&mut on, heard))
+    }
+
+    /// Moves the call to `to` (`None` is the relay), as `me`, winning over
+    /// whatever we follow now.
+    pub fn move_call(&self, to: Option<String>, me: &str) {
+        if let Ok(mut on) = self.call_on.lock() {
+            let mine = super::moves::choose(on.as_ref(), to, me);
+            tracing::info!("moving the call to {}", super::moves::describe(mine.to.as_deref()));
+            *on = Some(mine);
+        }
+    }
+
+    /// Forgets where the last call was, so a new one starts in the automatic
+    /// order rather than repeating an old room's choice.
+    pub(super) fn forget_moves(&self) {
+        if let Ok(mut on) = self.call_on.lock() {
+            *on = None;
+        }
+    }
+
+    /// Whether they say they host the room.
+    pub fn hosts_room(&self) -> bool {
+        self.hosts_room.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set_hosts_room(&self, on: bool) {
+        self.hosts_room.store(on, Ordering::Relaxed);
     }
 
     /// Their report on their link, or ours on our own entry.

@@ -700,7 +700,7 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
             return;
         }
     };
-    let (_catalog, mut producer) = match video_track(&mut broadcast, &mut config, SCREEN_PRIORITY).await {
+    let (catalog, mut producer) = match video_track(&mut broadcast, &mut config, SCREEN_PRIORITY).await {
         Ok(parts) => parts,
         Err(error) => {
             tracing::warn!("[share] {error}");
@@ -736,6 +736,9 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
     // A keyframe asked for before this share began is already answered: a
     // new encoder's first picture is one.
     keyframe.screen.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Written again as our routes change, as the camera's catalog is, so
+    // someone who joins after a move still finds the screen (`fresh.rs`).
+    let freshening = tokio::spawn(super::fresh::keep(catalog, keyframe.clone()));
     // Checked again: the announce is quick, but a stop can land during it,
     // and `sharing` must never be said by a share that is going. A stop seen
     // here also skips the loop, which must not poll a receiver `try_recv`
@@ -804,6 +807,7 @@ async fn share(source: ShareSource, call: Call, turn: u64, mut stop: oneshot::Re
     if local.share_is_current(turn) || !local.sharing() {
         shown.clear();
     }
+    freshening.abort();
     match &outcome {
         Ok(()) => tracing::info!("[share] stopped sharing {}", source.key()),
         Err(error) => {
@@ -862,7 +866,7 @@ struct Steering<'a> {
 /// `config` is unchanged.
 fn rebuild(
     encoder: &mut moq_video::encode::Encoder,
-    producer: &mut moq_video::encode::Producer,
+    producer: &mut super::fresh::Video,
     config: &mut moq_video::encode::Config,
     (width, height): (u32, u32),
     quality: ShareQuality,
@@ -920,7 +924,7 @@ async fn pump(
     source: &ShareSource,
     stream: &mut moq_video::capture::Stream,
     encoder: &mut moq_video::encode::Encoder,
-    producer: &mut moq_video::encode::Producer,
+    producer: &mut super::fresh::Video,
     config: &mut moq_video::encode::Config,
     steering: Steering<'_>,
 ) -> Result<(), String> {

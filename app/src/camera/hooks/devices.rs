@@ -50,6 +50,12 @@ fn use_devices() -> UseDevices {
 
     let refresh = use_callback(move |()| {
         let tx = tx.clone();
+        // The test pattern stands in for every camera, and a scan is not
+        // free of them: on Linux it probes each device node.
+        if crate::args::Args::get().test_pattern {
+            let _ = tx.unbounded_send(Vec::new());
+            return;
+        }
         // Enumeration hits platform APIs and can block for hundreds of
         // milliseconds, so it runs on a worker thread and reports back.
         let spawned = std::thread::Builder::new()

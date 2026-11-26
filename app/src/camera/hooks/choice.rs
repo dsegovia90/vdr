@@ -11,7 +11,7 @@ use std::rc::Rc;
 use cameras::{CameraSource, DeviceId, PixelFormat, Resolution, StreamConfig};
 use dioxus_native::prelude::*;
 
-use super::{UseCameraStream, UseDevices, use_camera_stream, use_shared_devices};
+use super::{UseCameraStream, UseDevices, use_camera_stream, use_pattern_stream, use_shared_devices};
 use crate::args::Args;
 use crate::camera::{FrameSlot, FrameTap};
 use crate::settings::{self, Settings};
@@ -101,7 +101,14 @@ pub fn use_camera_choice(slot: FrameSlot, tap: FrameTap) -> CameraChoice {
     let mut selected = use_signal::<Option<DeviceId>>(|| None);
     let enabled = use_signal(|| !Args::get().camera_off);
     let mut source = use_signal::<Option<CameraSource>>(|| None);
-    let stream = use_camera_stream(slot, source, CONFIG, Some(tap));
+    // Fixed for the life of the process, so the hooks called never change
+    // between renders.
+    let pattern = Args::get().test_pattern;
+    let stream = if pattern {
+        use_pattern_stream(slot, enabled, Some(tap))
+    } else {
+        use_camera_stream(slot, source, CONFIG, Some(tap))
+    };
 
     // What the user chose last launch. Read once: the file is ours, nothing
     // else writes it while we run.
@@ -135,6 +142,10 @@ pub fn use_camera_choice(slot: FrameSlot, tap: FrameTap) -> CameraChoice {
     // `None` either way stops the stream: it never falls through to whatever
     // other camera happens to be present.
     use_effect(move || {
+        // The pattern replaces the camera: no device is ever opened for it.
+        if pattern {
+            return;
+        }
         let next = if !enabled() {
             None
         } else {

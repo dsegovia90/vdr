@@ -17,18 +17,25 @@
 //! loopback -- which is why the renderer needs to know nothing about either.
 
 mod adapt;
+pub(crate) mod arrival;
 mod audio;
 mod call;
 mod codec_check;
+mod follow;
+mod forwarded;
+mod fresh;
 pub(crate) mod door;
 mod metrics;
 mod loopback;
+pub(crate) mod moves;
 pub(crate) mod quality;
+mod quiet;
 mod report;
 #[cfg(test)]
 mod routes;
 pub(crate) mod runtime;
 mod share;
+mod stamps;
 mod status;
 
 use std::sync::Arc;
@@ -316,13 +323,23 @@ pub fn use_remote() -> Remote {
         }
         let metrics = Arc::new(Metrics::default());
         let local = Arc::new(PeerStats::default());
-        // Our name, as last saved; the Profile tab changes it from here on.
-        local.set_name(saved.name.as_deref().and_then(crate::name::clean));
+        // Our name, as last saved or as this run was told; the Profile tab
+        // changes it from here on.
+        let name = crate::args::Args::get().name.as_deref().or(saved.name.as_deref());
+        local.set_name(name.and_then(crate::name::clean));
         // Whether we report our connection and show others'; the Experimental
         // tab changes it from here on, and the call reads it as it goes.
         local.set_connection_report(saved.connection_report_on());
         // Whether we host the rooms we join; read by each join as it starts.
         local.set_host_rooms(saved.hosts_rooms() || crate::args::Args::get().host_rooms);
+        // Whether we follow moves of the call; the Experimental tab changes it.
+        local.set_move_calls(saved.moves_calls() || crate::args::Args::get().move_calls);
+        // Whether tiles show the way each video arrives; the Experimental tab
+        // changes it from here on.
+        local.set_show_routes(saved.shows_routes() || crate::args::Args::get().show_routes);
+        // Whether a join keeps a spare offer of our media; the flag wins
+        // either way for its run, and the Experimental tab changes it.
+        local.set_spare_route(crate::args::Args::get().spare_route.unwrap_or(saved.keeps_spare_route()));
         // The camera and microphone as launched. Our entry starts "on" for
         // both, and only a click changes it, so without this a camera started
         // off was announced as on, and so was a microphone that `--no-audio`

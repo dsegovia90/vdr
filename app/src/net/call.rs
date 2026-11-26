@@ -42,13 +42,14 @@ use std::sync::Arc;
 
 use futures_channel::mpsc::UnboundedSender;
 use futures_util::StreamExt as _;
-use moq_mux::catalog::Stream as _;
 
 #[path = "sessions.rs"]
 mod sessions;
 
 use super::adapt;
+use super::arrival;
 use super::audio;
+use super::quiet;
 use super::door;
 use super::runtime::runtime;
 use super::share::{self, ShareWish};
@@ -56,6 +57,8 @@ use super::status::RemoteStatus;
 use super::{Feed, ParticipantEvent};
 use crate::args::Peering;
 use super::Metrics;
+use super::follow;
+use super::forwarded::Forwarded;
 use super::metrics::{Ask, Clock, Counts, FpsMeter, Path, PeerStats, Request, classify};
 use super::quality::{self, Link, Seen};
 use crate::audio::Controls;
@@ -149,14 +152,35 @@ async fn watch_path(endpoint: moq_tokio::iroh::Endpoint, metrics: Arc<Metrics>) 
 /// Timed by the elapsed time actually measured rather than the nominal second,
 /// so a late tick does not read as a burst. Writes atomics only: nothing here
 /// wakes the page, which samples [`Metrics`] on its own schedule.
-async fn meter_sent(metrics: Arc<Metrics>) {
+///
+/// A host's forwarded traffic is read on the same tick, before the second is
+/// kept, so each second's figures belong together; its summary is logged when
+/// this ends with the attempt.
+async fn meter_sent(metrics: Arc<Metrics>, forwarded: Option<Arc<Forwarded>>) {
+    let _summary = forwarded.clone().map(Summarise);
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last = ticker.tick().await;
     loop {
         let now = ticker.tick().await;
-        metrics.tick_sent(now.duration_since(last));
+        let elapsed = now.duration_since(last);
+        if let Some(forwarded) = &forwarded {
+            metrics.set_hosting(forwarded.sample(elapsed, metrics.estimate_kbps()));
+        }
+        metrics.tick_sent(elapsed);
         last = now;
+    }
+}
+
+/// Logs what hosting came to when the meter is dropped, which is how an
+/// attempt ends: aborted, not returned from.
+struct Summarise(Arc<Forwarded>);
+
+impl Drop for Summarise {
+    fn drop(&mut self) {
+        if let Some(summary) = self.0.summary() {
+            tracing::info!("{summary}");
+        }
     }
 }
 
@@ -176,24 +200,42 @@ struct Connect<'a> {
     keyframe: Arc<Keyframes>,
 }
 
-/// Set when a session comes back, read by the encode loops: a subscriber that
-/// rejoins mid-stream cannot decode until a keyframe arrives.
+/// What a change of route asks of what we publish, read by the encode loops
+/// and our catalogs' writers.
+///
+/// A session that comes back asks for a keyframe: a subscriber that rejoins
+/// mid-stream cannot decode until one arrives. Every change that can move
+/// our offer, that one included, also has our catalogs written again
+/// (`fresh.rs`), counted in `routes`.
 ///
 /// **One flag per encode loop.** Each loop `swap`s its flag back to false as
 /// it acts on it, so a single flag read by the camera and the screen would
 /// give the keyframe to whichever loop looked first and leave the other
-/// frozen.
+/// frozen. The count is only read, never taken, so any number of catalogs
+/// can follow it.
 #[derive(Default)]
 pub(super) struct Keyframes {
     pub camera: std::sync::atomic::AtomicBool,
     pub screen: std::sync::atomic::AtomicBool,
+    routes: std::sync::atomic::AtomicU64,
 }
 
 impl Keyframes {
-    /// Asks every loop for a keyframe.
+    /// Asks every loop for a keyframe, and every catalog to be written again.
     fn ask(&self) {
         self.camera.store(true, std::sync::atomic::Ordering::Relaxed);
         self.screen.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.rerouted();
+    }
+
+    /// Says our offer may have moved, so every catalog is written again.
+    pub(super) fn rerouted(&self) {
+        self.routes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many changes of route have been said so far.
+    pub(super) fn routes(&self) -> u64 {
+        self.routes.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -356,6 +398,15 @@ struct Serve<'a> {
     /// guests' links must not steer what we send; see [`host_alongside`].
     estimates: Option<Arc<adapt::Estimates>>,
     metrics: Arc<Metrics>,
+    /// Where a host counts what it sends each guest; `None` for a listener.
+    forwarded: Option<Arc<Forwarded>>,
+    /// Where each guest's session hop is kept while it lasts, so a route
+    /// straight from a guest reads as direct; `None` where nothing reads it.
+    guests: Option<Arc<arrival::Guests>>,
+    /// Where the last time any guest's session heard anything is kept, for a
+    /// join beside this to tell its own link from its relay's; `None` where
+    /// nothing reads it.
+    heard: Option<Arc<quiet::Heard>>,
 }
 
 /// Starts accepting sessions on our endpoint, for as long as the returned
@@ -373,6 +424,9 @@ async fn serve(
         door,
         estimates,
         metrics,
+        forwarded,
+        guests,
+        heard,
     } = args;
     let mut server_config = moq_tokio::server::Config::default();
     server_config.listen.bind = Some(moq_tokio::listen::Bind::Addr(
@@ -391,7 +445,7 @@ async fn serve(
         .bind()
         .await
         .map_err(|error| format!("could not listen: {error:#}"))?;
-    Ok(accept(server, door, estimates, metrics))
+    Ok(accept(server, door, estimates, metrics, forwarded, guests, heard))
 }
 
 /// The accept loop, apart from the server it runs on so it can be driven over
@@ -413,6 +467,9 @@ fn accept(
     door: Option<door::Hosting>,
     estimates: Option<Arc<adapt::Estimates>>,
     metrics: Arc<Metrics>,
+    forwarded: Option<Arc<Forwarded>>,
+    guests: Option<Arc<arrival::Guests>>,
+    heard: Option<Arc<quiet::Heard>>,
 ) -> (Abort, futures_channel::mpsc::UnboundedReceiver<bool>) {
     let (events, receiver) = futures_channel::mpsc::unbounded::<bool>();
     let task = Abort(tokio::spawn(async move {
@@ -434,22 +491,58 @@ fn accept(
                 continue;
             }
             let _ = events.unbounded_send(true);
+            let request = match &forwarded {
+                Some(forwarded) => request.with_stats(forwarded.guest()),
+                None => request,
+            };
             let estimates = estimates.clone();
             let metrics = metrics.clone();
             let events = events.clone();
+            let heard = heard.clone();
+            // The hop the guest declared, kept while its session lives.
+            let declared = guests.clone().zip(request.peer_hop().map(|hop| hop.id()).filter(|&hop| hop != 0));
+            if let Some((guests, hop)) = &declared {
+                guests.add(*hop);
+            }
             sessions.spawn(async move {
-                match (request.ok().await, estimates) {
+                let session = request.ok().await;
+                // Ends with this task, so it never outlives the session.
+                let _sampling = match (&session, heard) {
+                    (Ok(session), Some(heard)) => Some(Abort(tokio::spawn(sample_heard(session.clone(), heard)))),
+                    _ => None,
+                };
+                match (session, estimates) {
                     (Ok(session), Some(estimates)) => adapt::forward(session, estimates, metrics).await,
                     (Ok(session), None) => {
                         let _ = session.closed().await;
                     }
                     (Err(error), _) => tracing::warn!("a session failed to start: {error:#}"),
                 }
+                if let Some((guests, hop)) = declared {
+                    guests.remove(hop);
+                }
                 let _ = events.unbounded_send(false);
             });
         }
     }));
     (task, receiver)
+}
+
+/// Notes in `heard` whenever a guest's session receives anything, on the
+/// join's own cadence: a host's evidence that its link works while its relay
+/// says nothing. Holds a handle on the session only while it is sampled.
+async fn sample_heard(session: moq_net::Session, heard: Arc<quiet::Heard>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last = None;
+    loop {
+        ticker.tick().await;
+        let bytes = session.stats().bytes_received;
+        if bytes.is_some() && bytes != last {
+            heard.heard(std::time::Instant::now());
+            last = bytes;
+        }
+    }
 }
 
 /// Query parameters that carry a way in: a relay's token, a host's door, and
@@ -670,6 +763,13 @@ struct Presence {
     /// `Debug` leaves it out.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "door::lenient_offer")]
     host: Option<door::Offer>,
+    /// Where they follow the call to, while they have moving the call
+    /// switched on: absent otherwise, so a document without it is
+    /// byte-for-byte what a build without moves sends, and such a build
+    /// ignores the field. **Read leniently** (`moves::lenient`): a bad value
+    /// costs only itself.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "super::moves::lenient")]
+    moved: Option<super::moves::CallOn>,
 }
 
 impl Default for Presence {
@@ -686,6 +786,7 @@ impl Default for Presence {
             link: None,
             seen: std::collections::BTreeMap::new(),
             host: None,
+            moved: None,
         }
     }
 }
@@ -715,6 +816,9 @@ impl Presence {
             },
             // Set only while we serve the room; cleaned on the way out too.
             host: local.offer().and_then(door::Offer::clean),
+            // The winner we follow, repeated, so a choice outlives whoever
+            // made it. Cleaned on the way out too.
+            moved: local.followed_move().and_then(super::moves::CallOn::clean),
         }
     }
 }
@@ -769,7 +873,7 @@ fn participant_of(path: &str) -> Option<&str> {
 const TRACK: &str = "video.avc3";
 
 /// The encoder's pacing hint, not a promise. Matches the loopback.
-const FRAMERATE: u32 = 30;
+pub(super) const FRAMERATE: u32 = 30;
 
 /// Set once a hardware encoder has failed mid-call, so every later attempt in
 /// this process uses software. One failure is enough to stop trusting a driver:
@@ -808,8 +912,8 @@ pub(super) async fn video_track(
     broadcast: &mut moq_net::broadcast::Producer,
     config: &mut moq_video::encode::Config,
     priority: u8,
-) -> Result<(moq_mux::catalog::Producer, moq_video::encode::Producer), String> {
-    let catalog = moq_mux::catalog::Producer::new(broadcast, Default::default())
+) -> Result<(super::fresh::Catalog, super::fresh::Video), String> {
+    let catalog = super::fresh::catalog(broadcast)
         .map_err(|error| format!("could not create a catalog: {error:#}"))?;
     let producer = add_video(broadcast, &catalog, config, priority).await?;
     Ok((catalog, producer))
@@ -820,10 +924,10 @@ pub(super) async fn video_track(
 /// arrives, after the microphone and possibly mid-call.
 async fn add_video(
     broadcast: &moq_net::broadcast::Producer,
-    catalog: &moq_mux::catalog::Producer,
+    catalog: &super::fresh::Catalog,
     config: &mut moq_video::encode::Config,
     priority: u8,
-) -> Result<moq_video::encode::Producer, String> {
+) -> Result<super::fresh::Video, String> {
     config.kind = encoder_kind();
     let rendition = match config.probe().await {
         Ok(rendition) => rendition,
@@ -840,7 +944,7 @@ async fn add_video(
     let track = broadcast
         .create_track(TRACK, catalog.track_info(priority))
         .map_err(|error| format!("could not create a track: {error:#}"))?;
-    moq_video::encode::Producer::with_track(track, catalog.clone(), rendition)
+    super::fresh::Video::with_track(track, catalog.clone(), rendition)
         .map_err(|error| format!("could not publish video: {error:#}"))
 }
 
@@ -1090,8 +1194,11 @@ async fn run(
             .create_broadcast(camera_path(&me.to_string()))
             .map_err(|error| format!("could not create a broadcast: {error:#}"))?;
         // One catalog for the microphone now and the camera whenever it comes.
-        let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default())
+        let catalog = super::fresh::catalog(&mut broadcast)
             .map_err(|error| format!("could not create a catalog: {error:#}"))?;
+        // Written again as our routes change and every few seconds, so
+        // someone who joins after a move is not left without it.
+        let _freshening = Abort(tokio::spawn(super::fresh::keep(catalog.clone(), keyframe.clone())));
 
         // Announced beside the camera, and said before anything is shown: the
         // peer knows we are here whether or not a frame ever arrives.
@@ -1100,12 +1207,7 @@ async fn run(
             .map_err(|error| format!("could not create a control broadcast: {error:#}"))?;
         let presence = control
             .create_track(PRESENCE, None)
-            .map(|track| {
-                moq_json::snapshot::Producer::new(
-                    track,
-                    moq_json::snapshot::Config::default(),
-                )
-            })
+            .map(Said::new)
             .map_err(|error| format!("could not create a presence track: {error:#}"))?;
         // Shared with the announcer below and with the leave sequence. A plain
         // mutex: every use is a quick update, never held across an await.
@@ -1173,7 +1275,11 @@ async fn run(
         // join is wired exactly as it always was, two origins, until a change
         // to everyone's has been tried by hand.
         let host_rooms = local.host_rooms();
+        // Where the last call was moved says nothing about this one.
+        local.forget_moves();
         let shared = shares_origin(&peering, host_rooms);
+        // Only a host passes on other people's media, so only a host counts it.
+        let forwarded = shared.then(|| Forwarded::new(me.to_string()));
         let inbound = inbound_for(&outbound, shared);
         // Where else the room can meet, as the interface put it with the
         // decision. A join with somewhere else to go, or one we host, holds
@@ -1207,6 +1313,29 @@ async fn run(
             Peering::Dial(_) | Peering::Listen | Peering::Host(_) => true,
             Peering::Loopback | Peering::Idle => false,
         };
+        // What reading each person's route needs beside the chain itself.
+        let routing = Routing {
+            guests: Arc::new(arrival::Guests::default()),
+            ours: outbound.hop().id(),
+            far: match &peering {
+                Peering::Join(url) if url.scheme() == "iroh" => url.host_str().map(str::to_string),
+                _ => None,
+            },
+        };
+        // Where our media goes, for our own tile. A join over several sessions
+        // says it as it moves (see `sessions`).
+        local.set_sending(match &peering {
+            Peering::Join(_) if !several => Some(arrival::Sending::Relay),
+            Peering::Host(_) => Some(arrival::Sending::Guests),
+            _ => None,
+        });
+        // For the host borders: without a relay server, the endpoint the room
+        // meets at is a person, who carries everyone else's media.
+        local.set_meets_at(match &peering {
+            Peering::Host(_) => Some(arrival::MeetsAt::Us),
+            Peering::Join(_) => routing.far.clone().map(arrival::MeetsAt::Endpoint),
+            _ => None,
+        });
         let peer_transport: Peer = match peering {
             Peering::Dial(peer) => {
                 report(RemoteStatus::Dialing {
@@ -1254,6 +1383,7 @@ async fn run(
                 // on, and so a relay that is down cannot hold it up.
                 let guests = moq_net::bandwidth::Producer::new();
                 let guests_link = guests.consume();
+                let heard = Arc::new(quiet::Heard::default());
                 if shared {
                     alongside = host_alongside(Alongside {
                         config: &client_config,
@@ -1263,14 +1393,31 @@ async fn run(
                         doors: &doors,
                         estimates: adapt::Estimates::new(guests),
                         local: local.clone(),
+                        forwarded: forwarded.clone(),
+                        guests: routing.guests.clone(),
+                        heard: heard.clone(),
                     })
                     .await;
                 }
-                let client = client_config
-                    .clone()
+                // A healthy session to an `http(s)` relay then hears
+                // something at least every second, which is what lets a join
+                // leave one that went quiet after two (see `quiet`). Only
+                // here: a join with one session has nothing to compare with,
+                // and is left as it was. iroh sessions ignore it.
+                let mut several_config = client_config.clone();
+                several_config.quic.keep_alive = quiet::KEEP_ALIVE;
+                let client = several_config
                     .init()
                     .map_err(|error| format!("could not build a client: {error:#}"))?
                     .with_iroh(endpoint.clone());
+                // A scripted run's choice, said as the join starts.
+                if let Some(to) = crate::args::Args::get().move_call.clone() {
+                    local.move_call(to, &me.to_string());
+                }
+                let client = match &forwarded {
+                    Some(forwarded) => client.with_stats(forwarded.outgoing()),
+                    None => client,
+                };
                 sessions::join(sessions::Join {
                     client,
                     me: me.to_string(),
@@ -1280,11 +1427,13 @@ async fn run(
                     hosting: shared,
                     estimate: estimate.clone(),
                     guests: alongside.is_some().then_some(guests_link),
+                    heard: alongside.is_some().then_some(heard),
                     metrics: metrics.clone(),
                     local: local.clone(),
                     status: status.clone(),
                     keyframe: keyframe.clone(),
                     room,
+                    bounce: crate::args::Args::get().bounce,
                 })
             }
             Peering::Listen => {
@@ -1307,6 +1456,9 @@ async fn run(
                     door: None,
                     estimates: Some(adapt::Estimates::new(estimate.clone())),
                     metrics: metrics.clone(),
+                    forwarded: None,
+                    guests: None,
+                    heard: None,
                 })
                 .await?;
                 let status = status.clone();
@@ -1383,8 +1535,15 @@ async fn run(
                     door: Some(hosting.clone()),
                     estimates: Some(adapt::Estimates::new(estimate.clone())),
                     metrics: metrics.clone(),
+                    forwarded: forwarded.clone(),
+                    guests: Some(routing.guests.clone()),
+                    // Hosting alone, there is no relay to judge.
+                    heard: None,
                 })
                 .await?;
+                if let Some(forwarded) = &forwarded {
+                    forwarded.set_serving(true);
+                }
                 // **Stdout, not the log.** The invite carries the door, and
                 // the log file is what people attach to bug reports. Quoted,
                 // because an unquoted `?` is a glob to zsh.
@@ -1450,7 +1609,7 @@ async fn run(
             })
         });
         let pathing = over_iroh.then(|| Abort(tokio::spawn(watch_path(endpoint.clone(), metrics.clone()))));
-        let metering = Abort(tokio::spawn(meter_sent(metrics.clone())));
+        let metering = Abort(tokio::spawn(meter_sent(metrics.clone(), forwarded.clone())));
 
         // The person's wish to share a screen, served for this attempt. Its
         // own broadcast on the same outbound origin, so a share started now
@@ -1493,6 +1652,7 @@ async fn run(
                     controls: controls.clone(),
                 },
                 news,
+                routing,
             },
             engine,
         ));
@@ -1603,10 +1763,11 @@ async fn run(
                 );
                 // A hardware encoder failing mid-call demotes the rest of this
                 // run to software; the call's own retry then reopens on it.
-                if outcome.is_err() && encoder.name() != SOFTWARE_ENCODER {
+                if demotes(&outcome, encoder.name()) {
                     tracing::warn!("[video] {} failed mid-call; software from now on", encoder.name());
                     HARDWARE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                let outcome = outcome.map_err(Stopped::into_message);
                 if let Ok(flushed) = encoder.flush() {
                     if !flushed.is_empty() && producer.publish(&flushed).is_ok() {
                         metrics.camera_sent(payload_bytes(&flushed));
@@ -1753,6 +1914,9 @@ async fn run(
         // The subroom was in a room that is gone now: the next call starts in
         // its main room, not in a name nobody else is using.
         local.set_room(None);
+        // Out of the room, our media goes nowhere.
+        local.set_sending(None);
+        local.set_meets_at(None);
         // Aborting the loop above stops the per-participant tasks with it, but
         // the tiles are the interface's and have to be taken down by name.
         let _ = participants.unbounded_send(ParticipantEvent::Cleared);
@@ -1803,12 +1967,40 @@ pub(super) fn payload_bytes(encoded: &[moq_video::encode::Encoded]) -> usize {
     encoded.iter().map(|frame| frame.payload.len()).sum()
 }
 
+/// How the camera's encode loop ended badly.
+///
+/// **Only the encoder's own failure says anything about the encoder.** A
+/// publish that fails is the track's or the session's, and treating it as
+/// the hardware encoder failing would put the rest of the process on
+/// software for a fault the encoder never had.
+#[derive(Debug)]
+enum Stopped {
+    /// The encoder could not encode a frame.
+    Encoder(String),
+    /// What it encoded could not be published.
+    Publish(String),
+}
+
+impl Stopped {
+    fn into_message(self) -> String {
+        match self {
+            Self::Encoder(message) | Self::Publish(message) => message,
+        }
+    }
+}
+
+/// Whether an encode loop that ended with `outcome`, on the encoder named
+/// `encoder`, is a hardware encoder failing.
+fn demotes(outcome: &Result<(), Stopped>, encoder: &str) -> bool {
+    matches!(outcome, Err(Stopped::Encoder(_))) && encoder != SOFTWARE_ENCODER
+}
+
 fn encode(
     feed: &mut FrameFeed,
     encoder: &mut moq_video::encode::Encoder,
-    producer: &mut moq_video::encode::Producer,
+    producer: &mut super::fresh::Video,
     steering: Steering<'_>,
-) -> Result<(), String> {
+) -> Result<(), Stopped> {
     let Steering {
         scale,
         lane,
@@ -1817,6 +2009,9 @@ fn encode(
         local,
         metrics,
     } = steering;
+    // For as long as this producer: the camera turned off and on again is
+    // the same track, and its timeline must keep rising (see `stamps`).
+    let mut rising = super::stamps::Rising::default();
     loop {
         // The only way out other than the camera going away. Checked per frame
         // rather than per sleep, so a busy encoder still notices promptly.
@@ -1854,9 +2049,9 @@ fn encode(
         let Some(surface) = frame.to_i420_surface(scale) else {
             continue;
         };
+        let stamp = rising.stamp(frame.timestamp.as_micros() as u64);
         // The encoder paces on these, so a wrong one stalls the stream.
-        let Ok(timestamp) = moq_net::Timestamp::from_micros(frame.timestamp.as_micros() as u64)
-        else {
+        let Ok(timestamp) = moq_net::Timestamp::from_micros(stamp) else {
             tracing::warn!("frame timestamp out of range; skipping");
             continue;
         };
@@ -1864,14 +2059,31 @@ fn encode(
         // document to carry. Taken as the frame is encoded, a few ms after
         // capture, so measured delays read that much short -- small next to
         // what is being measured, and stated where the numbers are reported.
-        local.set_clock(Clock::now(frame.timestamp.as_micros() as u64));
+        // The published stamp, not the capture's: it is what a viewer reads.
+        local.set_clock(Clock::now(stamp));
         let encoded = encoder
             .encode(&moq_video::Frame::new(surface, timestamp))
-            .map_err(|error| format!("encode failed: {error:#}"))?;
+            .map_err(|error| Stopped::Encoder(format!("encode failed: {error:#}")))?;
         if !encoded.is_empty() {
-            producer
-                .publish(&encoded)
-                .map_err(|error| format!("publish failed: {error:#}"))?;
+            if let Err(error) = producer.publish(&encoded) {
+                match super::stamps::refusal(&error) {
+                    // Skipped, and a keyframe asked for, since what follows
+                    // a skipped frame cannot be decoded without one.
+                    Some(refusal) => {
+                        if refusal == super::stamps::Refusal::Rewind {
+                            tracing::warn!("[video] the track refused a frame stamped below its edge; skipping it and moving on");
+                            rising.refused();
+                        } else {
+                            tracing::debug!("[video] skipping a frame until the next keyframe");
+                        }
+                        if let Err(error) = encoder.cut() {
+                            tracing::warn!("could not ask the encoder for a keyframe: {error:#}");
+                        }
+                        continue;
+                    }
+                    None => return Err(Stopped::Publish(format!("publish failed: {error:#}"))),
+                }
+            }
             metrics.camera_sent(payload_bytes(&encoded));
             metrics.camera_frames(encoded.len());
         }
@@ -1900,6 +2112,19 @@ struct Reports {
     rooms: audio::Rooms,
     /// Where hosts heard in this room are reported, on a join.
     news: Option<RoomNews>,
+    /// What reading each person's route needs beside its chain.
+    routing: Routing,
+}
+
+/// What reading a route needs beside its hop chain (see `arrival`).
+struct Routing {
+    /// Our guests' session hops, while we host.
+    guests: Arc<arrival::Guests>,
+    /// Our own origin's hop.
+    ours: u64,
+    /// The endpoint id we joined at, over iroh: a person, when the room is
+    /// hosted with `--host`, or else a relay that is never in the room.
+    far: Option<String>,
 }
 
 /// Watches who is here, and gives each of them a tile and a decoder.
@@ -1927,6 +2152,7 @@ async fn attend(
         in_room,
         rooms,
         news,
+        routing,
     } = reports;
     // The stats file, if asked for (`--stats`). A file that cannot be opened is
     // a line in the log, not a failed call.
@@ -1947,6 +2173,9 @@ async fn attend(
     // same operation as the attempt ending.
     let mut attending: std::collections::HashMap<String, Vec<Abort>> =
         std::collections::HashMap::new();
+    // When each person's camera last went, so its return can say how long
+    // their tile was gone: what a move of the call is judged by from logs.
+    let mut gone: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
     // **Cloned per participant, never taken.** Clones of an engine share its
     // device and its mix, so each peer becomes one more sink in the same output
     // -- and the echo canceller, built from this engine, subtracts that whole
@@ -1974,6 +2203,12 @@ async fn attend(
         rooms: rooms.clone(),
         seen: Arc::default(),
     };
+    // Each person's route, as the hop chain of their control broadcast's
+    // announcement: everything of theirs is offered the same way, and this
+    // one is there whether or not a camera is. Read once a second rather than
+    // as it changes, so a host's presence has had time to name its hop.
+    let mut chains: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+    let mut routes: std::collections::HashMap<String, arrival::Arrival> = std::collections::HashMap::new();
 
     loop {
         let update = tokio::select! {
@@ -1983,6 +2218,7 @@ async fn attend(
             },
             _ = stats_tick.tick() => {
                 reporter.tick(std::time::Instant::now(), &metrics, &rooms.local, &people, &present, &me);
+                note_routes(&chains, &people, &mut routes, &routing, in_room);
                 if let Some(file) = stats_file.as_mut() {
                     write_stats(file, &me, &people, &metrics);
                 }
@@ -2011,6 +2247,21 @@ async fn attend(
         if owner == Some(me.as_str()) {
             continue;
         }
+        if let Some(id) = controller_of(&path) {
+            match update.kind {
+                moq_net::announce::Kind::Retracted => {
+                    chains.remove(id);
+                    if routes.remove(id).is_some() {
+                        if let Some(stats) = people.get(id) {
+                            stats.set_arrival(None);
+                        }
+                    }
+                }
+                _ => {
+                    chains.insert(id.to_string(), update.route.hops.as_slice().iter().map(|hop| hop.id()).collect());
+                }
+            }
+        }
         // An announcement names a path; the broadcast is asked for by that path.
         // A re-priced route changes nothing we act on, and a retraction is the
         // goodbye, carried as `None` the way the old cursor carried it.
@@ -2036,6 +2287,7 @@ async fn attend(
                     listening.insert(
                         id.to_string(),
                         Abort(tokio::spawn(listen(
+                            inbound.clone(),
                             broadcast,
                             id.to_string(),
                             saying.clone(),
@@ -2108,6 +2360,10 @@ async fn attend(
                     sharing.insert(
                         id.to_string(),
                         Abort(tokio::spawn(watch(
+                            follow::Asking {
+                                inbound: inbound.clone(),
+                                path: path.clone(),
+                            },
                             broadcast,
                             slot,
                             format!("{id}/screen"),
@@ -2150,6 +2406,7 @@ async fn attend(
 
         let Some(broadcast) = broadcast else {
             tracing::info!("{id} left");
+            gone.insert(id.to_string(), std::time::Instant::now());
             attending.remove(id);
             // Forgotten once all of their broadcasts are gone, so a rejoin
             // with the same key starts from "on" rather than their last word.
@@ -2164,6 +2421,9 @@ async fn attend(
         };
 
         tracing::info!("{id} joined");
+        if let Some(left) = gone.remove(id) {
+            tracing::info!("{id} back after {} ms", left.elapsed().as_millis());
+        }
         let slot = FrameSlot::default();
         let stats = people.entry(id.to_string()).or_default().clone();
         let _ = participants.unbounded_send(ParticipantEvent::Joined {
@@ -2174,6 +2434,10 @@ async fn attend(
         });
 
         let mut tasks = vec![Abort(tokio::spawn(watch(
+            follow::Asking {
+                inbound: inbound.clone(),
+                path: path.clone(),
+            },
             broadcast.clone(),
             slot,
             id.to_string(),
@@ -2189,8 +2453,12 @@ async fn attend(
                 static IGNORED: std::sync::Once = std::sync::Once::new();
                 IGNORED.call_once(|| tracing::warn!("--audio-stall is for --loopback only; ignored in a call"));
             }
+            let asking = follow::Asking {
+                inbound: inbound.clone(),
+                path: path.clone(),
+            };
             tasks.push(Abort(tokio::spawn(async move {
-                audio::subscribe(broadcast, peer, engine, stats, Some(rooms), None).await;
+                audio::subscribe(Some(asking), broadcast, peer, engine, stats, Some(rooms), None).await;
             })));
         } else if !crate::args::Args::get().no_audio {
             tracing::warn!("[audio] {id} cannot be heard: there is no output device");
@@ -2199,14 +2467,100 @@ async fn attend(
     }
 }
 
+/// Reads each person's route from the chain last announced to us, and on a
+/// change sets it on their entry (which their tile polls) and logs it, so a
+/// scripted run can be judged from the log. Nobody is read before their
+/// presence has arrived: until then, a host would read as the relay.
+///
+/// Outside a room (a call dialled to one peer) there is nobody between.
+fn note_routes(
+    chains: &std::collections::HashMap<String, Vec<u64>>,
+    people: &std::collections::HashMap<String, Arc<PeerStats>>,
+    said: &mut std::collections::HashMap<String, arrival::Arrival>,
+    routing: &Routing,
+    in_room: bool,
+) {
+    let hosts: std::collections::BTreeMap<u64, String> = people
+        .iter()
+        .filter_map(|(id, stats)| stats.host_hop().map(|hop| (hop, id.clone())))
+        .collect();
+    let guests = routing.guests.hops();
+    let far = routing.far.as_deref().filter(|far| people.contains_key(*far));
+    for (id, hops) in chains {
+        let Some(stats) = people.get(id).filter(|stats| stats.heard()) else { continue };
+        let arrival = if in_room {
+            arrival::read(
+                hops,
+                &arrival::Known {
+                    theirs: stats.host_hop(),
+                    hosts: &hosts,
+                    guests: &guests,
+                    ours: routing.ours,
+                    far,
+                    who: id,
+                },
+            )
+        } else {
+            Some(arrival::Arrival::Direct)
+        };
+        let Some(arrival) = arrival else { continue };
+        if said.get(id) != Some(&arrival) {
+            tracing::info!("{id} now arrives {}", arrival::arrival_log(&arrival));
+            stats.set_arrival(Some(arrival.clone()));
+            said.insert(id.clone(), arrival);
+        }
+    }
+}
+
+/// The moq-json shape [`Said`] writes, for tests that stand in for a peer:
+/// every document a group of its own, plain JSON, no deltas.
+#[cfg(test)]
+fn presence_config() -> moq_json::snapshot::Config {
+    moq_json::snapshot::Config::default().with_delta_ratio(0)
+}
+
+/// Our presence track: **every document a group of its own**, as the library
+/// writes its catalogs, never a snapshot followed by deltas. The library
+/// carries a subscription across a change of route at a group boundary; a
+/// group held open for deltas has none, and a reader of one was seen to stall
+/// for good, with no error, at the first move of the call -- every move
+/// changes routes.
+///
+/// **And every document said is written, changed or not.** moq-json's own
+/// producer writes nothing for a value equal to the last, and with the camera
+/// off and nothing else happening every document is the same. A reader
+/// carried across a change of route waits for the next group, and a relay
+/// holding such a read attaches anyone who asks later to it (`fresh.rs`), so
+/// someone joining after a move could go without our presence -- our name,
+/// our camera, where the call is -- until we next changed something. Written
+/// each time, the announcer's re-saying every [`CLOCK_EVERY`] bounds that.
+///
+/// The bytes are what moq-json writes for one document with no deltas and no
+/// compression, so every reader, an older build's included, reads them as it
+/// always has.
+struct Said(moq_net::track::Producer);
+
+impl Said {
+    fn new(track: moq_net::track::Producer) -> Self {
+        Self(track)
+    }
+
+    fn write(&mut self, presence: &Presence) -> Result<(), String> {
+        let document = serde_json::to_vec(presence).map_err(|error| format!("{error:#}"))?;
+        self.0
+            .write_frame(moq_net::Timestamp::now(), document)
+            .map_err(|error| format!("{error:#}"))
+    }
+}
+
 /// Publishes one presence document, logging rather than failing: a word that
 /// does not get out is a degraded call, not a broken one.
-fn say(presence: &std::sync::Mutex<moq_json::snapshot::Producer<Presence>>, now: Presence) {
+fn say(presence: &std::sync::Mutex<Said>, now: Presence) {
     let Ok(mut presence) = presence.lock() else {
         return;
     };
-    if let Err(error) = presence.update(&now) {
-        tracing::warn!("could not publish our presence: {error:#}");
+    if let Err(error) = presence.write(&now) {
+        tracing::warn!("could not publish our presence: {error}");
     }
 }
 
@@ -2217,7 +2571,7 @@ fn say(presence: &std::sync::Mutex<moq_json::snapshot::Producer<Presence>>, now:
 /// a notification channel, and a quarter-second lag on "camera off" is not
 /// something anyone can see. Runs until the call aborts it.
 async fn announce(
-    presence: Arc<std::sync::Mutex<moq_json::snapshot::Producer<Presence>>>,
+    presence: Arc<std::sync::Mutex<Said>>,
     local: Arc<PeerStats>,
 ) {
     let mut said = Presence::here(&local);
@@ -2229,8 +2583,10 @@ async fn announce(
         let now = Presence::here(&local);
         // What a person did, for the log. The connection report changes with
         // the link, and is only logged as it starts and stops.
-        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name, now.link.is_some(), &now.host)
-            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name, said.link.is_some(), &said.host);
+        // A move of the call is in it too: followers act on it as it is said,
+        // so it must not wait for the clock refresh.
+        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name, now.link.is_some(), &now.host, &now.moved)
+            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name, said.link.is_some(), &said.host, &said.moved);
         if changed {
             let asking = match now.requests.len() {
                 0 => String::new(),
@@ -2242,8 +2598,14 @@ async fn announce(
             let reporting = if now.link.is_some() { ", reporting the connection" } else { "" };
             // Whether, never the door.
             let hosting = if now.host.is_some() { ", hosting" } else { "" };
+            // Where we say the call is, so a scripted run can see the
+            // choice leave the chooser and each follower repeat it.
+            let moved = match &now.moved {
+                Some(on) => format!(", call on {}", super::moves::describe(on.to.as_deref())),
+                None => String::new(),
+            };
             tracing::info!(
-                "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}{hosting}",
+                "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}{hosting}{moved}",
                 on_off(now.camera),
                 on_off(now.mic),
                 room_name(&now.room)
@@ -2321,10 +2683,12 @@ fn write_stats(
         lines.push('\n');
     }
     let aec = metrics.aec().unwrap_or_default();
+    let hosting = metrics.hosting();
     let link = serde_json::json!({
         "t": t, "me": me, "link": true,
         "rtt_ms": metrics.rtt(), "loss_pct": metrics.loss(), "up_kbps": metrics.send_kbps(),
         "camera_cap_kbps": metrics.camera_cap_kbps(), "camera_sent_kbps": metrics.camera_sent_kbps(),
+        "camera_sent_fps": metrics.camera_fps(),
         "share_cap_kbps": metrics.share_cap_kbps(), "share_sent_kbps": metrics.share_sent_kbps(),
         "estimate_kbps": metrics.estimate_kbps(),
         "camera_slice_kbps": metrics.camera_slice_kbps(),
@@ -2332,6 +2696,9 @@ fn write_stats(
         "aec_erle_db": aec.erle_db, "aec_erl_db": aec.erl_db,
         "aec_delay_ms": aec.delay_ms,
         "aec_reference_frames": aec.reference_frames, "aec_reference_rms": aec.reference_rms,
+        "hosting": hosting.is_some(), "guests": hosting.map(|h| h.guests),
+        "guests_pulling": hosting.map(|h| h.pulling),
+        "forwarded_kbps": hosting.map(|h| h.forwarded), "own_out_kbps": hosting.map(|h| h.own),
     });
     lines.push_str(&link.to_string());
     lines.push('\n');
@@ -2359,7 +2726,18 @@ fn alone(hangup: &UnboundedSender<String>, last: String, in_room: bool) {
 /// saying, so nothing here tracks what it has seen before or asks for anything
 /// to be repeated. Saying *leaving* is the one thing that ends a call from the
 /// far side rather than from the transport.
+///
+/// **Asked for again when the subscription fails** while they are still
+/// announced. Every move of the call redials a session, and a presence read
+/// through the session that went was seen to fail ("dropped", "internal
+/// error") with the path still announced: the announcement only changes
+/// route, so nothing else would ever start a new reader, and everything they
+/// said from then on -- a mute, a name, a move of the call -- was lost for
+/// the rest of the call. The library says as much: a broadcast whose route
+/// changes may end, and the next request serves it again. A reader that is
+/// asking again ends like any other, when the retraction lets it go.
 async fn listen(
+    inbound: moq_net::origin::Consumer,
     broadcast: moq_net::broadcast::Consumer,
     id: String,
     saying: UnboundedSender<String>,
@@ -2376,85 +2754,141 @@ async fn listen(
         local: asked.rooms.local.clone(),
         from: id.clone(),
     };
-    let track = match broadcast.track(PRESENCE) {
-        Ok(track) => track,
-        Err(error) => {
-            tracing::warn!("{id} has no presence track: {error:#}");
-            return;
+    let mut broadcast = Some(broadcast);
+    // Whether we are asking again, so an outage is said once and its end too.
+    let mut lost = false;
+    loop {
+        let broadcast = match broadcast.take() {
+            Some(broadcast) => broadcast,
+            None => {
+                tokio::time::sleep(follow::AGAIN).await;
+                match inbound.request_broadcast(control_path(&id).as_str()).await {
+                    Ok(broadcast) => broadcast,
+                    Err(error) => {
+                        tracing::debug!("{id}'s presence is not there to ask for yet: {error:#}");
+                        continue;
+                    }
+                }
+            }
+        };
+        let mut presence = match subscribe_presence(&broadcast).await {
+            Ok(presence) => presence,
+            Err(error) => {
+                if !std::mem::replace(&mut lost, true) {
+                    tracing::warn!("could not subscribe to {id}'s presence: {error}; asking again");
+                }
+                continue;
+            }
+        };
+        loop {
+            match presence.next().await {
+                Ok(Some(Presence {
+                    state,
+                    camera,
+                    mic,
+                    clock,
+                    room,
+                    requests,
+                    sharing,
+                    name,
+                    link,
+                    seen,
+                    host,
+                    moved,
+                })) => {
+                    let room = subroom(room);
+                    if let Some(clock) = clock {
+                        stats.set_clock(clock);
+                    }
+                    tracing::debug!(
+                        "{id} says {state:?}, camera {}, mic {}, room {}",
+                        on_off(camera),
+                        on_off(mic),
+                        room_name(&room)
+                    );
+                    // Their choice, for their tile: a card instead of a frozen
+                    // frame, a badge instead of silence nobody can explain.
+                    stats.set_camera(camera);
+                    stats.set_mic(mic);
+                    stats.set_sharing(sharing);
+                    // Never trusted as sent: cleaned here whatever their build
+                    // did, and shown only.
+                    stats.set_name(name.as_deref().and_then(crate::name::clean));
+                    // Cleaned again here, whatever their build did: a report is a
+                    // claim like a name, and their own id has no place in it.
+                    stats.set_link(link.map(Link::clean));
+                    stats.set_seen(quality::clean_seen(seen, &id));
+                    // Read by their audio task on every frame, which is what sets
+                    // how loud they are to us.
+                    stats.set_room(room.clone());
+                    asked.act(&id, &room, mic, &requests);
+                    stats.set_hosts_room(host.is_some());
+                    // Their hop names them in a route; the door stays here.
+                    stats.set_host_hop(host.clone().and_then(door::Offer::clean).map(|offer| offer.hop));
+                    stats.set_heard();
+                    heard_hosting(&id, state, host, &mut offered, news.as_ref());
+                    followed(&asked.rooms.local, moved);
+                    if std::mem::take(&mut lost) {
+                        tracing::info!("{id}'s presence is back");
+                    }
+                    if state == State::Leaving {
+                        // Reported, not acted on: whether the call is over is a
+                        // question about everyone, and the loop that tracks
+                        // everyone answers it.
+                        let _ = saying.unbounded_send(id);
+                        return;
+                    }
+                }
+                // Ended without their goodbye: the same as a failure, since
+                // only the retraction says they went.
+                Ok(None) => {
+                    if !std::mem::replace(&mut lost, true) {
+                        tracing::info!("{id}'s presence ended without a goodbye; asking again");
+                    }
+                    break;
+                }
+                Err(error) => {
+                    if !std::mem::replace(&mut lost, true) {
+                        tracing::info!("lost {id}'s presence ({error:#}); asking again");
+                    }
+                    break;
+                }
+            }
         }
-    };
+    }
+}
+
+/// Subscribes to a participant's presence track on `broadcast`.
+async fn subscribe_presence(
+    broadcast: &moq_net::broadcast::Consumer,
+) -> Result<moq_json::snapshot::Consumer<Presence>, String> {
+    let track = broadcast.track(PRESENCE).map_err(|error| format!("no presence track: {error:#}"))?;
     // Preempts media, the way hang prioritises its own catalog: this is small
     // and structural, and late it is worthless.
-    let subscription =
-        moq_net::track::Subscription::default().with_priority(CONTROL_PRIORITY);
-    let track = match track.subscribe(subscription).await {
-        Ok(track) => track,
-        Err(error) => {
-            tracing::warn!("could not subscribe to {id}'s presence: {error:#}");
-            return;
-        }
-    };
-    let mut presence = moq_json::snapshot::Consumer::<Presence>::new(
+    let subscription = moq_net::track::Subscription::default().with_priority(CONTROL_PRIORITY);
+    let track = track.subscribe(subscription).await.map_err(|error| format!("{error:#}"))?;
+    Ok(moq_json::snapshot::Consumer::<Presence>::new(
         track,
         moq_json::snapshot::consumer::Config::default(),
-    );
+    ))
+}
 
-    loop {
-        match presence.next().await {
-            Ok(Some(Presence {
-                state,
-                camera,
-                mic,
-                clock,
-                room,
-                requests,
-                sharing,
-                name,
-                link,
-                seen,
-                host,
-            })) => {
-                let room = subroom(room);
-                if let Some(clock) = clock {
-                    stats.set_clock(clock);
-                }
-                tracing::debug!(
-                    "{id} says {state:?}, camera {}, mic {}, room {}",
-                    on_off(camera),
-                    on_off(mic),
-                    room_name(&room)
-                );
-                // Their choice, for their tile: a card instead of a frozen
-                // frame, a badge instead of silence nobody can explain.
-                stats.set_camera(camera);
-                stats.set_mic(mic);
-                stats.set_sharing(sharing);
-                // Never trusted as sent: cleaned here whatever their build
-                // did, and shown only.
-                stats.set_name(name.as_deref().and_then(crate::name::clean));
-                // Cleaned again here, whatever their build did: a report is a
-                // claim like a name, and their own id has no place in it.
-                stats.set_link(link.map(Link::clean));
-                stats.set_seen(quality::clean_seen(seen, &id));
-                // Read by their audio task on every frame, which is what sets
-                // how loud they are to us.
-                stats.set_room(room.clone());
-                asked.act(&id, &room, mic, &requests);
-                heard_hosting(&id, state, host, &mut offered, news.as_ref());
-                if state == State::Leaving {
-                    // Reported, not acted on: whether the call is over is a
-                    // question about everyone, and the loop that tracks
-                    // everyone answers it.
-                    let _ = saying.unbounded_send(id);
-                    return;
-                }
-            }
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!("could not read {id}'s presence: {error:#}");
-                return;
-            }
-        }
+/// Whether a catalog read ended because the transport under it did -- the
+/// session it came through closed, or its route went with a move or a relay
+/// going down -- rather than because what arrived could not be read. The
+/// first is a reader ending like any other in a call whose routes change,
+/// said where the reader ends; only the second is a fault of ours or theirs.
+pub(super) fn catalog_cut_off(error: &moq_mux::Error) -> bool {
+    matches!(error, moq_mux::Error::Moq(_) | moq_mux::Error::Json(moq_json::Error::Net(_)))
+}
+
+/// Takes in where someone says the call is, if we follow moves at all, and
+/// says so when it changes where we follow it to.
+fn followed(local: &PeerStats, moved: Option<super::moves::CallOn>) {
+    let Some(moved) = moved.filter(|_| local.move_calls()) else { return };
+    let (to, by) = (moved.to.clone(), moved.by.clone());
+    if local.hear_move(moved) {
+        tracing::info!("the call moves to {} (said by {by})", super::moves::describe(to.as_deref()));
     }
 }
 
@@ -2564,6 +2998,11 @@ struct Alongside<'a> {
     /// our media.
     estimates: Arc<adapt::Estimates>,
     local: Arc<PeerStats>,
+    forwarded: Option<Arc<Forwarded>>,
+    /// Where our guests' session hops are kept, for reading routes.
+    guests: Arc<arrival::Guests>,
+    /// Where the last time a guest's session heard anything is kept.
+    heard: Arc<quiet::Heard>,
 }
 
 /// Serves the room's members directly beside a join, behind the room's door,
@@ -2589,6 +3028,9 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         doors,
         estimates,
         local,
+        forwarded,
+        guests,
+        heard,
     } = args;
     let room = url.path().trim_matches('/').to_string();
     if room.is_empty() {
@@ -2610,6 +3052,9 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         // The guests' figures stay out of the Network tab, which shows the
         // link carrying our media; see the doc above.
         metrics: Arc::new(Metrics::default()),
+        forwarded: forwarded.clone(),
+        guests: Some(guests),
+        heard: Some(heard),
     })
     .await;
     let (accepting, mut events) = match served {
@@ -2620,6 +3065,9 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         }
     };
     local.set_offer(Some(hosting.offer(shared.hop().id())));
+    if let Some(forwarded) = &forwarded {
+        forwarded.set_serving(true);
+    }
     tracing::info!("hosting this room for its members as well as joining it");
     Some(Abort(tokio::spawn(async move {
         let mut accepting = Some(accepting);
@@ -2653,6 +3101,9 @@ async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
         // read the door after it stopped opening.
         accepting.take();
         local.set_offer(None);
+        if let Some(forwarded) = &forwarded {
+            forwarded.set_serving(false);
+        }
     })))
 }
 
@@ -2738,13 +3189,15 @@ impl Drop for Invited {
     }
 }
 
-/// Opens a decoder from one participant's catalog and drains frames into their
-/// slot.
+/// Plays one participant's video into their slot, from their own catalog,
+/// for as long as they are here: across changes of route, a camera turned on
+/// late, and a rendition that changes (see `follow`).
 ///
 /// **The catalog is theirs, never a local guess.** An early version failed here
 /// by passing a *local* config and a hardcoded track name instead, and got `Net(Remote(30))`
 /// for it.
 async fn watch(
+    asking: follow::Asking,
     broadcast: moq_net::broadcast::Consumer,
     slot: FrameSlot,
     peer: String,
@@ -2754,112 +3207,137 @@ async fn watch(
     stats: Arc<PeerStats>,
     metrics: Arc<Metrics>,
 ) {
-    // The catalog is the peer's description of what it is sending. An early
-    // version failed here by passing a *local* config and a hardcoded track name instead, and
-    // got `Net(Remote(30))` for it.
-    let mut catalog = match moq_mux::catalog::Consumer::<()>::new(
-        &broadcast,
-        moq_mux::catalog::CatalogFormat::Hang,
-    )
-    .await
-    {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            tracing::error!("no catalog from the peer: {error:#}");
-            return;
-        }
+    let video = Video {
+        slot,
+        peer: peer.clone(),
+        status,
+        stats,
+        metrics,
+        opened: false,
     };
-    // **Waits for a video rendition rather than reading one snapshot.** A
-    // peer whose camera is off publishes its microphone alone, and adds video
-    // when the camera produces its first frame -- possibly mid-call. The audio
-    // subscriber waits for its rendition the same way.
-    let mut reported = false;
-    let (name, config) = loop {
-        let snapshot = match catalog.next().await {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                tracing::warn!("{peer}'s catalog closed before it offered video");
-                return;
-            }
-            Err(error) => {
-                tracing::error!("could not read {peer}'s catalog: {error:#}");
-                return;
-            }
-        };
+    follow::follow(Some(asking), broadcast, peer, video).await;
+}
+
+/// A participant's video, as `follow` plays it.
+struct Video {
+    slot: FrameSlot,
+    peer: String,
+    status: Option<UnboundedSender<RemoteStatus>>,
+    stats: Arc<PeerStats>,
+    metrics: Arc<Metrics>,
+    /// Whether a decoder has opened before, so a reopening after a change of
+    /// route is not announced like the first.
+    opened: bool,
+}
+
+impl follow::Reader for Video {
+    const WHAT: &'static str = "video";
+
+    fn pick(&self, catalog: &follow::Catalog) -> Option<follow::Rendition> {
+        catalog.video.renditions.iter().next().map(|(name, config)| follow::Rendition::new(name, config))
+    }
+
+    fn heard(&mut self, first: bool, offered: bool) {
         // **The listening side can name its caller now.** iroh exposes no
         // client identity to a server, so the transport genuinely cannot say
         // who this is -- but the broadcast path can, and does. Said on their
         // first catalog rather than their first video, which a peer with the
         // camera off never sends.
-        let first = !reported;
-        if first {
-            reported = true;
-            if let Some(status) = &status {
-                let _ = status.unbounded_send(RemoteStatus::Connected {
-                    peer: Some(peer.clone()),
-                });
-            }
-        }
-        match snapshot.video.renditions.iter().next() {
-            Some((name, config)) => break (name.clone(), config.clone()),
-            // Once: the catalog is rewritten often (audio's own updates), and
-            // each would otherwise say the same thing again.
-            None if first => tracing::info!("{peer} has no video yet; waiting for it"),
-            None => {}
-        }
-    };
-
-    let mut consumer = match moq_video::decode::Consumer::new(
-        &broadcast,
-        &config,
-        &name,
-        // Default options: a zero `max_age`, so a stalled group is skipped as
-        // soon as a newer one exists -- video's newest-wins posture.
-        moq_video::decode::Options::default(),
-    )
-    .await
-    {
-        Ok(consumer) => consumer,
-        Err(error) => {
-            tracing::error!("no decoder for the peer's video: {error:#}");
+        if !first {
             return;
         }
-    };
-    tracing::info!("decoding {peer}'s video with {}", consumer.name());
-    metrics.set_decoder(consumer.name());
-
-    // The network half's own rate, independent of whether anything is painting.
-    // `camera::paint::FrameRate` measures capture against the GPU; this measures
-    // what actually arrived from the peer, which is the only number that tells
-    // a stalled connection apart from an occluded window.
-    let mut decoded = 0u32;
-    let mut since = std::time::Instant::now();
-
-    // Per tile, so a stalled peer shows as one tile at zero rather than hiding
-    // behind whichever healthy peer wrote the shared number last.
-    let meter = FpsMeter::new(stats.clone());
-
-    while let Ok(Some(frame)) = consumer.read().await {
-        meter.frame();
-        stats.frame_arrived(frame.timestamp.as_micros() as u64);
-        decoded += 1;
-        if decoded == REPORT_EVERY {
-            let elapsed = since.elapsed().as_secs_f32();
-            if elapsed > 0.0 {
-                // Named, because in a room there are several of these lines
-                // and an unnamed rate cannot be told apart from the others.
-                tracing::debug!("[remote] {peer}: {:.1} fps decoded", decoded as f32 / elapsed);
-            }
-            decoded = 0;
-            since = std::time::Instant::now();
+        if let Some(status) = &self.status {
+            let _ = status.unbounded_send(RemoteStatus::Connected {
+                peer: Some(self.peer.clone()),
+            });
         }
-        if let Some(frame) = from_decoded(frame) {
-            slot.publish(frame);
+        // **Waits for a video rendition rather than giving up.** A peer whose
+        // camera is off publishes its microphone alone, and adds video when
+        // the camera produces its first frame -- possibly mid-call.
+        if !offered {
+            tracing::info!("{} has no video yet; waiting for it", self.peer);
         }
     }
-    // The producer is gone, so the last frame must come off the screen rather
-    // than sit there looking live.
-    slot.clear();
+
+    fn play(
+        &mut self,
+        broadcast: &moq_net::broadcast::Consumer,
+        catalog: &follow::Catalog,
+        rendition: &follow::Rendition,
+    ) -> follow::Playing {
+        let config = catalog.video.renditions.get(&rendition.name).cloned();
+        let broadcast = broadcast.clone();
+        let name = rendition.name.clone();
+        let (slot, peer, stats, metrics) = (self.slot.clone(), self.peer.clone(), self.stats.clone(), self.metrics.clone());
+        let again = std::mem::replace(&mut self.opened, true);
+        Box::pin(async move {
+            let Some(config) = config else { return follow::Played::Failed };
+            let mut consumer = match moq_video::decode::Consumer::new(
+                &broadcast,
+                &config,
+                &name,
+                // Default options: a zero `max_age`, so a stalled group is skipped as
+                // soon as a newer one exists -- video's newest-wins posture.
+                moq_video::decode::Options::default(),
+            )
+            .await
+            {
+                Ok(consumer) => consumer,
+                // The broadcast went from under it: asked for again.
+                Err(moq_video::Error::Net(error)) => {
+                    tracing::debug!("could not subscribe to {peer}'s video: {error:#}");
+                    return follow::Played::Lost;
+                }
+                Err(error) => {
+                    tracing::error!("no decoder for {peer}'s video: {error:#}");
+                    return follow::Played::Failed;
+                }
+            };
+            if again {
+                tracing::debug!("decoding {peer}'s video again with {}", consumer.name());
+            } else {
+                tracing::info!("decoding {peer}'s video with {}", consumer.name());
+            }
+            metrics.set_decoder(consumer.name());
+
+            // The network half's own rate, independent of whether anything is painting.
+            // `camera::paint::FrameRate` measures capture against the GPU; this measures
+            // what actually arrived from the peer, which is the only number that tells
+            // a stalled connection apart from an occluded window.
+            let mut decoded = 0u32;
+            let mut since = std::time::Instant::now();
+
+            // Per tile, so a stalled peer shows as one tile at zero rather than hiding
+            // behind whichever healthy peer wrote the shared number last.
+            let meter = FpsMeter::new(stats.clone());
+
+            while let Ok(Some(frame)) = consumer.read().await {
+                meter.frame();
+                stats.frame_arrived(frame.timestamp.as_micros() as u64);
+                decoded += 1;
+                if decoded == REPORT_EVERY {
+                    let elapsed = since.elapsed().as_secs_f32();
+                    if elapsed > 0.0 {
+                        // Named, because in a room there are several of these lines
+                        // and an unnamed rate cannot be told apart from the others.
+                        tracing::debug!("[remote] {peer}: {:.1} fps decoded", decoded as f32 / elapsed);
+                    }
+                    decoded = 0;
+                    since = std::time::Instant::now();
+                }
+                if let Some(frame) = from_decoded(frame) {
+                    slot.publish(frame);
+                }
+            }
+            follow::Played::Lost
+        })
+    }
+
+    /// The producer is gone, so the last frame must come off the screen
+    /// rather than sit there looking live.
+    fn stopped(&mut self) {
+        self.slot.clear();
+    }
 }
 
 #[cfg(test)]
@@ -2919,7 +3397,7 @@ mod path_tests {
 
 #[cfg(test)]
 mod presence_tests {
-    use super::{HostNews, Link, Presence, RoomNews, Seen, State, asked_of, dials_several, door, heard_hosting, honour, inbound_for, quality, shares_origin, subroom};
+    use super::{HostNews, Link, Presence, RoomNews, Seen, State, asked_of, dials_several, door, followed, heard_hosting, honour, inbound_for, quality, shares_origin, subroom};
     use crate::args::Peering;
     use crate::net::metrics::{Ask, Clock, Request};
     use crate::net::quality::Quality;
@@ -3058,6 +3536,7 @@ mod presence_tests {
             link: None,
             seen: Default::default(),
             host: None,
+            moved: None,
         };
         let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
         assert_eq!(heard, said);
@@ -3327,6 +3806,72 @@ mod presence_tests {
         assert_eq!(Presence::here(&local).host, None, "cleaned on the way out too");
     }
 
+    /// Our entry following a move of the call to host `h`, with the switch
+    /// as given.
+    fn following(on: bool) -> crate::net::PeerStats {
+        let local = reporting(false);
+        local.set_move_calls(true);
+        local.move_call(Some(id('c')), &id('a'));
+        local.set_move_calls(on);
+        local
+    }
+
+    #[test]
+    fn a_move_is_said_only_while_we_follow_moves_and_survives_the_round_trip() {
+        let off = serde_json::to_string(&Presence::here(&following(false))).unwrap();
+        assert_eq!(off, serde_json::to_string(&Presence::here(&reporting(false))).unwrap(), "the old shape");
+        assert!(!off.contains("moved"), "{off}");
+        let said = Presence::here(&following(true));
+        let json = serde_json::to_string(&said).unwrap();
+        assert!(json.contains(&format!(r#""moved":{{"to":"{}","n":1,"by":"{}"}}"#, id('c'), id('a'))), "{json}");
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard, said);
+    }
+
+    #[test]
+    fn an_older_peer_reads_a_moved_document_and_we_read_theirs() {
+        let json = serde_json::to_string(&Presence::here(&following(true))).unwrap();
+        let heard: Previous = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard.name.as_deref(), Some("Ada"));
+        let old: Presence = serde_json::from_str(r#"{"state":"here","name":"Ada"}"#).unwrap();
+        assert_eq!(old.moved, None);
+    }
+
+    #[test]
+    fn a_malformed_move_costs_only_itself() {
+        for bad in [
+            r#""moved":"relay""#.to_string(),
+            r#""moved":{"to":"x","n":1,"by":"y"}"#.to_string(),
+            format!(r#""moved":{{"n":-1,"by":"{}"}}"#, id('a')),
+            format!(r#""moved":{{"n":9007199254740993,"by":"{}"}}"#, id('a')),
+        ] {
+            let heard: Presence = serde_json::from_str(&format!(r#"{{"state":"here","name":"Ada",{bad}}}"#)).unwrap();
+            assert_eq!(heard.moved, None, "{bad}");
+            assert_eq!(heard.name.as_deref(), Some("Ada"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_heard_move_is_followed_only_with_the_switch_on() {
+        let theirs = super::super::moves::CallOn { to: Some(id('c')), n: 3, by: id('b') };
+        let local = reporting(false);
+        followed(&local, Some(theirs.clone()));
+        local.set_move_calls(true);
+        assert_eq!(local.call_host(), None, "heard while off, so not taken in");
+        followed(&local, Some(theirs));
+        assert_eq!(local.call_host(), Some(id('c')));
+        local.set_move_calls(false);
+        assert_eq!(local.call_host(), None, "off puts us back in the usual order");
+    }
+
+    #[test]
+    fn a_catalog_cut_off_by_its_transport_is_told_apart_from_one_that_does_not_read() {
+        assert!(super::catalog_cut_off(&moq_mux::Error::Moq(moq_net::Error::Cancel)));
+        assert!(super::catalog_cut_off(&moq_mux::Error::Json(moq_json::Error::Net(moq_net::Error::Dropped))));
+        assert!(!super::catalog_cut_off(&moq_mux::Error::Json(moq_json::Error::Json("expected value".into()))));
+        assert!(!super::catalog_cut_off(&moq_mux::Error::Json(moq_json::Error::MissingSnapshot)));
+    }
+
     /// The wiring table: whether the origins are shared, and whether a join
     /// holds several sessions. A join with no hosts and hosting off is the
     /// one session over two origins it always was.
@@ -3343,6 +3888,10 @@ mod presence_tests {
         }
         let join = Peering::Join(url);
         assert!(!dials_several(&join, false, false), "no hosts, not hosting: as before");
+        // The spare route lives only in the set, so it cannot touch a join
+        // that never reaches it; and a host's join keeps none.
+        assert!(super::sessions::keeps_spare(false, true), "on by default for a member of a room with hosts");
+        assert!(!super::sessions::keeps_spare(true, true), "a hosting join offers everything everywhere already");
         assert!(dials_several(&join, false, true), "a room with hosts");
         assert!(dials_several(&join, true, false), "a room we host");
         assert!(dials_several(&join, true, true));
@@ -3529,7 +4078,7 @@ mod served_tests {
         let server = config.init().unwrap().bind().await.unwrap();
         let port = server.local_addr().unwrap().port();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (task, _) = accept(server, door, Some(estimates), Arc::new(Metrics::default()));
+        let (task, _) = accept(server, door, Some(estimates), Arc::new(Metrics::default()), None, None, None);
         (task, port)
     }
 
@@ -3554,6 +4103,10 @@ mod served_tests {
         camera.announce(moq_net::origin::Route::default()).unwrap();
         let inbound = moq_tokio::origin::spawn();
         let mut config = moq_tokio::client::Config::default();
+        // On the loopback address as the servers are: a dual-stack port can
+        // share its number with another test's server, which then takes
+        // this client's answers (see `sessions`' socket tests).
+        config.connect.bind = Some(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)));
         config.connect.tls.insecure = Some(true);
         let url: url::Url = format!("moqt://localhost:{port}{target}").parse().unwrap();
         let connection = config
@@ -3647,7 +4200,7 @@ mod served_tests {
         let server = config.init().unwrap().bind().await.unwrap();
         let port = server.local_addr().unwrap().port();
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (task, _) = accept(server, None, Some(estimates), Arc::new(Metrics::default()));
+        let (task, _) = accept(server, None, Some(estimates), Arc::new(Metrics::default()), None, None, None);
         (task, port)
     }
 
@@ -3666,6 +4219,10 @@ mod served_tests {
         let camera = shared.create_broadcast(camera_path(id)).unwrap();
         camera.announce(moq_net::origin::Route::default()).unwrap();
         let mut config = moq_tokio::client::Config::default();
+        // On the loopback address as the servers are: a dual-stack port can
+        // share its number with another test's server, which then takes
+        // this client's answers (see `sessions`' socket tests).
+        config.connect.bind = Some(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)));
         config.connect.tls.insecure = Some(true);
         let url: url::Url = format!("moqt://localhost:{relay}/room").parse().unwrap();
         let connection = config
@@ -3775,5 +4332,174 @@ mod served_tests {
         drop(accepting);
         let ended = tokio::time::timeout(WITHIN, connection.closed()).await;
         assert!(ended.is_ok(), "the session outlived the call");
+    }
+
+    /// Writes 1000 bytes on `broadcast`'s video track every 20 ms (400 kbps)
+    /// for as long as the returned task lives.
+    fn stream(broadcast: &moq_net::broadcast::Producer) -> Abort {
+        let mut track = broadcast.create_track(TRACK, None).unwrap();
+        Abort(tokio::spawn(async move {
+            for n in 0u64.. {
+                if track.write_frame(moq_net::Timestamp::from_millis(n * 20).unwrap(), [0u8; 1000].as_slice()).is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }))
+    }
+
+    /// Reads every group of `path`'s video track as it arrives.
+    async fn pull(inbound: &moq_net::origin::Producer, path: String) -> Abort {
+        let broadcast = tokio::time::timeout(WITHIN, inbound.consume().routed_broadcast(path))
+            .await
+            .expect("announced in time")
+            .expect("a broadcast");
+        Abort(tokio::spawn(async move {
+            let Ok(track) = broadcast.track(TRACK) else { return };
+            let Ok(mut subscriber) = track.subscribe(None).await else { return };
+            while let Ok(Some(mut group)) = subscriber.recv_group().await {
+                while let Ok(Some(_)) = group.read_frame().await {}
+            }
+        }))
+    }
+
+    /// One second of the host's counters, read the way the meter reads them.
+    async fn second_of(forwarded: &Forwarded) -> crate::rates::Hosting {
+        let start = tokio::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        forwarded.sample(start.elapsed(), None).expect("serving")
+    }
+
+    /// A host behind its door, as the app wires one: one origin for its own
+    /// camera and its guests, each guest counted. Its own camera streams
+    /// throughout; a guest's media is what it forwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_counts_what_it_forwards_apart_from_its_own() {
+        let me = "h".repeat(64);
+        let hosting = team();
+        let shared = moq_tokio::origin::spawn();
+        let own = shared.create_broadcast(camera_path(&me)).unwrap();
+        let _own_stream = stream(&own);
+        own.announce(moq_net::origin::Route::default()).unwrap();
+        let mut config = moq_tokio::server::Config::default();
+        config.listen.bind = Some(moq_tokio::listen::Bind::Addr(([127, 0, 0, 1], 0).into()));
+        config.listen.tls.generate = vec!["localhost".to_string()];
+        config.publisher = Some(shared.consume());
+        config.subscriber = Some(shared);
+        let server = config.init().unwrap().bind().await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let forwarded = Forwarded::new(me.clone());
+        forwarded.set_serving(true);
+        let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
+        let (_accepting, _) = accept(
+            server,
+            Some(hosting.clone()),
+            Some(estimates),
+            Arc::new(Metrics::default()),
+            Some(forwarded.clone()),
+            None,
+            None,
+        );
+
+        let a = guest(port, &invited(&hosting), "a");
+        let _a_stream = stream(&a._camera);
+        let b = guest(port, &invited(&hosting), "b");
+        sees(&b, "a").await;
+        sees(&b, &me).await;
+
+        // Connected, everything announced, nobody pulling: nothing but
+        // control traffic, which is not payload.
+        second_of(&forwarded).await;
+        let idle = second_of(&forwarded).await;
+        assert_eq!(idle, crate::rates::Hosting { forwarded: 0, own: 0, guests: 2, pulling: 0, forwarding: false });
+
+        // b pulls a's video, which we forward, and ours, which is our own.
+        let _from_a = pull(&b.inbound, camera_path("a")).await;
+        let _from_us = pull(&b.inbound, camera_path(&me)).await;
+        second_of(&forwarded).await;
+        let busy = second_of(&forwarded).await;
+        assert!((300..=500).contains(&busy.forwarded), "{busy:?}");
+        assert!((300..=500).contains(&busy.own), "{busy:?}");
+        assert_eq!((busy.guests, busy.pulling), (2, 1), "{busy:?}");
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_encoders_own_failure_demotes_it() {
+        let encoder = Err(Stopped::Encoder("encode failed".into()));
+        let publish = Err(Stopped::Publish("publish failed".into()));
+        assert!(demotes(&encoder, "videotoolbox"));
+        assert!(!demotes(&publish, "videotoolbox"), "a publish error is not the encoder's");
+        assert!(!demotes(&encoder, SOFTWARE_ENCODER), "software has nowhere to go");
+        assert!(!demotes(&Ok(()), "videotoolbox"));
+    }
+
+    /// The camera off and on under one producer, as the encode loop keeps
+    /// it, with the capture's clock starting again: the track refuses the
+    /// restart as it is, and takes it on the published stamps.
+    #[tokio::test]
+    async fn a_restarted_capture_is_refused_as_it_is_and_taken_rising() {
+        let (width, height) = (160, 90);
+        let origin = moq_tokio::origin::spawn();
+        let mut broadcast = origin.create_broadcast("restart").unwrap();
+        let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+        let mut config = moq_video::encode::Config::new(width, height, framerate());
+        config.kind = moq_video::encode::Kind::Software;
+        let rendition = config.probe().await.unwrap();
+        let track = broadcast.create_track(TRACK, catalog.track_info(VIDEO_PRIORITY)).unwrap();
+        let mut producer = moq_video::encode::Producer::with_track(track, catalog.clone(), rendition).unwrap();
+        let mut encoder = moq_video::encode::Encoder::new(&config).unwrap();
+        let mut encode = |n: u64, micros: u64| {
+            let frame = crate::camera::pattern::frame(width, height, n, std::time::Duration::from_micros(micros));
+            let surface = frame.to_i420_surface(1).unwrap();
+            let timestamp = moq_net::Timestamp::from_micros(micros).unwrap();
+            encoder.cut().unwrap();
+            encoder.encode(&moq_video::Frame::new(surface, timestamp)).unwrap()
+        };
+
+        let mut rising = super::super::stamps::Rising::default();
+        for n in 0..5u64 {
+            let encoded = encode(n, rising.stamp(1_000_000 + n * 33_333));
+            producer.publish(&encoded).unwrap();
+        }
+        // The capture's clock starts again near zero.
+        let refused = producer.publish(&encode(5, 0)).unwrap_err();
+        assert_eq!(super::super::stamps::refusal(&refused), Some(super::super::stamps::Refusal::Rewind));
+        for n in 0..5u64 {
+            let encoded = encode(10 + n, rising.stamp(n * 33_333));
+            producer.publish(&encoded).unwrap_or_else(|error| panic!("frame {n} after the restart: {error:#}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod said_tests {
+    use super::*;
+
+    /// The same document said twice is two groups, each read whole by the
+    /// reader every build uses.
+    #[tokio::test]
+    async fn an_unchanged_presence_is_written_again() {
+        let origin = moq_tokio::origin::spawn();
+        let control = origin.create_broadcast(control_path("someone")).unwrap();
+        let presence = std::sync::Mutex::new(Said::new(control.create_track(PRESENCE, None).unwrap()));
+        control.announce(moq_net::origin::Route::default()).unwrap();
+        let said = Presence {
+            name: Some("Someone".into()),
+            ..Presence::default()
+        };
+        say(&presence, said.clone());
+        let broadcast = origin.consume().request_broadcast(control_path("someone").as_str()).await.unwrap();
+        let mut reading = subscribe_presence(&broadcast).await.unwrap();
+        let wait = std::time::Duration::from_secs(2);
+        let first = tokio::time::timeout(wait, reading.next()).await.expect("the first document");
+        assert_eq!(first.unwrap(), Some(said.clone()));
+        say(&presence, said.clone());
+        let again = tokio::time::timeout(wait, reading.next()).await.expect("said again, unchanged");
+        assert_eq!(again.unwrap(), Some(said));
     }
 }

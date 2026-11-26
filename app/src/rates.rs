@@ -37,6 +37,26 @@ pub struct Second {
     pub share_slice: Option<u32>,
     /// The transport's estimate for the whole connection.
     pub estimate: Option<u32>,
+    /// What we passed on for other people, while we host; `None` otherwise.
+    pub hosting: Option<Hosting>,
+}
+
+/// One second of hosting: other people's media sent on through us, and our
+/// own, both as payload handed to the transport, in kbps.
+///
+/// Our own counts every copy: a host whose guests pull its video directly
+/// sends it once to each.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hosting {
+    pub forwarded: u32,
+    pub own: u32,
+    /// Guests connected directly, and how many of them we sent media to.
+    pub guests: u32,
+    pub pulling: u32,
+    /// Whether this second is inside a forwarding episode, as the log's
+    /// "forwarding started" and "stopped" bound it: their hysteresis, so a
+    /// tile that shows it agrees with the log and does not flicker.
+    pub forwarding: bool,
 }
 
 impl Second {
@@ -136,6 +156,17 @@ impl Point {
             cap: second.share_cap,
             target: second.share_target,
             link: second.share_slice,
+        }
+    }
+
+    /// What we forwarded against the link, with no cap: what other people
+    /// send is theirs to limit.
+    pub fn forwarded(second: &Second) -> Self {
+        Self {
+            sent: second.hosting.map(|hosting| hosting.forwarded),
+            cap: None,
+            target: None,
+            link: second.estimate,
         }
     }
 
@@ -373,6 +404,22 @@ mod tests {
         assert_eq!((Point::camera(&second).target, Point::camera(&second).link), (Some(400), Some(300)));
         assert_eq!((Point::share(&second).target, Point::share(&second).link), (Some(1800), Some(1700)));
         assert_eq!((Point::total(&second).target, Point::total(&second).link), (None, Some(2100)));
+    }
+
+    #[test]
+    fn what_we_forward_is_drawn_against_the_link_with_no_cap() {
+        let hosting = Hosting { forwarded: 340, own: 60, guests: 2, pulling: 1, forwarding: true };
+        let second = Second { hosting: Some(hosting), estimate: Some(3000), ..Second::default() };
+        assert_eq!(Point::forwarded(&second), Point { sent: Some(340), cap: None, target: None, link: Some(3000) });
+        assert_eq!(Point::forwarded(&Second::default()).sent, None);
+    }
+
+    #[test]
+    fn a_second_of_hosting_alone_starts_the_history() {
+        let mut history = History::default();
+        let hosting = Hosting { guests: 1, ..Hosting::default() };
+        history.push(Second { hosting: Some(hosting), ..Second::default() });
+        assert_eq!(history.seconds().len(), 1);
     }
 
     #[test]

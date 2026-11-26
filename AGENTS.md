@@ -54,6 +54,13 @@ focus.
   updates itself, and `--ephemeral` wins if both are given.
 - **`--camera-off`** unless the camera is what you are testing. A second app
   opening the camera can change its format under another app that is using it.
+- **`--test-pattern`** when a test needs video but not the camera: generated
+  frames (640x360, 30 fps, moving, with a frame counter) enter where a
+  camera's do (the self-view slot and the encoder's tap), so everything after
+  capture runs for real, and no camera is enumerated or opened. It says the
+  camera is on, as a camera would; with `--camera-off` it starts off. Judge a
+  run from `--stats`: `camera_sent_fps`/`camera_sent_kbps` on the sender's
+  `"link": true` line, `fps` on each viewer's line for that peer.
 - **`--loopback` plays the microphone back through the speakers.** Do not use
   it unasked.
 - **`--no-audio`** opens neither the microphone nor the speaker. Use it for
@@ -324,7 +331,7 @@ focus.
 
 | Path | Role |
 |---|---|
-| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--host`, `--loopback`, `--camera`, `--camera-off`, `--no-audio`, `--host-rooms`, `--ephemeral`, `--profile`, `--quality`, `--encoder`, …) |
+| `main.rs`, `args.rs` | entry point, CLI (`--relay`, `--listen`, `--dial`, `--host`, `--loopback`, `--camera`, `--camera-off`, `--test-pattern`, `--no-audio`, `--host-rooms`, `--move-calls`, `--move-call`, `--bounce`, `--show-routes`, `--spare-route`, `--no-spare-route`, `--ephemeral`, `--profile`, `--quality`, `--encoder`, …) |
 | `settings.rs` | what the app remembers between launches, the data folder, the log path |
 | `hotkeys.rs` | keyboard shortcuts as a pure table: actions, chords, the keymap. No UI in it |
 | `name.rs` | display names: cleaning, the short id, which label to show |
@@ -337,10 +344,14 @@ focus.
 | `channel.rs` | shared single-slot channel primitive |
 | `audio/` | `Controls` (mute, chosen devices, level), device enumeration, `catchup.rs` |
 | `camera/hooks/` | chosen device, on/off, persistence, the stream and its watchdog |
+| `camera/pattern.rs` | the test pattern (`--test-pattern`): generated frames, and the thread that feeds them in where a camera's go |
 | `camera/frames.rs` | `FrameSlot`: newest-wins handoff, with its own neutral `Frame`/`Pixels` |
 | `camera/paint/` | `VideoPaintSource` (a blitz `Widget`), wgpu upload, fit math |
 | `net/call.rs` | a call over iroh + MoQ: rooms on a relay, direct calls, hosting a room (`--host`), presence |
+| `net/follow.rs` | reading what a peer offers (video, voice, screen) for as long as they are here: follows the catalog, asks again for a broadcast whose read ended with a change of route |
 | `net/sessions.rs` | a join that dials the relay and the room's saved hosts together: which session carries our media, and moving it |
+| `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes, for the log and the host borders on tiles (`read` and `through` are pure) |
+| `net/moves.rs` | moving the call to a host, an experiment: the presence field, which choice wins, the bounce order (pure) |
 | `net/door.rs` | a hosted room's door: its name, the secret guests present as `?door=`, the check (pure) |
 | `net/audio.rs` | the audio half: Opus out, each peer's voice in, echo cancelled |
 | `net/share.rs` | screen sharing: capture and its own broadcast |
@@ -354,5 +365,5 @@ Frames never touch the DOM:
 
 `cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`, `rates.rs`, `net/quality.rs`,
 `camera/paint/fit.rs`, `audio/catchup.rs`, `components/layout.rs`,
-`update/release.rs`, `update/verify.rs`, `net/door.rs`) are where
+`update/release.rs`, `update/verify.rs`, `net/door.rs`, `net/moves.rs`, `net/arrival.rs`) are where
 logic that can be tested without a window belongs.

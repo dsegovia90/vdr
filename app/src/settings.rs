@@ -256,6 +256,27 @@ pub struct Settings {
     /// other people's video, which nobody should find they had agreed to.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
     pub host_rooms: Option<bool>,
+
+    /// Whether to follow, and be able to make, moves of the call to a host:
+    /// an experiment. `None` is the default, which is **off**
+    /// ([`moves_calls`](Self::moves_calls)): a move sends media through
+    /// someone's computer.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
+    pub move_calls: Option<bool>,
+    /// Whether the videos of people who could host have a border, brighter
+    /// while they carry the call. Keyed as it was when it showed routes in
+    /// words, so a saved choice survives. `None` is the default, which is
+    /// **off** ([`shows_routes`](Self::shows_routes)): it is a debugging aid.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
+    pub show_routes: Option<bool>,
+    /// Whether a join that can meet in several places keeps a spare offer of
+    /// our media on a second one, so a relay going away is a splice rather
+    /// than everyone's tiles leaving and coming back. `None` is the default,
+    /// which is **on** ([`keeps_spare_route`](Self::keeps_spare_route)): it
+    /// costs an announcement, not an upload, and does nothing in a room
+    /// without hosts.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
+    pub spare_route: Option<bool>,
 }
 
 impl Settings {
@@ -272,6 +293,21 @@ impl Settings {
     /// Whether we host the rooms we join.
     pub fn hosts_rooms(&self) -> bool {
         self.host_rooms.unwrap_or(false)
+    }
+
+    /// Whether we follow and make moves of the call.
+    pub fn moves_calls(&self) -> bool {
+        self.move_calls.unwrap_or(false)
+    }
+
+    /// Whether each video is marked with the way it arrives.
+    pub fn shows_routes(&self) -> bool {
+        self.show_routes.unwrap_or(false)
+    }
+
+    /// Whether we keep a spare offer of our media beside the one in use.
+    pub fn keeps_spare_route(&self) -> bool {
+        self.spare_route.unwrap_or(true)
     }
 }
 
@@ -898,6 +934,52 @@ mod tests {
         let bad: Settings = serde_json::from_str(r#"{"camera":"abc","host_rooms":"yes"}"#).expect("still valid");
         assert_eq!(bad.camera.as_deref(), Some("abc"));
         assert!(!bad.hosts_rooms(), "a malformed flag costs only itself");
+    }
+
+    #[test]
+    fn moving_calls_is_off_unless_turned_on_and_read_leniently() {
+        assert!(!Settings::default().moves_calls());
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","host_rooms":true}"#).expect("valid");
+        assert!(!older.moves_calls(), "a file from before the setting means off");
+        let on: Settings = serde_json::from_str(r#"{"move_calls":true}"#).expect("valid");
+        assert!(on.moves_calls());
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("move_calls"), "left out until changed: {json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","move_calls":7}"#).expect("still valid");
+        assert_eq!(bad.camera.as_deref(), Some("abc"));
+        assert!(!bad.moves_calls(), "a malformed flag costs only itself");
+    }
+
+    #[test]
+    fn showing_routes_is_off_unless_turned_on_and_read_leniently() {
+        assert!(!Settings::default().shows_routes());
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","host_rooms":true}"#).expect("valid");
+        assert!(!older.shows_routes(), "a file from before the setting means off");
+        let on: Settings = serde_json::from_str(r#"{"show_routes":true}"#).expect("valid");
+        assert!(on.shows_routes());
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&on).expect("serialises")).expect("deserialises");
+        assert_eq!(back, on);
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("show_routes"), "left out until changed: {json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","show_routes":"yes"}"#).expect("still valid");
+        assert_eq!(bad.camera.as_deref(), Some("abc"));
+        assert!(!bad.shows_routes(), "a malformed flag costs only itself");
+    }
+
+    #[test]
+    fn a_spare_route_is_kept_unless_turned_off_and_read_leniently() {
+        assert!(Settings::default().keeps_spare_route());
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","move_calls":true}"#).expect("valid");
+        assert!(older.keeps_spare_route(), "a file from before the setting means on");
+        let off: Settings = serde_json::from_str(r#"{"spare_route":false}"#).expect("valid");
+        assert!(!off.keeps_spare_route());
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&off).expect("serialises")).expect("deserialises");
+        assert_eq!(back, off);
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("spare_route"), "left out until changed: {json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","spare_route":"no"}"#).expect("still valid");
+        assert_eq!(bad.camera.as_deref(), Some("abc"));
+        assert!(bad.keeps_spare_route(), "a malformed flag costs only itself");
     }
 
     #[test]

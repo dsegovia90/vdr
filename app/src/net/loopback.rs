@@ -92,11 +92,13 @@ async fn pump(
     // Kept for the whole run: dropping the origin would end the broadcast.
     let origin = moq_tokio::origin::spawn();
     let mut broadcast = origin.create_broadcast("loopback.hang")?;
-    let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default())?;
+    // Ours, for `audio::publish`; nothing writes it again, since nothing
+    // here changes route.
+    let catalog = super::fresh::catalog(&mut broadcast)?;
     // Video's priority, as hang's catalog ranks it (audio is 80).
     let track = broadcast.create_track("video.avc3", catalog.track_info(60))?;
     let mut producer =
-        moq_video::encode::Producer::with_track(track, catalog.clone(), rendition.clone())?;
+        super::fresh::Video::with_track(track, catalog.clone(), rendition.clone())?;
 
     let no_audio = crate::args::Args::get().no_audio;
     let engine = if no_audio { None } else { audio::open_playback(&controls).await };
@@ -125,6 +127,7 @@ async fn pump(
     let audio_decode = engine.map(|engine| {
         let broadcast = broadcast.consume();
         tokio::spawn(audio::subscribe(
+            None,
             broadcast,
             "loopback".to_string(),
             engine,

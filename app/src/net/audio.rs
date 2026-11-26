@@ -29,7 +29,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moq_audio::{capture, decode, encode, playback};
-use moq_mux::catalog::Stream as _;
 
 use crate::audio::catchup::{self, Catchup, Outcome};
 use crate::audio::{Controls, Speaking, Talking, loudness};
@@ -111,10 +110,10 @@ pub(super) async fn open_playback(controls: &Controls) -> Option<playback::Engin
 /// the microphone is published plain.
 pub(super) fn publish(
     broadcast: moq_net::broadcast::Producer,
-    catalog: moq_mux::catalog::Producer,
+    catalog: super::fresh::Catalog,
     engine: Option<&playback::Engine>,
     bandwidth: moq_net::bandwidth::Allocator,
-) -> Result<(encode::Publication, encode::Driver, Option<moq_audio::aec::Control>), String> {
+) -> Result<(encode::Publication, encode::Driver<super::fresh::Ext>, Option<moq_audio::aec::Control>), String> {
     // Opus at 20 ms, the system default input.
     let mut options = encode::PublicationOptions::default();
     // The call's send budget. moq-audio reserves its bitrate against it, at
@@ -218,7 +217,7 @@ const AEC_REPORT_EVERY: Duration = Duration::from_secs(5);
 ///
 /// Ends when the last [`Publication`](encode::Publication) clone drops, which is
 /// what the call does when the attempt finishes.
-pub(super) fn drive(driver: encode::Driver) {
+pub(super) fn drive(driver: encode::Driver<super::fresh::Ext>) {
     let spawned = std::thread::Builder::new()
         .name("microphone".into())
         .spawn(move || {
@@ -249,15 +248,19 @@ pub(super) struct Rooms {
     pub controls: Arc<Controls>,
 }
 
-/// Waits for one peer's audio rendition, decodes it, and plays it.
+/// Waits for one peer's audio rendition, decodes it, and plays it, for as
+/// long as they are here: across changes of route and a rendition that
+/// changes (see `follow`). Without `asking` (the loopback), a read that ends
+/// is the end.
 ///
-/// Runs until the track closes or the peer leaves, which aborts it. Every
-/// failure is terminal *for this peer's audio only* and says so in the log
-/// rather than propagating: the call keeps its video.
+/// Runs until the peer leaves, which aborts it. Every failure is *for this
+/// peer's audio only* and says so in the log rather than propagating: the
+/// call keeps its video.
 ///
 /// `engine` is a clone of the call's one engine -- clones share the device and
 /// its mix -- so several of these run at once, one per peer.
 pub(super) async fn subscribe(
+    asking: Option<super::follow::Asking>,
     broadcast: moq_net::broadcast::Consumer,
     peer: String,
     engine: playback::Engine,
@@ -270,47 +273,86 @@ pub(super) async fn subscribe(
     // The loopback's `--audio-stall`: hold decoded audio back this long, once.
     stall: Option<Duration>,
 ) {
-    let mut catalog = match moq_mux::catalog::Consumer::<()>::new(
-        &broadcast,
-        moq_mux::catalog::CatalogFormat::Hang,
-    )
-    .await
-    {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            tracing::error!("[audio] no catalog from {peer}: {error:#}");
-            return;
-        }
+    let voice = Voice {
+        peer: peer.clone(),
+        engine,
+        stats,
+        rooms,
+        stall,
     };
+    super::follow::follow(asking, broadcast, peer, voice).await;
+}
 
-    let (name, config) = loop {
-        match catalog.next().await {
-            Ok(Some(snapshot)) => {
-                if let Some((name, config)) = snapshot.audio.renditions.iter().next() {
-                    break (name.clone(), config.clone());
+/// A peer's voice, as `follow` plays it. **Each player is a new listener**:
+/// its own decoder and its own sink, filled to the sink's padding before it
+/// plays, so a voice picked up again after a change of route is buffered as
+/// at the start of a call, never stitched onto the old sink's backlog.
+struct Voice {
+    peer: String,
+    engine: playback::Engine,
+    stats: Arc<super::PeerStats>,
+    rooms: Option<Rooms>,
+    stall: Option<Duration>,
+}
+
+impl super::follow::Reader for Voice {
+    const WHAT: &'static str = "audio";
+
+    fn pick(&self, catalog: &super::follow::Catalog) -> Option<super::follow::Rendition> {
+        catalog
+            .audio
+            .renditions
+            .iter()
+            .next()
+            .map(|(name, config)| super::follow::Rendition::new(name, config))
+    }
+
+    fn heard(&mut self, first: bool, offered: bool) {
+        if first && !offered {
+            tracing::debug!("[audio] {} has no audio rendition yet; waiting", self.peer);
+        }
+    }
+
+    fn play(
+        &mut self,
+        broadcast: &moq_net::broadcast::Consumer,
+        catalog: &super::follow::Catalog,
+        rendition: &super::follow::Rendition,
+    ) -> super::follow::Playing {
+        let config = catalog.audio.renditions.get(&rendition.name).cloned();
+        let broadcast = broadcast.clone();
+        let name = rendition.name.clone();
+        let (peer, engine, stats, rooms) = (self.peer.clone(), self.engine.clone(), self.stats.clone(), self.rooms.clone());
+        // Once per subscriber, as it always was.
+        let stall = self.stall.take();
+        Box::pin(async move {
+            let Some(config) = config else { return super::follow::Played::Failed };
+            let consumer = match decode::Consumer::new(&broadcast, &config, &name, decode_config()).await {
+                Ok(consumer) => consumer,
+                // The broadcast went from under it: asked for again.
+                Err(moq_audio::Error::Net(error)) => {
+                    tracing::debug!("[audio] could not subscribe to {peer}'s audio: {error:#}");
+                    return super::follow::Played::Lost;
                 }
-                tracing::debug!("[audio] {peer} has no audio rendition yet; waiting");
-            }
-            Ok(None) => {
-                tracing::warn!("[audio] {peer}'s catalog closed before it offered audio");
-                return;
-            }
-            Err(error) => {
-                tracing::error!("[audio] could not read {peer}'s catalog: {error:#}");
-                return;
-            }
-        }
-    };
+                Err(error) => {
+                    tracing::error!("[audio] no decoder for {peer}'s audio: {error:#}");
+                    return super::follow::Played::Failed;
+                }
+            };
+            play(consumer, peer, engine, stats, rooms, stall).await
+        })
+    }
+}
 
-    let mut consumer =
-        match decode::Consumer::new(&broadcast, &config, &name, decode_config()).await {
-            Ok(consumer) => consumer,
-            Err(error) => {
-                tracing::error!("[audio] no decoder for {peer}'s audio: {error:#}");
-                return;
-            }
-        };
-
+/// Plays one decoded audio track into a sink of its own until the track ends.
+async fn play(
+    mut consumer: decode::Consumer,
+    peer: String,
+    engine: playback::Engine,
+    stats: Arc<super::PeerStats>,
+    rooms: Option<Rooms>,
+    stall: Option<Duration>,
+) -> super::follow::Played {
     let mut input = playback::Input::default();
     input.format = moq_audio::Format::F32;
     input.sample_rate = consumer.sample_rate();
@@ -320,7 +362,7 @@ pub(super) async fn subscribe(
         Ok(sink) => sink,
         Err(error) => {
             tracing::error!("[audio] could not add {peer} to the mix: {error:#}");
-            return;
+            return super::follow::Played::Failed;
         }
     };
     let rate = consumer.sample_rate();
@@ -571,6 +613,7 @@ pub(super) async fn subscribe(
         }
     }
     tracing::info!("[audio] {peer}'s audio track ended");
+    super::follow::Played::Lost
 }
 
 /// How often a `[sync]` line is logged per peer. Often enough to see a drift
