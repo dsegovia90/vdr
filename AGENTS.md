@@ -377,7 +377,7 @@ focus.
 | `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes, for the log and the host borders on tiles (`read` and `through` are pure) |
 | `net/moves.rs` | moving the call to a host, an experiment: the presence field, which choice wins, the bounce order (pure) |
 | `net/web.rs` | the room as a web of nodes for the Network tab: the `via`/`held` presence fields (wire form, lenient reading, cleaning) and the pure graph built from every entry |
-| `web_layout.rs` | where the Network tab's map puts each node (rings, in a unit square, from counts and order only), which lines it draws, and the made-up room of `--fake-web` |
+| `web_layout.rs` | where the Network tab's map puts each node (one ring with the relays at six o'clock, a thin inner ring for people past about ninety; in a unit square, from counts and order only), which lines it draws, how a line bows round a node it does not end at, and the made-up room of `--fake-web` |
 | `net/door.rs` | a hosted room's door: its name, the secret guests present as `?door=`, the check (pure) |
 | `net/audio.rs` | the audio half: Opus out, each peer's voice in, echo cancelled |
 | `net/share.rs` | screen sharing: capture and its own broadcast |

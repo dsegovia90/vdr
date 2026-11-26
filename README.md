@@ -130,7 +130,11 @@ removes it, Esc gives up. Its *Updates* tab is described below. Its
 *Network* tab opens on a map of the room: relays as squares, people as
 circles (a blue ring on anyone who could host), a grey line wherever media
 could flow and a white one where it flows now, as each person says it;
-click a node for its links. Under the map it charts the last minute of a
+click a node for its links. Everyone sits on one ring, you at the top and
+the relays together at the bottom, so a line between two people never
+passes through a relay; a line that would brush a node it does not end at
+is drawn curved around it. A direct call is one white line between the two
+of you. Under the map it charts the last minute of a
 call: what the camera sent against
 its cap and its slice of the link and, while a screen is shared and for a
 minute after, the same for the share plus everything sent together against

@@ -16,7 +16,8 @@
 //! which is what a closed (`hidden`) window's widget does.
 //!
 //! **What people say is drawn, not what we infer** (see `net::web`). A direct
-//! call meets nowhere, so it has no relay and no assumed lines.
+//! call meets nowhere, so it has no relay and no assumed lines; its one line
+//! is the session between the two, drawn once the other's media is heard.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,6 +35,7 @@ use peniko::{Color, Fill};
 use super::super::colour;
 use super::network::{POLL, roster_of};
 use crate::channel::use_channel;
+use crate::net::arrival::Arrival;
 use crate::net::web::{self, Kind, State, Web};
 use crate::net::{Participant, PeerStats};
 use crate::web_layout::{self, Place};
@@ -61,6 +63,8 @@ struct Line {
     a: usize,
     b: usize,
     state: State,
+    /// How far it bows off straight, from [`web_layout::bows`].
+    bow: f64,
 }
 
 /// The drawing and a count that moves whenever it changes, shared between
@@ -139,8 +143,17 @@ fn draw(drawing: &Drawing, width: u32, height: u32, scale: f64) -> Scene {
                 &mut paths.last_mut().expect("just pushed").1
             }
         };
-        path.move_to(at(&a.place));
-        path.line_to(at(&b.place));
+        let (from, to) = (at(&a.place), at(&b.place));
+        path.move_to(from);
+        if line.bow == 0.0 {
+            path.line_to(to);
+        } else {
+            // The control point, off the middle along the normal
+            // `web_layout::bows` measures from.
+            let along = to - from;
+            let normal = peniko::kurbo::Vec2::new(-along.y, along.x) / along.hypot().max(f64::MIN_POSITIVE);
+            path.quad_to(from.midpoint(to) + normal * (line.bow * side), to);
+        }
     }
     // Flowing last, so it lies over the grey.
     paths.sort_by_key(|((state, selected), _)| (*state == State::Flowing, *selected));
@@ -188,7 +201,7 @@ fn draw(drawing: &Drawing, width: u32, height: u32, scale: f64) -> Scene {
 
 /// The room as we see it: us from `local`, everyone else from their entry,
 /// and where the room meets. Outside a room there is no meeting place to
-/// draw, only people.
+/// draw, only people, and a line to whoever's media reaches us straight.
 fn gather(me: &str, local: &PeerStats, roster: &[(String, Arc<PeerStats>)]) -> Web {
     let mut people = vec![web::person(me, true, local)];
     people.extend(roster.iter().map(|(id, stats)| web::person(id, false, stats)));
@@ -197,7 +210,16 @@ fn gather(me: &str, local: &PeerStats, roster: &[(String, Arc<PeerStats>)]) -> W
     // call thread sets, not from a flag of its own: none exists.
     let in_room = local.sending().is_some() || local.meets_at().is_some() || !local.held().is_empty();
     if !in_room {
-        return web::build(&people, &[], None);
+        // Outside a room the call thread marks a peer's arrival direct only
+        // once their broadcast is heard over the one session between us,
+        // which carries ours too: media flows both ways on it. A peer not
+        // yet heard has no line, as in a room.
+        let straight: Vec<&str> = roster
+            .iter()
+            .filter(|(_, stats)| stats.arrival() == Some(Arrival::Direct))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        return web::direct(web::build(&people, &[], None), me, &straight);
     }
     let at = web::meeting(local.meets_at().as_ref(), me, &people);
     let relays: Vec<web::Relay> = at.relay.into_iter().collect();
@@ -324,6 +346,17 @@ pub(super) fn RoomMap(local: Arc<PeerStats>, participants: Signal<Vec<Participan
     let shown = web_layout::shown_edges(&now, chosen.as_deref());
     let index_of = |id: &str| now.nodes.iter().position(|node| node.id == id);
     let chosen_at = chosen.as_deref().and_then(index_of);
+    let ends: Vec<(usize, usize, State)> = shown
+        .edges
+        .iter()
+        .filter_map(|&at| {
+            let edge = &now.edges[at];
+            Some((index_of(&edge.from)?, index_of(&edge.to)?, edge.state))
+        })
+        .collect();
+    let kinds: Vec<Kind> = now.nodes.iter().map(|node| node.kind).collect();
+    let pairs: Vec<(usize, usize)> = ends.iter().map(|&(a, b, _)| (a, b)).collect();
+    let bent = web_layout::bows(&kinds, &places, &pairs);
     let drawing = Drawing {
         dots: now
             .nodes
@@ -331,14 +364,7 @@ pub(super) fn RoomMap(local: Arc<PeerStats>, participants: Signal<Vec<Participan
             .zip(&places)
             .map(|(node, place)| Dot { kind: node.kind, can_host: node.can_host, me: node.me, place: *place })
             .collect(),
-        lines: shown
-            .edges
-            .iter()
-            .filter_map(|&at| {
-                let edge = &now.edges[at];
-                Some(Line { a: index_of(&edge.from)?, b: index_of(&edge.to)?, state: edge.state })
-            })
-            .collect(),
+        lines: ends.iter().zip(&bent).map(|(&(a, b, state), &bow)| Line { a, b, state, bow }).collect(),
         selected: chosen_at,
     };
 
@@ -360,36 +386,35 @@ pub(super) fn RoomMap(local: Arc<PeerStats>, participants: Signal<Vec<Participan
         window.request_redraw();
     }
 
-    // Names: under a node, or over it near the bottom edge, where under it
-    // would leave the square.
+    // Names: outside the ring, away from the lines in the middle; above a
+    // node in the top half, hugging it by its bottom edge, and below one in
+    // the bottom half.
     let names: Vec<(String, String)> = now
         .nodes
         .iter()
         .zip(&places)
         .filter(|(_, place)| place.named)
         .map(|(node, place)| {
-            let width = place.label;
-            let left = (place.x - width / 2.0).clamp(0.0, 1.0 - width) * 100.0;
-            let reach = place.reach(node.kind);
-            let vertical = if place.y < 0.8 {
-                format!("top:{:.2}%", (place.y + reach + 0.008) * 100.0)
+            let name = web_layout::name_box(place, node.kind);
+            let vertical = if name.above {
+                format!("bottom:{:.2}%", (1.0 - name.edge) * 100.0)
             } else {
-                format!("bottom:{:.2}%", (1.0 - place.y + reach + 0.008) * 100.0)
+                format!("top:{:.2}%", name.edge * 100.0)
             };
-            (node.id.clone(), format!("left:{left:.2}%;width:{:.2}%;{vertical}", width * 100.0))
+            (node.id.clone(), format!("left:{:.2}%;width:{:.2}%;{vertical}", name.left * 100.0, name.width * 100.0))
         })
         .collect();
     let labels: Vec<(String, String, String)> = names
         .into_iter()
         .filter_map(|(id, style)| now.nodes.iter().find(|node| node.id == id).map(|node| (id, style, label(node))))
         .collect();
-    // Click targets: at least a few pixels across even for the smallest dot.
+    // Click targets: larger than the dot, as the layout sized them.
     let targets: Vec<(String, String)> = now
         .nodes
         .iter()
         .zip(&places)
         .map(|(node, place)| {
-            let across = (place.reach(node.kind) * 2.0 * 1.3).max(0.05);
+            let across = place.hit;
             let style = format!(
                 "left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%",
                 (place.x - across / 2.0) * 100.0,
@@ -513,6 +538,15 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_call_has_no_line_until_their_media_arrives() {
+        let (me, them) = ("b".repeat(64), "a".repeat(64));
+        let roster = vec![(them, Arc::new(PeerStats::default()))];
+        let web = gather(&me, &PeerStats::default(), &roster);
+        assert_eq!(web.nodes.len(), 2);
+        assert!(web.edges.is_empty());
+    }
+
+    #[test]
     fn the_details_name_who_media_flows_with() {
         let web = web_layout::fake(6, 1, 0);
         let me = web.nodes.iter().position(|node| node.me).unwrap();
@@ -534,7 +568,10 @@ mod tests {
                 .zip(&places)
                 .map(|(node, place)| Dot { kind: node.kind, can_host: node.can_host, me: node.me, place: *place })
                 .collect(),
-            lines: vec![Line { a: 0, b: 1, state: State::Flowing }, Line { a: 1, b: 2, state: State::Assumed }],
+            lines: vec![
+                Line { a: 0, b: 1, state: State::Flowing, bow: 0.0 },
+                Line { a: 1, b: 2, state: State::Assumed, bow: 0.05 },
+            ],
             selected: Some(1),
         };
         let scene = draw(&drawing, 400, 300, 2.0);

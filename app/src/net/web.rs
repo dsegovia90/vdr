@@ -322,6 +322,33 @@ pub fn build<'p>(people: &'p [Person], relays: &'p [Relay], venue: Option<&'p st
     }
 }
 
+/// `web` with a flowing line between `me` and each of `straight`: a direct
+/// call, where the one session between two people carries both ways and
+/// nobody says a `via`, since nothing meets anywhere. Ids that are not nodes
+/// draw nothing, as in [`build`], and the edges stay sorted.
+pub fn direct(mut web: Web, me: &str, straight: &[&str]) -> Web {
+    let known = |id: &str| web.nodes.iter().any(|node| node.id == id);
+    if !known(me) {
+        return web;
+    }
+    let mut added = Vec::new();
+    for &them in straight {
+        if them == me || !known(them) {
+            continue;
+        }
+        let (from, to) = if me < them { (me, them) } else { (them, me) };
+        added.push(Edge { from: from.to_string(), to: to.to_string(), state: State::Flowing });
+    }
+    for edge in added {
+        match web.edges.iter_mut().find(|seen| seen.from == edge.from && seen.to == edge.to) {
+            Some(seen) => seen.state = seen.state.max(State::Flowing),
+            None => web.edges.push(edge),
+        }
+    }
+    web.edges.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
+    web
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +575,18 @@ mod tests {
         assert!(web.edges.is_empty());
         // A venue that is not drawn takes no edges either.
         assert!(build(&[says(&id('a'), Some(Sending::Relay), &[])], &[], Some(RELAY_ID)).edges.is_empty());
+    }
+
+    #[test]
+    fn a_direct_call_draws_one_flowing_line_between_the_two() {
+        let (me, them) = (id('b'), id('a'));
+        let people = vec![Person { me: true, ..says(&me, None, &[]) }, says(&them, None, &[])];
+        let web = build(&people, &[], None);
+        assert!(web.edges.is_empty(), "nothing said, nothing meets");
+        let web = direct(web, &me, &[&them, &id('f'), &me]);
+        assert_eq!(web.edges, vec![edge(&me, &them, State::Flowing)], "and nobody unknown, nor us to us");
+        // Saying it again changes nothing.
+        assert_eq!(direct(web.clone(), &me, &[&them]), web);
     }
 
     #[test]
