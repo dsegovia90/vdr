@@ -657,10 +657,10 @@ pub fn quiet_alpha(drawn: usize, state: State, selected: bool) -> f32 {
 /// half of [`DASH_PERIOD`] (past half, the nearest dash in the next frame is
 /// the one behind, and the eye takes that one), and it reads as one thing
 /// gliding while a frame moves it less than its own length, so where it was
-/// and where it is overlap. At 90 px/s that is 1.5 px a frame at 60 fps and
-/// 4.5 px at a degraded 20, against 8 and 6
+/// and where it is overlap. At 50 px/s that is under 1 px a frame at 60 fps and
+/// 2.5 px at a degraded 20, against 8 and 6
 /// (`dashes_cannot_seem_to_step_backwards`).
-pub const DASH_SPEED: f64 = 90.0;
+pub const DASH_SPEED: f64 = 50.0;
 /// A dash, and the gap after it, in logical pixels. A dash shorter than its
 /// gap reads as a thing moving rather than as a dashed line; 6 px rather
 /// than 5 keeps a dash longer than a 20 fps frame's step at this speed. At
