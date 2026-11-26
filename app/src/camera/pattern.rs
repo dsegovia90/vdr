@@ -17,7 +17,7 @@
 //! at two tiles) keep the encoder working on something that changes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -142,11 +142,26 @@ impl Drop for Running {
     }
 }
 
-/// Starts the pattern. Each run counts from frame zero.
+/// What every run of the pattern stamps its frames from, for the life of the
+/// process.
+///
+/// **Stamps keep rising across runs, as a camera's clock does.** Turning the
+/// camera off and on starts a new run, but the call keeps publishing on the
+/// same track, which refuses a frame stamped below what it has already
+/// reached; a run stamping from its own start sent the stamps back to zero,
+/// and the call ended on the refusal.
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Starts the pattern. Each run counts from frame zero, and stamps from
+/// [`epoch`].
 pub fn spawn(slot: FrameSlot, tap: Option<FrameTap>) -> std::io::Result<Running> {
     let live = Arc::new(AtomicBool::new(true));
     let running = live.clone();
     std::thread::Builder::new().name("camera-pattern".into()).spawn(move || {
+        let epoch = epoch();
         let start = Instant::now();
         let every = Duration::from_secs(1) / FPS;
         for n in 0u64.. {
@@ -156,7 +171,7 @@ pub fn spawn(slot: FrameSlot, tap: Option<FrameTap>) -> std::io::Result<Running>
             if let Some(wait) = due.checked_duration_since(Instant::now()) {
                 std::thread::sleep(wait);
             }
-            let frame = frame(WIDTH, HEIGHT, n, start.elapsed());
+            let frame = frame(WIDTH, HEIGHT, n, epoch.elapsed());
             if !running.load(Ordering::Relaxed) {
                 return;
             }
@@ -203,6 +218,15 @@ mod tests {
         let frame = frame(WIDTH, HEIGHT, 3, Duration::from_millis(100));
         assert!(frame.to_i420_surface(1).is_some());
         assert!(frame.to_i420_surface(2).is_some());
+    }
+
+    #[test]
+    fn a_later_run_stamps_after_an_earlier_one() {
+        let before = epoch().elapsed();
+        std::thread::sleep(Duration::from_millis(5));
+        // As a second run would: the base is the process's, not the run's.
+        assert!(epoch().elapsed() > before);
+        assert_eq!(epoch(), epoch());
     }
 
     #[test]

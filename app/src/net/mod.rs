@@ -34,6 +34,7 @@ mod report;
 mod routes;
 pub(crate) mod runtime;
 mod share;
+mod stamps;
 mod status;
 
 use std::sync::Arc;

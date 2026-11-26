@@ -855,7 +855,7 @@ fn participant_of(path: &str) -> Option<&str> {
 const TRACK: &str = "video.avc3";
 
 /// The encoder's pacing hint, not a promise. Matches the loopback.
-const FRAMERATE: u32 = 30;
+pub(super) const FRAMERATE: u32 = 30;
 
 /// Set once a hardware encoder has failed mid-call, so every later attempt in
 /// this process uses software. One failure is enough to stop trusting a driver:
@@ -1737,10 +1737,11 @@ async fn run(
                 );
                 // A hardware encoder failing mid-call demotes the rest of this
                 // run to software; the call's own retry then reopens on it.
-                if outcome.is_err() && encoder.name() != SOFTWARE_ENCODER {
+                if demotes(&outcome, encoder.name()) {
                     tracing::warn!("[video] {} failed mid-call; software from now on", encoder.name());
                     HARDWARE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                let outcome = outcome.map_err(Stopped::into_message);
                 if let Ok(flushed) = encoder.flush() {
                     if !flushed.is_empty() && producer.publish(&flushed).is_ok() {
                         metrics.camera_sent(payload_bytes(&flushed));
@@ -1939,12 +1940,40 @@ pub(super) fn payload_bytes(encoded: &[moq_video::encode::Encoded]) -> usize {
     encoded.iter().map(|frame| frame.payload.len()).sum()
 }
 
+/// How the camera's encode loop ended badly.
+///
+/// **Only the encoder's own failure says anything about the encoder.** A
+/// publish that fails is the track's or the session's, and treating it as
+/// the hardware encoder failing would put the rest of the process on
+/// software for a fault the encoder never had.
+#[derive(Debug)]
+enum Stopped {
+    /// The encoder could not encode a frame.
+    Encoder(String),
+    /// What it encoded could not be published.
+    Publish(String),
+}
+
+impl Stopped {
+    fn into_message(self) -> String {
+        match self {
+            Self::Encoder(message) | Self::Publish(message) => message,
+        }
+    }
+}
+
+/// Whether an encode loop that ended with `outcome`, on the encoder named
+/// `encoder`, is a hardware encoder failing.
+fn demotes(outcome: &Result<(), Stopped>, encoder: &str) -> bool {
+    matches!(outcome, Err(Stopped::Encoder(_))) && encoder != SOFTWARE_ENCODER
+}
+
 fn encode(
     feed: &mut FrameFeed,
     encoder: &mut moq_video::encode::Encoder,
     producer: &mut moq_video::encode::Producer,
     steering: Steering<'_>,
-) -> Result<(), String> {
+) -> Result<(), Stopped> {
     let Steering {
         scale,
         lane,
@@ -1953,6 +1982,9 @@ fn encode(
         local,
         metrics,
     } = steering;
+    // For as long as this producer: the camera turned off and on again is
+    // the same track, and its timeline must keep rising (see `stamps`).
+    let mut rising = super::stamps::Rising::default();
     loop {
         // The only way out other than the camera going away. Checked per frame
         // rather than per sleep, so a busy encoder still notices promptly.
@@ -1990,9 +2022,9 @@ fn encode(
         let Some(surface) = frame.to_i420_surface(scale) else {
             continue;
         };
+        let stamp = rising.stamp(frame.timestamp.as_micros() as u64);
         // The encoder paces on these, so a wrong one stalls the stream.
-        let Ok(timestamp) = moq_net::Timestamp::from_micros(frame.timestamp.as_micros() as u64)
-        else {
+        let Ok(timestamp) = moq_net::Timestamp::from_micros(stamp) else {
             tracing::warn!("frame timestamp out of range; skipping");
             continue;
         };
@@ -2000,14 +2032,31 @@ fn encode(
         // document to carry. Taken as the frame is encoded, a few ms after
         // capture, so measured delays read that much short -- small next to
         // what is being measured, and stated where the numbers are reported.
-        local.set_clock(Clock::now(frame.timestamp.as_micros() as u64));
+        // The published stamp, not the capture's: it is what a viewer reads.
+        local.set_clock(Clock::now(stamp));
         let encoded = encoder
             .encode(&moq_video::Frame::new(surface, timestamp))
-            .map_err(|error| format!("encode failed: {error:#}"))?;
+            .map_err(|error| Stopped::Encoder(format!("encode failed: {error:#}")))?;
         if !encoded.is_empty() {
-            producer
-                .publish(&encoded)
-                .map_err(|error| format!("publish failed: {error:#}"))?;
+            if let Err(error) = producer.publish(&encoded) {
+                match super::stamps::refusal(&error) {
+                    // Skipped, and a keyframe asked for, since what follows
+                    // a skipped frame cannot be decoded without one.
+                    Some(refusal) => {
+                        if refusal == super::stamps::Refusal::Rewind {
+                            tracing::warn!("[video] the track refused a frame stamped below its edge; skipping it and moving on");
+                            rising.refused();
+                        } else {
+                            tracing::debug!("[video] skipping a frame until the next keyframe");
+                        }
+                        if let Err(error) = encoder.cut() {
+                            tracing::warn!("could not ask the encoder for a keyframe: {error:#}");
+                        }
+                        continue;
+                    }
+                    None => return Err(Stopped::Publish(format!("publish failed: {error:#}"))),
+                }
+            }
             metrics.camera_sent(payload_bytes(&encoded));
             metrics.camera_frames(encoded.len());
         }
@@ -4314,5 +4363,57 @@ mod served_tests {
         assert!((300..=500).contains(&busy.forwarded), "{busy:?}");
         assert!((300..=500).contains(&busy.own), "{busy:?}");
         assert_eq!((busy.guests, busy.pulling), (2, 1), "{busy:?}");
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_encoders_own_failure_demotes_it() {
+        let encoder = Err(Stopped::Encoder("encode failed".into()));
+        let publish = Err(Stopped::Publish("publish failed".into()));
+        assert!(demotes(&encoder, "videotoolbox"));
+        assert!(!demotes(&publish, "videotoolbox"), "a publish error is not the encoder's");
+        assert!(!demotes(&encoder, SOFTWARE_ENCODER), "software has nowhere to go");
+        assert!(!demotes(&Ok(()), "videotoolbox"));
+    }
+
+    /// The camera off and on under one producer, as the encode loop keeps
+    /// it, with the capture's clock starting again: the track refuses the
+    /// restart as it is, and takes it on the published stamps.
+    #[tokio::test]
+    async fn a_restarted_capture_is_refused_as_it_is_and_taken_rising() {
+        let (width, height) = (160, 90);
+        let origin = moq_tokio::origin::spawn();
+        let mut broadcast = origin.create_broadcast("restart").unwrap();
+        let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+        let mut config = moq_video::encode::Config::new(width, height, framerate());
+        config.kind = moq_video::encode::Kind::Software;
+        let rendition = config.probe().await.unwrap();
+        let track = broadcast.create_track(TRACK, catalog.track_info(VIDEO_PRIORITY)).unwrap();
+        let mut producer = moq_video::encode::Producer::with_track(track, catalog.clone(), rendition).unwrap();
+        let mut encoder = moq_video::encode::Encoder::new(&config).unwrap();
+        let mut encode = |n: u64, micros: u64| {
+            let frame = crate::camera::pattern::frame(width, height, n, std::time::Duration::from_micros(micros));
+            let surface = frame.to_i420_surface(1).unwrap();
+            let timestamp = moq_net::Timestamp::from_micros(micros).unwrap();
+            encoder.cut().unwrap();
+            encoder.encode(&moq_video::Frame::new(surface, timestamp)).unwrap()
+        };
+
+        let mut rising = super::super::stamps::Rising::default();
+        for n in 0..5u64 {
+            let encoded = encode(n, rising.stamp(1_000_000 + n * 33_333));
+            producer.publish(&encoded).unwrap();
+        }
+        // The capture's clock starts again near zero.
+        let refused = producer.publish(&encode(5, 0)).unwrap_err();
+        assert_eq!(super::super::stamps::refusal(&refused), Some(super::super::stamps::Refusal::Rewind));
+        for n in 0..5u64 {
+            let encoded = encode(10 + n, rising.stamp(n * 33_333));
+            producer.publish(&encoded).unwrap_or_else(|error| panic!("frame {n} after the restart: {error:#}"));
+        }
     }
 }
