@@ -583,7 +583,7 @@ fn gather(me: &str, local: &PeerStats, roster: &[(String, Arc<PeerStats>)]) -> O
 
 /// Everyone else in the call, once each, by their camera's entry: a share
 /// carries its sharer's, so it would only be them again.
-fn roster_of(participants: &[Participant]) -> Vec<(String, Arc<PeerStats>)> {
+pub(super) fn roster_of(participants: &[Participant]) -> Vec<(String, Arc<PeerStats>)> {
     let mut roster: Vec<(String, Arc<PeerStats>)> = Vec::new();
     for participant in participants.iter().filter(|participant| participant.feed == Feed::Camera) {
         if !roster.iter().any(|(id, _)| *id == participant.id) {

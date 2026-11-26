@@ -477,16 +477,18 @@ enum HostMark {
 impl HostMark {
     /// One hue, sky blue, which nothing else on a tile uses: emerald is
     /// talking and a good link, amber a stall or a weak link, red a muted
-    /// microphone or a poor link. Plain hex rather than palette shades, as
-    /// the icons need. Quiet is thinner and see-through; carrying is the same
+    /// microphone or a poor link. The `host` theme colour (`colour::HOST`),
+    /// plain hex rather than a palette shade, as the icons need; `/40` is the
+    /// same mix of it with transparent that the dim layers' `bg-black/N` use.
+    /// Quiet is thinner and see-through; carrying is the same
     /// colour at full strength and thicker, so the two read as one thing
     /// turned up. A border, not a ring: rings are box shadows, and borders
     /// are what this renderer is known to draw on the menus.
     fn class(self) -> &'static str {
         match self {
             HostMark::None => "hidden pointer-events-none absolute inset-0 rounded-[12px]",
-            HostMark::Can => "pointer-events-none absolute inset-0 rounded-[12px] border-2 border-[#38bdf866]",
-            HostMark::Carrying => "pointer-events-none absolute inset-0 rounded-[12px] border-[3px] border-[#38bdf8]",
+            HostMark::Can => "pointer-events-none absolute inset-0 rounded-[12px] border-2 border-host/40",
+            HostMark::Carrying => "pointer-events-none absolute inset-0 rounded-[12px] border-[3px] border-host",
         }
     }
 }
@@ -739,7 +741,7 @@ mod tests {
         assert!(HostMark::None.class().starts_with("hidden"));
         for mark in [HostMark::Can, HostMark::Carrying] {
             assert!(!mark.class().contains("hidden"));
-            assert!(mark.class().contains("border-[#38bdf8"));
+            assert!(mark.class().contains(" border-host"));
         }
     }
 

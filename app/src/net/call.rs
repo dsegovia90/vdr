@@ -500,10 +500,10 @@ fn accept(
             let events = events.clone();
             let heard = heard.clone();
             // The hop the guest declared, kept while its session lives.
-            let declared = guests.clone().zip(request.peer_hop().map(|hop| hop.id()).filter(|&hop| hop != 0));
-            if let Some((guests, hop)) = &declared {
-                guests.add(*hop);
-            }
+            let declared = guests
+                .clone()
+                .zip(request.peer_hop().map(|hop| hop.id()).filter(|&hop| hop != 0))
+                .map(|(guests, hop)| Declared::new(guests, hop));
             sessions.spawn(async move {
                 let session = request.ok().await;
                 // Ends with this task, so it never outlives the session.
@@ -518,14 +518,36 @@ fn accept(
                     }
                     (Err(error), _) => tracing::warn!("a session failed to start: {error:#}"),
                 }
-                if let Some((guests, hop)) = declared {
-                    guests.remove(hop);
-                }
+                drop(declared);
                 let _ = events.unbounded_send(false);
             });
         }
     }));
     (task, receiver)
+}
+
+/// A guest's hop in [`arrival::Guests`] while its session lives.
+///
+/// **Taken back on drop**, because the accept loop is aborted when hosting is
+/// switched off, which drops each session's task mid-await: a removal written
+/// after the await never ran, and every guest turned away stayed a guest for
+/// the rest of the attempt.
+struct Declared {
+    guests: Arc<arrival::Guests>,
+    hop: u64,
+}
+
+impl Declared {
+    fn new(guests: Arc<arrival::Guests>, hop: u64) -> Self {
+        guests.add(hop);
+        Self { guests, hop }
+    }
+}
+
+impl Drop for Declared {
+    fn drop(&mut self) {
+        self.guests.remove(self.hop);
+    }
 }
 
 /// Notes in `heard` whenever a guest's session receives anything, on the
@@ -672,6 +694,32 @@ const CONTROL: &str = "control";
 /// The document inside it.
 const PRESENCE: &str = "presence.json";
 
+/// Beside it: how every other person's media reaches this one, for the
+/// room map (`web` says what the document holds).
+///
+/// **A track of its own, asked for on demand**, rather than more presence.
+/// A hundred people each describing ninety-nine paths is kilobytes a
+/// person, worth sending only to someone looking at the map. A subscription
+/// is what makes a publisher serve a track, so a track nobody has asked for
+/// costs nothing on the wire; and its writer works out and writes nothing
+/// while it is unused (`publish_routes`), so it costs no work either.
+/// Readers ask only while their map is open (`attend`). An older build
+/// neither publishes nor asks for it.
+const ROUTES: &str = "routes.json";
+
+/// What a routes read asks of the publisher: below audio and video, since
+/// it is drawn and never heard, and a few hundred bytes every few seconds.
+const ROUTES_PRIORITY: u8 = 50;
+
+/// How long a peer whose routes could not be asked for is left before
+/// asking again. An older build has none, and asking it every quarter
+/// second, as presence is asked for again, would be a request per peer for
+/// nothing.
+const ROUTES_AGAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the routes writer looks for a change while it is used.
+const ROUTES_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// How long a departed participant's reader may keep running to deliver their
 /// last word. Generous: it only ever runs out on a reader that hears nothing.
 const GOODBYE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -770,6 +818,23 @@ struct Presence {
     /// costs only itself.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "super::moves::lenient")]
     moved: Option<super::moves::CallOn>,
+    /// Where their media goes now: `"relay"`, `"guests"`, or a host's
+    /// endpoint id (`web` says what each means). Said by every build that
+    /// has it, switch or no switch, for the room's map in the Topology tab;
+    /// absent outside a room and from older builds. **Read leniently**: a
+    /// bad value is nothing said.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "super::web::say_via",
+        deserialize_with = "super::web::lenient_via"
+    )]
+    via: Option<arrival::Sending>,
+    /// The hosts they hold a session to, by endpoint id, never a door; at
+    /// most `web::HELD_MAX`. Absent when empty, and read entry by entry as
+    /// leniently as `seen`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "super::web::lenient_held")]
+    held: Vec<String>,
 }
 
 impl Default for Presence {
@@ -787,6 +852,8 @@ impl Default for Presence {
             seen: std::collections::BTreeMap::new(),
             host: None,
             moved: None,
+            via: None,
+            held: Vec::new(),
         }
     }
 }
@@ -819,6 +886,9 @@ impl Presence {
             // The winner we follow, repeated, so a choice outlives whoever
             // made it. Cleaned on the way out too.
             moved: local.followed_move().and_then(super::moves::CallOn::clean),
+            // Cleaned on the way out too, as everything here is.
+            via: super::web::clean_via(local.sending(), ""),
+            held: super::web::clean_held(local.held(), ""),
         }
     }
 }
@@ -1215,6 +1285,12 @@ async fn run(
         // The first word already carries the camera and microphone as they
         // are, so joining muted is announced from the start.
         say(&presence, Presence::here(&local));
+        // Beside presence, and written only while someone is subscribed: the
+        // room map is the only reader, and it asks only while it is open.
+        let routes_track = control
+            .create_track(ROUTES, None)
+            .map_err(|error| format!("could not create a routes track: {error:#}"))?;
+        let _routes_out = Abort(tokio::spawn(publish_routes(routes_track, local.clone())));
         // Advertised only now that the presence track exists: an announce is
         // acted on at once, so a peer must find the document waiting.
         control
@@ -1273,11 +1349,15 @@ async fn run(
         // that from looping (a route is never offered back to the session it
         // came in on), which this module's bridge tests show. With hosting off a
         // join is wired exactly as it always was, two origins, until a change
-        // to everyone's has been tried by hand.
+        // to everyone's has been tried by hand. So the switch is read here for
+        // the wiring; once wired, a shared join follows it both ways for the
+        // rest of the attempt (`keep_hosting`), and one wired apart says why
+        // switching on waits for the next join.
         let host_rooms = local.host_rooms();
         // Where the last call was moved says nothing about this one.
         local.forget_moves();
         let shared = shares_origin(&peering, host_rooms);
+        let _noting = (wired(&peering, shared) == Wired::Apart).then(|| Abort(tokio::spawn(note_next_join(local.clone()))));
         // Only a host passes on other people's media, so only a host counts it.
         let forwarded = shared.then(|| Forwarded::new(me.to_string()));
         let inbound = inbound_for(&outbound, shared);
@@ -1299,7 +1379,7 @@ async fn run(
             }),
             _ => None,
         };
-        // Serving the room's members beside the join, while hosting stays on.
+        // Serving the room's members beside the join, while hosting is on.
         let mut alongside: Option<Abort> = None;
 
         // Read before the match below takes `peering` apart. A hosted room is
@@ -1386,11 +1466,11 @@ async fn run(
                 let heard = Arc::new(quiet::Heard::default());
                 if shared {
                     alongside = host_alongside(Alongside {
-                        config: &client_config,
-                        endpoint: &endpoint,
+                        config: client_config.clone(),
+                        endpoint: endpoint.clone(),
                         shared: outbound.clone(),
-                        url,
-                        doors: &doors,
+                        url: url.clone(),
+                        doors: doors.clone(),
                         estimates: adapt::Estimates::new(guests),
                         local: local.clone(),
                         forwarded: forwarded.clone(),
@@ -1916,6 +1996,7 @@ async fn run(
         local.set_room(None);
         // Out of the room, our media goes nowhere.
         local.set_sending(None);
+        local.set_held(Vec::new());
         local.set_meets_at(None);
         // Aborting the loop above stops the per-participant tasks with it, but
         // the tiles are the interface's and have to be taken down by name.
@@ -2209,6 +2290,8 @@ async fn attend(
     // as it changes, so a host's presence has had time to name its hop.
     let mut chains: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
     let mut routes: std::collections::HashMap<String, arrival::Arrival> = std::collections::HashMap::new();
+    // Whose `routes.json` we read, while our map is open: none otherwise.
+    let mut following: std::collections::HashMap<String, Abort> = std::collections::HashMap::new();
 
     loop {
         let update = tokio::select! {
@@ -2218,7 +2301,8 @@ async fn attend(
             },
             _ = stats_tick.tick() => {
                 reporter.tick(std::time::Instant::now(), &metrics, &rooms.local, &people, &present, &me);
-                note_routes(&chains, &people, &mut routes, &routing, in_room);
+                note_routes(&chains, &people, &mut routes, &routing, in_room, &rooms.local, &me);
+                follow_all_routes(&rooms.local, &present, &people, &mut following, &inbound);
                 if let Some(file) = stats_file.as_mut() {
                     write_stats(file, &me, &people, &metrics);
                 }
@@ -2472,6 +2556,10 @@ async fn attend(
 /// scripted run can be judged from the log. Nobody is read before their
 /// presence has arrived: until then, a host would read as the relay.
 ///
+/// **And works out our `routes.json`, only while it is wanted**: someone
+/// subscribed to it, or our own map open. Otherwise nothing beyond the
+/// arrivals is worked out, and the last document is let go.
+///
 /// Outside a room (a call dialled to one peer) there is nobody between.
 fn note_routes(
     chains: &std::collections::HashMap<String, Vec<u64>>,
@@ -2479,6 +2567,8 @@ fn note_routes(
     said: &mut std::collections::HashMap<String, arrival::Arrival>,
     routing: &Routing,
     in_room: bool,
+    local: &PeerStats,
+    me: &str,
 ) {
     let hosts: std::collections::BTreeMap<u64, String> = people
         .iter()
@@ -2486,29 +2576,99 @@ fn note_routes(
         .collect();
     let guests = routing.guests.hops();
     let far = routing.far.as_deref().filter(|far| people.contains_key(*far));
+    let wanted = local.routes_wanted() || local.map_open();
+    let heard = |id: &String| people.get(id).filter(|stats| stats.heard());
+    // The far side of our session to the meeting place, from every chain
+    // that ends there: what names the relay further back in another's.
+    let mut venue = std::collections::HashSet::new();
+    if wanted && in_room {
+        let none = std::collections::HashSet::new();
+        for (id, hops) in chains {
+            let Some(stats) = heard(id) else { continue };
+            let reading = arrival::Known { theirs: stats.host_hop(), hosts: &hosts, guests: &guests, ours: routing.ours, far, who: id, venue: &none };
+            if arrival::ends_at_venue(hops, &reading) {
+                venue.extend(hops.last().copied());
+            }
+        }
+    }
+    let gates = if wanted { arrival::own_gates(chains.values().map(Vec::as_slice)) } else { Default::default() };
+    let mut paths: std::collections::BTreeMap<String, Option<Vec<super::web::Hop>>> = std::collections::BTreeMap::new();
     for (id, hops) in chains {
-        let Some(stats) = people.get(id).filter(|stats| stats.heard()) else { continue };
-        let arrival = if in_room {
-            arrival::read(
-                hops,
-                &arrival::Known {
-                    theirs: stats.host_hop(),
-                    hosts: &hosts,
-                    guests: &guests,
-                    ours: routing.ours,
-                    far,
-                    who: id,
-                },
-            )
-        } else {
-            Some(arrival::Arrival::Direct)
-        };
+        let Some(stats) = heard(id) else { continue };
+        let reading = arrival::Known { theirs: stats.host_hop(), hosts: &hosts, guests: &guests, ours: routing.ours, far, who: id, venue: &venue };
+        if wanted {
+            let path = if in_room { arrival::path_of(hops, &reading) } else { Some(Vec::new()) };
+            let path = path.map(|mut path| {
+                path.retain(|hop| !matches!(hop, super::web::Hop::Unnamed(hop) if gates.contains(hop)));
+                path
+            });
+            paths.insert(id.clone(), path);
+        }
+        let arrival = if in_room { arrival::read(hops, &reading) } else { Some(arrival::Arrival::Direct) };
         let Some(arrival) = arrival else { continue };
         if said.get(id) != Some(&arrival) {
             tracing::info!("{id} now arrives {}", arrival::arrival_log(&arrival));
             stats.set_arrival(Some(arrival.clone()));
             said.insert(id.clone(), arrival);
         }
+    }
+    if !wanted {
+        if local.routes_out().is_some() {
+            local.set_routes_out(None);
+        }
+        return;
+    }
+    // Someone heard whose broadcast has no route to us: not received.
+    for (id, _) in people.iter().filter(|(id, stats)| stats.heard() && id.as_str() != me) {
+        paths.entry(id.clone()).or_insert(None);
+    }
+    let mut roster: Vec<&str> = people.keys().map(String::as_str).chain(std::iter::once(me)).collect();
+    roster.sort_unstable();
+    let routes = super::web::Routes {
+        origin: routing.ours,
+        gates: local.gates(),
+        venue: {
+            let mut venue: Vec<u64> = venue.into_iter().collect();
+            venue.sort_unstable();
+            venue
+        },
+        paths,
+    };
+    let document: Arc<[u8]> = super::web::say_routes(&routes, &roster).into();
+    if local.routes_out().as_deref() != Some(&*document) {
+        local.set_routes_out(Some(document));
+    }
+}
+
+/// Keeps one routes reader per person present while our map is open, and
+/// none while it is closed: what makes the map cost nothing unseen. Logged
+/// as it starts and stops, so a run shows that no `routes` subscription is
+/// left behind.
+fn follow_all_routes(
+    local: &PeerStats,
+    present: &std::collections::HashSet<String>,
+    people: &std::collections::HashMap<String, Arc<PeerStats>>,
+    following: &mut std::collections::HashMap<String, Abort>,
+    inbound: &moq_net::origin::Consumer,
+) {
+    if !local.map_open() {
+        if !following.is_empty() {
+            tracing::info!("the room map closed: following nobody's routes");
+            following.clear();
+        }
+        return;
+    }
+    let before = following.len();
+    following.retain(|id, _| present.contains(id));
+    for id in present {
+        if following.contains_key(id) {
+            continue;
+        }
+        let Some(stats) = people.get(id) else { continue };
+        following.insert(id.clone(), Abort(tokio::spawn(follow_routes(inbound.clone(), id.clone(), stats.clone()))));
+    }
+    if following.len() != before {
+        tracing::info!("the room map is open: following {} people's routes", following.len());
     }
 }
 
@@ -2585,8 +2745,10 @@ async fn announce(
         // the link, and is only logged as it starts and stops.
         // A move of the call is in it too: followers act on it as it is said,
         // so it must not wait for the clock refresh.
-        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name, now.link.is_some(), &now.host, &now.moved)
-            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name, said.link.is_some(), &said.host, &said.moved);
+        // Where our media goes and which hosts we hold go at once too: the
+        // room's map would otherwise show a move for up to the clock refresh.
+        let changed = (now.camera, now.mic, &now.room, &now.requests, now.sharing, &now.name, now.link.is_some(), &now.host, &now.moved, &now.via, &now.held)
+            != (said.camera, said.mic, &said.room, &said.requests, said.sharing, &said.name, said.link.is_some(), &said.host, &said.moved, &said.via, &said.held);
         if changed {
             let asking = match now.requests.len() {
                 0 => String::new(),
@@ -2604,8 +2766,9 @@ async fn announce(
                 Some(on) => format!(", call on {}", super::moves::describe(on.to.as_deref())),
                 None => String::new(),
             };
+            let held = held_said(&now.held);
             tracing::info!(
-                "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}{hosting}{moved}",
+                "now camera {}, mic {}, room {}{asking}{sharing}{named}{reporting}{hosting}{moved}{held}",
                 on_off(now.camera),
                 on_off(now.mic),
                 room_name(&now.room)
@@ -2623,6 +2786,141 @@ async fn announce(
     }
 }
 
+/// Writes our `routes.json` while anyone is subscribed to it, and nothing
+/// while nobody is.
+///
+/// **On the used edge, on any change, and every [`super::fresh::HEARTBEAT`]**:
+/// each document a group of its own, as presence is, and written again
+/// unchanged, because a reader carried across a change of route waits for
+/// a group that may never come otherwise (`fresh.rs`). While unused it
+/// waits on the track, no timer running, and says so on our entry, so the
+/// attendance loop stops working routes out too; the last document is
+/// dropped, so a later reader never gets a stale one first.
+///
+/// The library counts every live handle to the track as a use: one per
+/// subscription a session serves (read in moq-net's publisher), so a
+/// subscriber anywhere downstream is one here, through a relay too, which
+/// holds its upstream subscription while someone reads through it
+/// (inferred, not read in the relay).
+async fn publish_routes(mut track: moq_net::track::Producer, local: Arc<PeerStats>) {
+    loop {
+        if track.used().await.is_err() {
+            return;
+        }
+        tracing::info!("our routes are asked for");
+        local.set_routes_wanted(true);
+        let mut last: Option<Arc<[u8]>> = None;
+        let mut written = tokio::time::Instant::now();
+        let mut ticker = tokio::time::interval(ROUTES_TICK);
+        let closed = loop {
+            tokio::select! {
+                gone = track.unused() => break gone.is_err(),
+                _ = ticker.tick() => {}
+            }
+            // Nothing until the attendance loop has worked it out, within its
+            // second.
+            let Some(now) = local.routes_out() else { continue };
+            if last.as_ref() != Some(&now) || written.elapsed() >= super::fresh::HEARTBEAT {
+                if let Err(error) = track.write_frame(moq_net::Timestamp::now(), now.to_vec()) {
+                    tracing::warn!("could not publish our routes: {error:#}");
+                }
+                last = Some(now);
+                written = tokio::time::Instant::now();
+            }
+        };
+        local.set_routes_wanted(false);
+        // Our own map reads it too, and keeps it while open.
+        if !local.map_open() {
+            local.set_routes_out(None);
+        }
+        if closed {
+            return;
+        }
+        tracing::info!("our routes are no longer asked for");
+    }
+}
+
+/// Reads one peer's `routes.json` onto their entry, for as long as it runs:
+/// `attend` keeps one per person while our map is open and drops it when it
+/// closes or they leave, which takes what they said off their entry.
+///
+/// Asked for again as presence is when a read ends; one that hears nothing
+/// within [`follow::PATIENCE`] of starting, or for a heartbeat and that
+/// again after a document, is given up and asked again, since a reader
+/// carried to a new route may wait for good. A peer without the track (an
+/// older build) is asked again only after [`ROUTES_AGAIN`].
+async fn follow_routes(inbound: moq_net::origin::Consumer, id: String, stats: Arc<PeerStats>) {
+    struct Forget(Arc<PeerStats>);
+    impl Drop for Forget {
+        fn drop(&mut self) {
+            self.0.set_reported(None);
+        }
+    }
+    let _forget = Forget(stats.clone());
+    // Reads in a row that heard nothing: the first is asked again at once.
+    let mut quiet = 0u32;
+    loop {
+        let wait = match read_routes(&inbound, &id, &stats).await {
+            RoutesRead::Missing => ROUTES_AGAIN,
+            RoutesRead::Quiet => {
+                quiet += 1;
+                if quiet >= 2 { ROUTES_AGAIN } else { follow::AGAIN }
+            }
+            RoutesRead::Ended => {
+                quiet = 0;
+                follow::AGAIN
+            }
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// How one read of someone's routes ended.
+enum RoutesRead {
+    /// It could not be asked for: they have no such track, or are gone.
+    Missing,
+    /// Asked for, and nothing came.
+    Quiet,
+    /// It was heard, then ended or went quiet.
+    Ended,
+}
+
+async fn read_routes(inbound: &moq_net::origin::Consumer, id: &str, stats: &PeerStats) -> RoutesRead {
+    let Ok(broadcast) = inbound.request_broadcast(control_path(id).as_str()).await else {
+        return RoutesRead::Missing;
+    };
+    let Ok(track) = broadcast.track(ROUTES) else { return RoutesRead::Missing };
+    let subscription = moq_net::track::Subscription::default().with_priority(ROUTES_PRIORITY);
+    let subscriber = match tokio::time::timeout(follow::PATIENCE, track.subscribe(subscription)).await {
+        Ok(Ok(subscriber)) => subscriber,
+        Ok(Err(error)) => {
+            tracing::debug!("{id} has no routes to follow: {error:#}");
+            return RoutesRead::Missing;
+        }
+        Err(_) => return RoutesRead::Missing,
+    };
+    let mut groups = subscriber.ordered();
+    let mut heard = false;
+    loop {
+        let limit = if heard { super::fresh::HEARTBEAT + follow::PATIENCE } else { follow::PATIENCE };
+        let mut group = match tokio::time::timeout(limit, groups.next_group()).await {
+            Ok(Ok(Some(group))) => group,
+            Ok(Ok(None)) | Ok(Err(_)) if !heard => return RoutesRead::Missing,
+            Ok(Ok(None)) | Ok(Err(_)) => return RoutesRead::Ended,
+            Err(_) if heard => return RoutesRead::Ended,
+            Err(_) => return RoutesRead::Quiet,
+        };
+        let Ok(Ok(Some(frame))) = tokio::time::timeout(follow::PATIENCE, group.read_frame()).await else { continue };
+        match super::web::read_routes(&frame.payload, id) {
+            Some(reported) => {
+                stats.set_reported(Some(Arc::new(reported)));
+                heard = true;
+            }
+            None => tracing::debug!("{id}'s routes could not be read ({} bytes)", frame.payload.len()),
+        }
+    }
+}
+
 /// How often our clock pairing is re-said. Clocks drift slowly; this is about
 /// a peer that joins late having one soon, not about precision.
 const CLOCK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
@@ -2630,6 +2928,21 @@ const CLOCK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long a request is said before we give up on it. An invite nobody
 /// accepts simply goes away; there is no decline.
 const ASK_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The sessions we hold, for the status line: the relay by name, hosts by
+/// count, since `sessions` logs each host as it comes and goes. `held`
+/// carries the relay as a word beside the hosts' ids, so a plain count would
+/// call it a host.
+fn held_said(held: &[String]) -> String {
+    let relay = held.iter().any(|id| id == super::web::HELD_RELAY);
+    let hosts = held.len() - usize::from(relay);
+    match (relay, hosts) {
+        (false, 0) => String::new(),
+        (true, 0) => ", holding the relay".to_string(),
+        (false, n) => format!(", holding {n} host session(s)"),
+        (true, n) => format!(", holding the relay and {n} host session(s)"),
+    }
+}
 
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
@@ -2795,6 +3108,8 @@ async fn listen(
                     seen,
                     host,
                     moved,
+                    via,
+                    held,
                 })) => {
                     let room = subroom(room);
                     if let Some(clock) = clock {
@@ -2818,6 +3133,10 @@ async fn listen(
                     // claim like a name, and their own id has no place in it.
                     stats.set_link(link.map(Link::clean));
                     stats.set_seen(quality::clean_seen(seen, &id));
+                    // For the room's map: cleaned again with their id, which
+                    // has no place in either.
+                    stats.set_sending(super::web::clean_via(via, &id));
+                    stats.set_held(super::web::clean_held(held, &id));
                     // Read by their audio task on every frame, which is what sets
                     // how loud they are to us.
                     stats.set_room(room.clone());
@@ -2985,15 +3304,17 @@ fn inbound_for(outbound: &moq_net::origin::Producer, shared: bool) -> moq_net::o
     if shared { outbound.clone() } else { moq_tokio::origin::spawn() }
 }
 
-/// Everything [`host_alongside`] needs, named rather than positional.
-struct Alongside<'a> {
-    config: &'a moq_tokio::client::Config,
-    endpoint: &'a moq_tokio::iroh::Endpoint,
+/// Everything [`host_alongside`] needs, named rather than positional. Owned,
+/// because the door is opened again from inside the hosting task each time
+/// the switch comes back on.
+struct Alongside {
+    config: moq_tokio::client::Config,
+    endpoint: moq_tokio::iroh::Endpoint,
     /// The one origin the join and its guests share.
     shared: moq_net::origin::Producer,
     /// The room on the relay; its path is the room we host.
-    url: &'a url::Url,
-    doors: &'a door::Doors,
+    url: url::Url,
+    doors: Arc<door::Doors>,
     /// Where the guests' links are gathered, for when nothing else carries
     /// our media.
     estimates: Arc<adapt::Estimates>,
@@ -3005,9 +3326,66 @@ struct Alongside<'a> {
     heard: Arc<quiet::Heard>,
 }
 
+/// One opening of the door: the accept loop with its sessions, what it says
+/// about them, and what we say in presence while it runs.
+struct Served {
+    accepting: Abort,
+    events: futures_channel::mpsc::UnboundedReceiver<bool>,
+    offer: door::Offer,
+}
+
+impl Alongside {
+    /// Starts accepting the room's members behind its door. `None` when it
+    /// cannot, logged once here.
+    ///
+    /// **The room's own door, every time.** It is the one the interface issued
+    /// for this room as the join started, which is the one its members saved
+    /// with the room, so switching hosting off and on again leaves their
+    /// saved invites working, as a rejoin would.
+    async fn open(&self) -> Option<Served> {
+        let room = self.url.path().trim_matches('/').to_string();
+        if room.is_empty() {
+            tracing::info!("not hosting: this room is the relay's root, which has no name a guest could ask for");
+            return None;
+        }
+        let Some(entry) = self.doors.get(&crate::recent::identity(&self.url)) else {
+            tracing::warn!("not hosting: no door was issued for this room");
+            return None;
+        };
+        let hosting = door::Hosting::with_door(room, entry);
+        let served = serve(Serve {
+            config: &self.config,
+            endpoint: &self.endpoint,
+            publisher: self.shared.consume(),
+            subscriber: self.shared.clone(),
+            door: Some(hosting.clone()),
+            estimates: Some(self.estimates.clone()),
+            // The guests' figures stay out of the Network tab, which shows the
+            // link carrying our media; see `host_alongside`.
+            metrics: Arc::new(Metrics::default()),
+            forwarded: self.forwarded.clone(),
+            guests: Some(self.guests.clone()),
+            heard: Some(self.heard.clone()),
+        })
+        .await;
+        match served {
+            Ok((accepting, events)) => Some(Served {
+                accepting,
+                events,
+                offer: hosting.offer(self.shared.hop().id()),
+            }),
+            Err(error) => {
+                tracing::warn!("not hosting: {error}");
+                None
+            }
+        }
+    }
+}
+
 /// Serves the room's members directly beside a join, behind the room's door,
-/// and says so in presence, until hosting is switched off or the attempt
-/// ends. `None` when it cannot: logged, and the join goes on regardless.
+/// and says so in presence, while hosting is switched on, until the attempt
+/// ends. `None` when it cannot as the join starts: logged, and the join goes
+/// on regardless.
 ///
 /// **The guests' links steer what we send only when nothing else carries
 /// it.** They are gathered apart from the call's estimate, and the join
@@ -3016,95 +3394,178 @@ struct Alongside<'a> {
 /// connection figures never reach the Network tab, so that it always shows
 /// one link.
 ///
-/// Switching hosting off ends this at once and every guest's session with
-/// it; switching it on again takes effect from the next join, because the
-/// origins are wired as the attempt starts.
-async fn host_alongside(args: Alongside<'_>) -> Option<Abort> {
-    let Alongside {
-        config,
-        endpoint,
-        shared,
-        url,
-        doors,
-        estimates,
-        local,
-        forwarded,
-        guests,
-        heard,
-    } = args;
-    let room = url.path().trim_matches('/').to_string();
-    if room.is_empty() {
-        tracing::info!("not hosting: this room is the relay's root, which has no name a guest could ask for");
-        return None;
-    }
-    let Some(entry) = doors.get(&crate::recent::identity(url)) else {
-        tracing::warn!("not hosting: no door was issued for this room");
-        return None;
-    };
-    let hosting = door::Hosting::with_door(room, entry);
-    let served = serve(Serve {
-        config,
-        endpoint,
-        publisher: shared.consume(),
-        subscriber: shared.clone(),
-        door: Some(hosting.clone()),
-        estimates: Some(estimates),
-        // The guests' figures stay out of the Network tab, which shows the
-        // link carrying our media; see the doc above.
-        metrics: Arc::new(Metrics::default()),
-        forwarded: forwarded.clone(),
-        guests: Some(guests),
-        heard: Some(heard),
-    })
-    .await;
-    let (accepting, mut events) = match served {
-        Ok(served) => served,
-        Err(error) => {
-            tracing::warn!("not hosting: {error}");
-            return None;
-        }
-    };
-    local.set_offer(Some(hosting.offer(shared.hop().id())));
-    if let Some(forwarded) = &forwarded {
-        forwarded.set_serving(true);
-    }
+/// Switching hosting off closes the door at once and ends every guest's
+/// session with it; switching it on again opens it again in the same call
+/// (see [`keep_hosting`]). That needs the join's one shared origin, so it
+/// holds only for a join that started with hosting on; one that started with
+/// it off is wired apart and waits for the next join (see [`turn`]).
+async fn host_alongside(args: Alongside) -> Option<Abort> {
+    let first = args.open().await?;
     tracing::info!("hosting this room for its members as well as joining it");
-    Some(Abort(tokio::spawn(async move {
-        let mut accepting = Some(accepting);
-        let mut live = 0usize;
-        // Polled as the presence announcer polls: a quarter of a second to
-        // notice a switch is not something anyone can see.
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => if !local.host_rooms() {
-                    tracing::info!("hosting switched off; turning {live} guests away");
-                    break;
-                },
-                event = events.next() => match event {
-                    Some(true) => {
-                        live += 1;
-                        tracing::info!("a guest came in directly; {live} connected");
+    let local = args.local.clone();
+    let forwarded = args.forwarded.clone();
+    let args = Arc::new(args);
+    Some(Abort(tokio::spawn(keep_hosting(local, forwarded, first, move || {
+        let args = args.clone();
+        async move { args.open().await }
+    }))))
+}
+
+/// How an attempt was wired for hosting as it started, which is what the
+/// switch can still change during it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wired {
+    /// A join on one shared origin: the door can open and close at will.
+    Shared,
+    /// A join on two origins, joined with hosting off. What guests publish
+    /// could not reach the relay, nor the relay's room them, so nothing is
+    /// served before the next join.
+    Apart,
+    /// Not a join: a room hosted here serves whatever the switch says, and a
+    /// direct call or a listener has no room to host.
+    Elsewhere,
+}
+
+/// What the switch asks of an attempt, given how it was wired and whether
+/// the switch was on when we last acted on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Turn {
+    /// Open the door.
+    Start,
+    /// Close it, turning every guest away.
+    Stop,
+    /// Switched on where it cannot apply before the next join.
+    NextJoin,
+    /// Nothing changed that this attempt acts on.
+    Stay,
+}
+
+/// Acts on an edge, never a level: a door that failed to open, or a server
+/// that ended, is tried again only when the switch goes off and on again,
+/// never every tick.
+fn turn(wired: Wired, switch: bool, acted: bool) -> Turn {
+    match (wired, switch, acted) {
+        (Wired::Elsewhere, ..) | (_, true, true) | (_, false, false) => Turn::Stay,
+        (Wired::Shared, true, false) => Turn::Start,
+        (Wired::Shared, false, true) => Turn::Stop,
+        (Wired::Apart, true, false) => Turn::NextJoin,
+        (Wired::Apart, false, true) => Turn::Stay,
+    }
+}
+
+/// How an attempt is wired for hosting; see [`Wired`].
+fn wired(peering: &Peering, shared: bool) -> Wired {
+    match peering {
+        Peering::Join(_) if shared => Wired::Shared,
+        Peering::Join(_) => Wired::Apart,
+        _ => Wired::Elsewhere,
+    }
+}
+
+/// Keeps the door open while the switch is on and closed while it is off,
+/// from `first` until the attempt ends.
+///
+/// **One task, one door at most.** The accept loop is held here and only
+/// here, and is dropped before another is opened, so switching on and off
+/// any number of times never leaves two loops on the endpoint or a listener
+/// behind. Dropping this task drops whichever is open.
+///
+/// `open` is how a door is opened, apart so the tests can open one on a
+/// plain local socket.
+async fn keep_hosting<F, Fut>(local: Arc<PeerStats>, forwarded: Option<Arc<Forwarded>>, first: Served, mut open: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<Served>>,
+{
+    let mut serving = Some(first);
+    said_serving(&local, &forwarded, serving.as_ref());
+    // The switch as last acted on: on, since the first door is open.
+    let mut acted = true;
+    let mut live = 0usize;
+    // Polled as the presence announcer polls: a quarter of a second to
+    // notice a switch is not something anyone can see.
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        let event = async {
+            match serving.as_mut() {
+                Some(served) => served.events.next().await,
+                None => std::future::pending().await,
+            }
+        };
+        let woke = tokio::select! {
+            _ = ticker.tick() => None,
+            event = event => Some(event),
+        };
+        match woke {
+            None => match turn(Wired::Shared, local.host_rooms(), acted) {
+                Turn::Start => {
+                    acted = true;
+                    tracing::info!("hosting switched on; opening this room's door again");
+                    serving = open().await;
+                    live = 0;
+                    if serving.is_some() {
+                        tracing::info!("hosting this room for its members as well as joining it");
                     }
-                    Some(false) => {
-                        live = live.saturating_sub(1);
-                        tracing::info!("a direct guest's session ended; {live} connected");
+                    said_serving(&local, &forwarded, serving.as_ref());
+                }
+                Turn::Stop => {
+                    acted = false;
+                    if serving.is_some() {
+                        tracing::info!("hosting switched off; turning {live} guests away");
                     }
-                    None => {
-                        tracing::warn!("stopped hosting: the server ended");
-                        break;
-                    }
-                },
+                    closed(&mut serving, &local, &forwarded);
+                    live = 0;
+                }
+                Turn::NextJoin | Turn::Stay => {}
+            },
+            Some(Some(true)) => {
+                live += 1;
+                tracing::info!("a guest came in directly; {live} connected");
+            }
+            Some(Some(false)) => {
+                live = live.saturating_sub(1);
+                tracing::info!("a direct guest's session ended; {live} connected");
+            }
+            Some(None) => {
+                tracing::warn!("stopped hosting: the server ended");
+                closed(&mut serving, &local, &forwarded);
+                live = 0;
             }
         }
-        // The server and its sessions first, then the word: nobody should
-        // read the door after it stopped opening.
-        accepting.take();
-        local.set_offer(None);
-        if let Some(forwarded) = &forwarded {
-            forwarded.set_serving(false);
+    }
+}
+
+/// Says in presence what is being served now, and counts what we forward
+/// only while it is.
+fn said_serving(local: &PeerStats, forwarded: &Option<Arc<Forwarded>>, serving: Option<&Served>) {
+    local.set_offer(serving.map(|served| served.offer.clone()));
+    if let Some(forwarded) = forwarded {
+        forwarded.set_serving(serving.is_some());
+    }
+}
+
+/// The server and its sessions first, then the word: nobody should read the
+/// door after it stopped opening.
+fn closed(serving: &mut Option<Served>, local: &PeerStats, forwarded: &Option<Arc<Forwarded>>) {
+    if let Some(served) = serving.take() {
+        drop(served.accepting);
+    }
+    said_serving(local, forwarded, None);
+}
+
+/// Says once per switching on, for a join wired apart, why nothing is served
+/// yet; see [`Wired::Apart`].
+async fn note_next_join(local: Arc<PeerStats>) {
+    let mut acted = local.host_rooms();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        ticker.tick().await;
+        let switch = local.host_rooms();
+        if turn(Wired::Apart, switch, acted) == Turn::NextJoin {
+            tracing::info!("hosting switched on; this room was joined with it off, so it is hosted from the next join");
         }
-    })))
+        acted = switch;
+    }
 }
 
 /// What a presence reader needs to act on requests addressed to us: who we
@@ -3397,7 +3858,7 @@ mod path_tests {
 
 #[cfg(test)]
 mod presence_tests {
-    use super::{HostNews, Link, Presence, RoomNews, Seen, State, asked_of, dials_several, door, followed, heard_hosting, honour, inbound_for, quality, shares_origin, subroom};
+    use super::{HostNews, Link, Presence, RoomNews, Seen, State, Turn, Wired, asked_of, dials_several, door, followed, heard_hosting, held_said, honour, inbound_for, quality, shares_origin, subroom, turn, wired};
     use crate::args::Peering;
     use crate::net::metrics::{Ask, Clock, Request};
     use crate::net::quality::Quality;
@@ -3537,6 +3998,8 @@ mod presence_tests {
             seen: Default::default(),
             host: None,
             moved: None,
+            via: None,
+            held: Vec::new(),
         };
         let heard: Presence = serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
         assert_eq!(heard, said);
@@ -3713,6 +4176,110 @@ mod presence_tests {
         assert_eq!((heard.link, heard.seen.len(), heard.camera), (None, 0, false));
         let heard: Presence = serde_json::from_str(r#"{"state":"here","link":null}"#).unwrap();
         assert_eq!(heard.link, None);
+    }
+
+    /// `Presence` as the build before `via` and `held` declared it, field for
+    /// field, both ways.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Unwoven {
+        state: State,
+        #[serde(default = "super::on")]
+        camera: bool,
+        #[serde(default = "super::on")]
+        mic: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clock: Option<Clock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        room: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        requests: Vec<Request>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        sharing: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "quality::lenient_link")]
+        link: Option<Link>,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "quality::lenient_seen")]
+        seen: std::collections::BTreeMap<String, Seen>,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "door::lenient_offer")]
+        host: Option<door::Offer>,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::net::moves::lenient")]
+        moved: Option<crate::net::moves::CallOn>,
+    }
+
+    /// Our own entry in a room, our media through host `d`, holding `d` and `e`.
+    fn woven() -> crate::net::PeerStats {
+        let local = crate::net::PeerStats::default();
+        local.set_name(Some("Ada".into()));
+        local.set_sending(Some(super::arrival::Sending::Host(id('d'))));
+        local.set_held(vec![id('d'), id('e')]);
+        local
+    }
+
+    #[test]
+    fn where_we_send_and_the_hosts_we_hold_are_said_and_survive_the_round_trip() {
+        let said = Presence::here(&woven());
+        let json = serde_json::to_string(&said).unwrap();
+        assert!(json.contains(&format!(r#""via":"{}""#, id('d'))), "{json}");
+        assert!(json.contains(&format!(r#""held":["{}","{}"]"#, id('d'), id('e'))), "{json}");
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard, said);
+        // The two words, and nothing said outside a room.
+        for (via, word) in [(super::arrival::Sending::Relay, "relay"), (super::arrival::Sending::Guests, "guests")] {
+            let json = serde_json::to_string(&Presence { via: Some(via), ..Presence::default() }).unwrap();
+            assert!(json.contains(&format!(r#""via":"{word}""#)), "{json}");
+        }
+        let json = serde_json::to_string(&Presence::here(&crate::net::PeerStats::default())).unwrap();
+        assert!(!json.contains("via") && !json.contains("held"), "{json}");
+    }
+
+    #[test]
+    fn an_older_peer_says_nowhere_and_holds_nothing() {
+        let old = serde_json::to_string(&Unwoven {
+            state: State::Here,
+            camera: true,
+            mic: false,
+            clock: None,
+            room: None,
+            requests: Vec::new(),
+            sharing: false,
+            name: Some("Ada".into()),
+            link: None,
+            seen: Default::default(),
+            host: None,
+            moved: None,
+        })
+        .unwrap();
+        let heard: Presence = serde_json::from_str(&old).unwrap();
+        assert_eq!((heard.via, heard.held.len()), (None, 0));
+        assert_eq!(heard.name.as_deref(), Some("Ada"));
+        assert!(!heard.mic);
+    }
+
+    #[test]
+    fn an_older_peer_reads_a_document_that_says_where_we_send() {
+        let json = serde_json::to_string(&Presence::here(&woven())).unwrap();
+        let heard: Unwoven = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard.name.as_deref(), Some("Ada"));
+        assert!(heard.camera && heard.mic);
+    }
+
+    #[test]
+    fn garbage_in_via_or_held_costs_only_itself() {
+        for via in ["5", r#""somewhere""#, "[]", r#"{"to":"x"}"#, "null", r#""RELAY""#] {
+            for held in ["7", r#""x""#, r#"{"a":1}"#, "null", r#"[1,"y",null,{}]"#] {
+                let json = format!(r#"{{"state":"here","mic":false,"name":"Ada","via":{via},"held":{held},"sharing":true}}"#);
+                let heard: Presence = serde_json::from_str(&json).unwrap_or_else(|error| panic!("{json}: {error}"));
+                assert_eq!((heard.via, heard.held.len()), (None, 0), "{json}");
+                assert!(!heard.mic && heard.sharing, "{json}");
+                assert_eq!(heard.name.as_deref(), Some("Ada"));
+            }
+        }
+        // One good field beside a bad one keeps the good one.
+        let json = format!(r#"{{"state":"here","via":"relay","held":["{}","no"]}}"#, id('e'));
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!(heard.via, Some(super::arrival::Sending::Relay));
+        assert_eq!(heard.held, vec![id('e')]);
     }
 
     #[test]
@@ -3900,6 +4467,61 @@ mod presence_tests {
                 assert!(!dials_several(&other, host_rooms, has_hosts), "{other:?}");
             }
         }
+    }
+
+    /// The switch is acted on at its edges: a shared join opens and closes
+    /// the door as it turns, a join wired apart only says it waits for the
+    /// next one, and nothing else is touched. Nothing is asked twice for one
+    /// turn, so a door that failed to open is not retried every tick.
+    #[test]
+    fn the_switch_opens_and_closes_the_door_only_where_the_join_was_wired_for_it() {
+        assert_eq!(turn(Wired::Shared, true, false), Turn::Start);
+        assert_eq!(turn(Wired::Shared, false, true), Turn::Stop);
+        assert_eq!(turn(Wired::Shared, true, true), Turn::Stay);
+        assert_eq!(turn(Wired::Shared, false, false), Turn::Stay);
+        assert_eq!(turn(Wired::Apart, true, false), Turn::NextJoin);
+        for (switch, acted) in [(false, true), (true, true), (false, false)] {
+            assert_eq!(turn(Wired::Apart, switch, acted), Turn::Stay, "{switch} {acted}");
+        }
+        for switch in [false, true] {
+            for acted in [false, true] {
+                assert_eq!(turn(Wired::Elsewhere, switch, acted), Turn::Stay);
+            }
+        }
+        // On, off, on again: each edge asked for once, each level never.
+        let mut acted = true;
+        let mut asked = Vec::new();
+        for switch in [true, false, false, true, true, false, true] {
+            let next = turn(Wired::Shared, switch, acted);
+            if next != Turn::Stay {
+                asked.push(next);
+            }
+            acted = switch;
+        }
+        assert_eq!(asked, [Turn::Stop, Turn::Start, Turn::Stop, Turn::Start]);
+
+        let url: url::Url = "https://relay.example.com/team".parse().unwrap();
+        let peer: iroh::EndpointId = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        assert_eq!(wired(&Peering::Join(url.clone()), true), Wired::Shared);
+        assert_eq!(wired(&Peering::Join(url), false), Wired::Apart);
+        // A room hosted here serves regardless, as it always has; the guests
+        // of a relay-less room are joins, and follow the rules above.
+        for other in [Peering::Host("team".into()), Peering::Dial(peer), Peering::Listen, Peering::Loopback, Peering::Idle] {
+            for shared in [false, true] {
+                assert_eq!(wired(&other, shared), Wired::Elsewhere, "{other:?}");
+            }
+        }
+    }
+
+    /// The status line names the relay apart from the hosts it counts.
+    #[test]
+    fn the_status_line_does_not_count_the_relay_as_a_host() {
+        let relay = super::super::web::HELD_RELAY.to_string();
+        let host = "a".repeat(64);
+        assert_eq!(held_said(&[]), "");
+        assert_eq!(held_said(std::slice::from_ref(&relay)), ", holding the relay");
+        assert_eq!(held_said(std::slice::from_ref(&host)), ", holding 1 host session(s)");
+        assert_eq!(held_said(&[relay, host.clone(), "b".repeat(64)]), ", holding the relay and 2 host session(s)");
     }
 
     /// With hosting off a join keeps two origins, as it always has: the
@@ -4501,5 +5123,82 @@ mod said_tests {
         say(&presence, said.clone());
         let again = tokio::time::timeout(wait, reading.next()).await.expect("said again, unchanged");
         assert_eq!(again.unwrap(), Some(said));
+    }
+
+    /// Our routes: nothing written while nobody is subscribed, written on
+    /// the used edge and on a change, and quiet again once they go.
+    #[tokio::test]
+    async fn the_routes_writer_is_quiet_while_nobody_reads() {
+        let origin = moq_tokio::origin::spawn();
+        let control = origin.create_broadcast(control_path("someone")).unwrap();
+        let track = control.create_track(ROUTES, None).unwrap();
+        let watch = track.clone();
+        control.announce(moq_net::origin::Route::default()).unwrap();
+        let local = Arc::new(PeerStats::default());
+        let first: Arc<[u8]> = Arc::from(&br#"{"v":1}"#[..]);
+        local.set_routes_out(Some(first.clone()));
+        let _writer = Abort(tokio::spawn(publish_routes(track, local.clone())));
+        let wait = std::time::Duration::from_secs(2);
+
+        tokio::time::sleep(ROUTES_TICK * 3).await;
+        assert_eq!(watch.latest(), None, "nothing written while unused");
+        assert!(!local.routes_wanted());
+
+        let broadcast = origin.consume().request_broadcast(control_path("someone").as_str()).await.unwrap();
+        let subscriber = broadcast.track(ROUTES).unwrap().subscribe(moq_net::track::Subscription::default()).await.unwrap();
+        let mut reader = subscriber.ordered();
+        {
+            let mut group = tokio::time::timeout(wait, reader.next_group()).await.expect("written on the used edge").unwrap().unwrap();
+            assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], &first[..]);
+        }
+        assert!(local.routes_wanted());
+
+        let changed: Arc<[u8]> = Arc::from(&br#"{"v":1,"n":1}"#[..]);
+        local.set_routes_out(Some(changed.clone()));
+        {
+            let mut group = tokio::time::timeout(wait, reader.next_group()).await.expect("a change goes at once").unwrap().unwrap();
+            assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], &changed[..]);
+        }
+
+        drop((reader, broadcast));
+        tokio::time::sleep(ROUTES_TICK * 2).await;
+        assert!(!local.routes_wanted());
+        assert_eq!(local.routes_out(), None, "the last document is let go while our map is closed");
+        let after = watch.latest();
+        local.set_routes_out(Some(first));
+        tokio::time::sleep(ROUTES_TICK * 4).await;
+        assert_eq!(watch.latest(), after, "quiet again");
+    }
+
+    /// Routes are worked out only while someone wants them, and say every
+    /// peer we hear.
+    #[test]
+    fn routes_are_worked_out_only_while_wanted() {
+        let (b, c) = ("b".repeat(64), "c".repeat(64));
+        let people: std::collections::HashMap<String, Arc<PeerStats>> =
+            [b.clone(), c.clone()].into_iter().map(|id| (id, Arc::new(PeerStats::default()))).collect();
+        for stats in people.values() {
+            stats.set_heard();
+        }
+        let chains = std::collections::HashMap::from([(b.clone(), vec![20, 21, 99]), (c.clone(), vec![30, 31, 99])]);
+        let routing = Routing { guests: Arc::default(), ours: 10, far: None };
+        let local = PeerStats::default();
+        let me = "a".repeat(64);
+        let mut said = std::collections::HashMap::new();
+        note_routes(&chains, &people, &mut said, &routing, true, &local, &me);
+        assert_eq!(local.routes_out(), None);
+        assert_eq!(said.len(), 2, "arrivals are read either way");
+        local.set_map_open(true);
+        note_routes(&chains, &people, &mut said, &routing, true, &local, &me);
+        let document = local.routes_out().expect("worked out while the map is open");
+        let reported = super::super::web::read_routes(&document, &me).unwrap();
+        // Each one's gate is in their chain alone, so theirs; the relay's hop
+        // ends both chains, so it is the meeting place.
+        assert_eq!(reported.default, Some(vec![super::super::web::Hop::Venue]));
+        assert!(reported.except.is_empty());
+        assert_eq!((reported.origin, reported.venue.as_slice(), reported.heard), (Some(10), &[99][..], Some(2)));
+        local.set_map_open(false);
+        note_routes(&chains, &people, &mut said, &routing, true, &local, &me);
+        assert_eq!(local.routes_out(), None);
     }
 }

@@ -277,6 +277,12 @@ pub struct Settings {
     /// without hosts.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
     pub spare_route: Option<bool>,
+    /// Whether the Topology tab's map shows which way media travels by
+    /// dashes drifting along its lines. `None` is the default, which is
+    /// **on** ([`animates_map`](Self::animates_map)): off freezes them, and
+    /// the map then redraws the window only when the room changes.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
+    pub animate_map: Option<bool>,
 }
 
 impl Settings {
@@ -308,6 +314,11 @@ impl Settings {
     /// Whether we keep a spare offer of our media beside the one in use.
     pub fn keeps_spare_route(&self) -> bool {
         self.spare_route.unwrap_or(true)
+    }
+
+    /// Whether the room map's dashes drift.
+    pub fn animates_map(&self) -> bool {
+        self.animate_map.unwrap_or(true)
     }
 }
 
@@ -964,6 +975,22 @@ mod tests {
         let bad: Settings = serde_json::from_str(r#"{"camera":"abc","show_routes":"yes"}"#).expect("still valid");
         assert_eq!(bad.camera.as_deref(), Some("abc"));
         assert!(!bad.shows_routes(), "a malformed flag costs only itself");
+    }
+
+    #[test]
+    fn the_map_animates_unless_turned_off_and_is_read_leniently() {
+        assert!(Settings::default().animates_map());
+        let older: Settings = serde_json::from_str(r#"{"camera":"abc","spare_route":false}"#).expect("valid");
+        assert!(older.animates_map(), "a file from before the setting means on");
+        let off: Settings = serde_json::from_str(r#"{"animate_map":false}"#).expect("valid");
+        assert!(!off.animates_map());
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&off).expect("serialises")).expect("deserialises");
+        assert_eq!(back, off);
+        let json = serde_json::to_string(&Settings::default()).expect("serialises");
+        assert!(!json.contains("animate_map"), "left out until changed: {json}");
+        let bad: Settings = serde_json::from_str(r#"{"camera":"abc","animate_map":"no"}"#).expect("still valid");
+        assert_eq!(bad.camera.as_deref(), Some("abc"));
+        assert!(bad.animates_map(), "a malformed flag costs only itself");
     }
 
     #[test]

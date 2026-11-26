@@ -272,6 +272,31 @@ pub fn ChartIcon() -> Element {
     }
 }
 
+/// Three nodes joined by lines: the settings' Topology tab. Hollow circles,
+/// so at 16 px it reads as things connected rather than a filled triangle.
+#[component]
+pub fn TopologyIcon() -> Element {
+    rsx! {
+        svg {
+            xmlns: "http://www.w3.org/2000/svg",
+            width: "16",
+            height: "16",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            circle { cx: "12", cy: "5", r: "2.5" }
+            circle { cx: "5", cy: "19", r: "2.5" }
+            circle { cx: "19", cy: "19", r: "2.5" }
+            path { d: "M10.66 7.68L6.34 16.32" }
+            path { d: "M13.34 7.68L17.66 16.32" }
+            path { d: "M8 19h8" }
+        }
+    }
+}
+
 /// An arrow into a tray: the settings' Updates tab.
 #[component]
 pub fn UpdateIcon() -> Element {

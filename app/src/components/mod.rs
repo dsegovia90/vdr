@@ -3,6 +3,7 @@
 mod bar;
 mod button;
 mod call_screen;
+mod colour;
 mod connect;
 mod device_menu;
 mod icons;
@@ -22,7 +23,7 @@ mod tile_menu;
 pub use bar::ControlBar;
 pub use button::{Button, Size, Tone};
 pub use device_menu::{DeviceMenu, DropdownOption, MenuSection, use_open_menu_provider};
-pub use icons::{CameraIcon, ChartIcon, CloseIcon, FlaskIcon, GearIcon, InfoIcon, KeyboardIcon, LeaveIcon, MicIcon, PersonIcon, PinIcon, ScreenIcon, SpeakerIcon, UpdateIcon};
+pub use icons::{CameraIcon, ChartIcon, CloseIcon, FlaskIcon, GearIcon, InfoIcon, KeyboardIcon, LeaveIcon, MicIcon, PersonIcon, PinIcon, ScreenIcon, SpeakerIcon, TopologyIcon, UpdateIcon};
 pub use keys::{KeyFocus, SettingsPanel};
 pub use call_screen::CallScreen;
 pub use connect::ConnectRow;

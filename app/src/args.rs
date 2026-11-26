@@ -39,6 +39,7 @@
 //! vdr --bounce 30                         # move it round the relay and the hosts every 30 s (10 at least)
 //! vdr --show-routes                       # border hosts' videos, brighter while they carry the call
 //! vdr --no-spare-route                    # no spare offer beside the one in use (--spare-route: one)
+//! vdr --fake-web 100,50                   # the Topology tab's room map draws a made-up room of 100 people, 50 relays
 //! ```
 //!
 //! **The command line is not going away.** In-app key entry is a second
@@ -292,6 +293,10 @@ pub struct Args {
     /// `None` leaves it to the setting, which is on by default; a scripted
     /// run compares the two.
     pub spare_route: Option<bool>,
+    /// Draw a made-up room on the Topology tab's map in place of the real
+    /// one (`--fake-web <people>,<relays>`): for looking at a big room
+    /// without gathering a hundred people. Changes nothing else.
+    pub fake_web: Option<(usize, usize)>,
 }
 
 impl Args {
@@ -335,6 +340,7 @@ impl Args {
         let mut bounce = None;
         let mut show_routes = false;
         let mut spare_route = None;
+        let mut fake_web = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => peering = Peering::Listen,
@@ -414,6 +420,11 @@ impl Args {
                 "--show-routes" => show_routes = true,
                 "--spare-route" => spare_route = Some(true),
                 "--no-spare-route" => spare_route = Some(false),
+                "--fake-web" => match args.next().as_deref().map(fake_web_counts) {
+                    Some(Ok(counts)) => fake_web = Some(counts),
+                    Some(Err(error)) => tracing::error!("--fake-web {error}"),
+                    None => tracing::error!("--fake-web needs <people>,<relays>, e.g. 100,50"),
+                },
                 // Read by `settings::data_dir` from the raw arguments, since
                 // the log opens before this parser runs; only skipped here.
                 "--profile" => {
@@ -449,8 +460,28 @@ impl Args {
             bounce,
             show_routes,
             spare_route,
+            fake_web,
         }
     }
+}
+
+/// The most `--fake-web` draws of each, which is what the map is laid out
+/// for; more would only test the layout's last resort.
+const FAKE_PEOPLE_MAX: usize = 500;
+const FAKE_RELAYS_MAX: usize = 100;
+
+/// `--fake-web`'s value: `<people>,<relays>`, at least one person (us).
+fn fake_web_counts(text: &str) -> Result<(usize, usize), String> {
+    let (people, relays) = text.split_once(',').ok_or_else(|| format!("{text:?} is not <people>,<relays>"))?;
+    let people: usize = people.trim().parse().map_err(|_| format!("{people:?} is not a number of people"))?;
+    let relays: usize = relays.trim().parse().map_err(|_| format!("{relays:?} is not a number of relays"))?;
+    if people == 0 {
+        return Err("needs at least one person: you".to_string());
+    }
+    if people > FAKE_PEOPLE_MAX || relays > FAKE_RELAYS_MAX {
+        return Err(format!("draws at most {FAKE_PEOPLE_MAX} people and {FAKE_RELAYS_MAX} relays"));
+    }
+    Ok((people, relays))
 }
 
 #[cfg(test)]
@@ -468,6 +499,15 @@ mod tests {
         }
         for bad in ["ftp://host/room", "not a url", "localhost:4443/room"] {
             assert!(relay_url(bad).is_err(), "{bad} should not be a relay url");
+        }
+    }
+
+    #[test]
+    fn fake_web_is_two_counts() {
+        assert_eq!(fake_web_counts("100,50"), Ok((100, 50)));
+        assert_eq!(fake_web_counts("1, 0"), Ok((1, 0)));
+        for bad in ["x,1", "1", "1,", ",1", "0,3", "-1,2", "1,2,3", "501,1", "1,101"] {
+            assert!(fake_web_counts(bad).is_err(), "{bad}");
         }
     }
 }

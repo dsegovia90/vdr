@@ -691,11 +691,33 @@ pub struct PeerStats {
     /// Through whom their broadcasts reach us, as last read; `None` before
     /// the first reading and after they leave.
     arrival: std::sync::Mutex<Option<super::arrival::Arrival>>,
-    /// Where our own broadcasts go. Our own entry only; `None` outside a room.
+    /// Where our own broadcasts go, `None` outside a room; on a peer's entry,
+    /// where they say theirs go (`via` in presence), `None` while they say
+    /// nothing.
     sending: std::sync::Mutex<Option<super::arrival::Sending>>,
+    /// The hosts we hold a session to, cleaned and sorted (`web::clean_held`);
+    /// on a peer's entry, the ones they say they hold (`held` in presence).
+    held: std::sync::Mutex<Vec<String>>,
     /// Where the room meets, when it is an endpoint we can name. Our own
     /// entry only; `None` outside a room and in a room on a relay server.
     meets_at: std::sync::Mutex<Option<super::arrival::MeetsAt>>,
+    /// Whether the room map is on screen. Our own entry only; the map sets
+    /// it as it mounts and clears it as it goes, and the call asks everyone
+    /// for their `routes.json` only while it is set.
+    map_open: AtomicBool,
+    /// Whether anyone is subscribed to our `routes.json`, as its writer last
+    /// saw. Our own entry only; while neither this nor `map_open` is set,
+    /// no route of ours is worked out beyond what a tile needs.
+    routes_wanted: AtomicBool,
+    /// Our gates' hops, one per session of a join over several. Our own
+    /// entry only; set by `sessions` as it makes them.
+    gates: std::sync::Mutex<Vec<u64>>,
+    /// Our `routes.json` as last worked out, `None` while nobody wants it.
+    /// Our own entry only: the writer sends it, our map reads it.
+    routes_out: std::sync::Mutex<Option<Arc<[u8]>>>,
+    /// What they say in their `routes.json`, cleaned, while our map is open
+    /// and theirs has arrived; `None` otherwise.
+    reported: std::sync::Mutex<Option<Arc<super::web::Reported>>>,
     /// What we say about hosting this room, while we are serving it. Our own
     /// entry only; the presence announcer reads it. Carries the door.
     offer: std::sync::Mutex<Option<super::door::Offer>>,
@@ -916,7 +938,13 @@ impl Default for PeerStats {
             heard: AtomicBool::new(false),
             arrival: std::sync::Mutex::new(None),
             sending: std::sync::Mutex::new(None),
+            held: std::sync::Mutex::new(Vec::new()),
             meets_at: std::sync::Mutex::new(None),
+            map_open: AtomicBool::new(false),
+            routes_wanted: AtomicBool::new(false),
+            gates: std::sync::Mutex::new(Vec::new()),
+            routes_out: std::sync::Mutex::new(None),
+            reported: std::sync::Mutex::new(None),
             offer: std::sync::Mutex::new(None),
             move_calls: AtomicBool::new(false),
             spare_route: AtomicBool::new(true),
@@ -1288,7 +1316,8 @@ impl PeerStats {
         }
     }
 
-    /// Where our own broadcasts go. Meaningful on our own entry.
+    /// Where our own broadcasts go, or on a peer's entry where they say
+    /// theirs go.
     pub fn sending(&self) -> Option<super::arrival::Sending> {
         self.sending.lock().ok().and_then(|slot| slot.clone())
     }
@@ -1297,6 +1326,22 @@ impl PeerStats {
         if let Ok(mut slot) = self.sending.lock() {
             *slot = sending;
         }
+    }
+
+    /// The hosts we hold a session to, or on a peer's entry the ones they
+    /// say they hold. Endpoint ids only, never a door.
+    pub fn held(&self) -> Vec<String> {
+        self.held.lock().map(|held| held.clone()).unwrap_or_default()
+    }
+
+    /// Takes a list already cleaned. Whether it changed, so a caller that
+    /// samples sessions on every pass need not log the same list again.
+    pub(super) fn set_held(&self, held: Vec<String>) -> bool {
+        self.held.lock().is_ok_and(|mut slot| {
+            let changed = *slot != held;
+            *slot = held;
+            changed
+        })
     }
 
     /// Where the room meets, when it is an endpoint. Meaningful on our own
@@ -1308,6 +1353,55 @@ impl PeerStats {
     pub(super) fn set_meets_at(&self, at: Option<super::arrival::MeetsAt>) {
         if let Ok(mut slot) = self.meets_at.lock() {
             *slot = at;
+        }
+    }
+
+    /// Whether the room map is on screen. Meaningful on our own entry.
+    pub fn map_open(&self) -> bool {
+        self.map_open.load(Ordering::Relaxed)
+    }
+
+    pub fn set_map_open(&self, open: bool) {
+        self.map_open.store(open, Ordering::Relaxed);
+    }
+
+    pub(super) fn routes_wanted(&self) -> bool {
+        self.routes_wanted.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set_routes_wanted(&self, wanted: bool) {
+        self.routes_wanted.store(wanted, Ordering::Relaxed);
+    }
+
+    pub(super) fn gates(&self) -> Vec<u64> {
+        self.gates.lock().map(|gates| gates.clone()).unwrap_or_default()
+    }
+
+    pub(super) fn set_gates(&self, gates: Vec<u64>) {
+        if let Ok(mut slot) = self.gates.lock() {
+            *slot = gates;
+        }
+    }
+
+    /// Our `routes.json` as last worked out.
+    pub fn routes_out(&self) -> Option<Arc<[u8]>> {
+        self.routes_out.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub(super) fn set_routes_out(&self, routes: Option<Arc<[u8]>>) {
+        if let Ok(mut slot) = self.routes_out.lock() {
+            *slot = routes;
+        }
+    }
+
+    /// What they last said in their `routes.json`.
+    pub fn reported(&self) -> Option<Arc<super::web::Reported>> {
+        self.reported.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub(super) fn set_reported(&self, reported: Option<Arc<super::web::Reported>>) {
+        if let Ok(mut slot) = self.reported.lock() {
+            *slot = reported;
         }
     }
 
