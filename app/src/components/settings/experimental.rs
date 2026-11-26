@@ -15,10 +15,12 @@
 //! starts, so turning it on waits for the next one; turning it off stops
 //! serving at once.
 //!
-//! Showing the route on each video (**off** by default: a debugging aid):
-//! each tile is marked with the way that person's video reaches us, ours with
-//! where our own goes, and whoever hosts is marked. Only the marks; the
-//! routes are read and logged either way.
+//! Marking hosts on their videos (**off** by default: a debugging aid):
+//! whoever could host gets a faint border on their tile, and a host carrying
+//! the call for us (our media goes through them, or anyone's reaches us
+//! through them; on our own tile, we forward for others) a strong one. Only
+//! the borders; the routes are read and logged either way, in more detail
+//! than a border can say.
 //!
 //! Moving the call (**off** by default, because a move sends everyone's
 //! video through someone's computer): we follow where the room says the call
@@ -161,16 +163,16 @@ pub fn ExperimentalTab(local: Arc<PeerStats>, me: String) -> Element {
                     }
                 }
                 Row {
-                    title: "Show the route on each video",
+                    title: "Mark hosts on their videos",
                     first: false,
-                    description: "Marks each video with the way it reaches you: through the relay, through someone hosting the room, or directly, and marks whoever hosts. Your own says where your video goes. It shows the route announced as best; the video itself follows it within a moment. A debugging aid.",
+                    description: "Puts a faint blue border around everyone who could host the room, and a bright, thicker one around a host carrying the call for you: your video goes through them, or someone's reaches you through them. Your own video gets the bright border while you pass other people's video on. A debugging aid; the log says the routes in full.",
                     Switch {
                         on: routes(),
                         onclick: move |_| {
                             let next = !*routes.peek();
                             routes.set(next);
                             marks.set_show_routes(next);
-                            tracing::info!("showing routes {}", if next { "on" } else { "off" });
+                            tracing::info!("host borders {}", if next { "on" } else { "off" });
                             Settings::update(move |settings| settings.show_routes = Some(next));
                         },
                     }

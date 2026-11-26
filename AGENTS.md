@@ -350,7 +350,7 @@ focus.
 | `net/call.rs` | a call over iroh + MoQ: rooms on a relay, direct calls, hosting a room (`--host`), presence |
 | `net/follow.rs` | reading what a peer offers (video, voice, screen) for as long as they are here: follows the catalog, asks again for a broadcast whose read ended with a change of route |
 | `net/sessions.rs` | a join that dials the relay and the room's saved hosts together: which session carries our media, and moving it |
-| `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes: the route marks (`read` is pure) |
+| `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes, for the log and the host borders on tiles (`read` and `through` are pure) |
 | `net/moves.rs` | moving the call to a host, an experiment: the presence field, which choice wins, the bounce order (pure) |
 | `net/door.rs` | a hosted room's door: its name, the secret guests present as `?door=`, the check (pure) |
 | `net/audio.rs` | the audio half: Opus out, each peer's voice in, echo cancelled |

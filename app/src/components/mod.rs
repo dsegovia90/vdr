@@ -34,5 +34,5 @@ use settings::{UpdateBanner, Updates, use_updates_provider};
 pub use signal::SignalBars;
 pub use stats::StatsRow;
 pub use share::{ShareControl, ShareTile};
-pub use subroom::{CrosstalkLevel, Invites, Names, OwnShare, Rooms, SubroomMenu, use_crosstalk_provider, use_rooms_provider};
+pub use subroom::{CrosstalkLevel, Invites, Names, OwnShare, Rooms, SubroomMenu, Through, use_crosstalk_provider, use_rooms_provider};
 pub use tile::ParticipantTile;

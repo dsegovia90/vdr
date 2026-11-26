@@ -263,8 +263,9 @@ pub struct Settings {
     /// someone's computer.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
     pub move_calls: Option<bool>,
-    /// Whether each video is marked with the way it arrives (the relay, a
-    /// host, or directly) and whoever hosts. `None` is the default, which is
+    /// Whether the videos of people who could host have a border, brighter
+    /// while they carry the call. Keyed as it was when it showed routes in
+    /// words, so a saved choice survives. `None` is the default, which is
     /// **off** ([`shows_routes`](Self::shows_routes)): it is a debugging aid.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient_flag")]
     pub show_routes: Option<bool>,

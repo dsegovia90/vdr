@@ -36,7 +36,7 @@
 //! vdr --move-calls                       # follow the call when someone moves it
 //! vdr --move-call relay                   # move the call as the join starts: relay or a host's id
 //! vdr --bounce 30                         # move it round the relay and the hosts every 30 s (10 at least)
-//! vdr --show-routes                       # mark each video with the way it arrives
+//! vdr --show-routes                       # border hosts' videos, brighter while they carry the call
 //! vdr --no-spare-route                    # no spare offer beside the one in use (--spare-route: one)
 //! ```
 //!
@@ -277,8 +277,9 @@ pub struct Args {
     /// Move the call round the relay and every host this often
     /// (`--bounce <secs>`), so a scripted run can judge moves from logs.
     pub bounce: Option<std::time::Duration>,
-    /// Mark each video with the way it arrives, as the Experimental switch
-    /// does, without saving it (`--show-routes`). For looking at a scripted
+    /// Border the videos of people who could host, brighter while they
+    /// carry the call, as the Experimental switch does, without saving it
+    /// (`--show-routes`). For looking at a scripted
     /// run; the routes are logged whether or not this is on.
     pub show_routes: bool,
     /// Keep a spare offer of our media on a second session, or not, for

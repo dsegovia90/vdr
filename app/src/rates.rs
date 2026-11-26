@@ -53,6 +53,10 @@ pub struct Hosting {
     /// Guests connected directly, and how many of them we sent media to.
     pub guests: u32,
     pub pulling: u32,
+    /// Whether this second is inside a forwarding episode, as the log's
+    /// "forwarding started" and "stopped" bound it: their hysteresis, so a
+    /// tile that shows it agrees with the log and does not flicker.
+    pub forwarding: bool,
 }
 
 impl Second {
@@ -404,7 +408,7 @@ mod tests {
 
     #[test]
     fn what_we_forward_is_drawn_against_the_link_with_no_cap() {
-        let hosting = Hosting { forwarded: 340, own: 60, guests: 2, pulling: 1 };
+        let hosting = Hosting { forwarded: 340, own: 60, guests: 2, pulling: 1, forwarding: true };
         let second = Second { hosting: Some(hosting), estimate: Some(3000), ..Second::default() };
         assert_eq!(Point::forwarded(&second), Point { sent: Some(340), cap: None, target: None, link: Some(3000) });
         assert_eq!(Point::forwarded(&Second::default()).sent, None);

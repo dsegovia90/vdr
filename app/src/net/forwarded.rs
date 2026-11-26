@@ -128,13 +128,14 @@ impl Forwarded {
         if !self.serving.load(Ordering::Relaxed) {
             return None;
         }
-        let hosting = moved.rates(elapsed, connected);
+        let mut hosting = moved.rates(elapsed, connected);
         for event in state.tally.observe(hosting, estimate, elapsed) {
             match event {
                 Event::Over { .. } => tracing::warn!("{event}"),
                 _ => tracing::info!("{event}"),
             }
         }
+        hosting.forwarding = state.tally.forwarding;
         Some(hosting)
     }
 
@@ -206,6 +207,8 @@ impl Moved {
             own: kbps(self.own),
             guests,
             pulling: self.guests.values().filter(|bytes| kbps(**bytes) > MEDIA_KBPS).count() as u32,
+            // The tally's to say, once it has seen this second.
+            forwarding: false,
         }
     }
 }
@@ -385,11 +388,11 @@ mod tests {
             guests: HashMap::from([("guest/0".to_string(), 50_000), ("guest/1".to_string(), 200)]),
         };
         let hosting = moved.rates(SECOND, 2);
-        assert_eq!(hosting, Hosting { forwarded: 400, own: 0, guests: 2, pulling: 1 });
+        assert_eq!(hosting, Hosting { forwarded: 400, own: 0, guests: 2, pulling: 1, forwarding: false });
     }
 
     fn second(forwarded: u32, own: u32) -> Hosting {
-        Hosting { forwarded, own, guests: 2, pulling: 1 }
+        Hosting { forwarded, own, guests: 2, pulling: 1, forwarding: false }
     }
 
     #[test]

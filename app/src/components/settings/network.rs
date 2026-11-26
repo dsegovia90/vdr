@@ -804,7 +804,7 @@ mod tests {
     fn hosting_is_said_against_the_link() {
         use crate::rates::Hosting;
         let second = Second {
-            hosting: Some(Hosting { forwarded: 340, own: 60, guests: 2, pulling: 1 }),
+            hosting: Some(Hosting { forwarded: 340, own: 60, guests: 2, pulling: 1, forwarding: true }),
             estimate: Some(3000),
             ..Second::default()
         };

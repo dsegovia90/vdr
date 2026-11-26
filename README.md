@@ -156,11 +156,13 @@ is not known yet. A person not reporting has none, and neither does a shared
 screen; the person's menu says it in a line. Turning the switch off stops
 telling the room about your connection and hides everyone else's. The
 thresholds are first guesses.
-*Show the route on each video*, off by default, is a debugging aid: each
-video's label says how it reaches you (through the relay, through someone
-hosting the room, or directly) and marks whoever hosts; your own says where
-your video goes. It shows the route announced as best, which the video
-follows within a moment.
+*Mark hosts on their videos*, off by default, is a debugging aid: everyone
+who could host the room has a faint blue border around their video, and a
+host carrying the call for you, because your video goes through them or
+someone's reaches you through them, a bright, thicker one. Your own video
+has the bright border while you pass other people's video on. It follows
+the routes announced as best, which the video follows within a moment; the
+log says those routes in full.
 *Keep a spare route*, on by default, does something only in a room with
 hosts: your video is also offered through a second way into the room, priced
 so that nobody uses it while the first works, so when the relay stops
@@ -260,9 +262,11 @@ and one of them with `--bounce <secs>`, which moves the call round the relay
 and each host it knows every so often (10 seconds at least, 30 if no number
 is given). `--move-call relay|<host id>` moves it once, as the join starts.
 Each move is logged, and each viewer logs `<id> left` and `<id> back after N
-ms` for a tile that went and came back. `--show-routes` turns on the route
-marks for that run without saving it; each viewer logs `<id> now arrives …`
-whenever someone's route changes, whether or not the marks are on.
+ms` for a tile that went and came back. `--show-routes` turns on the host
+borders for that run without saving it; each viewer logs `<id> now arrives …`
+whenever someone's route changes, whether or not the borders are on, and,
+with them on, `[tile] <id> carries the call for us now` when a border turns
+bright (and `no longer` when it fades).
 `--no-spare-route` (or `--spare-route`) turns the *Keep a spare route* switch
 off (or on) for that run without saving it, to compare the two; with it on,
 the log says where the spare is (`a spare offer on host <id>`) and when it

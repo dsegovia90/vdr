@@ -440,6 +440,7 @@ pub fn CallScreen() -> Element {
                                 dim: item.dim,
                                 local: remote.local.clone(),
                                 me: me.clone(),
+                                metrics: Some(remote.metrics.clone()),
                             }
                         }
                         if let Some(class) = item.line_break {

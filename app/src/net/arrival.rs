@@ -113,7 +113,7 @@ pub(crate) fn read(hops: &[u64], known: &Known<'_>) -> Option<Arrival> {
 /// The hops our direct guests' sessions declared, while each session lives.
 ///
 /// **Display only.** A hop is the guest's own claim, unauthenticated; it
-/// decides nothing but a word on a tile. Counted, because one guest can hold
+/// decides nothing but a log line and a tile's border. Counted, because one guest can hold
 /// two sessions for a moment across a redial.
 #[derive(Default)]
 pub(crate) struct Guests(std::sync::Mutex<HashMap<u64, usize>>);
@@ -141,28 +141,19 @@ impl Guests {
     }
 }
 
-/// What a person's tile says about them: the way they reach us, or where we
-/// send, and whether they host. Words, with `name` turning an endpoint id
-/// into what the page calls that person.
-pub(crate) fn arrival_words(arrival: &Arrival, name: impl Fn(&str) -> String) -> String {
+/// The hosts someone's broadcasts pass through on their way to us, nearest
+/// first: whoever the route names, the one before the nearest included. A
+/// host the route names is carrying their media for us, so a tile can say
+/// so; the relay is not a person and has no tile.
+pub(crate) fn through(arrival: &Arrival) -> Vec<String> {
     match arrival {
-        Arrival::Direct => "direct".to_string(),
-        Arrival::Relay { from: None } => "via relay".to_string(),
-        Arrival::Relay { from: Some(id) } => format!("via relay, from {}", name(id)),
-        Arrival::Host { id, from: None } => format!("via {}", name(id)),
-        Arrival::Host { id, from: Some(before) } => format!("via {}, from {}", name(id), name(before)),
+        Arrival::Direct | Arrival::Relay { from: None } => Vec::new(),
+        Arrival::Relay { from: Some(id) } => vec![id.clone()],
+        Arrival::Host { id, from } => std::iter::once(id.clone()).chain(from.clone()).collect(),
     }
 }
 
-pub(crate) fn sending_words(sending: &Sending, name: impl Fn(&str) -> String) -> String {
-    match sending {
-        Sending::Relay => "to relay".to_string(),
-        Sending::Host(id) => format!("to {}", name(id)),
-        Sending::Guests => "to guests".to_string(),
-    }
-}
-
-/// The same, for the log: full ids, and "host" said, so a scripted run can be
+/// For the log: full ids, and "host" said, so a scripted run can be
 /// judged by grepping for an id.
 pub(crate) fn arrival_log(arrival: &Arrival) -> String {
     match arrival {
@@ -279,16 +270,18 @@ mod tests {
     }
 
     #[test]
-    fn words_name_people_as_the_page_does_and_logs_say_ids() {
-        let name = |id: &str| format!("<{id}>");
-        assert_eq!(arrival_words(&Arrival::Direct, name), "direct");
-        assert_eq!(arrival_words(&RELAYED, name), "via relay");
-        assert_eq!(arrival_words(&host("h"), name), "via <h>");
-        assert_eq!(arrival_words(&Arrival::Relay { from: Some("h".into()) }, name), "via relay, from <h>");
-        assert_eq!(sending_words(&Sending::Relay, name), "to relay");
-        assert_eq!(sending_words(&Sending::Host("h".into()), name), "to <h>");
-        assert_eq!(sending_words(&Sending::Guests, name), "to guests");
+    fn every_host_a_route_names_is_passed_through_and_the_relay_is_nobody() {
+        assert!(through(&Arrival::Direct).is_empty());
+        assert!(through(&RELAYED).is_empty());
+        assert_eq!(through(&Arrival::Relay { from: Some("h".into()) }), ["h"]);
+        assert_eq!(through(&host("h")), ["h"]);
+        assert_eq!(through(&Arrival::Host { id: "h".into(), from: Some("k".into()) }), ["h", "k"]);
+    }
+
+    #[test]
+    fn logs_say_ids() {
         assert_eq!(arrival_log(&host("h")), "via host h");
         assert_eq!(arrival_log(&Arrival::Direct), "directly");
+        assert_eq!(arrival_log(&Arrival::Relay { from: Some("h".into()) }), "via relay, from host h");
     }
 }

@@ -4403,7 +4403,7 @@ mod served_tests {
         // control traffic, which is not payload.
         second_of(&forwarded).await;
         let idle = second_of(&forwarded).await;
-        assert_eq!(idle, crate::rates::Hosting { forwarded: 0, own: 0, guests: 2, pulling: 0 });
+        assert_eq!(idle, crate::rates::Hosting { forwarded: 0, own: 0, guests: 2, pulling: 0, forwarding: false });
 
         // b pulls a's video, which we forward, and ours, which is our own.
         let _from_a = pull(&b.inbound, camera_path("a")).await;

@@ -679,8 +679,8 @@ pub struct PeerStats {
     /// Whether we host the rooms we join. Our own entry only; the
     /// Experimental tab sets it, and a join reads it as it starts.
     host_rooms: AtomicBool,
-    /// Whether each tile is marked with the way that person's video arrives.
-    /// Our own entry only; the Experimental tab sets it.
+    /// Whether tiles of people who could host have a border, brighter while
+    /// they carry the call. Our own entry only; the Experimental tab sets it.
     show_routes: AtomicBool,
     /// Their origin's hop while they say they host, as cleaned on arrival;
     /// zero when they do not. Names them in a route's hop chain.
@@ -1238,8 +1238,7 @@ impl PeerStats {
         self.host_rooms.store(on, Ordering::Relaxed);
     }
 
-    /// Whether tiles show the way each video arrives. Meaningful on our own
-    /// entry.
+    /// Whether tiles show host borders. Meaningful on our own entry.
     pub fn show_routes(&self) -> bool {
         self.show_routes.load(Ordering::Relaxed)
     }
