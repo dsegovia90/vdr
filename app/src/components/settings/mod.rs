@@ -14,6 +14,7 @@ mod experimental;
 mod keyboard;
 mod network;
 mod profile;
+mod room_map;
 mod updates;
 
 use std::sync::Arc;

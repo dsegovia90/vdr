@@ -11,6 +11,7 @@ mod rates;
 mod recent;
 mod settings;
 mod update;
+mod web_layout;
 
 use dioxus_native::prelude::*;
 

@@ -1,5 +1,6 @@
-//! The Network tab: the last minute of what each outgoing stream sent, against
-//! its cap and its slice of the link.
+//! The Network tab: the room as a map of who links to whom (`room_map`),
+//! then the last minute of what each outgoing stream sent, against its cap
+//! and its slice of the link.
 //!
 //! **One budget, divided.** The transport's estimate for the whole connection
 //! is split among the microphone, the screen share and the camera, in that
@@ -41,6 +42,7 @@ use std::time::Duration;
 use dioxus_native::prelude::*;
 
 use super::Heading;
+use super::room_map::RoomMap;
 use super::super::SignalBars;
 use crate::channel::use_channel;
 use crate::net::quality::{self, Blame, Link, Quality, Seen};
@@ -49,7 +51,7 @@ use crate::rates::{self, Point, Second, kbps_words as rate};
 
 /// How often the poller looks. The history moves once a second, so faster
 /// would only find the same minute again.
-const POLL: Duration = Duration::from_secs(1);
+pub(super) const POLL: Duration = Duration::from_secs(1);
 
 /// The SVG's own coordinate space. It is stretched to the pane's width and
 /// drawn [`HEIGHT`] px tall, so vertical units are pixels and horizontal ones
@@ -76,6 +78,13 @@ pub fn NetworkTab(
         div { class: "flex flex-col",
             div { class: "text-lg font-semibold text-neutral-100", "Network" }
             p { class: "mt-1 text-sm text-neutral-400",
+                "Everyone in the room and the relays it meets at, as each says it: a grey line where media could flow, a white one where it flows now."
+            }
+            if open {
+                RoomMap { local: local.clone(), participants, me: me.clone() }
+            }
+            Heading { text: "What you sent" }
+            p { class: "text-sm text-neutral-400",
                 "What your call sent over the last minute, newest at the right. The link's estimate is divided between your microphone, your screen share and your camera, in that order; each video stream follows its slice, and never goes over its cap."
             }
             if open {
@@ -583,7 +592,7 @@ fn gather(me: &str, local: &PeerStats, roster: &[(String, Arc<PeerStats>)]) -> O
 
 /// Everyone else in the call, once each, by their camera's entry: a share
 /// carries its sharer's, so it would only be them again.
-fn roster_of(participants: &[Participant]) -> Vec<(String, Arc<PeerStats>)> {
+pub(super) fn roster_of(participants: &[Participant]) -> Vec<(String, Arc<PeerStats>)> {
     let mut roster: Vec<(String, Arc<PeerStats>)> = Vec::new();
     for participant in participants.iter().filter(|participant| participant.feed == Feed::Camera) {
         if !roster.iter().any(|(id, _)| *id == participant.id) {

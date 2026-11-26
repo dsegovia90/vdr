@@ -37,8 +37,6 @@ pub(crate) mod runtime;
 mod share;
 mod stamps;
 mod status;
-// The graph half has no reader until the Network tab draws the room from it.
-#[allow(dead_code)]
 pub(crate) mod web;
 
 use std::sync::Arc;
