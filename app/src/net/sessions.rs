@@ -1478,20 +1478,36 @@ mod socket_tests {
     /// How long a test client keeps trying a way in before giving up on it.
     /// Well short of the app's own budget, so a test of a dead address does
     /// not wait that out, but longer than a live one can take on a busy
-    /// machine, where a local handshake sometimes needs QUIC to send it again:
+    /// machine, where QUIC may have to send a lost handshake packet again:
     /// after a second, and again two seconds later, before any round trip has
-    /// been measured. With two runs of the tests at once, connections took
-    /// 1.27 s and 3.26 s (a quarter of a second of that is the dial trying
-    /// `[::1]` first); why the first answer goes missing was not found. At two
-    /// seconds such a session gave up, and a join rests a session that gave
-    /// up for longer than any test here waits.
+    /// been measured. A join rests a session that gave up for longer than any
+    /// test here waits, so a budget too short fails the test outright.
     const GIVE_UP: Duration = Duration::from_secs(5);
+
+    /// Where every test client sends from: the loopback address, as every
+    /// test server listens on it.
+    ///
+    /// Left to its default, a client binds a dual-stack `[::]` port, and
+    /// macOS hands out the same port number to a socket on `[::]` and to one
+    /// on `127.0.0.1`: one test's client and another's server. A packet to
+    /// `127.0.0.1` on that port goes to the more specific socket, the server,
+    /// so the client never hears its answers until that server goes. Traced:
+    /// handshakes of 4.3 s or none at all, the server's replies arriving at
+    /// another test's server and refused there; about one dial in a hundred
+    /// with many at once. Two sockets on `127.0.0.1` are never given one
+    /// port. The app's own listener binds `[::]`, so this is the tests' doing.
+    ///
+    /// It also spares every dial of `localhost` a quarter of a second: the
+    /// `[::1]` attempt, which cannot be sent from here, fails at once rather
+    /// than holding the IPv4 one back until the race lets it go.
+    const LOOPBACK: std::net::SocketAddr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
 
     /// A client as the app's, minus iroh, giving up on a dead address after
     /// [`GIVE_UP`].
     fn client() -> moq_tokio::Client {
         crypto();
         let mut config = moq_tokio::client::Config::default();
+        config.connect.bind = Some(LOOPBACK);
         config.connect.tls.insecure = Some(true);
         config.connect.backoff.timeout = GIVE_UP;
         // As a join's client pings: what the quiet limits are set against.
@@ -1519,6 +1535,7 @@ mod socket_tests {
     fn patient_client() -> moq_tokio::Client {
         crypto();
         let mut config = moq_tokio::client::Config::default();
+        config.connect.bind = Some(LOOPBACK);
         config.connect.tls.insecure = Some(true);
         config.connect.backoff.initial = Duration::from_millis(200);
         config.connect.backoff.max = Duration::from_millis(500);

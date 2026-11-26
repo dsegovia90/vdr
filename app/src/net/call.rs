@@ -3996,6 +3996,10 @@ mod served_tests {
         camera.announce(moq_net::origin::Route::default()).unwrap();
         let inbound = moq_tokio::origin::spawn();
         let mut config = moq_tokio::client::Config::default();
+        // On the loopback address as the servers are: a dual-stack port can
+        // share its number with another test's server, which then takes
+        // this client's answers (see `sessions`' socket tests).
+        config.connect.bind = Some(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)));
         config.connect.tls.insecure = Some(true);
         let url: url::Url = format!("moqt://localhost:{port}{target}").parse().unwrap();
         let connection = config
@@ -4108,6 +4112,10 @@ mod served_tests {
         let camera = shared.create_broadcast(camera_path(id)).unwrap();
         camera.announce(moq_net::origin::Route::default()).unwrap();
         let mut config = moq_tokio::client::Config::default();
+        // On the loopback address as the servers are: a dual-stack port can
+        // share its number with another test's server, which then takes
+        // this client's answers (see `sessions`' socket tests).
+        config.connect.bind = Some(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)));
         config.connect.tls.insecure = Some(true);
         let url: url::Url = format!("moqt://localhost:{relay}/room").parse().unwrap();
         let connection = config

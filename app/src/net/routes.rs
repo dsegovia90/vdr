@@ -113,6 +113,10 @@ fn install_crypto() {
 fn client(versions: &[Version]) -> moq_tokio::Client {
     install_crypto();
     let mut config = moq_tokio::client::Config::default();
+    // On the loopback address as the servers are: a dual-stack port can
+    // share its number with another test's server, which then takes this
+    // client's answers (see `sessions`' socket tests).
+    config.connect.bind = Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     config.connect.tls.insecure = Some(true);
     config.connect.version = versions.to_vec();
     config.init().expect("client config").with_reconnect(false)
