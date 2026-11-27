@@ -1413,7 +1413,11 @@ async fn run(
         // "nothing moved".
         let over_iroh = match &peering {
             // As before every join went through the set: a room on an
-            // `https://` relay with no hosts known stays without one.
+            // `https://` relay with no hosts known stays without one, and
+            // keeps none if it later dials a host heard of during the call
+            // over iroh: nothing then logs or reports which way that
+            // session's traffic goes (direct or through iroh's relays).
+            // Left so for now; it is figures, not the call.
             Peering::Join(url) => url.scheme() == "iroh" || host_rooms || !known.is_empty(),
             Peering::Dial(_) | Peering::Listen | Peering::Host(_) => true,
             Peering::Loopback | Peering::Idle => false,
