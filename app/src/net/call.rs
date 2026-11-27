@@ -2212,8 +2212,17 @@ struct Routing {
 ///
 /// **An announcement is the join, and its withdrawal is the leave** -- there is
 /// no separate presence mechanism to keep in step with this one. `announced()`
-/// yields `Some` for a broadcast appearing and `None` for it going away, so
-/// membership is read off the same stream the media arrives on.
+/// yields an announcement for a broadcast appearing and a retraction for it
+/// going away, so membership is read off the same stream the media arrives on.
+///
+/// **But a withdrawal is a leave only once it outlasts its grace**
+/// (`grace.rs`). The library ends a read whenever its route changes and says
+/// so by retracting the path and announcing it again at once, so a relay
+/// going or the call moving reaches us as a withdrawal and the same
+/// announcement. That is a change of route: the person's readers start again
+/// on the fresh broadcast, into the tile they already have, and nobody is
+/// told anyone left. A goodbye said in presence makes every withdrawal of
+/// theirs a leave at once.
 ///
 /// This replaced two separate waits on one well-known path, which was the thing
 /// that made a call exactly two people. Through a relay this is the whole room:
@@ -2225,6 +2234,7 @@ async fn attend(
     reports: Reports,
     engine: Option<moq_audio::playback::Engine>,
 ) {
+    use super::grace::{GRACE, Strand};
     let Reports {
         status,
         participants,
@@ -2250,31 +2260,11 @@ async fn attend(
     let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut reporter = super::report::Reporter::default();
     let mut announced = inbound.announced();
-    // Dropping an entry aborts that participant's decoders, so leaving is the
-    // same operation as the attempt ending.
-    let mut attending: std::collections::HashMap<String, Vec<Abort>> =
-        std::collections::HashMap::new();
-    // When each person's camera last went, so its return can say how long
-    // their tile was gone: what a move of the call is judged by from logs.
-    let mut gone: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
+    let mut here = Here::default();
     // **Cloned per participant, never taken.** Clones of an engine share its
     // device and its mix, so each peer becomes one more sink in the same output
     // -- and the echo canceller, built from this engine, subtracts that whole
     // mix. `None` only when there is no output device at all.
-    // Who has a live control broadcast. Presence is this, not the camera: a
-    // participant with no video is still on the call, and this is the set whose
-    // emptying means the call is over.
-    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut listening: std::collections::HashMap<String, Abort> =
-        std::collections::HashMap::new();
-    // Whose shared screen we are decoding. A map of its own: a share comes and
-    // goes without its sharer doing either.
-    let mut sharing: std::collections::HashMap<String, Abort> = std::collections::HashMap::new();
-    // One per person, shared by their presence reader and their tile, so what
-    // they say about their camera reaches the tile showing it. Either
-    // broadcast may be announced first, hence get-or-insert at both.
-    let mut people: std::collections::HashMap<String, Arc<PeerStats>> =
-        std::collections::HashMap::new();
     // Where the per-participant readers report a goodbye. One arbiter, so the
     // rule for "is the call over" is written once.
     let (saying, mut said) = futures_channel::mpsc::unbounded::<String>();
@@ -2284,35 +2274,55 @@ async fn attend(
         rooms: rooms.clone(),
         seen: Arc::default(),
     };
-    // Each person's route, as the hop chain of their control broadcast's
-    // announcement: everything of theirs is offered the same way, and this
-    // one is there whether or not a camera is. Read once a second rather than
-    // as it changes, so a host's presence has had time to name its hop.
-    let mut chains: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
-    let mut routes: std::collections::HashMap<String, arrival::Arrival> = std::collections::HashMap::new();
     // Whose `routes.json` we read, while our map is open: none otherwise.
     let mut following: std::collections::HashMap<String, Abort> = std::collections::HashMap::new();
+    let gone = Gone {
+        participants: &participants,
+        hangup: &hangup,
+        in_room,
+    };
 
     loop {
+        let due = here.departures.next();
         let update = tokio::select! {
             update = announced.next() => match update {
                 Some(update) => update,
                 None => break,
             },
             _ = stats_tick.tick() => {
-                reporter.tick(std::time::Instant::now(), &metrics, &rooms.local, &people, &present, &me);
-                note_routes(&chains, &people, &mut routes, &routing, in_room, &rooms.local, &me);
-                follow_all_routes(&rooms.local, &present, &people, &mut following, &inbound);
+                reporter.tick(std::time::Instant::now(), &metrics, &rooms.local, &here.people, &here.present, &me);
+                note_routes(&here.chains, &here.people, &mut here.routes, &routing, in_room, &rooms.local, &me);
+                follow_all_routes(&rooms.local, &here.present, &here.people, &mut following, &inbound);
                 if let Some(file) = stats_file.as_mut() {
-                    write_stats(file, &me, &people, &metrics);
+                    write_stats(file, &me, &here.people, &metrics);
+                }
+                // A share whose sharer has since said they stopped is a stop,
+                // not a change of route: its tile comes down now.
+                for id in here.departures.of(Strand::Screen) {
+                    if here.stopped_sharing(&id) {
+                        here.departures.release(&id, Strand::Screen);
+                        here.screen_left(&id, &gone);
+                    }
+                }
+                continue;
+            }
+            _ = until(due) => {
+                for (id, strand) in here.departures.expired(std::time::Instant::now()) {
+                    tracing::info!("{id}'s {} did not come back within {} ms", strand_name(strand), GRACE.as_millis());
+                    here.left(&id, strand, &gone);
                 }
                 continue;
             }
             goodbye = said.next() => {
                 if let Some(id) = goodbye {
                     tracing::info!("{id} is leaving");
-                    listening.remove(&id);
-                    if present.remove(&id) && present.is_empty() {
+                    here.goodbyes.insert(id.clone());
+                    here.listening.remove(&id);
+                    // Nothing of theirs is coming back on another route.
+                    for strand in here.departures.release_all(&id) {
+                        here.left(&id, strand, &gone);
+                    }
+                    if here.present.remove(&id) && here.present.is_empty() {
                         alone(&hangup, id, in_room);
                     }
                 }
@@ -2325,229 +2335,337 @@ async fn attend(
         // hop of its own (see `sessions::Gate`), so a session's split horizon
         // no longer hides them. Skipped before asking for the broadcast, so
         // reading them back opens nothing.
-        let owner = controller_of(&path)
-            .or_else(|| sharer_of(&path))
-            .or_else(|| participant_of(&path));
-        if owner == Some(me.as_str()) {
-            continue;
-        }
-        if let Some(id) = controller_of(&path) {
-            match update.kind {
-                moq_net::announce::Kind::Retracted => {
-                    chains.remove(id);
-                    if routes.remove(id).is_some() {
-                        if let Some(stats) = people.get(id) {
-                            stats.set_arrival(None);
-                        }
-                    }
-                }
-                _ => {
-                    chains.insert(id.to_string(), update.route.hops.as_slice().iter().map(|hop| hop.id()).collect());
-                }
-            }
-        }
-        // An announcement names a path; the broadcast is asked for by that path.
-        // A re-priced route changes nothing we act on, and a retraction is the
-        // goodbye, carried as `None` the way the old cursor carried it.
-        let broadcast = match update.kind {
-            moq_net::announce::Kind::Updated => continue,
-            moq_net::announce::Kind::Retracted => None,
-            moq_net::announce::Kind::Announced => match inbound.request_broadcast(path.as_str()).await {
-                Ok(broadcast) => Some(broadcast),
-                Err(error) => {
-                    tracing::warn!("could not open the broadcast at {path}: {error:#}");
-                    continue;
-                }
-            },
-        };
-
-        if let Some(id) = controller_of(&path) {
-            if id == me {
-                continue;
-            }
-            match broadcast {
-                Some(broadcast) => {
-                    present.insert(id.to_string());
-                    listening.insert(
-                        id.to_string(),
-                        Abort(tokio::spawn(listen(
-                            inbound.clone(),
-                            broadcast,
-                            id.to_string(),
-                            saying.clone(),
-                            people.entry(id.to_string()).or_default().clone(),
-                            asked.clone(),
-                            news.clone(),
-                        ))),
-                    );
-                }
-                None => {
-                    // An unannounce is the authoritative goodbye. Deliberate,
-                    // it arrives at once; abrupt, it waits out the linger, by
-                    // which time the reconnect has already given up.
-                    //
-                    // **The reader is let go, not killed.** Through a relay the
-                    // unannounce can overtake the last document -- the
-                    // `Leaving` said just before it -- and aborting the reader
-                    // here threw that word away: a hang-up then looked exactly
-                    // like a drop. It ends by itself once the document arrives
-                    // or the track closes; the grace only bounds a reader that
-                    // never hears either.
-                    if let Some(reader) = listening.remove(id) {
-                        tokio::spawn(async move {
-                            tokio::time::sleep(GOODBYE_GRACE).await;
-                            drop(reader);
-                        });
-                    }
-                    if present.remove(id) && present.is_empty() {
-                        alone(&hangup, id.to_string(), in_room);
-                    }
-                    // Their screen goes with them, rather than lingering on
-                    // the relay after a leave. Their camera is left to its own
-                    // retract, which `Leaving` already hastens.
-                    if sharing.remove(id).is_some() {
-                        tracing::info!("{id} left while sharing; dropping their screen");
-                        let _ = participants.unbounded_send(ParticipantEvent::Left {
-                            id: id.to_string(),
-                            feed: Feed::Screen,
-                        });
-                    }
-                    if !attending.contains_key(id) {
-                        people.remove(id);
-                    }
-                }
-            }
-            continue;
-        }
-
-        if let Some(id) = sharer_of(&path) {
-            if id == me {
-                continue;
-            }
-            match broadcast {
-                Some(broadcast) => {
-                    tracing::info!("{id} is sharing a screen");
-                    let slot = FrameSlot::default();
-                    // The person's entry, so the share's tile reads their room.
-                    let stats = people.entry(id.to_string()).or_default().clone();
-                    let _ = participants.unbounded_send(ParticipantEvent::Joined {
-                        id: id.to_string(),
-                        slot: slot.clone(),
-                        stats,
-                        feed: Feed::Screen,
-                    });
-                    // The seam for a shared screen's sound, which is not sent
-                    // yet. It would ride in this broadcast, and be played as
-                    // the camera branch below plays a voice: with a clone of
-                    // `engine`, `audio::subscribe(broadcast, ..)`.
-                    let _audio: Option<moq_audio::playback::Engine> = None;
-                    sharing.insert(
-                        id.to_string(),
-                        Abort(tokio::spawn(watch(
-                            follow::Asking {
-                                inbound: inbound.clone(),
-                                path: path.clone(),
-                            },
-                            broadcast,
-                            slot,
-                            format!("{id}/screen"),
-                            // A screen arriving is not the call connecting.
-                            None,
-                            // **A meter of its own**: `watch` writes frame
-                            // rate and delay into it, and the share must not
-                            // overwrite their camera's numbers.
-                            Arc::new(PeerStats::default()),
-                            metrics.clone(),
-                        ))),
-                    );
-                }
-                None => {
-                    tracing::info!("{id} stopped sharing");
-                    sharing.remove(id);
-                    if !present.contains(id) && !attending.contains_key(id) {
-                        people.remove(id);
-                    }
-                    let _ = participants.unbounded_send(ParticipantEvent::Left {
-                        id: id.to_string(),
-                        feed: Feed::Screen,
-                    });
-                }
-            }
-            continue;
-        }
-
-        let Some(id) = participant_of(&path) else {
+        //
+        // Through a relay a session's own broadcasts should not come back
+        // either -- the relay does not announce a session's own broadcasts
+        // back to it -- but that is the relay's rule, not ours, so the check
+        // stays for every kind.
+        let Some((id, strand)) = controller_of(&path)
+            .map(|id| (id, Strand::Presence))
+            .or_else(|| sharer_of(&path).map(|id| (id, Strand::Screen)))
+            .or_else(|| participant_of(&path).map(|id| (id, Strand::Camera)))
+        else {
             tracing::debug!("ignoring an announcement at {path}");
             continue;
         };
-        // Cannot happen while each side keeps its own origin. Through a relay
-        // it should not either -- the relay does not announce a session's own
-        // broadcasts back to it -- but that is the relay's rule, not ours, so
-        // the check stays.
-        if id == me {
+        if id == me.as_str() {
             continue;
         }
-
-        let Some(broadcast) = broadcast else {
-            tracing::info!("{id} left");
-            gone.insert(id.to_string(), std::time::Instant::now());
-            attending.remove(id);
-            // Forgotten once all of their broadcasts are gone, so a rejoin
-            // with the same key starts from "on" rather than their last word.
-            if !present.contains(id) && !sharing.contains_key(id) {
-                people.remove(id);
+        let id = id.to_string();
+        if strand == Strand::Presence && update.kind.is_active() {
+            here.chains.insert(id.clone(), update.route.hops.as_slice().iter().map(|hop| hop.id()).collect());
+        }
+        match update.kind {
+            // A re-priced route changes nothing we act on.
+            moq_net::announce::Kind::Updated => continue,
+            moq_net::announce::Kind::Retracted => {
+                if here.holds(&id, strand) {
+                    tracing::debug!("{id}'s {} was withdrawn; waiting for it to come back", strand_name(strand));
+                    here.departures.retracted(&id, strand, std::time::Instant::now());
+                } else {
+                    here.left(&id, strand, &gone);
+                }
+                continue;
             }
-            let _ = participants.unbounded_send(ParticipantEvent::Left {
-                id: id.to_string(),
-                feed: Feed::Camera,
-            });
-            continue;
+            moq_net::announce::Kind::Announced => {}
+        }
+        // Back after a goodbye is a new arrival, whose withdrawals are graced
+        // again.
+        here.goodbyes.remove(&id);
+        let returned = here.departures.announced(&id, strand);
+        let broadcast = match inbound.request_broadcast(path.as_str()).await {
+            Ok(broadcast) => broadcast,
+            Err(error) => {
+                tracing::warn!("could not open the broadcast at {path}: {error:#}");
+                // Still a withdrawal waiting to become a leave, rather than a
+                // tile left with nothing feeding it.
+                if let Some(at) = returned {
+                    here.departures.retracted(&id, strand, at);
+                }
+                continue;
+            }
+        };
+        if let Some(at) = returned {
+            tracing::info!("{id}'s {} is back on a new route after {} ms", strand_name(strand), at.elapsed().as_millis());
+        }
+        let stats = here.people.entry(id.clone()).or_default().clone();
+        let asking = || follow::Asking {
+            inbound: inbound.clone(),
+            path: path.clone(),
         };
 
-        tracing::info!("{id} joined");
-        if let Some(left) = gone.remove(id) {
-            tracing::info!("{id} back after {} ms", left.elapsed().as_millis());
+        match strand {
+            Strand::Presence => {
+                here.present.insert(id.clone());
+                // Replaces the reader of the broadcast that ended, if any.
+                here.listening.insert(
+                    id.clone(),
+                    Abort(tokio::spawn(listen(
+                        inbound.clone(),
+                        broadcast,
+                        id.clone(),
+                        saying.clone(),
+                        stats,
+                        asked.clone(),
+                        news.clone(),
+                    ))),
+                );
+            }
+            Strand::Screen => {
+                // The tile they have, on a change of route; a new one otherwise.
+                // Its old reader goes before the new one starts, so the slot
+                // never has two.
+                let slot = match here.sharing.remove(&id) {
+                    Some((slot, reader)) => {
+                        drop(reader);
+                        slot
+                    }
+                    None => {
+                        tracing::info!("{id} is sharing a screen");
+                        let slot = FrameSlot::default();
+                        let _ = participants.unbounded_send(ParticipantEvent::Joined {
+                            id: id.clone(),
+                            slot: slot.clone(),
+                            stats,
+                            feed: Feed::Screen,
+                        });
+                        slot
+                    }
+                };
+                // The seam for a shared screen's sound, which is not sent
+                // yet. It would ride in this broadcast, and be played as
+                // the camera branch below plays a voice: with a clone of
+                // `engine`, `audio::subscribe(broadcast, ..)`.
+                let _audio: Option<moq_audio::playback::Engine> = None;
+                let reader = Abort(tokio::spawn(watch(
+                    asking(),
+                    broadcast,
+                    slot.clone(),
+                    format!("{id}/screen"),
+                    // A screen arriving is not the call connecting.
+                    None,
+                    // **A meter of its own**: `watch` writes frame
+                    // rate and delay into it, and the share must not
+                    // overwrite their camera's numbers.
+                    Arc::new(PeerStats::default()),
+                    metrics.clone(),
+                )));
+                here.sharing.insert(id, (slot, reader));
+            }
+            Strand::Camera => {
+                // The same for a camera: the tile stays, its readers start
+                // again, the old ones gone first.
+                let slot = match here.attending.remove(&id) {
+                    Some((slot, readers)) => {
+                        drop(readers);
+                        slot
+                    }
+                    None => {
+                        tracing::info!("{id} joined");
+                        if let Some(left) = here.gone.remove(&id) {
+                            tracing::info!("{id} back after {} ms", left.elapsed().as_millis());
+                        }
+                        let slot = FrameSlot::default();
+                        let _ = participants.unbounded_send(ParticipantEvent::Joined {
+                            id: id.clone(),
+                            slot: slot.clone(),
+                            stats: stats.clone(),
+                            feed: Feed::Camera,
+                        });
+                        slot
+                    }
+                };
+                let mut tasks = vec![Abort(tokio::spawn(watch(
+                    asking(),
+                    broadcast.clone(),
+                    slot.clone(),
+                    id.clone(),
+                    (!in_room).then(|| status.clone()),
+                    stats.clone(),
+                    metrics.clone(),
+                )))];
+                if let Some(engine) = engine.clone() {
+                    let peer = id.clone();
+                    let stats = stats.clone();
+                    let rooms = rooms.clone();
+                    if crate::args::Args::get().audio_stall.is_some() {
+                        static IGNORED: std::sync::Once = std::sync::Once::new();
+                        IGNORED.call_once(|| tracing::warn!("--audio-stall is for --loopback only; ignored in a call"));
+                    }
+                    let asking = asking();
+                    tasks.push(Abort(tokio::spawn(async move {
+                        audio::subscribe(Some(asking), broadcast, peer, engine, stats, Some(rooms), None).await;
+                    })));
+                } else if !crate::args::Args::get().no_audio {
+                    tracing::warn!("[audio] {id} cannot be heard: there is no output device");
+                }
+                here.attending.insert(id, (slot, tasks));
+            }
         }
-        let slot = FrameSlot::default();
-        let stats = people.entry(id.to_string()).or_default().clone();
-        let _ = participants.unbounded_send(ParticipantEvent::Joined {
+    }
+}
+
+/// Sleeps until `at`, or for ever without one.
+async fn until(at: Option<std::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn strand_name(strand: super::grace::Strand) -> &'static str {
+    match strand {
+        super::grace::Strand::Presence => "presence",
+        super::grace::Strand::Camera => "camera",
+        super::grace::Strand::Screen => "screen",
+    }
+}
+
+/// Where a leave is told: the tiles, and the call when it leaves us alone.
+struct Gone<'a> {
+    participants: &'a UnboundedSender<ParticipantEvent>,
+    hangup: &'a UnboundedSender<String>,
+    in_room: bool,
+}
+
+/// Everyone the attendance loop knows of, and what it runs for them.
+#[derive(Default)]
+struct Here {
+    /// Each person's camera tile, and its readers. Dropping the readers
+    /// aborts them, so leaving is the same operation as the attempt ending.
+    attending: std::collections::HashMap<String, (FrameSlot, Vec<Abort>)>,
+    /// When each person's camera last went, so its return can say how long
+    /// their tile was gone: what a move of the call is judged by from logs.
+    gone: std::collections::HashMap<String, std::time::Instant>,
+    /// Who has a live control broadcast. Presence is this, not the camera: a
+    /// participant with no video is still on the call, and this is the set
+    /// whose emptying means the call is over.
+    present: std::collections::HashSet<String>,
+    listening: std::collections::HashMap<String, Abort>,
+    /// Whose shared screen we are decoding, into which tile. A map of its
+    /// own: a share comes and goes without its sharer doing either.
+    sharing: std::collections::HashMap<String, (FrameSlot, Abort)>,
+    /// One per person, shared by their presence reader and their tile, so
+    /// what they say about their camera reaches the tile showing it. Either
+    /// broadcast may be announced first, hence get-or-insert at both.
+    people: std::collections::HashMap<String, Arc<PeerStats>>,
+    /// Each person's route, as the hop chain of their control broadcast's
+    /// announcement: everything of theirs is offered the same way, and this
+    /// one is there whether or not a camera is. Read once a second rather
+    /// than as it changes, so a host's presence has had time to name its hop.
+    chains: std::collections::HashMap<String, Vec<u64>>,
+    routes: std::collections::HashMap<String, arrival::Arrival>,
+    /// Withdrawals waiting to see whether they are a change of route.
+    departures: super::grace::Departures,
+    /// Who said goodbye: their withdrawals are leaves at once.
+    goodbyes: std::collections::HashSet<String>,
+}
+
+impl Here {
+    /// Whether a withdrawal of `id`'s `strand` waits out a grace rather
+    /// than being a leave at once: only for something we show, and never
+    /// after a goodbye, or for a share its sharer has said is over.
+    fn holds(&self, id: &str, strand: super::grace::Strand) -> bool {
+        use super::grace::Strand;
+        if self.goodbyes.contains(id) {
+            return false;
+        }
+        match strand {
+            Strand::Presence => self.present.contains(id),
+            Strand::Camera => self.attending.contains_key(id),
+            Strand::Screen => self.sharing.contains_key(id) && !self.stopped_sharing(id),
+        }
+    }
+
+    /// Whether `id`'s presence, once heard, says they are not sharing.
+    fn stopped_sharing(&self, id: &str) -> bool {
+        self.people.get(id).is_some_and(|stats| stats.heard() && !stats.sharing())
+    }
+
+    fn left(&mut self, id: &str, strand: super::grace::Strand, gone: &Gone) {
+        use super::grace::Strand;
+        match strand {
+            Strand::Presence => self.presence_left(id, gone),
+            Strand::Camera => self.camera_left(id, gone),
+            Strand::Screen => self.screen_left(id, gone),
+        }
+    }
+
+    fn camera_left(&mut self, id: &str, gone: &Gone) {
+        tracing::info!("{id} left");
+        self.gone.insert(id.to_string(), std::time::Instant::now());
+        self.attending.remove(id);
+        // Forgotten once all of their broadcasts are gone, so a rejoin with
+        // the same key starts from "on" rather than their last word.
+        if !self.present.contains(id) && !self.sharing.contains_key(id) {
+            self.people.remove(id);
+        }
+        let _ = gone.participants.unbounded_send(ParticipantEvent::Left {
             id: id.to_string(),
-            slot: slot.clone(),
-            stats: stats.clone(),
             feed: Feed::Camera,
         });
+    }
 
-        let mut tasks = vec![Abort(tokio::spawn(watch(
-            follow::Asking {
-                inbound: inbound.clone(),
-                path: path.clone(),
-            },
-            broadcast.clone(),
-            slot,
-            id.to_string(),
-            (!in_room).then(|| status.clone()),
-            stats.clone(),
-            metrics.clone(),
-        )))];
-        if let Some(engine) = engine.clone() {
-            let peer = id.to_string();
-            let stats = stats.clone();
-            let rooms = rooms.clone();
-            if crate::args::Args::get().audio_stall.is_some() {
-                static IGNORED: std::sync::Once = std::sync::Once::new();
-                IGNORED.call_once(|| tracing::warn!("--audio-stall is for --loopback only; ignored in a call"));
-            }
-            let asking = follow::Asking {
-                inbound: inbound.clone(),
-                path: path.clone(),
-            };
-            tasks.push(Abort(tokio::spawn(async move {
-                audio::subscribe(Some(asking), broadcast, peer, engine, stats, Some(rooms), None).await;
-            })));
-        } else if !crate::args::Args::get().no_audio {
-            tracing::warn!("[audio] {id} cannot be heard: there is no output device");
+    fn screen_left(&mut self, id: &str, gone: &Gone) {
+        tracing::info!("{id} stopped sharing");
+        self.sharing.remove(id);
+        if !self.present.contains(id) && !self.attending.contains_key(id) {
+            self.people.remove(id);
         }
-        attending.insert(id.to_string(), tasks);
+        let _ = gone.participants.unbounded_send(ParticipantEvent::Left {
+            id: id.to_string(),
+            feed: Feed::Screen,
+        });
+    }
+
+    fn presence_left(&mut self, id: &str, gone: &Gone) {
+        // Their media waiting on a grace goes with them: nothing of theirs
+        // comes back on another route once they are gone.
+        for strand in self.departures.release_all(id) {
+            match strand {
+                super::grace::Strand::Camera => self.camera_left(id, gone),
+                super::grace::Strand::Screen => self.screen_left(id, gone),
+                super::grace::Strand::Presence => {}
+            }
+        }
+        self.chains.remove(id);
+        if self.routes.remove(id).is_some() {
+            if let Some(stats) = self.people.get(id) {
+                stats.set_arrival(None);
+            }
+        }
+        // The authoritative goodbye. Deliberate, it arrives at once;
+        // abrupt, it waits out the linger and the grace, by which time the
+        // reconnect has already given up.
+        //
+        // **The reader is let go, not killed.** Through a relay the
+        // unannounce can overtake the last document -- the `Leaving` said
+        // just before it -- and aborting the reader here threw that word
+        // away: a hang-up then looked exactly like a drop. It ends by itself
+        // once the document arrives or the track closes; the grace only
+        // bounds a reader that never hears either.
+        if let Some(reader) = self.listening.remove(id) {
+            tokio::spawn(async move {
+                tokio::time::sleep(GOODBYE_GRACE).await;
+                drop(reader);
+            });
+        }
+        if self.present.remove(id) && self.present.is_empty() {
+            alone(gone.hangup, id.to_string(), gone.in_room);
+        }
+        // Their screen goes with them, rather than lingering on the relay
+        // after a leave. Their camera is left to its own retract, which
+        // `Leaving` already hastens.
+        if self.sharing.remove(id).is_some() {
+            tracing::info!("{id} left while sharing; dropping their screen");
+            let _ = gone.participants.unbounded_send(ParticipantEvent::Left {
+                id: id.to_string(),
+                feed: Feed::Screen,
+            });
+        }
+        if !self.attending.contains_key(id) {
+            self.people.remove(id);
+        }
     }
 }
 
@@ -3070,11 +3188,15 @@ async fn listen(
     let mut broadcast = Some(broadcast);
     // Whether we are asking again, so an outage is said once and its end too.
     let mut lost = false;
+    // Paced as a media reader is (`follow::Again`): at once after a change
+    // of route, backing off while the broadcast stays open.
+    let mut again = follow::Again::default();
+    let mut ended: Option<moq_net::broadcast::Consumer> = None;
     loop {
         let broadcast = match broadcast.take() {
             Some(broadcast) => broadcast,
             None => {
-                tokio::time::sleep(follow::AGAIN).await;
+                again.wait(ended.take().as_ref()).await;
                 match inbound.request_broadcast(control_path(&id).as_str()).await {
                     Ok(broadcast) => broadcast,
                     Err(error) => {
@@ -3090,6 +3212,7 @@ async fn listen(
                 if !std::mem::replace(&mut lost, true) {
                     tracing::warn!("could not subscribe to {id}'s presence: {error}; asking again");
                 }
+                ended = Some(broadcast);
                 continue;
             }
         };
@@ -3164,12 +3287,14 @@ async fn listen(
                     if !std::mem::replace(&mut lost, true) {
                         tracing::info!("{id}'s presence ended without a goodbye; asking again");
                     }
+                    ended = Some(broadcast.clone());
                     break;
                 }
                 Err(error) => {
                     if !std::mem::replace(&mut lost, true) {
                         tracing::info!("lost {id}'s presence ({error:#}); asking again");
                     }
+                    ended = Some(broadcast.clone());
                     break;
                 }
             }
@@ -5200,5 +5325,270 @@ mod said_tests {
         local.set_map_open(false);
         note_routes(&chains, &people, &mut said, &routing, true, &local, &me);
         assert_eq!(local.routes_out(), None);
+    }
+}
+
+#[cfg(test)]
+mod grace_tests {
+    //! The attendance loop across a withdrawal and the same announcement:
+    //! a change of route, never shown as a leave, with one set of readers
+    //! after it; and a withdrawal that does not come back, which is.
+    use super::*;
+    use super::super::grace::GRACE;
+    use std::time::{Duration, Instant};
+
+    /// The attendance loop over `origin`, as the call runs it, with what it
+    /// tells the tiles and the call.
+    struct Watching {
+        events: futures_channel::mpsc::UnboundedReceiver<ParticipantEvent>,
+        hangups: futures_channel::mpsc::UnboundedReceiver<String>,
+        _attending: Abort,
+    }
+
+    fn watching(origin: &moq_net::origin::Producer, in_room: bool) -> Watching {
+        let (participants, events) = futures_channel::mpsc::unbounded();
+        let (hangup, hangups) = futures_channel::mpsc::unbounded();
+        let reports = Reports {
+            status: futures_channel::mpsc::unbounded().0,
+            participants,
+            hangup,
+            metrics: Arc::new(Metrics::default()),
+            in_room,
+            rooms: audio::Rooms {
+                local: Arc::new(PeerStats::default()),
+                controls: Arc::default(),
+            },
+            news: None,
+            routing: Routing {
+                guests: Arc::default(),
+                ours: origin.hop().id(),
+                far: None,
+            },
+        };
+        let attending = Abort(tokio::spawn(attend(origin.consume(), "me".to_string(), reports, None)));
+        Watching {
+            events,
+            hangups,
+            _attending: attending,
+        }
+    }
+
+    /// What the tiles were told, in short.
+    #[derive(Debug, PartialEq)]
+    enum Told {
+        Joined(Feed),
+        Left(Feed),
+    }
+
+    impl Watching {
+        /// Everything told within `over`.
+        async fn told(&mut self, over: Duration) -> Vec<Told> {
+            let mut told = Vec::new();
+            let until = tokio::time::Instant::now() + over;
+            while let Ok(Some(event)) = tokio::time::timeout_at(until, self.events.next()).await {
+                match event {
+                    ParticipantEvent::Joined { feed, .. } => told.push(Told::Joined(feed)),
+                    ParticipantEvent::Left { feed, .. } => told.push(Told::Left(feed)),
+                    ParticipantEvent::Cleared => {}
+                }
+            }
+            told
+        }
+
+        /// Waits for the next thing told, and when it came.
+        async fn next(&mut self, within: Duration) -> (Told, Instant) {
+            let event = tokio::time::timeout(within, self.events.next()).await.expect("nothing told in time").expect("told");
+            let told = match event {
+                ParticipantEvent::Joined { feed, .. } => Told::Joined(feed),
+                ParticipantEvent::Left { feed, .. } => Told::Left(feed),
+                ParticipantEvent::Cleared => panic!("cleared"),
+            };
+            (told, Instant::now())
+        }
+
+        fn hung_up(&mut self) -> bool {
+            self.hangups.try_recv().is_ok()
+        }
+    }
+
+    /// A broadcast at `path` with a catalog, announced, as a camera or a
+    /// share is before it has video.
+    fn offered(origin: &moq_net::origin::Producer, path: &str) -> (moq_net::broadcast::Producer, super::super::fresh::Catalog) {
+        let mut broadcast = origin.create_broadcast(path).unwrap();
+        let catalog = super::super::fresh::catalog(&mut broadcast).unwrap();
+        broadcast.announce(moq_net::origin::Route::default()).unwrap();
+        (broadcast, catalog)
+    }
+
+    /// Waits for `broadcast` to be read, or no longer read.
+    async fn read(broadcast: &moq_net::broadcast::Producer, used: bool, what: &str) {
+        let demand = broadcast.demand();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while demand.is_used() != used {
+            assert!(Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A broadcast published again at the same path while the old one is
+    /// up, twice in quick succession: what the call's readers see when the
+    /// library bounces the path, a relay's bounce and then a host's. No
+    /// leave, no second tile, and the old broadcasts are no longer read, so
+    /// one set of readers follows the newest.
+    async fn bounced_twice(path: &str, feed: Feed) {
+        let origin = moq_tokio::origin::spawn();
+        let mut w = watching(&origin, true);
+        let first = offered(&origin, path);
+        assert_eq!(w.next(Duration::from_secs(2)).await.0, Told::Joined(feed));
+        read(&first.0, true, "the first broadcast was never read").await;
+        let mut seen = origin.consume().announced();
+        assert!(tokio::time::timeout(Duration::from_secs(1), seen.next()).await.unwrap().unwrap().kind.is_active());
+
+        let second = offered(&origin, path);
+        let third = offered(&origin, path);
+        read(&first.0, false, "the first broadcast was still read after two bounces").await;
+        read(&second.0, false, "the second broadcast was still read after the next bounce").await;
+        read(&third.0, true, "the newest broadcast was never read").await;
+        assert_eq!(w.told(GRACE + Duration::from_millis(500)).await, Vec::new(), "a bounce was shown");
+        // The library did bounce the path: what the loop saw and did not show.
+        let mut withdrawn = 0;
+        while let Ok(Some(update)) = tokio::time::timeout(Duration::from_millis(100), seen.next()).await {
+            withdrawn += usize::from(!update.kind.is_active());
+        }
+        assert!(withdrawn >= 1, "the path was never withdrawn");
+        // Read still, or again: with no catalog written yet the readers ask
+        // again after their patience, and are briefly not reading.
+        read(&third.0, true, "the newest broadcast lost its readers").await;
+        assert!(!first.0.demand().is_used() && !second.0.demand().is_used(), "an old broadcast is read again");
+    }
+
+    #[tokio::test]
+    async fn a_camera_bounced_twice_is_no_leave_and_one_reader() {
+        bounced_twice(&camera_path("them"), Feed::Camera).await;
+    }
+
+    /// A share stopped and started again at once, or a source switched,
+    /// publishes the screen again at the same path: the others keep its
+    /// tile.
+    #[tokio::test]
+    async fn a_share_published_again_is_no_leave_and_one_reader() {
+        bounced_twice(&screen_path("them"), Feed::Screen).await;
+    }
+
+    /// The same withdrawal with nothing announced after it is a leave, once
+    /// its grace has run out, and not before.
+    #[tokio::test]
+    async fn a_withdrawal_that_does_not_come_back_is_a_leave_after_the_grace() {
+        let origin = moq_tokio::origin::spawn();
+        let mut w = watching(&origin, true);
+        let camera = offered(&origin, &camera_path("them"));
+        assert_eq!(w.next(Duration::from_secs(2)).await.0, Told::Joined(Feed::Camera));
+        let withdrawn = Instant::now();
+        drop(camera);
+        let (told, at) = w.next(GRACE + Duration::from_secs(1)).await;
+        assert_eq!(told, Told::Left(Feed::Camera));
+        let took = at - withdrawn;
+        assert!(took >= GRACE - Duration::from_millis(50), "left after only {took:?}");
+        eprintln!("a real leave shown after {took:?}");
+    }
+
+    /// Someone who withdraws and is back within the grace, as a quick leave
+    /// and rejoin with the same key is, keeps their tile.
+    #[tokio::test]
+    async fn back_within_the_grace_keeps_the_tile() {
+        let origin = moq_tokio::origin::spawn();
+        let mut w = watching(&origin, true);
+        let camera = offered(&origin, &camera_path("them"));
+        assert_eq!(w.next(Duration::from_secs(2)).await.0, Told::Joined(Feed::Camera));
+        drop(camera);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let again = offered(&origin, &camera_path("them"));
+        read(&again.0, true, "the new broadcast was never read").await;
+        assert_eq!(w.told(GRACE + Duration::from_millis(500)).await, Vec::new());
+    }
+
+    /// Someone's presence, saying `state`.
+    fn present(origin: &moq_net::origin::Producer, id: &str) -> (moq_net::broadcast::Producer, std::sync::Mutex<Said>) {
+        let control = origin.create_broadcast(control_path(id)).unwrap();
+        let presence = std::sync::Mutex::new(Said::new(control.create_track(PRESENCE, None).unwrap()));
+        say(&presence, Presence::default());
+        control.announce(moq_net::origin::Route::default()).unwrap();
+        (control, presence)
+    }
+
+    /// A goodbye said in presence makes their withdrawals leaves at once.
+    #[tokio::test]
+    async fn after_a_goodbye_a_withdrawal_is_a_leave_at_once() {
+        let origin = moq_tokio::origin::spawn();
+        let mut w = watching(&origin, true);
+        let (control, presence) = present(&origin, "them");
+        read(&control, true, "their presence was never read").await;
+        let camera = offered(&origin, &camera_path("them"));
+        assert_eq!(w.next(Duration::from_secs(2)).await.0, Told::Joined(Feed::Camera));
+        say(
+            &presence,
+            Presence {
+                state: State::Leaving,
+                ..Presence::default()
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let withdrawn = Instant::now();
+        drop(camera);
+        let (told, at) = w.next(Duration::from_secs(1)).await;
+        assert_eq!(told, Told::Left(Feed::Camera));
+        assert!(at - withdrawn < Duration::from_millis(500), "a goodbye still waited {:?}", at - withdrawn);
+    }
+
+    /// A share whose sharer says they stopped comes down at the next look,
+    /// not after the grace.
+    #[tokio::test]
+    async fn a_share_said_to_be_over_comes_down_without_the_grace() {
+        let origin = moq_tokio::origin::spawn();
+        let mut w = watching(&origin, true);
+        let (control, presence) = present(&origin, "them");
+        say(
+            &presence,
+            Presence {
+                sharing: true,
+                ..Presence::default()
+            },
+        );
+        read(&control, true, "their presence was never read").await;
+        let screen = offered(&origin, &screen_path("them"));
+        assert_eq!(w.next(Duration::from_secs(2)).await.0, Told::Joined(Feed::Screen));
+        say(&presence, Presence::default());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let stopped = Instant::now();
+        drop(screen);
+        let (told, at) = w.next(Duration::from_secs(2)).await;
+        assert_eq!(told, Told::Left(Feed::Screen));
+        // At once, or at the next once-a-second look when presence came late.
+        assert!(at - stopped < Duration::from_millis(1200), "the share stayed up {:?}", at - stopped);
+    }
+
+    /// A call that is not a room ends when the other side goes, but not
+    /// when their presence is bounced: only once its grace runs out.
+    #[tokio::test]
+    async fn a_direct_call_survives_a_bounce_and_ends_on_a_leave() {
+        let origin = moq_tokio::origin::spawn();
+        let mut w = watching(&origin, false);
+        let (first, _said) = present(&origin, "them");
+        read(&first, true, "their presence was never read").await;
+        let (second, _said_again) = present(&origin, "them");
+        read(&first, false, "the old presence was still read").await;
+        read(&second, true, "the new presence was never read").await;
+        tokio::time::sleep(GRACE + Duration::from_millis(500)).await;
+        assert!(!w.hung_up(), "a bounce hung the call up");
+
+        let withdrawn = Instant::now();
+        drop(first);
+        drop(second);
+        let deadline = withdrawn + GRACE + Duration::from_secs(1);
+        while !w.hung_up() {
+            assert!(Instant::now() < deadline, "a leave never ended the call");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(withdrawn.elapsed() >= GRACE - Duration::from_millis(50));
     }
 }
