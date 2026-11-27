@@ -781,6 +781,9 @@ struct Member {
     /// When it was retired, after which its slot may go to another host
     /// once what it kept for the overlap has gone.
     retired: Option<Instant>,
+    /// Whether the log has said its host has a new door, while its session
+    /// keeps the old one.
+    door_noted: bool,
 }
 
 impl Member {
@@ -799,6 +802,7 @@ impl Member {
             hold: quiet::Hold::new(),
             generation: 0,
             retired: None,
+            door_noted: false,
             target,
         }
     }
@@ -872,15 +876,47 @@ fn reconcile(
     }
     let want: Vec<Target> = hosts.want().into_iter().cloned().collect();
     let mut changed = false;
-    for member in members.iter_mut().filter(|member| member.state != State::Retired && member.target.host.is_some()) {
-        if !want.contains(&member.target) {
-            tracing::info!("hanging up {}: it no longer hosts the room, or its door changed", spoken(member));
-            member.retire(now);
-            changed = true;
+    for (index, member) in members.iter_mut().enumerate() {
+        if member.state == State::Retired {
+            continue;
+        }
+        let Some(id) = member.target.host.clone() else { continue };
+        match want.iter().find(|target| target.host.as_deref() == Some(id.as_str())) {
+            None => {
+                tracing::info!("hanging up {}: it no longer hosts the room", spoken(member));
+                member.retire(now);
+                changed = true;
+            }
+            Some(target) if *target == member.target => {}
+            // **A new door does not hang up a session that works**: the host
+            // let us in with the old one, and that session stays good. The
+            // new one is for the next dial, which is when this session is
+            // next not up.
+            Some(_) if member.state.up() => {
+                if !std::mem::replace(&mut member.door_noted, true) {
+                    tracing::info!("{} has a new door; keeping the session it let us in with until it next drops", spoken(member));
+                }
+            }
+            Some(target) => {
+                tracing::info!("dialling {} again, at its new door", spoken(member));
+                if let Some(old) = member.session.take() {
+                    old.connection.abort(moq_net::Error::Cancel);
+                }
+                member.target = target.clone();
+                member.generation += 1;
+                member.state = State::Dialing;
+                member.error = None;
+                member.redialled = false;
+                member.door_noted = false;
+                member.session = Some(dial(index, member, false));
+            }
         }
     }
     for target in want {
-        if members.iter().any(|member| member.state != State::Retired && member.target == target) {
+        if members
+            .iter()
+            .any(|member| member.state != State::Retired && member.target.host == target.host)
+        {
             continue;
         }
         let mut member = Member::new(target, hosting, outbound);
@@ -4451,5 +4487,42 @@ mod socket_tests {
         assert_eq!(dials.get(), before + 1, "a burst dialled more than once");
         reconcile(&mut members, &mut hosts, burst + DOOR_SETTLE * 2, false, &outbound, &mut quiet, &mut dial);
         assert_eq!(dials.get(), before + 2, "the latest door of the burst was never dialled");
+    }
+
+    /// The host carrying our media, with the relay gone, says a new door.
+    /// The session it let us in with stays good, so it is kept: nobody there
+    /// loses our media, and the new door waits for the next dial. This host
+    /// still opens only its first door, so a session redialled with the new
+    /// one would be turned away: hanging up the working one loses m.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_door_from_the_host_carrying_our_media_keeps_its_session() {
+        use super::super::super::arrival::Sending;
+        let relay = Meeting::older().await;
+        let first = door::fresh().unwrap();
+        let h = hosted_behind('e', vec![relay_at(relay.url())], Some(door::Hosting::with_door("team".to_string(), first.clone()))).await;
+        let on_m = Arc::new(PeerStats::default());
+        let m = member_as("m", vec![relay_at(relay.url())], client(), on_m.clone());
+        let door = |door: &str| {
+            let mut url = at(h.port);
+            url.query_pairs_mut().append_pair(door::PARAM, door);
+            host_at('e', url)
+        };
+        let _ = m.learn.unbounded_send(Learned::Host(door(&first)));
+        holding(&on_m, &['e'], true, "m never dialled the host").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        relay.stop().await;
+        let deadline = Instant::now() + WITHIN;
+        while on_m.sending() != Some(Sending::Host(id('e'))) {
+            assert!(Instant::now() < deadline, "m's media never moved to the host");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let view = Absences::of(&h.origin, &[camera_path("m")], "the host").await;
+        let changed = Instant::now();
+        let _ = m.learn.unbounded_send(Learned::Host(door(&door::fresh().unwrap())));
+        past_the_grace(changed + MOVE_OVERLAP + Duration::from_secs(1)).await;
+        let gone = view.over(super::super::super::grace::GRACE);
+        assert!(gone.is_empty(), "the host lost {gone:?}");
+        assert!(on_m.held().contains(&id('e')), "m hung up the host");
+        assert_eq!(on_m.sending(), Some(Sending::Host(id('e'))));
     }
 }
