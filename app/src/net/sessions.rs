@@ -2395,13 +2395,19 @@ mod socket_tests {
         }
     }
 
-    /// When each of someone's camera frames reached its tile at a viewer.
+    /// When each of someone's camera frames reached its tile at a viewer,
+    /// and how many times a camera tile there was taken down.
     #[derive(Clone, Default)]
-    struct Arrivals(Arc<std::sync::Mutex<Vec<Instant>>>);
+    struct Arrivals(Arc<std::sync::Mutex<Vec<Instant>>>, Arc<std::sync::atomic::AtomicUsize>);
 
     impl Arrivals {
         fn count(&self) -> usize {
             self.0.lock().unwrap().len()
+        }
+
+        /// The camera tiles taken down: what a person sees as a leave.
+        fn left(&self) -> usize {
+            self.1.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         /// Waits for `more` frames beyond those seen so far.
@@ -2462,6 +2468,12 @@ mod socket_tests {
         let who = who.map(str::to_string);
         let tiles = Abort(tokio::spawn(async move {
             while let Some(event) = events.next().await {
+                if let ParticipantEvent::Left { id, feed: Feed::Camera } = &event {
+                    if who.as_ref().is_none_or(|who| who == id) {
+                        counting.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    continue;
+                }
                 if let ParticipantEvent::Joined { id, slot, feed: Feed::Camera, .. } = event {
                     if who.as_ref().is_some_and(|who| *who != id) {
                         continue;
@@ -2740,7 +2752,8 @@ mod socket_tests {
         // Past the library's hold on a re-announcement, so a leave would show.
         w.arrivals.more(75, "video stopped when the relay did").await;
         let gap = w.arrivals.longest_gap(stopped);
-        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        assert_eq!(w.arrivals.left(), 0, "the viewer's tile for m left");
+        eprintln!("relay stopped: gap {gap:?}, {} withdrawals", count(&retracted));
         assert!(gap < SPLICE, "video was gone {gap:?} when the relay stopped");
     }
 
@@ -2787,10 +2800,12 @@ mod socket_tests {
                 w.to(host, &format!("the call never moved, round {round}")).await;
                 w.arrivals.more(30, &format!("video stopped after a move, round {round}")).await;
                 let gap = w.arrivals.longest_gap(moved);
+                eprintln!("moved to the {}, round {round}: gap {gap:?}", if host { "host" } else { "relay" });
                 assert!(gap < GAP, "video was gone {gap:?} moving to the {}, round {round}", if host { "host" } else { "relay" });
             }
         }
-        assert_eq!(count(&retracted), 0, "the viewer lost m across a move");
+        eprintln!("moves: {} withdrawals", count(&retracted));
+        assert_eq!(w.arrivals.left(), 0, "the viewer's tile for m left across a move");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2837,7 +2852,8 @@ mod socket_tests {
         routed_through(&inbound, &camera_path("m"), room.host.origin.hop(), "m never came through the host").await;
         arrivals.more(75, "video stopped when we hung up on the relay").await;
         let gap = arrivals.longest_gap(cut);
-        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        assert_eq!(arrivals.left(), 0, "the viewer's tile for m left");
+        eprintln!("hung up: {} withdrawals", count(&retracted));
         // Nobody asks m for a keyframe here: the read picks up at m's next group.
         assert!(gap < GROUP, "video was gone {gap:?}");
         eprintln!("hung up: gap {gap:?}");
@@ -3087,7 +3103,8 @@ mod socket_tests {
         routed_through(&r.v.inbound, &camera_path("m"), r.host.origin.hop(), "m never came through the host").await;
         r.arrivals.more(60, "video stopped when the relay went silent").await;
         let gap = r.arrivals.longest_gap(cut);
-        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        assert_eq!(r.arrivals.left(), 0, "the viewer's tile for m left");
+        eprintln!("silent relay: {} withdrawals", count(&retracted));
         assert_eq!(r.on_m.sending(), Some(super::super::super::arrival::Sending::Host(id('c'))), "m's media never left the relay");
         assert_eq!(r.host.local.sending(), Some(super::super::super::arrival::Sending::Guests), "the host never left the relay");
         assert!(gap < QUIET_GAP, "video was gone {gap:?} when the relay went silent");
@@ -3196,7 +3213,8 @@ mod socket_tests {
         let moved = said.elapsed();
         tokio::time::sleep_until((said + DRAIN + Duration::from_secs(2)).into()).await;
         let gap = arrivals.longest_gap(said);
-        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        assert_eq!(arrivals.left(), 0, "the viewer's tile for m left");
+        eprintln!("going away: {} withdrawals", count(&retracted));
         assert!(gap < Duration::from_secs(1), "video was gone {gap:?} across the relay going away");
         eprintln!("going away: moved in {moved:?}, gap {gap:?}");
     }
@@ -3375,8 +3393,13 @@ mod socket_tests {
         of_host.more(75, "the host's video stopped when the relay did").await;
         of_member.more(75, "the host's view of m stopped when the relay did").await;
         let (host_gap, member_gap) = (of_host.longest_gap(stopped), of_member.longest_gap(stopped));
-        assert_eq!(count(&host_left), 0, "the viewer lost the host");
-        assert_eq!(count(&member_left), 0, "the host lost m");
+        assert_eq!(of_host.left(), 0, "the viewer's tile for the host left");
+        assert_eq!(of_member.left(), 0, "the host's tile for m left");
+        eprintln!(
+            "relay stopped under the host: host's video gap {host_gap:?}, its view of m {member_gap:?}, {} and {} withdrawals",
+            count(&host_left),
+            count(&member_left)
+        );
         // This stand-in host is not a join, so nothing asks its encoder for a
         // keyframe: its own video waits out the group in flight.
         assert!(host_gap < GROUP, "the host's video was gone {host_gap:?}");
