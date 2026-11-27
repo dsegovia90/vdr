@@ -1013,19 +1013,9 @@ pub(super) fn join(args: Join) -> Peer {
                         if let Some(old) = member.session.replace(fresh) {
                             // Kept a moment, as an old offer is, so what is
                             // pulled through it moves to the new session.
-                            //
-                            // Its going bounces every read still routed
-                            // through it, ours and everyone else's who moved
-                            // with us at the same moment, and a read asked for
-                            // again mid-group waits for the next group (see
-                            // `Keyframes::ask`). So a keyframe once it has
-                            // gone, rather than the rest of the encoder's
-                            // interval.
-                            let keyframe = keyframe.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep(MOVE_OVERLAP).await;
                                 drop(old);
-                                keyframe.ask();
                             });
                         }
                         if carrier == Some(index) {
@@ -2650,17 +2640,6 @@ mod socket_tests {
     /// bound at all.
     const GAP: Duration = Duration::from_millis(3500);
 
-    /// The longest a viewer may go without a frame across a move of the call
-    /// with the sender asking for keyframes as the call does. A read asked for
-    /// again in the middle of a group waits for the next one, and every move
-    /// bounces reads twice: as the offer moves, and as the sessions it left
-    /// go a second later. Each asks the sender for a keyframe, and again a
-    /// quarter second later (`Keyframes::ask`), which bounds the wait:
-    /// at most 0.73 s in 60 runs, six at once. Without the keyframes after
-    /// the sessions went, the first move waited out the encoder's
-    /// two-second interval every time, 1.4 to 1.9 s.
-    const MOVE_GAP: Duration = Duration::from_millis(1000);
-
     /// A member and a viewer in a room a host bridges to the relay, both
     /// following moves of the call, the viewer reading the member's camera
     /// the way the call does.
@@ -2872,7 +2851,7 @@ mod socket_tests {
                 w.arrivals.more(30, &format!("video stopped after a move, round {round}")).await;
                 let gap = w.arrivals.longest_gap(moved);
                 eprintln!("moved to the {}, round {round}: gap {gap:?}", if host { "host" } else { "relay" });
-                assert!(gap < MOVE_GAP, "video was gone {gap:?} moving to the {}, round {round}", if host { "host" } else { "relay" });
+                assert!(gap < GAP, "video was gone {gap:?} moving to the {}, round {round}", if host { "host" } else { "relay" });
             }
         }
         // The last move's old offer goes a moment after it settles; earlier

@@ -230,44 +230,12 @@ pub(super) struct Keyframes {
     routes: std::sync::atomic::AtomicU64,
 }
 
-/// How long after a change of route the keyframe it asked for is cut again.
-///
-/// **A viewer that asks afresh in the middle of a group waits for the next
-/// one.** Its new read is placed inside the group in flight, and moq-net's
-/// splice then waits for the rest of that group from a route that never
-/// delivers it, giving up only when a newer group arrives ("no route can
-/// serve the rest of this group", `model/resume.rs`; what it waits on
-/// upstream is not traced). So a viewer whose bounce reaches it after our
-/// keyframe lands in that group and waits out the encoder's two-second
-/// interval: seen as 1.4 to 1.9 s frozen after a move. A viewer bounces a few
-/// hundred milliseconds after we change route (its announce cursor holds a
-/// changed route 300 ms, and its own sessions move too), so a second keyframe
-/// a moment later usually starts the group it waits for; the sessions a move
-/// leaves go a second later and ask again for themselves (`sessions.rs`).
-/// Half a second here left a relay stop at 0.51 s now and then; a quarter
-/// keeps it inside its half-second budget. It does not help a viewer whose
-/// route comes back only after the library's two-second hold on a worse one.
-const KEYFRAME_AGAIN: std::time::Duration = std::time::Duration::from_millis(250);
-
 impl Keyframes {
-    /// Asks every loop for a keyframe, and every catalog to be written again;
-    /// and for a keyframe once more [`KEYFRAME_AGAIN`] later.
-    fn ask(self: &Arc<Self>) {
-        self.cut();
-        self.rerouted();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let again = self.clone();
-            runtime.spawn(async move {
-                tokio::time::sleep(KEYFRAME_AGAIN).await;
-                again.cut();
-            });
-        }
-    }
-
-    /// Asks every loop for a keyframe.
-    fn cut(&self) {
+    /// Asks every loop for a keyframe, and every catalog to be written again.
+    fn ask(&self) {
         self.camera.store(true, std::sync::atomic::Ordering::Relaxed);
         self.screen.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.rerouted();
     }
 
     /// Says our offer may have moved, so every catalog is written again.
