@@ -808,6 +808,8 @@ struct Member {
     /// Whether the log has said its host has a new door, while its session
     /// keeps the old one.
     door_noted: bool,
+    /// Whether its session was dialled free, to the host the call is on.
+    free: bool,
 }
 
 impl Member {
@@ -827,6 +829,7 @@ impl Member {
             generation: 0,
             retired: None,
             door_noted: false,
+            free: false,
             target,
         }
     }
@@ -882,9 +885,9 @@ fn reconcile(
     members: &mut Vec<Member>,
     hosts: &mut Hosts,
     now: Instant,
-    hosting: bool,
-    outbound: &moq_net::origin::Producer,
+    new: &dyn Fn(Target) -> Member,
     quiet: &mut Quiet,
+    call_host: Option<&str>,
     dial: &mut dyn FnMut(usize, &Member, bool) -> Session,
 ) -> bool {
     hosts.settle(now);
@@ -945,7 +948,8 @@ fn reconcile(
                 member.error = None;
                 member.redialled = false;
                 member.door_noted = false;
-                member.session = Some(dial(index, member, false));
+                member.free = call_host == Some(id.as_str());
+                member.session = Some(dial(index, member, member.free));
             }
         }
     }
@@ -956,7 +960,10 @@ fn reconcile(
         {
             continue;
         }
-        let mut member = Member::new(target, hosting, outbound);
+        let mut member = new(target);
+        // At its price from the start when the call is already on it, rather
+        // than dialled at the usual price and again, free, a pass later.
+        member.free = call_host.is_some() && member.target.host.as_deref() == call_host;
         let index = match members.iter().position(|slot| slot.free(now)) {
             Some(at) => {
                 member.generation = members[at].generation + 1;
@@ -965,7 +972,7 @@ fn reconcile(
             None => members.len(),
         };
         tracing::info!("dialling {}, heard of during the call", spoken(&member));
-        member.session = Some(dial(index, &member, false));
+        member.session = Some(dial(index, &member, member.free));
         // A slot new to this host: its history, or our guests' when it is
         // one past the end, is not this session's.
         quiet.forget(index);
@@ -1138,7 +1145,8 @@ pub(super) fn join(args: Join) -> Peer {
     // price from the start rather than dialled twice.
     let mut chosen = chosen_member(&members, &local);
     for (index, member) in members.iter_mut().enumerate() {
-        member.session = Some(dial(index, member, chosen == Some(index)));
+        member.free = chosen == Some(index);
+        member.session = Some(dial(index, member, member.free));
     }
     if let Some(every) = bounce {
         tracing::info!("bouncing every {}s between the relay and {hosts} hosts", every.as_secs());
@@ -1256,7 +1264,9 @@ pub(super) fn join(args: Join) -> Peer {
 
                 // Hosts heard of, or let go, since the last pass: a session
                 // to each one wanted and to no other.
-                if reconcile(&mut members, &mut hosts_wanted, Instant::now(), hosting, &outbound, &mut quiet, &mut |index, member, chosen| {
+                let call_host = local.call_host();
+                let new = |target| Member::new(target, hosting, &outbound);
+                if reconcile(&mut members, &mut hosts_wanted, Instant::now(), &new, &mut quiet, call_host.as_deref(), &mut |index, member, chosen| {
                     dial(index, member, chosen)
                 }) {
                     local.set_gates(gates(&members));
@@ -1278,7 +1288,8 @@ pub(super) fn join(args: Join) -> Peer {
                     if let State::Resting(until) = member.state {
                         if going && now >= until {
                             member.state = State::Dialing;
-                            member.session = Some(dial(index, member, chosen == Some(index)));
+                            member.free = chosen == Some(index);
+                            member.session = Some(dial(index, member, member.free));
                         }
                     }
                 }
@@ -1365,7 +1376,8 @@ pub(super) fn join(args: Join) -> Peer {
                     for index in [chosen, now_chosen].into_iter().flatten() {
                         let free = now_chosen == Some(index);
                         let member = &mut members[index];
-                        if member.session.is_none() {
+                        // Not up to redial, or dialled at this price already.
+                        if member.session.is_none() || member.free == free {
                             continue;
                         }
                         let id = member.target.host.clone().unwrap_or_default();
@@ -1374,6 +1386,7 @@ pub(super) fn join(args: Join) -> Peer {
                         } else {
                             tracing::info!("the call left host {id}; dialling it again at the usual price");
                         }
+                        member.free = free;
                         let fresh = dial(index, member, free);
                         member.redialled = member.state.live();
                         if let Some(old) = member.session.replace(fresh) {
@@ -4531,7 +4544,8 @@ mod socket_tests {
     async fn many_doors_for_one_host_keep_the_set_bounded_and_dial_once_per_settle() {
         let down = Reserved::new();
         let outbound = moq_tokio::origin::spawn();
-        let mut members = vec![super::Member::new(relay_at(down.url()), false, &outbound)];
+        let new = |target| super::Member::new(target, false, &outbound);
+        let mut members = vec![new(relay_at(down.url()))];
         let mut hosts = Hosts::default();
         let mut quiet = Quiet::default();
         let dials = std::cell::Cell::new(0usize);
@@ -4548,7 +4562,7 @@ mod socket_tests {
         for n in 0..30 {
             let now = start + (DOOR_SETTLE + MOVE_OVERLAP) * n;
             hosts.learn(Learned::Host(door(n)), now);
-            reconcile(&mut members, &mut hosts, now, false, &outbound, &mut quiet, &mut dial);
+            reconcile(&mut members, &mut hosts, now, &new, &mut quiet, None, &mut dial);
         }
         assert_eq!(dials.get(), 30, "each settled door dialled once");
         assert!(members.len() <= 3, "{} slots for one host", members.len());
@@ -4565,10 +4579,10 @@ mod socket_tests {
         for n in 0..20 {
             let now = burst + Duration::from_millis(100) * n;
             hosts.learn(Learned::Host(door(100 + n)), now);
-            reconcile(&mut members, &mut hosts, now, false, &outbound, &mut quiet, &mut dial);
+            reconcile(&mut members, &mut hosts, now, &new, &mut quiet, None, &mut dial);
         }
         assert_eq!(dials.get(), before + 1, "a burst dialled more than once");
-        reconcile(&mut members, &mut hosts, burst + DOOR_SETTLE * 2, false, &outbound, &mut quiet, &mut dial);
+        reconcile(&mut members, &mut hosts, burst + DOOR_SETTLE * 2, &new, &mut quiet, None, &mut dial);
         assert_eq!(dials.get(), before + 2, "the latest door of the burst was never dialled");
     }
 
@@ -4607,5 +4621,21 @@ mod socket_tests {
         assert!(gone.is_empty(), "the host lost {gone:?}");
         assert!(on_m.held().contains(&id('e')), "m hung up the host");
         assert_eq!(on_m.sending(), Some(Sending::Host(id('e'))));
+    }
+
+    /// A host heard of after the call was moved to it: dialled once, free,
+    /// not at the usual price and then again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_heard_of_after_the_call_moved_to_it_is_dialled_once() {
+        let room = bridged().await;
+        let on_m = following();
+        on_m.move_call(Some(id('c')), "m");
+        let m = member_as("m", vec![relay_at(room.relay.url())], client(), on_m.clone());
+        becomes(&room.relay.origin, &camera_path("m"), true).await;
+        let _ = m.learn.unbounded_send(Learned::Host(host_at('c', room.host.url())));
+        holding(&on_m, &['c'], true, "m never dialled the host the call is on").await;
+        tokio::time::sleep(MOVE_OVERLAP + Duration::from_secs(1)).await;
+        let dialled = room.host.sessions.lock().unwrap().len();
+        assert_eq!(dialled, 1, "the host was dialled {dialled} times");
     }
 }
