@@ -2328,7 +2328,7 @@ async fn attend(
             goodbye = said.next() => {
                 if let Some(id) = goodbye {
                     tracing::info!("{id} is leaving");
-                    here.goodbyes.insert(id.clone());
+                    here.goodbyes.entry(id.clone()).or_insert(false);
                     here.listening.remove(&id);
                     // Nothing of theirs is coming back on another route.
                     for strand in here.departures.release_all(&id) {
@@ -2381,9 +2381,6 @@ async fn attend(
             }
             moq_net::announce::Kind::Announced => {}
         }
-        // Back after a goodbye is a new arrival, whose withdrawals are graced
-        // again.
-        here.goodbyes.remove(&id);
         let returned = here.departures.announced(&id, strand);
         let broadcast = match inbound.request_broadcast(path.as_str()).await {
             Ok(broadcast) => broadcast,
@@ -2574,8 +2571,10 @@ struct Here {
     routes: std::collections::HashMap<String, arrival::Arrival>,
     /// Withdrawals waiting to see whether they are a change of route.
     departures: super::grace::Departures,
-    /// Who said goodbye: their withdrawals are leaves at once.
-    goodbyes: std::collections::HashSet<String>,
+    /// Who said goodbye, and whether their presence has since been
+    /// withdrawn: their withdrawals are leaves at once, a bounce's included,
+    /// until nothing of theirs is left here (`forget_if_gone`).
+    goodbyes: std::collections::HashMap<String, bool>,
 }
 
 impl Here {
@@ -2584,7 +2583,7 @@ impl Here {
     /// after a goodbye, or for a share its sharer has said is over.
     fn holds(&self, id: &str, strand: super::grace::Strand) -> bool {
         use super::grace::Strand;
-        if self.goodbyes.contains(id) {
+        if self.goodbyes.contains_key(id) {
             return false;
         }
         match strand {
@@ -2608,6 +2607,17 @@ impl Here {
         }
     }
 
+    /// Forgets `id`'s goodbye once nothing of theirs is left, their
+    /// presence's withdrawal included (a goodbye already takes them out of
+    /// `present`), so a later return with the same key is graced like
+    /// anyone's.
+    fn forget_if_gone(&mut self, id: &str) {
+        let presence_gone = self.goodbyes.get(id).copied().unwrap_or(false);
+        if presence_gone && !self.present.contains(id) && !self.attending.contains_key(id) && !self.sharing.contains_key(id) {
+            self.goodbyes.remove(id);
+        }
+    }
+
     fn camera_left(&mut self, id: &str, gone: &Gone) {
         tracing::info!("{id} left");
         self.gone.insert(id.to_string(), std::time::Instant::now());
@@ -2621,6 +2631,7 @@ impl Here {
             id: id.to_string(),
             feed: Feed::Camera,
         });
+        self.forget_if_gone(id);
     }
 
     fn screen_left(&mut self, id: &str, gone: &Gone) {
@@ -2633,6 +2644,7 @@ impl Here {
             id: id.to_string(),
             feed: Feed::Screen,
         });
+        self.forget_if_gone(id);
     }
 
     fn presence_left(&mut self, id: &str, gone: &Gone) {
@@ -2683,6 +2695,10 @@ impl Here {
         if !self.attending.contains_key(id) {
             self.people.remove(id);
         }
+        if let Some(presence_gone) = self.goodbyes.get_mut(id) {
+            *presence_gone = true;
+        }
+        self.forget_if_gone(id);
     }
 }
 
@@ -5648,5 +5664,50 @@ mod grace_tests {
             drop(said_again);
         }
         drop(first);
+    }
+
+    /// After a goodbye, a bounce of their camera does not undo it: the last
+    /// withdrawal is still a leave at once. And once nothing of theirs is
+    /// left, the goodbye is forgotten, so a return with the same key is
+    /// graced like anyone's.
+    #[tokio::test]
+    async fn a_goodbye_outlasts_a_bounce_and_is_forgotten_once_they_are_gone() {
+        let origin = moq_tokio::origin::spawn();
+        let mut w = watching(&origin, true);
+        let (control, presence) = present(&origin, "them");
+        read(&control, true, "their presence was never read").await;
+        let camera = offered(&origin, &camera_path("them"));
+        assert_eq!(w.next(Duration::from_secs(2)).await.0, Told::Joined(Feed::Camera));
+        say(
+            &presence,
+            Presence {
+                state: State::Leaving,
+                ..Presence::default()
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Bounced after the goodbye: shown as it comes, since they are going.
+        let again = offered(&origin, &camera_path("them"));
+        read(&again.0, true, "the bounced camera was never read").await;
+        let _ = w.told(Duration::from_millis(200)).await;
+        let withdrawn = Instant::now();
+        drop(camera);
+        drop(again);
+        let (told, at) = w.next(Duration::from_secs(1)).await;
+        assert_eq!(told, Told::Left(Feed::Camera));
+        assert!(at - withdrawn < Duration::from_millis(500), "the last withdrawal waited {:?}", at - withdrawn);
+        drop(control);
+        drop(presence);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Back with the same key: graced again.
+        let (_control, _presence) = present(&origin, "them");
+        let camera = offered(&origin, &camera_path("them"));
+        assert_eq!(w.next(Duration::from_secs(2)).await.0, Told::Joined(Feed::Camera));
+        let withdrawn = Instant::now();
+        drop(camera);
+        let (told, at) = w.next(GRACE + Duration::from_secs(1)).await;
+        assert_eq!(told, Told::Left(Feed::Camera));
+        assert!(at - withdrawn >= GRACE - Duration::from_millis(50), "a goodbye was remembered past their leave");
     }
 }
