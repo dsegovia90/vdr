@@ -1383,11 +1383,21 @@ async fn run(
         };
         let several = dials_several(&peering, host_rooms, !known.is_empty());
         // Where what we hear about hosts goes: only a join has a remembered
-        // room to keep them with.
+        // room to keep them with, and a join over several sessions also dials
+        // them as the call goes on.
+        let (learn, learned) = futures_channel::mpsc::unbounded();
+        let mut learned = Some(learned);
         let news = match &peering {
             Peering::Join(url) => Some(RoomNews {
                 room: crate::recent::identity(url),
                 to: hosts.clone(),
+                dial: several.then(|| {
+                    let relay = url.clone();
+                    Dial {
+                        to: learn,
+                        locate: Arc::new(move |known: &door::Known| sessions::target(&relay, known)),
+                    }
+                }),
             }),
             _ => None,
         };
@@ -1526,6 +1536,7 @@ async fn run(
                     keyframe: keyframe.clone(),
                     room,
                     bounce: crate::args::Args::get().bounce,
+                    learned: learned.take().unwrap_or_else(|| futures_channel::mpsc::unbounded().1),
                 })
             }
             Peering::Listen => {
@@ -2292,6 +2303,7 @@ async fn attend(
         participants: &participants,
         hangup: &hangup,
         in_room,
+        news: news.as_ref(),
     };
 
     loop {
@@ -2550,6 +2562,9 @@ struct Gone<'a> {
     participants: &'a UnboundedSender<ParticipantEvent>,
     hangup: &'a UnboundedSender<String>,
     in_room: bool,
+    /// Where a leave is told to the join's sessions, which let go of a host
+    /// that left once its session ends.
+    news: Option<&'a RoomNews>,
 }
 
 /// Everyone the attendance loop knows of, and what it runs for them.
@@ -2707,6 +2722,11 @@ impl Here {
         }
         if let Some(presence_gone) = self.goodbyes.get_mut(id) {
             *presence_gone = true;
+        }
+        // Only here, past the grace or after a goodbye: a bounce is never
+        // told as a leave.
+        if let Some(dial) = gone.news.and_then(|news| news.dial.as_ref()) {
+            let _ = dial.to.unbounded_send(sessions::Learned::Left(id.to_string()));
         }
         self.forget_if_gone(id);
     }
@@ -3401,7 +3421,21 @@ pub(crate) enum HostNews {
 struct RoomNews {
     room: String,
     to: UnboundedSender<HostNews>,
+    /// Where a join over several sessions takes in what is heard, to dial a
+    /// host during the call rather than only at the next join.
+    dial: Option<Dial>,
 }
+
+/// A join's way of taking in the hosts heard in presence.
+#[derive(Clone)]
+struct Dial {
+    to: UnboundedSender<sessions::Learned>,
+    /// Where a host heard of is dialled (`sessions::target`), or `None`.
+    locate: Arc<Locate>,
+}
+
+/// Where a host heard of is dialled.
+type Locate = dyn Fn(&door::Known) -> Option<sessions::Target> + Send + Sync;
 
 /// Acts on what one document says about hosting.
 ///
@@ -3431,6 +3465,15 @@ fn heard_hosting(
                     door: offer.door.clone(),
                     told_by: id.to_string(),
                 });
+                if let Some(dial) = &news.dial {
+                    let known = door::Known {
+                        id: id.to_string(),
+                        door: offer.door.clone(),
+                    };
+                    if let Some(target) = (dial.locate)(&known) {
+                        let _ = dial.to.unbounded_send(sessions::Learned::Host(target));
+                    }
+                }
             }
             *offered = Some(offer.door);
         }
@@ -3444,6 +3487,9 @@ fn heard_hosting(
                         room: news.room.clone(),
                         id: id.to_string(),
                     });
+                    if let Some(dial) = &news.dial {
+                        let _ = dial.to.unbounded_send(sessions::Learned::Stopped(id.to_string()));
+                    }
                 }
             }
         }
@@ -4722,7 +4768,7 @@ mod presence_tests {
 
     fn news() -> (RoomNews, futures_channel::mpsc::UnboundedReceiver<HostNews>) {
         let (to, from) = futures_channel::mpsc::unbounded();
-        (RoomNews { room: "room".to_string(), to }, from)
+        (RoomNews { room: "room".to_string(), to, dial: None }, from)
     }
 
     fn offer(door: &str) -> Option<door::Offer> {
@@ -4757,6 +4803,36 @@ mod presence_tests {
             drained(&mut from),
             [("heard", DOOR.to_string()), ("heard", other.to_string()), ("stopped", String::new())]
         );
+    }
+
+    /// A join over several sessions is told the same changes, each host as
+    /// the target it dials, and nothing for a goodbye.
+    #[test]
+    fn a_join_is_told_each_host_heard_as_where_to_dial_it_and_when_it_stops() {
+        use super::{Dial, sessions};
+        let (mut news, _from) = news();
+        let (to, mut told) = futures_channel::mpsc::unbounded();
+        let relay: url::Url = "iroh://relay/team".parse().unwrap();
+        news.dial = Some(Dial {
+            to,
+            locate: std::sync::Arc::new(move |known: &door::Known| sessions::target(&relay, known)),
+        });
+        let other = "ffeeddccbbaa99887766554433221100";
+        let mut offered = None;
+        let mut say = |state, host| heard_hosting(&id('h'), state, host, &mut offered, Some(&news));
+        say(State::Here, offer(DOOR));
+        say(State::Here, offer(DOOR));
+        say(State::Here, offer(other));
+        say(State::Leaving, None);
+        say(State::Here, None);
+        let told: Vec<String> = std::iter::from_fn(|| told.try_recv().ok())
+            .map(|learned| match learned {
+                sessions::Learned::Host(target) => format!("host {} {}", target.host.unwrap_or_default() == id('h'), target.url.query().unwrap_or_default()),
+                sessions::Learned::Stopped(who) => format!("stopped {}", who == id('h')),
+                sessions::Learned::Left(_) => "left".to_string(),
+            })
+            .collect();
+        assert_eq!(told, [format!("host true door={DOOR}"), format!("host true door={other}"), "stopped true".to_string()]);
     }
 }
 
