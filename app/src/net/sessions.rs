@@ -281,10 +281,10 @@ pub(super) enum Learned {
 /// The hosts a join wants a session to: those known at join and those heard
 /// since, less any that stopped hosting.
 ///
-/// **The lowest ids are kept, not the latest heard**, past [`HOSTS_DIALLED`]:
-/// everyone who hears the same hosts then holds the same ones whatever order
-/// they heard them in, and our media goes to the lowest one when the relay
-/// is down, so everyone meets there.
+/// **The lowest ids are dialled, not the latest heard**, past
+/// [`HOSTS_DIALLED`] ([`kept`]): everyone who hears the same hosts then holds
+/// the same ones whatever order they heard them in, and our media goes to the
+/// lowest one when the relay is down, so everyone meets there.
 ///
 /// **A host that left is kept until its session ends.** Its leave is read
 /// off its presence going, which is also what our own link failing looks
@@ -382,10 +382,34 @@ impl Hosts {
         }
     }
 
-    /// The hosts to hold a session to: the lowest [`HOSTS_DIALLED`] ids.
+    /// Every host wanted, by id; [`kept`] says which to hold.
     pub(super) fn want(&self) -> Vec<&Target> {
-        self.wanted.values().take(HOSTS_DIALLED).collect()
+        self.wanted.values().collect()
     }
+}
+
+/// Which of the `wanted` hosts, sorted by id, to hold a session to: every one
+/// whose session already works (`working`), then the lowest of the rest, up
+/// to [`HOSTS_DIALLED`] in all.
+///
+/// **A session that works is never given up for a lower id.** A door is
+/// whatever someone's presence says, so eight made-up hosts with low ids
+/// would otherwise push out every real one and split the room again when the
+/// relay goes. The price: past eight hosts, members who heard them in
+/// different orders can hold slightly different sets, and some media may
+/// cross between hosts. That is the safer side: a host that bridges is
+/// slower, a host nobody holds a session to is a split.
+pub(super) fn kept(wanted: &[&str], working: &[&str]) -> Vec<String> {
+    let mut kept: Vec<String> = wanted.iter().filter(|id| working.contains(id)).map(|id| id.to_string()).collect();
+    for id in wanted {
+        if kept.len() >= HOSTS_DIALLED {
+            break;
+        }
+        if !kept.iter().any(|held| held == id) {
+            kept.push(id.to_string());
+        }
+    }
+    kept
 }
 
 /// The order of `members` our media prefers: the relay, then the hosts by
@@ -874,7 +898,16 @@ fn reconcile(
         tracing::info!("host {id} left the room and its session ended; not dialling it again");
         hosts.let_go(&id);
     }
-    let want: Vec<Target> = hosts.want().into_iter().cloned().collect();
+    let wanted: Vec<Target> = hosts.want().into_iter().cloned().collect();
+    let ids: Vec<&str> = wanted.iter().filter_map(|target| target.host.as_deref()).collect();
+    let working: Vec<String> = members
+        .iter()
+        .filter(|member| member.state != State::Retired && member.state.up())
+        .filter_map(|member| member.target.host.clone())
+        .collect();
+    let working: Vec<&str> = working.iter().map(String::as_str).collect();
+    let kept = kept(&ids, &working);
+    let want: Vec<Target> = wanted.iter().filter(|target| target.host.as_ref().is_some_and(|id| kept.contains(id))).cloned().collect();
     let mut changed = false;
     for (index, member) in members.iter_mut().enumerate() {
         if member.state == State::Retired {
@@ -883,7 +916,11 @@ fn reconcile(
         let Some(id) = member.target.host.clone() else { continue };
         match want.iter().find(|target| target.host.as_deref() == Some(id.as_str())) {
             None => {
-                tracing::info!("hanging up {}: it no longer hosts the room", spoken(member));
+                if ids.contains(&id.as_str()) {
+                    tracing::info!("letting {} go: more hosts than we hold, and its session is not up", spoken(member));
+                } else {
+                    tracing::info!("hanging up {}: it no longer hosts the room", spoken(member));
+                }
                 member.retire(now);
                 changed = true;
             }
@@ -1610,8 +1647,9 @@ mod tests {
         assert_eq!(hosts_of(&found), [None, Some("a".into())]);
     }
 
-    /// Nine hosts heard in two different orders: the same eight kept, the
-    /// lowest ids, so everyone holds the same ones.
+    /// Nine hosts heard in two different orders, before any session to
+    /// them is up: the same eight kept, the lowest ids, so everyone holds the
+    /// same ones.
     #[test]
     fn the_same_nine_hosts_heard_in_any_order_keep_the_same_lowest_eight() {
         let nine: Vec<char> = "123456789".chars().collect();
@@ -1620,7 +1658,8 @@ mod tests {
             for c in order {
                 hosts.learn(Learned::Host(target(&relay(), &known(*c)).unwrap()), Instant::now());
             }
-            hosts.want().into_iter().map(|target| target.host.clone().unwrap()).collect::<Vec<_>>()
+            let ids: Vec<String> = hosts.want().into_iter().map(|target| target.host.clone().unwrap()).collect();
+            kept(&ids.iter().map(String::as_str).collect::<Vec<_>>(), &[])
         };
         let forwards = heard(&nine);
         let mut shuffled = nine.clone();
@@ -1628,6 +1667,24 @@ mod tests {
         shuffled.swap(0, 4);
         assert_eq!(forwards, heard(&shuffled));
         assert_eq!(forwards, "12345678".chars().map(id).collect::<Vec<_>>());
+    }
+
+    /// Eight hosts held and working, then eight more claiming lower ids: none
+    /// of the working ones is given up. A slot opens only when one of them
+    /// stops working, and then the lowest newcomer takes it.
+    #[test]
+    fn hosts_with_lower_ids_never_evict_sessions_that_work() {
+        let all: Vec<String> = "0123456789abcdef".chars().map(id).collect();
+        let wanted: Vec<&str> = all.iter().map(String::as_str).collect();
+        let held: Vec<&str> = wanted[8..].to_vec();
+        let mut kept_now = kept(&wanted, &held);
+        kept_now.sort();
+        assert_eq!(kept_now, all[8..].to_vec(), "a lower id evicted a working session");
+        let mut kept_now = kept(&wanted, &held[..7]);
+        kept_now.sort();
+        let mut expected = vec![id('0')];
+        expected.extend(all[8..15].iter().cloned());
+        assert_eq!(kept_now, expected);
     }
 
     /// What presence says changes what is wanted: a new host or a new door
