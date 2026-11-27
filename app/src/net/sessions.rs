@@ -3016,6 +3016,12 @@ mod socket_tests {
     }
 
     async fn hosted(relay: url::Url) -> Hosted {
+        hosted_as('c', vec![relay_at(relay)]).await
+    }
+
+    /// A member hosting the room as `me`, joined to `targets`, the first of
+    /// which is the relay.
+    async fn hosted_as(me: char, targets: Vec<Target>) -> Hosted {
         crypto();
         let shared = moq_tokio::origin::spawn();
         let mut config = moq_tokio::server::Config::default();
@@ -3035,8 +3041,8 @@ mod socket_tests {
         }));
         let host = join(Join {
             client: client(),
-            me: id('c'),
-            targets: vec![relay_at(relay)],
+            me: id(me),
+            targets,
             outbound: shared.clone(),
             inbound: shared.clone(),
             hosting: true,
@@ -3607,5 +3613,107 @@ mod socket_tests {
             assert!(gone.elapsed() < WITHIN, "the guest was never turned away");
         }
         assert!(guests.hops().is_empty(), "a guest turned away is still counted as one");
+    }
+
+    /// A camera of `me`'s on `origin`, a small frame every 20 ms.
+    fn publishing(me: &str, origin: &moq_net::origin::Producer) -> (moq_net::broadcast::Producer, Abort) {
+        let camera = origin.create_broadcast(camera_path(me)).unwrap();
+        let mut track = camera.create_track("video", None).unwrap();
+        camera.announce(moq_net::origin::Route::default()).unwrap();
+        let writing = Abort(tokio::spawn(async move {
+            for n in 0u64.. {
+                if track.write_frame(moq_net::Timestamp::from_millis(n * 20).unwrap(), vec![0u8; 100]).is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }));
+        (camera, writing)
+    }
+
+    /// How long each of some paths has gone unannounced at one origin, at
+    /// most, from when they were all first there: what the attendance loop
+    /// takes for a leave once it outlasts the grace.
+    struct Absences {
+        gaps: Arc<std::sync::Mutex<std::collections::HashMap<String, (Option<Instant>, Duration)>>>,
+        _watching: Abort,
+    }
+
+    impl Absences {
+        /// Waits until every one of `paths` is announced at `origin`, then
+        /// watches them.
+        async fn of(origin: &moq_net::origin::Producer, paths: &[String], what: &str) -> Absences {
+            for path in paths {
+                assert!(heard_within(origin, path, Duration::from_secs(10)).await, "{what}: {path} never arrived");
+            }
+            let gaps: std::collections::HashMap<String, (Option<Instant>, Duration)> =
+                paths.iter().map(|path| (path.clone(), (None, Duration::ZERO))).collect();
+            let gaps = Arc::new(std::sync::Mutex::new(gaps));
+            let writing = gaps.clone();
+            let mut announced = origin.consume().announced();
+            let watching = Abort(tokio::spawn(async move {
+                while let Some(update) = announced.next().await {
+                    let mut gaps = writing.lock().unwrap();
+                    let Some((since, longest)) = gaps.get_mut(update.prefix.as_str()) else { continue };
+                    match (update.kind.is_active(), *since) {
+                        (true, Some(at)) => {
+                            *longest = (*longest).max(at.elapsed());
+                            *since = None;
+                        }
+                        (false, None) => *since = Some(Instant::now()),
+                        _ => {}
+                    }
+                }
+            }));
+            Absences { gaps, _watching: watching }
+        }
+
+        /// Each path that has been gone for `limit` or longer, and for how long.
+        fn over(&self, limit: Duration) -> Vec<(String, Duration)> {
+            let gaps = self.gaps.lock().unwrap();
+            let mut over: Vec<(String, Duration)> = gaps
+                .iter()
+                .map(|(path, (since, longest))| (path.clone(), (*longest).max(since.map(|at| at.elapsed()).unwrap_or_default())))
+                .filter(|(_, gap)| *gap >= limit)
+                .collect();
+            over.sort();
+            over
+        }
+    }
+
+    /// Everyone's camera but `me`'s, of `everyone`.
+    fn others(me: &str, everyone: &[&str]) -> Vec<String> {
+        everyone.iter().filter(|who| **who != me).map(|who| camera_path(who)).collect()
+    }
+
+    /// Two hosts that know each other from the start, each with a guest who
+    /// knows only that host, all on the relay. The relay stops: the two hosts'
+    /// session to each other carries each side's guest across, and nobody is
+    /// gone from anybody's view for as long as a leave takes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_hosts_that_know_each_other_keep_the_room_whole_when_the_relay_stops() {
+        let relay = Meeting::older().await;
+        let p = hosted_as('c', vec![relay_at(relay.url())]).await;
+        let h = hosted_as('h', vec![relay_at(relay.url()), host_at('c', at(p.port))]).await;
+        let _p_camera = publishing("p", &p.origin);
+        let _h_camera = publishing("h", &h.origin);
+        let a = member("a", vec![relay_at(relay.url()), host_at('c', at(p.port))]);
+        let b = member("b", vec![relay_at(relay.url()), host_at('h', at(h.port))]);
+        let everyone = ["a", "b", "p", "h"];
+        let views = [
+            Absences::of(&a.inbound, &others("a", &everyone), "a").await,
+            Absences::of(&b.inbound, &others("b", &everyone), "b").await,
+            Absences::of(&p.origin, &others("p", &everyone), "p").await,
+            Absences::of(&h.origin, &others("h", &everyone), "h").await,
+        ];
+        // Every spare offered and every route ranked.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let stopped = Instant::now();
+        relay.stop().await;
+        past_the_grace(stopped + Duration::from_secs(1)).await;
+        for (who, view) in everyone.iter().zip(&views) {
+            let gone = view.over(super::super::super::grace::GRACE);
+            assert!(gone.is_empty(), "{who} lost {gone:?}");
+        }
     }
 }
