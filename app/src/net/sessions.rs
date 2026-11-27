@@ -292,11 +292,22 @@ pub(super) enum Learned {
 /// still works, or one the stack is still redialling, on that word could end
 /// a call that would have carried on. A host whose session gave up after it
 /// left is let go, and found again if its presence is heard again.
+///
+/// **A host's door is acted on at most once per [`DOOR_SETTLE`]**, the
+/// latest heard winning: each change of door can mean a dial, ours and
+/// everyone's, and a door is whatever someone's presence says.
 #[derive(Debug, Default)]
 pub(super) struct Hosts {
     wanted: std::collections::BTreeMap<String, Target>,
     left: std::collections::BTreeSet<String>,
+    /// A door heard while the last one acted on was still settling.
+    pending: std::collections::BTreeMap<String, Target>,
+    /// When each host's door was last acted on.
+    changed: std::collections::BTreeMap<String, Instant>,
 }
+
+/// How long a host's door is held before another change of it is acted on.
+pub(super) const DOOR_SETTLE: Duration = Duration::from_secs(5);
 
 impl Hosts {
     pub(super) fn new(known: impl IntoIterator<Item = Target>) -> Self {
@@ -309,22 +320,52 @@ impl Hosts {
         hosts
     }
 
-    /// Takes in what presence said. Whether it changed what is wanted.
-    pub(super) fn learn(&mut self, learned: Learned) -> bool {
+    /// Takes in what presence said `now`. Whether it changed what is wanted;
+    /// a door changed too soon after the last waits for [`Self::settle`].
+    pub(super) fn learn(&mut self, learned: Learned, now: Instant) -> bool {
         match learned {
             Learned::Host(target) => {
                 let Some(id) = target.host.clone() else { return false };
                 let back = self.left.remove(&id);
-                let changed = self.wanted.get(&id) != Some(&target);
-                self.wanted.insert(id, target);
-                changed || back
+                self.pending.remove(&id);
+                match self.wanted.get(&id) {
+                    Some(had) if *had == target => back,
+                    Some(_) if self.changed.get(&id).is_some_and(|at| now.duration_since(*at) < DOOR_SETTLE) => {
+                        self.pending.insert(id, target);
+                        back
+                    }
+                    _ => {
+                        self.changed.insert(id.clone(), now);
+                        self.wanted.insert(id, target);
+                        true
+                    }
+                }
             }
             Learned::Stopped(id) => {
                 self.left.remove(&id);
+                self.pending.remove(&id);
+                self.changed.remove(&id);
                 self.wanted.remove(&id).is_some()
             }
             Learned::Left(id) => self.wanted.contains_key(&id) && self.left.insert(id),
         }
+    }
+
+    /// Acts on each door that waited out [`DOOR_SETTLE`]. Whether any did.
+    pub(super) fn settle(&mut self, now: Instant) -> bool {
+        let due: Vec<String> = self
+            .pending
+            .keys()
+            .filter(|id| self.changed.get(*id).is_none_or(|at| now.duration_since(*at) >= DOOR_SETTLE))
+            .cloned()
+            .collect();
+        for id in &due {
+            if let Some(target) = self.pending.remove(id) {
+                self.changed.insert(id.clone(), now);
+                self.wanted.insert(id.clone(), target);
+            }
+        }
+        !due.is_empty()
     }
 
     /// Whether `id` has left the room since it was last heard hosting.
@@ -336,6 +377,8 @@ impl Hosts {
     pub(super) fn let_go(&mut self, id: &str) {
         if self.left.remove(id) {
             self.wanted.remove(id);
+            self.pending.remove(id);
+            self.changed.remove(id);
         }
     }
 
@@ -732,6 +775,12 @@ struct Member {
     hold: quiet::Hold,
     /// How long it may hear nothing before it counts as quiet.
     limit: Duration,
+    /// Which dialling of this slot its session's events come from, so one
+    /// from a session it no longer holds is not taken for its own.
+    generation: u64,
+    /// When it was retired, after which its slot may go to another host
+    /// once what it kept for the overlap has gone.
+    retired: Option<Instant>,
 }
 
 impl Member {
@@ -748,6 +797,8 @@ impl Member {
             priced: false,
             offer: None,
             hold: quiet::Hold::new(),
+            generation: 0,
+            retired: None,
             target,
         }
     }
@@ -767,22 +818,92 @@ impl Member {
         self.state = State::Resting(Instant::now() + REST);
     }
 
-    /// Retires a host session for good. Its session and offer are kept a
-    /// moment, as an old offer is, so that if it carried our media the next
-    /// pass moves it before the old one goes; then hung up as a lost
-    /// session is, so its routes go without marking anything stale.
-    fn retire(&mut self) {
+    /// Retires a host session for good. Its session, offer and gate are kept
+    /// a moment, as an old offer is, so that if it carried our media the next
+    /// pass moves it before the old one goes; then hung up as a lost session
+    /// is, so its routes go without marking anything stale, and everything it
+    /// ran is dropped. The slot keeps nothing live.
+    fn retire(&mut self, now: Instant) {
         self.state = State::Retired;
+        self.retired = Some(now);
         let session = self.session.take();
         let offer = self.offer.take();
+        let gate = self.gate.take();
         tokio::spawn(async move {
             tokio::time::sleep(MOVE_OVERLAP).await;
             if let Some(session) = session {
                 session.connection.abort(moq_net::Error::Cancel);
             }
             drop(offer);
+            drop(gate);
         });
     }
+
+    /// Whether this slot may be given to another host: retired, and past
+    /// the overlap its old session and offer were kept for.
+    fn free(&self, now: Instant) -> bool {
+        self.retired.is_some_and(|at| now.duration_since(at) >= MOVE_OVERLAP)
+    }
+}
+
+/// Holds a session to every host `hosts` wants and to no other: retires the
+/// rest, and dials each one wanted that has none, in a retired slot when one
+/// is free so the list stays as long as the most hosts held at once. Whether
+/// any session was added or retired, so our gates are said again.
+fn reconcile(
+    members: &mut Vec<Member>,
+    hosts: &mut Hosts,
+    now: Instant,
+    hosting: bool,
+    outbound: &moq_net::origin::Producer,
+    quiet: &mut Quiet,
+    dial: &mut dyn FnMut(usize, &Member, bool) -> Session,
+) -> bool {
+    hosts.settle(now);
+    for id in members
+        .iter()
+        .filter(|member| matches!(member.state, State::Resting(_) | State::Refused))
+        .filter_map(|member| member.target.host.clone())
+        .filter(|id| hosts.has_left(id))
+        .collect::<Vec<_>>()
+    {
+        tracing::info!("host {id} left the room and its session ended; not dialling it again");
+        hosts.let_go(&id);
+    }
+    let want: Vec<Target> = hosts.want().into_iter().cloned().collect();
+    let mut changed = false;
+    for member in members.iter_mut().filter(|member| member.state != State::Retired && member.target.host.is_some()) {
+        if !want.contains(&member.target) {
+            tracing::info!("hanging up {}: it no longer hosts the room, or its door changed", spoken(member));
+            member.retire(now);
+            changed = true;
+        }
+    }
+    for target in want {
+        if members.iter().any(|member| member.state != State::Retired && member.target == target) {
+            continue;
+        }
+        let mut member = Member::new(target, hosting, outbound);
+        let index = match members.iter().position(|slot| slot.free(now)) {
+            Some(at) => {
+                member.generation = members[at].generation + 1;
+                at
+            }
+            None => members.len(),
+        };
+        tracing::info!("dialling {}, heard of during the call", spoken(&member));
+        member.session = Some(dial(index, &member, false));
+        // A slot new to this host: its history, or our guests' when it is
+        // one past the end, is not this session's.
+        quiet.forget(index);
+        if index == members.len() {
+            members.push(member);
+        } else {
+            members[index] = member;
+        }
+        changed = true;
+    }
+    changed
 }
 
 /// How the log names a session: the relay by its address, a host by its id.
@@ -841,7 +962,7 @@ pub(super) fn join(args: Join) -> Peer {
     let mut learned = Some(learned);
     let relay_url = targets[0].url.clone();
     let mut hosts_wanted = Hosts::new(targets.iter().cloned());
-    let (events, mut heard) = futures_channel::mpsc::unbounded::<(usize, Event)>();
+    let (events, mut heard) = futures_channel::mpsc::unbounded::<(usize, u64, Event)>();
     let dial = {
         let inbound = inbound.clone();
         let outbound = outbound.clone();
@@ -866,9 +987,10 @@ pub(super) fn join(args: Join) -> Peer {
             let monitor = connection.monitor();
             let mut refusals = Refusals::for_url(&member.target.url);
             let events = events.clone();
+            let generation = member.generation;
             let running = Abort(tokio::spawn(async move {
                 let say = |event| {
-                    let _ = events.unbounded_send((index, event));
+                    let _ = events.unbounded_send((index, generation, event));
                 };
                 // The live session's going-away notice. Under `Restart::Wait`
                 // one naming no other address changes no status, so it is
@@ -969,9 +1091,10 @@ pub(super) fn join(args: Join) -> Peer {
             loop {
                 tokio::select! {
                     event = heard.next() => {
-                        let Some((index, event)) = event else { return "the sessions stopped".to_string() };
-                        // A session let go may still have been heard from.
-                        if members[index].state == State::Retired {
+                        let Some((index, generation, event)) = event else { return "the sessions stopped".to_string() };
+                        // A session let go, or one its slot no longer holds,
+                        // may still have been heard from.
+                        if members[index].state == State::Retired || members[index].generation != generation {
                             continue;
                         }
                         // Whether the call goes on elsewhere, so an ending here
@@ -1052,7 +1175,7 @@ pub(super) fn join(args: Join) -> Peer {
                         // The same rule as at join: a host dials only below.
                         Some(Learned::Host(target)) if !target.host.as_deref().is_some_and(|id| dials(id, &relay_url, &me, hosting)) => {}
                         Some(news) => {
-                            hosts_wanted.learn(news);
+                            hosts_wanted.learn(news, Instant::now());
                         }
                     },
                     _ = ticker.tick() => {}
@@ -1060,39 +1183,9 @@ pub(super) fn join(args: Join) -> Peer {
 
                 // Hosts heard of, or let go, since the last pass: a session
                 // to each one wanted and to no other.
-                for id in members
-                    .iter()
-                    .filter(|member| matches!(member.state, State::Resting(_) | State::Refused))
-                    .filter_map(|member| member.target.host.clone())
-                    .filter(|id| hosts_wanted.has_left(id))
-                    .collect::<Vec<_>>()
-                {
-                    tracing::info!("host {id} left the room and its session ended; not dialling it again");
-                    hosts_wanted.let_go(&id);
-                }
-                let want: Vec<Target> = hosts_wanted.want().into_iter().cloned().collect();
-                let mut regated = false;
-                for member in members.iter_mut().filter(|member| member.state != State::Retired && member.target.host.is_some()) {
-                    if !want.contains(&member.target) {
-                        tracing::info!("hanging up {}: it no longer hosts the room, or its door changed", spoken(member));
-                        member.retire();
-                        regated = true;
-                    }
-                }
-                for target in want {
-                    if members.iter().any(|member| member.state != State::Retired && member.target == target) {
-                        continue;
-                    }
-                    let index = members.len();
-                    let mut member = Member::new(target, hosting, &outbound);
-                    tracing::info!("dialling {}, heard of during the call", spoken(&member));
-                    member.session = Some(dial(index, &member, false));
-                    // Its slot was our guests' until now.
-                    quiet.forget(index);
-                    members.push(member);
-                    regated = true;
-                }
-                if regated {
+                if reconcile(&mut members, &mut hosts_wanted, Instant::now(), hosting, &outbound, &mut quiet, &mut |index, member, chosen| {
+                    dial(index, member, chosen)
+                }) {
                     local.set_gates(gates(&members));
                 }
                 let guests_at = members.len();
@@ -1489,7 +1582,7 @@ mod tests {
         let heard = |order: &[char]| {
             let mut hosts = Hosts::default();
             for c in order {
-                hosts.learn(Learned::Host(target(&relay(), &known(*c)).unwrap()));
+                hosts.learn(Learned::Host(target(&relay(), &known(*c)).unwrap()), Instant::now());
             }
             hosts.want().into_iter().map(|target| target.host.clone().unwrap()).collect::<Vec<_>>()
         };
@@ -1506,25 +1599,51 @@ mod tests {
     /// marks it until its session ends, unless it is heard again first.
     #[test]
     fn hosts_follow_what_presence_says() {
+        let now = Instant::now();
         let mut hosts = Hosts::new(targets(&relay(), &[known('a')], &id('z'), false));
         let a = || target(&relay(), &known('a')).unwrap();
-        assert!(!hosts.learn(Learned::Host(a())), "heard again as it was known");
+        assert!(!hosts.learn(Learned::Host(a()), now), "heard again as it was known");
         let mut moved = a();
         moved.url.set_query(Some("door=ffeeddccbbaa99887766554433221100"));
-        assert!(hosts.learn(Learned::Host(moved.clone())), "a new door");
+        assert!(hosts.learn(Learned::Host(moved.clone()), now), "a new door");
         assert_eq!(hosts.want(), vec![&moved]);
-        assert!(hosts.learn(Learned::Left(id('a'))));
+        assert!(hosts.learn(Learned::Left(id('a')), now));
         assert!(hosts.has_left(&id('a')));
         assert_eq!(hosts.want().len(), 1, "a leave alone cuts nothing");
-        assert!(hosts.learn(Learned::Host(moved.clone())), "back before its session ended");
+        assert!(hosts.learn(Learned::Host(moved.clone()), now), "back before its session ended");
         assert!(!hosts.has_left(&id('a')));
-        hosts.learn(Learned::Left(id('a')));
+        hosts.learn(Learned::Left(id('a')), now);
         hosts.let_go(&id('a'));
         assert!(hosts.want().is_empty(), "let go once its session ended");
-        assert!(!hosts.learn(Learned::Left(id('b'))), "a leave of someone not hosting");
-        hosts.learn(Learned::Host(a()));
-        assert!(hosts.learn(Learned::Stopped(id('a'))));
+        assert!(!hosts.learn(Learned::Left(id('b')), now), "a leave of someone not hosting");
+        hosts.learn(Learned::Host(a()), now);
+        assert!(hosts.learn(Learned::Stopped(id('a')), now));
         assert!(hosts.want().is_empty());
+    }
+
+    /// A burst of doors for one host: the first change is acted on, the rest
+    /// wait out the settle, and then only the latest is, once.
+    #[test]
+    fn a_burst_of_doors_is_acted_on_once_and_the_latest_wins() {
+        let start = Instant::now();
+        let mut hosts = Hosts::new(targets(&relay(), &[known('a')], &id('z'), false));
+        let door = |n: u8| {
+            let mut at = target(&relay(), &known('a')).unwrap();
+            at.url.set_query(Some(&format!("door={}", format!("{n:02x}").repeat(16))));
+            at
+        };
+        assert!(hosts.learn(Learned::Host(door(1)), start), "the first change");
+        let mut acted = 0;
+        for n in 2..=40u8 {
+            let now = start + Duration::from_millis(100) * u32::from(n);
+            acted += usize::from(hosts.learn(Learned::Host(door(n)), now));
+            acted += usize::from(hosts.settle(now));
+        }
+        assert_eq!(acted, 0, "a change acted on within the settle");
+        assert_eq!(hosts.want(), vec![&door(1)]);
+        assert!(hosts.settle(start + DOOR_SETTLE));
+        assert_eq!(hosts.want(), vec![&door(40)], "the latest wins");
+        assert!(!hosts.settle(start + DOOR_SETTLE * 3), "and only once");
     }
 
     #[test]
@@ -4271,5 +4390,66 @@ mod socket_tests {
         assert_eq!(by_plain.hops.as_slice().first(), Some(&plain.hop()), "{by_plain:?}");
         assert_eq!(by_set.hops.len(), by_plain.hops.len() + 1, "{by_set:?} beside {by_plain:?}");
         assert_eq!(by_set.cost, by_plain.cost);
+    }
+
+    /// A session to nowhere, as a dial makes one: what `reconcile` is
+    /// handed in a test that counts dials rather than making them.
+    fn nowhere(down: &Reserved) -> Session {
+        let connection = client().connect(down.url());
+        Session {
+            _running: Abort(tokio::spawn(std::future::pending())),
+            bandwidth: connection.send_bandwidth(),
+            monitor: connection.monitor(),
+            connection,
+        }
+    }
+
+    /// A host whose door changes again and again while its session is not
+    /// up: the list of sessions stays as long as the most held at once, no
+    /// retired slot keeps a session, offer or gate once its overlap is over,
+    /// and a burst of doors within the settle dials once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn many_doors_for_one_host_keep_the_set_bounded_and_dial_once_per_settle() {
+        let down = Reserved::new();
+        let outbound = moq_tokio::origin::spawn();
+        let mut members = vec![super::Member::new(relay_at(down.url()), false, &outbound)];
+        let mut hosts = Hosts::default();
+        let mut quiet = Quiet::default();
+        let dials = std::cell::Cell::new(0usize);
+        let mut dial = |_: usize, _: &super::Member, _: bool| {
+            dials.set(dials.get() + 1);
+            nowhere(&down)
+        };
+        let door = |n: u32| {
+            let mut url = down.url();
+            url.set_query(Some(&format!("door={n:032x}")));
+            host_at('a', url)
+        };
+        let start = Instant::now();
+        for n in 0..30 {
+            let now = start + (DOOR_SETTLE + MOVE_OVERLAP) * n;
+            hosts.learn(Learned::Host(door(n)), now);
+            reconcile(&mut members, &mut hosts, now, false, &outbound, &mut quiet, &mut dial);
+        }
+        assert_eq!(dials.get(), 30, "each settled door dialled once");
+        assert!(members.len() <= 3, "{} slots for one host", members.len());
+        // Past the last overlap, every retired slot has let go of all it held.
+        tokio::time::sleep(MOVE_OVERLAP + Duration::from_millis(200)).await;
+        for member in members.iter().filter(|member| member.state == State::Retired) {
+            assert!(member.session.is_none() && member.offer.is_none() && member.gate.is_none(), "a retired slot keeps something live");
+        }
+        let live = members.iter().filter(|member| member.state != State::Retired && member.gate.is_some()).count();
+        assert_eq!(live, 2, "the relay's gate and the host's");
+
+        let burst = start + (DOOR_SETTLE + MOVE_OVERLAP) * 30;
+        let before = dials.get();
+        for n in 0..20 {
+            let now = burst + Duration::from_millis(100) * n;
+            hosts.learn(Learned::Host(door(100 + n)), now);
+            reconcile(&mut members, &mut hosts, now, false, &outbound, &mut quiet, &mut dial);
+        }
+        assert_eq!(dials.get(), before + 1, "a burst dialled more than once");
+        reconcile(&mut members, &mut hosts, burst + DOOR_SETTLE * 2, false, &outbound, &mut quiet, &mut dial);
+        assert_eq!(dials.get(), before + 2, "the latest door of the burst was never dialled");
     }
 }
