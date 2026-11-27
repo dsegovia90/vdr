@@ -3208,6 +3208,7 @@ async fn listen(
                 }
             }
         };
+        again.began();
         let mut presence = match subscribe_presence(&broadcast).await {
             Ok(presence) => presence,
             Err(error) => {
