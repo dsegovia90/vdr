@@ -168,8 +168,9 @@ focus.
     Hyprland's portal.
   - `blitz-dom`: hit-testing a node that was just removed panicked. It also keeps
     scrollbar thumbs visible wherever content overflows (blitz fades them out
-    until a scroll); the `scrollbars` feature on `dioxus-native` turns them on,
-    and a `scrollbar-color` with two colours paints the track.
+    until a scroll); the `scrollbars` feature on `dioxus-native` turns them on.
+    (A `scrollbar-color` with two colours painting the track is upstream's
+    own behaviour, not part of the patch.)
 - **The moq stack is moq-video/moq-audio 0.1.21, moq-net 0.3, moq-tokio 0.19.**
   moq-video's `vaapi` and `nvidia` features are on for Linux only, `openh264`
   (the software fallback) everywhere. The video encoder is not `Send`: it is
@@ -179,11 +180,11 @@ focus.
   renderer, so the versions must match. Run `cargo tree -i wgpu` before
   touching any renderer dependency. (`Cargo.lock` also has a wgpu 29; it is
   target-gated and never on the host.)
-- **`tinyvec` is pinned to 1.12.0** in `Cargo.lock`. 1.13.0 does not compile.
-- **Colours are oversaturated on wide-gamut (P3) screens, knowingly.** wgpu
-  30's Metal backend applies no colour matching, so sRGB goes raw to the
-  panel. The fix is merged upstream and waiting on a release. Do not
-  compensate in our shader: it would double-correct once the fix ships.
+- **Colours on wide-gamut (P3) screens: do not compensate in our shader.**
+  wgpu 30's Metal backend applied no colour matching, so sRGB went raw to the
+  panel and looked oversaturated. `wgpu-hal` 30.0.2 carries the fix and the
+  lock file is on it; whether a P3 screen now looks right has not been judged
+  by eye. A correction of our own would double-correct.
 - **The updater's release interface** (`update/`). Installed copies look
   for exactly `vdr-macos-universal-<tag>.zip`, `vdr-linux-x86_64-<tag>.tar.gz`,
   `SHA256SUMS` (`sha256sum` format) and `SHA256SUMS.sig` (a raw 64-byte
