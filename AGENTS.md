@@ -171,7 +171,13 @@ focus.
     until a scroll); the `scrollbars` feature on `dioxus-native` turns them on.
     (A `scrollbar-color` with two colours painting the track is upstream's
     own behaviour, not part of the patch.)
-- **The moq stack is moq-video/moq-audio 0.1.21, moq-net 0.3, moq-tokio 0.19.**
+- **The moq stack is moq-video/moq-audio 0.1.21, moq-net 0.3 (0.3.24 or
+  later), moq-tokio 0.19.** From moq-net 0.3.24 a read never survives a
+  change of route: the library ends the broadcast and bounces the path
+  (withdrawn, announced again), and the attendance loop's grace is what keeps
+  that from looking like a leave (see "A withdrawal is a leave only after its
+  grace" below). Going back below 0.3.24 would make the grace and the
+  re-reads harmless but the tests' bounce assertions wrong.
   moq-video's `vaapi` and `nvidia` features are on for Linux only, `openh264`
   (the software fallback) everywhere. The video encoder is not `Send`: it is
   built and flushed on the encode thread. moq-tokio refuses an iroh key file
@@ -230,6 +236,18 @@ focus.
   frame), and two futures in one `select!` are one task. The symptom is not
   scheduling-shaped: audio sets up perfectly and then nothing arrives. **And it
   looks fixed in a release build**, where the work fits between frames.
+- **A withdrawal is a leave only after its grace** (`net/grace.rs`, 2.5 s).
+  The library bounces a path on every change of route, so a relay stopping
+  or the call moving reaches the attendance loop as a retraction then the
+  same announcement. Within the grace that is a change of route: the
+  person's readers start again on the fresh broadcast, into the tile they
+  have, with no `Left`, no presence forgotten, and no hang-up in a call that
+  is not a room. A goodbye said in presence makes every withdrawal of theirs
+  a leave at once, and a share whose presence says it stopped comes down at
+  the next once-a-second look; only an abrupt leave pays the grace, on top
+  of the session's linger. Readers that lose a read with the broadcast still
+  open ask again on a doubling wait (`follow::Again`), never four times a
+  second for ever.
 - **Audio is not video's shape.** Video is newest-wins end to end; audio is
   buffered and loss-tolerant, and the two are never aligned to each other.
   `net/audio.rs` sets the decoder's `max_age` explicitly because the default
@@ -409,8 +427,9 @@ focus.
 | `camera/frames.rs` | `FrameSlot`: newest-wins handoff, with its own neutral `Frame`/`Pixels` |
 | `camera/paint/` | `VideoPaintSource` (a blitz `Widget`), wgpu upload, fit math |
 | `net/call.rs` | a call over iroh + MoQ: rooms on a relay, direct calls, hosting a room (`--host`), presence |
-| `net/follow.rs` | reading what a peer offers (video, voice, screen) for as long as they are here: follows the catalog, asks again for a broadcast whose read ended with a change of route |
-| `net/sessions.rs` | a join that dials the relay and the room's saved hosts together: which session carries our media, and moving it |
+| `net/follow.rs` | reading what a peer offers (video, voice, screen) for as long as they are here: follows the catalog, asks again for a broadcast whose read ended (at once once it has closed, backing off while it stays open) |
+| `net/grace.rs` | withdrawals waiting out their grace, per person and strand (presence, camera, screen): which are a change of route and which a leave (pure) |
+| `net/sessions.rs` | a join that dials the relay and the room's saved hosts together: which session carries our media, and moving it; a change of route reaches viewers as a bounce of the path, read again from the newest group |
 | `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes, for the log and the host borders on tiles (`read` and `through` are pure) |
 | `net/moves.rs` | moving the call to a host, an experiment: the presence field, which choice wins, the bounce order (pure) |
 | `net/web.rs` | the room as a web of nodes for the Topology tab: the `via`/`held` presence fields and the `routes.json` document (wire form, lenient reading, cleaning, id prefixes), naming hops from everyone's claims, and the pure graph built from every entry, with each link's streams counted per direction and where a sender's word and its receivers part |
@@ -428,5 +447,5 @@ Frames never touch the DOM:
 
 `cargo test` runs the unit tests; the pure modules (`hotkeys.rs`, `name.rs`, `recent.rs`, `rates.rs`, `net/quality.rs`,
 `camera/paint/fit.rs`, `audio/catchup.rs`, `components/layout.rs`,
-`update/release.rs`, `update/verify.rs`, `net/door.rs`, `net/moves.rs`, `net/arrival.rs`, `net/web.rs`, `web_layout.rs`) are where
+`update/release.rs`, `update/verify.rs`, `net/door.rs`, `net/moves.rs`, `net/arrival.rs`, `net/web.rs`, `net/grace.rs`, `web_layout.rs`) are where
 logic that can be tested without a window belongs.

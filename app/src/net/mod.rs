@@ -24,6 +24,7 @@ mod codec_check;
 mod follow;
 mod forwarded;
 mod fresh;
+mod grace;
 pub(crate) mod door;
 mod metrics;
 mod loopback;

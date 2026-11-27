@@ -7,7 +7,10 @@
 //!
 //! **Listen on all, publish on one.** Every session lands in the same inbound
 //! origin, and the library already makes two routes to one publisher one
-//! broadcast, splicing to the other when the one in use dies. What we publish
+//! broadcast. When the route in use dies or another becomes best, it ends
+//! that broadcast and bounces the path (withdrawn, announced again), and the
+//! attendance loop takes the bounce as a change of route, not a leave
+//! (`grace.rs`), asking for the broadcast afresh. What we publish
 //! is offered on one session only, the first live one in [`targets`]' order,
 //! through an origin of its own per session ([`Gate`]) whose offers name our
 //! publishing identity first, so routes to us name one publisher whichever way
@@ -20,7 +23,8 @@
 //! there, and nobody's media has to cross between hosts.
 //!
 //! **Moving is make-before-break**: the new offer is made before the old one
-//! is withdrawn, and a viewer's subscription carries across. A withdrawal with
+//! is withdrawn, so a viewer has a route to ask through again the moment the
+//! path is bounced. A withdrawal with
 //! no replacement does not stop a track already flowing (the viewer has to stop
 //! reading), which is why the old offer is never dropped on its own: a session
 //! that died carries nothing, and one that comes back finds it still offered.
@@ -79,11 +83,12 @@
 //! default). With one offer, a session that dies leaves viewers with no route
 //! to us at all: they see a retraction, and the library holds the next
 //! announcement of us for two seconds when it ranks worse than the one lost,
-//! so every tile leaves and comes back. So we also offer on a second session,
-//! the first other live one in [`pick`]'s order ([`spare`]), at a price
+//! so our video is gone for that long (the attendance loop's grace outlasts
+//! it, so the tile stays). So we also offer on a second session, the first
+//! other live one in [`pick`]'s order ([`spare`]), at a price
 //! ([`SPARE_COST`]) that keeps it unused while the carrier works. Viewers
-//! then hold a route to us that outlives the carrier, and the library splices
-//! a read across at the next group instead of ending it. When the carrier
+//! then hold a route to us that outlives the carrier: the path is bounced
+//! through it at once, with no hold, and read again from the newest group. When the carrier
 //! goes or the call moves, the spare is promoted by **re-pricing it in
 //! place**, not by withdrawing one offer and making another, and the next
 //! live session becomes the spare. An offer is withdrawn only when its
@@ -122,8 +127,8 @@
 //! **What a spare does not change**: a relay that stops answering but whose
 //! session has not timed out still holds the best route to us at every
 //! viewer, so the freeze until the timeout stays. What it changes is what
-//! follows: when that session ends, every reader splices to the spare at once
-//! instead of leaving and coming back two seconds later.
+//! follows: when that session ends, every reader is bounced to the spare at
+//! once instead of waiting out the library's two-second hold.
 //!
 //! **So a relay that goes quiet is left sooner** (`super::super::quiet` has
 //! the rule and why it is relative): each pass samples what every session has
@@ -131,7 +136,7 @@
 //! another of ours (or, when we host, a guest's session) has been heard is
 //! given up ([`Member::give_up`]). That hangs it up from our side, so its
 //! routes go here as a lost session's do, marking nothing stale, and every
-//! read through it splices to whatever route is left (a socket test pins
+//! read through it is bounced to whatever route is left (a socket test pins
 //! it); the same pass promotes the spare. It then rests and is dialled again
 //! like any session that ended, and our media waits a hold before moving back
 //! to it that grows each time it is left again soon after
@@ -145,13 +150,13 @@
 //! [`State::Draining`]: still heard through, still counted as a way in, but
 //! never picked to carry our media or a spare. So our media moves make before
 //! break while the old session still serves, and the library itself already
-//! ranks every route through a draining session last, so reads splice to the
-//! spare before the relay's deadline.
+//! ranks every route through a draining session last, so reads are bounced
+//! to the spare before the relay's deadline.
 //!
 //! **A host needs no spare.** It offers its one origin on every session, so
 //! viewers already hold its own media through the relay and directly, and it
 //! holds each member through the relay and through the member's spare: when
-//! the relay goes, its own readers and its guests' splice like anyone's.
+//! the relay goes, its own readers and its guests' are bounced like anyone's.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -346,6 +351,24 @@ pub(super) fn spare(states: &[State], priced: &[bool], carrier: usize, preferred
 pub(super) fn carries_price(version: moq_net::Version) -> bool {
     let name = version.as_str();
     name.starts_with("moq-lite-") && !matches!(name, "moq-lite-01" | "moq-lite-02" | "moq-lite-03" | "moq-lite-04" | "moq-lite-05")
+}
+
+/// Where we say our media goes (`via` in presence), given the host the
+/// session carrying it reaches (`None` for the relay).
+///
+/// **A host the call has moved to says its guests**, though it still offers
+/// on the relay: everyone who follows the move reads it directly, so saying
+/// "relay" drew it on the room's map as sending to a relay nobody pulled
+/// from. Anyone who does not follow the move and does read it through the
+/// relay says so in their own report of routes, which the map draws as it
+/// is. The session to the relay stays in what we say we hold.
+pub(super) fn says(carrier_host: Option<&str>, serving: bool, call_host: Option<&str>, me: &str) -> super::super::arrival::Sending {
+    use super::super::arrival::Sending;
+    match carrier_host {
+        _ if serving && call_host == Some(me) => Sending::Guests,
+        None => Sending::Relay,
+        Some(id) => Sending::Host(id.to_string()),
+    }
 }
 
 /// Whether a join keeps a spare offer at all: only with the switch on, and
@@ -1024,10 +1047,6 @@ pub(super) fn join(args: Join) -> Peer {
                         None => tracing::info!("our media goes through the relay"),
                         Some(id) => tracing::info!("our media goes through host {id}"),
                     }
-                    local.set_sending(Some(match &member.target.host {
-                        None => super::super::arrival::Sending::Relay,
-                        Some(id) => super::super::arrival::Sending::Host(id.clone()),
-                    }));
                     if let Some(session) = &member.session {
                         _following = Some(follow(session, &estimate, &metrics));
                     }
@@ -1043,13 +1062,27 @@ pub(super) fn join(args: Join) -> Peer {
                     local.set_sending(Some(super::super::arrival::Sending::Guests));
                     _following = guests.clone().map(|guests| follow_guests(guests, &estimate));
                     // Every guest reading our own media through the relay
-                    // has just spliced to its direct route, and the library
-                    // passes on what it reads there from the next group: a
+                    // has just been bounced to its direct route. A fresh
+                    // read starts at our newest group, but an older relay
+                    // still carries a read across from the next one: a
                     // keyframe now, rather than the rest of the encoder's
                     // interval.
                     keyframe.ask();
                     carrier = None;
                     on_guests = true;
+                }
+
+                // Said again whenever the carrier or the call's place changes;
+                // set only on a change, since the announcer acts on it.
+                if let Some(carrier) = carrier.filter(|_| !on_guests) {
+                    let call_host = local.call_host();
+                    let now = says(members[carrier].target.host.as_deref(), serving, call_host.as_deref(), &me);
+                    if local.sending().as_ref() != Some(&now) {
+                        if now == super::super::arrival::Sending::Guests {
+                            tracing::info!("the call is on us: our media goes to our guests");
+                        }
+                        local.set_sending(Some(now));
+                    }
                 }
 
                 let now_via = via(&states, serving);
@@ -1080,7 +1113,7 @@ pub(super) fn join(args: Join) -> Peer {
 ///
 /// **Make before break, and re-price rather than withdraw.** A session that
 /// keeps an offer, changing only what it is for, is re-priced in place, so a
-/// spare becomes the carrier with every viewer's read carried across. A new
+/// spare becomes the carrier with no withdrawal for anyone to see. A new
 /// offer is made by a task as our paths are read back, so one leaving the
 /// pair is kept a moment longer rather than dropped in the same instant; a
 /// session that died carries nothing meanwhile.
@@ -1334,6 +1367,18 @@ mod tests {
         for newer in ["moq-lite-06", "moq-lite-07-wip"] {
             assert!(carries_price(version(newer)), "{newer}");
         }
+    }
+
+    #[test]
+    fn a_host_the_call_is_on_says_its_guests_and_everyone_else_their_carrier() {
+        use super::super::super::arrival::Sending;
+        let (me, other) = (id('c'), id('d'));
+        assert_eq!(says(None, true, Some(&me), &me), Sending::Guests, "the call is on us");
+        assert_eq!(says(None, true, None, &me), Sending::Relay, "the call is on the relay");
+        assert_eq!(says(None, true, Some(&other), &me), Sending::Relay, "the call is on another host we reach through the relay");
+        assert_eq!(says(Some(&other), true, Some(&other), &me), Sending::Host(other.clone()));
+        assert_eq!(says(None, false, Some(&me), &me), Sending::Relay, "not serving: nobody reads us as a host");
+        assert_eq!(says(Some(&other), false, None, &me), Sending::Host(other.clone()));
     }
 
     #[test]
@@ -2395,13 +2440,19 @@ mod socket_tests {
         }
     }
 
-    /// When each of someone's camera frames reached its tile at a viewer.
+    /// When each of someone's camera frames reached its tile at a viewer,
+    /// and how many times a camera tile there was taken down.
     #[derive(Clone, Default)]
-    struct Arrivals(Arc<std::sync::Mutex<Vec<Instant>>>);
+    struct Arrivals(Arc<std::sync::Mutex<Vec<Instant>>>, Arc<std::sync::atomic::AtomicUsize>);
 
     impl Arrivals {
         fn count(&self) -> usize {
             self.0.lock().unwrap().len()
+        }
+
+        /// The camera tiles taken down: what a person sees as a leave.
+        fn left(&self) -> usize {
+            self.1.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         /// Waits for `more` frames beyond those seen so far.
@@ -2462,6 +2513,12 @@ mod socket_tests {
         let who = who.map(str::to_string);
         let tiles = Abort(tokio::spawn(async move {
             while let Some(event) = events.next().await {
+                if let ParticipantEvent::Left { id, feed: Feed::Camera } = &event {
+                    if who.as_ref().is_none_or(|who| who == id) {
+                        counting.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    continue;
+                }
                 if let ParticipantEvent::Joined { id, slot, feed: Feed::Camera, .. } = event {
                     if who.as_ref().is_some_and(|who| *who != id) {
                         continue;
@@ -2574,10 +2631,10 @@ mod socket_tests {
     }
 
     /// The longest a viewer may go without a frame across a change of route.
-    /// A read carried across picks up at the next group, and one asked for
-    /// again starts at the newest, so the bound is a group (the encoder's
-    /// keyframe interval, two seconds) plus the wait before asking again and
-    /// the route settling: about 2 s was measured for a relay stopping, under
+    /// A read asked for again starts at the newest group, so the bound is a
+    /// round trip or two plus the route settling, and at worst a group (the
+    /// encoder's keyframe interval, two seconds) where something still
+    /// carries a read across: about 2 s was measured for a relay stopping, under
     /// 1 s for one coming back, and 0.4 to 2 s for each move of the call.
     /// Before a lost read was asked for again, the gap after a move had no
     /// bound at all.
@@ -2695,41 +2752,36 @@ mod socket_tests {
         of.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The longest a viewer may go without a frame when a spare takes over
-    /// from a carrier that stopped cleanly. The library splices the read to
-    /// the spare's route as soon as the carrier's goes, but what it then
-    /// passes on starts at the next group: on its own that is the rest of the
-    /// encoder's keyframe interval, up to two seconds (measured: 1.0 s with
-    /// the stop a second into a group, 0.5 s at a second and a half). The
-    /// member's own move to the spare asks its encoder for a keyframe, as the
-    /// call does, which starts that group at once: about 45 ms measured. The
-    /// bound leaves room for a debug build on a busy machine. Without a spare
-    /// the same stop usually takes 2 s: a retraction, the library's hold, and
-    /// the media asked for again.
-    ///
-    /// **This still fails now and then, and the fault is not the test's.**
-    /// Across the splice the viewer's track is handed the group in flight
-    /// twice, once from each copy, and when both copies of it finish cleanly
-    /// moq-mux's reader (`container::Consumer`, under moq-video's decoder)
-    /// steps its cursor once per copy. It then drops the next group whole as
-    /// "old", and the picture freezes from the end of the first group after
-    /// the splice to the start of the one after: 1 to 2 s, about two seconds
-    /// after the stop. Traced: every group reaches the viewer's track
-    /// complete, and moq-mux logs "skipping old group old=2 current=3". A
-    /// viewer in a call loses the same group. The keyframe asked for at the
-    /// move is not what is missing.
-    const SPLICE: Duration = Duration::from_millis(500);
+    /// Waits out the attendance loop's grace from `from`, the last moment a
+    /// withdrawal could have happened, with a margin: a withdrawal that was
+    /// going to be a leave has been told by then, so asserting no leave
+    /// earlier would race the very failure it is there to catch.
+    async fn past_the_grace(from: Instant) {
+        tokio::time::sleep_until((from + super::super::super::grace::GRACE + Duration::from_millis(500)).into()).await;
+    }
 
-    /// The same for media whose sender is not asked for a keyframe when the
-    /// route changes: the rest of the group in flight, at most the encoder's
-    /// two-second keyframe interval, and a margin.
+    /// The longest a viewer may go without a frame when its route changes:
+    /// the rest of the group in flight, at most the encoder's two-second
+    /// keyframe interval, and a margin.
+    ///
+    /// The library ends the viewer's read as soon as the carrier's route goes
+    /// and bounces the path through the spare, and the attendance loop asks
+    /// again at once. Usually that fresh read begins a group and the gap is
+    /// some 50 ms. But a read asked for in the middle of a group waits for
+    /// the rest of it from a route that never sends it, and is let go only
+    /// when the next group begins (the library logs `no route can serve the
+    /// rest of this group`). Asking the sender for a keyframe at the change
+    /// was tried and races the reader, so it cannot be relied on. A bound of
+    /// half a second held most runs and failed about one in twenty-four on a
+    /// loaded machine, at 1.7 s; this is the bound the library can keep.
     const GROUP: Duration = Duration::from_millis(2500);
 
     /// A clean relay stop with a host there: the viewer's read of the member
-    /// carries on through the member's spare on the host. No retraction, so
-    /// no tile leaves, and no wait for the library's hold.
+    /// is bounced to the member's spare on the host. The path is withdrawn
+    /// and announced again at once, so no tile leaves, and there is no wait
+    /// for the library's hold.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_relay_that_stops_is_a_splice_to_the_spare_not_a_leave() {
+    async fn a_relay_that_stops_is_a_bounce_to_the_spare_not_a_leave() {
         let mut w = moving().await;
         w.camera.turn_on();
         w.arrivals.more(30, "no video through the relay").await;
@@ -2737,11 +2789,15 @@ mod socket_tests {
         let stopped = Instant::now();
         w.room.relay.stop().await;
         routed_through(&w.v.inbound, &camera_path("m"), w.room.host.origin.hop(), "m never came through the host").await;
-        // Past the library's hold on a re-announcement, so a leave would show.
+        let flipped = Instant::now();
         w.arrivals.more(75, "video stopped when the relay did").await;
         let gap = w.arrivals.longest_gap(stopped);
-        assert_eq!(count(&retracted), 0, "the viewer lost m");
-        assert!(gap < SPLICE, "video was gone {gap:?} when the relay stopped");
+        // Past the grace on the withdrawal, so a leave would have shown.
+        past_the_grace(flipped).await;
+        w.arrivals.more(10, "video stopped after the relay did").await;
+        assert_eq!(w.arrivals.left(), 0, "the viewer's tile for m left");
+        eprintln!("relay stopped: gap {gap:?}, {} withdrawals", count(&retracted));
+        assert!(gap < GROUP, "video was gone {gap:?} when the relay stopped");
     }
 
     /// The control: with the spare switched off, the host holds m only
@@ -2753,8 +2809,8 @@ mod socket_tests {
     /// spare that stop is usually a leave, but not always. m's media moves to
     /// the host as soon as m hears the relay go, and when its new offer reaches
     /// the host before the host has heard the same news for itself, the host's
-    /// route to m changes rather than ending, and the viewer splices to it
-    /// with no retraction (seen once in about twenty runs of the whole suite
+    /// route to m changes rather than ending, and the viewer is bounced to it
+    /// with no gap in the host's own routes (seen once in about twenty runs of the whole suite
     /// on a loaded machine). That is the app doing well by luck, not a fault,
     /// and a control that needs it not to happen fails at random. Nor the
     /// converse with the spare on: nothing outside m shows when its spare has
@@ -2781,16 +2837,24 @@ mod socket_tests {
         w.camera.turn_on();
         w.arrivals.more(30, "no video through the relay").await;
         let (_watching, retracted) = retractions(&w.v.inbound, &camera_path("m"));
+        let mut settled = Instant::now();
         for round in 0..2 {
             for host in [true, false] {
                 let moved = Instant::now();
                 w.to(host, &format!("the call never moved, round {round}")).await;
+                settled = Instant::now();
                 w.arrivals.more(30, &format!("video stopped after a move, round {round}")).await;
                 let gap = w.arrivals.longest_gap(moved);
+                eprintln!("moved to the {}, round {round}: gap {gap:?}", if host { "host" } else { "relay" });
                 assert!(gap < GAP, "video was gone {gap:?} moving to the {}, round {round}", if host { "host" } else { "relay" });
             }
         }
-        assert_eq!(count(&retracted), 0, "the viewer lost m across a move");
+        // The last move's old offer goes a moment after it settles; earlier
+        // moves' graces ran out during the moves after them.
+        past_the_grace(settled).await;
+        w.arrivals.more(10, "video stopped after the last move").await;
+        eprintln!("moves: {} withdrawals", count(&retracted));
+        assert_eq!(w.arrivals.left(), 0, "the viewer's tile for m left across a move");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2806,10 +2870,11 @@ mod socket_tests {
     /// A viewer that hangs up its own session to the relay, with the relay
     /// still up and a host bridging it, keeps reading m: what came through
     /// that session goes as a lost session's routes do, never as a
-    /// withdrawal, and the read splices to the route through the host. What
-    /// leaving a quiet relay from our side relies on.
+    /// withdrawal of ours, and the read is bounced to the route through the
+    /// host, no tile leaving. What leaving a quiet relay from our side relies
+    /// on.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_relay_session_hung_up_here_splices_the_viewers_read_to_the_host() {
+    async fn a_relay_session_hung_up_here_bounces_the_viewers_read_to_the_host() {
         let room = bridged().await;
         let outbound = moq_tokio::origin::spawn();
         let mut theirs = camera("m", &outbound);
@@ -2835,9 +2900,13 @@ mod socket_tests {
         let cut = Instant::now();
         to_relay.abort(moq_net::Error::Cancel);
         routed_through(&inbound, &camera_path("m"), room.host.origin.hop(), "m never came through the host").await;
+        let flipped = Instant::now();
         arrivals.more(75, "video stopped when we hung up on the relay").await;
         let gap = arrivals.longest_gap(cut);
-        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        past_the_grace(flipped).await;
+        arrivals.more(10, "video stopped after we hung up on the relay").await;
+        assert_eq!(arrivals.left(), 0, "the viewer's tile for m left");
+        eprintln!("hung up: {} withdrawals", count(&retracted));
         // Nobody asks m for a keyframe here: the read picks up at m's next group.
         assert!(gap < GROUP, "video was gone {gap:?}");
         eprintln!("hung up: gap {gap:?}");
@@ -3065,7 +3134,8 @@ mod socket_tests {
     /// silent and a host is there. Everything then comes through the host,
     /// which leaves the relay at its own quiet limit, [`quiet::HOSTING_EXTRA`]
     /// after its members, within a tick of the join and a stale sample; its
-    /// read of m then splices to m directly and picks up at m's next group.
+    /// read of m is then bounced to m directly and read again from m's newest
+    /// group.
     /// Measured 2.6 to 3.6 s over twenty runs (about half a second less with
     /// no extra second for the host); the bound leaves a margin for a debug
     /// build on a busy machine.
@@ -3076,7 +3146,7 @@ mod socket_tests {
     /// The relay stops answering (killed, frozen, or its network gone), and
     /// nobody's session to it has ended. Everyone still hears the host, so
     /// each member, and the host, leaves the relay at its quiet limit rather
-    /// than its idle timeout, and the viewer's read splices to the host: no
+    /// than its idle timeout, and the viewer's read is bounced to the host: no
     /// leave, and a gap of about that limit.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_relay_that_goes_silent_is_left_and_the_video_comes_through_the_host() {
@@ -3085,9 +3155,13 @@ mod socket_tests {
         let cut = Instant::now();
         r.to_relay.set(DROP);
         routed_through(&r.v.inbound, &camera_path("m"), r.host.origin.hop(), "m never came through the host").await;
+        let flipped = Instant::now();
         r.arrivals.more(60, "video stopped when the relay went silent").await;
         let gap = r.arrivals.longest_gap(cut);
-        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        past_the_grace(flipped).await;
+        r.arrivals.more(10, "video stopped after the relay went silent").await;
+        assert_eq!(r.arrivals.left(), 0, "the viewer's tile for m left");
+        eprintln!("silent relay: {} withdrawals", count(&retracted));
         assert_eq!(r.on_m.sending(), Some(super::super::super::arrival::Sending::Host(id('c'))), "m's media never left the relay");
         assert_eq!(r.host.local.sending(), Some(super::super::super::arrival::Sending::Guests), "the host never left the relay");
         assert!(gap < QUIET_GAP, "video was gone {gap:?} when the relay went silent");
@@ -3196,7 +3270,11 @@ mod socket_tests {
         let moved = said.elapsed();
         tokio::time::sleep_until((said + DRAIN + Duration::from_secs(2)).into()).await;
         let gap = arrivals.longest_gap(said);
-        assert_eq!(count(&retracted), 0, "the viewer lost m");
+        // The relay closes at its deadline, the last withdrawal there is.
+        past_the_grace(said + DRAIN).await;
+        arrivals.more(10, "video stopped after the relay went").await;
+        assert_eq!(arrivals.left(), 0, "the viewer's tile for m left");
+        eprintln!("going away: {} withdrawals", count(&retracted));
         assert!(gap < Duration::from_secs(1), "video was gone {gap:?} across the relay going away");
         eprintln!("going away: moved in {moved:?}, gap {gap:?}");
     }
@@ -3276,21 +3354,44 @@ mod socket_tests {
     /// Bytes a second a host receives over every session it accepted,
     /// measured over `over`: what its guests upload to it.
     async fn received(host: &Meeting, over: Duration) -> u64 {
-        let total = || -> u64 {
-            host.sessions.lock().unwrap().iter().map(|session| session.stats().bytes_received.unwrap_or(0)).sum()
-        };
-        let start = total();
-        tokio::time::sleep(over).await;
-        (total() - start) * 1000 / over.as_millis() as u64
+        rate(over, || host.sessions.lock().unwrap().iter().map(|session| session.stats().bytes_received.unwrap_or(0)).sum()).await
     }
 
     /// Bytes a second a connection sends, measured over `over`.
     async fn sent(connection: &moq_tokio::Connection, over: Duration) -> u64 {
         let monitor = connection.monitor();
-        let total = || monitor.stats().and_then(|stats| stats.bytes_sent).unwrap_or(0);
-        let start = total();
-        tokio::time::sleep(over).await;
-        (total() - start) * 1000 / over.as_millis() as u64
+        rate(over, || monitor.stats().and_then(|stats| stats.bytes_sent).unwrap_or(0)).await
+    }
+
+    /// How often a session's counters are sampled while someone reads them
+    /// (moq-net's `POLL_INTERVAL`, read in its source), and a margin.
+    const SAMPLED: Duration = Duration::from_millis(150);
+
+    /// The rate of a byte counter over `over`.
+    ///
+    /// **A session's counters are a sample, taken when they are asked for.**
+    /// A read returns the last sample and asks for the next, and sampling
+    /// pauses once nobody has asked for a while. So the first read after a
+    /// pause is as old as the last read before it: read once at each end, a
+    /// window measured what the counters did since the previous measurement,
+    /// seconds earlier, rather than over `over`. After a relay stop that
+    /// counted the half-second before the spare carried, and the rate came out
+    /// at half the stream. Asked for throughout instead, both ends are at most
+    /// one sample old.
+    async fn rate(over: Duration, total: impl Fn() -> u64) -> u64 {
+        let ask = |until: Instant| {
+            let total = &total;
+            async move {
+                while Instant::now() < until {
+                    total();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                total()
+            }
+        };
+        let start = ask(Instant::now() + SAMPLED).await;
+        let end = ask(Instant::now() + over).await;
+        end.saturating_sub(start) * 1000 / over.as_millis() as u64
     }
 
     /// What the member sends: 2000 bytes every 20 ms, 100 kB/s.
@@ -3348,7 +3449,7 @@ mod socket_tests {
     /// The host itself, when the relay stops: a guest reading the host's own
     /// video, and the host reading a member, both carry on with no leave. The
     /// host needs no spare of its own (it offers on every session already);
-    /// what it reads of the member splices to the member's spare on it.
+    /// what it reads of the member is bounced to the member's spare on it.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_hosts_own_video_and_its_view_of_a_member_carry_on_when_the_relay_stops() {
         let room = bridged().await;
@@ -3375,12 +3476,20 @@ mod socket_tests {
         of_host.more(75, "the host's video stopped when the relay did").await;
         of_member.more(75, "the host's view of m stopped when the relay did").await;
         let (host_gap, member_gap) = (of_host.longest_gap(stopped), of_member.longest_gap(stopped));
-        assert_eq!(count(&host_left), 0, "the viewer lost the host");
-        assert_eq!(count(&member_left), 0, "the host lost m");
+        past_the_grace(stopped + Duration::from_millis(500)).await;
+        of_host.more(10, "the host's video stopped after the relay did").await;
+        of_member.more(10, "the host's view of m stopped after the relay did").await;
+        assert_eq!(of_host.left(), 0, "the viewer's tile for the host left");
+        assert_eq!(of_member.left(), 0, "the host's tile for m left");
+        eprintln!(
+            "relay stopped under the host: host's video gap {host_gap:?}, its view of m {member_gap:?}, {} and {} withdrawals",
+            count(&host_left),
+            count(&member_left)
+        );
         // This stand-in host is not a join, so nothing asks its encoder for a
         // keyframe: its own video waits out the group in flight.
         assert!(host_gap < GROUP, "the host's video was gone {host_gap:?}");
-        assert!(member_gap < SPLICE, "the host's view of m was gone {member_gap:?}");
+        assert!(member_gap < GROUP, "the host's view of m was gone {member_gap:?}");
     }
 
     /// Hosting switched off and on again in the same call opens the room's

@@ -1334,6 +1334,33 @@ mod tests {
         (people, reported)
     }
 
+    /// The call moved to host h, which says its guests while holding the
+    /// relay. a follows the move and reads h directly; b does not, and reads
+    /// h through the relay. The map shows h sending to the relay only
+    /// because b's report says so, and not at all when nobody reads it there.
+    #[test]
+    fn a_host_the_call_moved_to_sends_to_the_relay_only_when_someone_reads_it_there() {
+        let (h, a, b) = (id('h'), id('a'), id('b'));
+        let roster = [h.as_str(), a.as_str(), b.as_str()];
+        let people = vec![
+            person(&h, Some(Sending::Guests), &[HELD_RELAY]),
+            person(&a, Some(Sending::Host(h.clone())), &[&h, HELD_RELAY]),
+            person(&b, Some(Sending::Relay), &[HELD_RELAY]),
+        ];
+        let from_a = report(&a, 2, &[], &[], &[(&h, Some(vec![])), (&b, Some(vec![Hop::Venue]))], &roster);
+        let through_relay = report(&b, 3, &[], &[], &[(&h, Some(vec![Hop::Venue])), (&a, Some(vec![Hop::Venue]))], &roster);
+        let reported: BTreeMap<String, Reported> = [from_a.clone(), through_relay].into_iter().collect();
+        let web = build_reported(&people, &server(), Some(RELAY_ID), &reported);
+        assert!(carries(&web, &h, RELAY_ID), "b reads h through the relay, and the map must show it");
+        assert!(carries(&web, RELAY_ID, &b));
+        assert!(carries(&web, &h, &a));
+
+        let direct = report(&b, 3, &[], &[], &[(&h, Some(vec![])), (&a, Some(vec![Hop::Venue]))], &roster);
+        let reported: BTreeMap<String, Reported> = [from_a, direct].into_iter().collect();
+        let web = build_reported(&people, &server(), Some(RELAY_ID), &reported);
+        assert!(!carries(&web, &h, RELAY_ID), "nobody reads h through the relay, and its own word is its guests");
+    }
+
     #[test]
     fn in_a_relay_room_every_link_to_the_relay_carries_both_ways() {
         let (people, reported) = relay_room();

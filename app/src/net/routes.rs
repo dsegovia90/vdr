@@ -200,6 +200,21 @@ async fn update_within(announced: &mut announce::Consumer, wait: Duration) -> Op
     }
 }
 
+/// A bounce of our path, within `wait`: withdrawn, then announced again,
+/// perhaps re-priced between. The announcement it ends with.
+async fn bounced(announced: &mut announce::Consumer, wait: Duration) -> announce::Update {
+    let withdrawn = update_within(announced, wait).await.expect("the path is bounced");
+    assert_eq!(withdrawn.kind, announce::Kind::Retracted, "a change of route is withdrawn first: {withdrawn:?}");
+    loop {
+        let update = update_within(announced, wait).await.expect("the path is announced again");
+        match update.kind {
+            announce::Kind::Announced => return update,
+            announce::Kind::Updated => continue,
+            announce::Kind::Retracted => panic!("withdrawn twice: {update:?}"),
+        }
+    }
+}
+
 /// Every update for our path until nothing changes for `quiet`.
 async fn settle(announced: &mut announce::Consumer, quiet: Duration) -> Vec<announce::Update> {
     let mut updates = Vec::new();
@@ -233,11 +248,13 @@ async fn our_endpoints_negotiate_lite06_and_an_older_server_caps_it() {
 
 /// One publisher reached through two relays is one broadcast to a viewer on
 /// both: announced once, both routes starting with the publisher's own hop,
-/// and the last hop naming the relay. When the relay in use dies, the same
-/// subscription keeps receiving through the other, and the announcement is
-/// re-delivered in place naming it.
+/// and the last hop naming the relay. When the relay in use dies, the library
+/// never carries the subscription across: the broadcast ends, the path is
+/// bounced (withdrawn, then announced again through the other relay), and a
+/// fresh request reads on from there. What the call's attendance loop takes
+/// as a change of route rather than a leave (`grace.rs`).
 #[tokio::test]
-async fn one_publisher_through_two_relays_is_one_broadcast_that_fails_over() {
+async fn one_publisher_through_two_relays_is_one_broadcast_bounced_on_failover() {
     let a = Relay::start(&[]).await;
     let b = Relay::start(&[]).await;
 
@@ -266,19 +283,21 @@ async fn one_publisher_through_two_relays_is_one_broadcast_that_fails_over() {
     assert!(serving == a.hop() || serving == b.hop());
 
     let broadcast = inbound.consume().routed_broadcast(PATH).await.unwrap();
-    let (mut groups, _reading) = watch_groups(broadcast);
+    let (mut groups, _reading) = watch_groups(broadcast.clone());
     let before = groups_past(&mut groups, 0, 3).await;
 
     let (dying, surviving) = if serving == a.hop() { (a, b) } else { (b, a) };
     let surviving_hop = surviving.hop();
     dying.stop().await;
 
-    let update = update_within(&mut announced, PATIENCE).await.expect("the route moves");
-    assert_eq!(update.kind, announce::Kind::Updated, "not retracted and re-announced");
+    let update = bounced(&mut announced, PATIENCE).await;
     assert_eq!(through(&update.route), surviving_hop);
     assert_eq!(update.route.hops.as_slice()[0], outbound.hop());
 
-    // The same subscription, never re-requested.
+    // The old subscription ends; a fresh one reads on through the other relay.
+    tokio::time::timeout(PATIENCE, broadcast.closed()).await.expect("the old broadcast ends");
+    let again = inbound.consume().routed_broadcast(PATH).await.unwrap();
+    let (mut groups, _reading) = watch_groups(again);
     groups_past(&mut groups, before, 5).await;
     drop(surviving);
 }
@@ -459,9 +478,10 @@ impl Offering {
 
 /// Two sessions stay up for receiving while our broadcast is offered on only
 /// one; the other relay never hears of it. The offer then moves to the other
-/// session, opened there before it is withdrawn here: a viewer's subscription
-/// carries on through the move with no redial and no re-request, and the old
-/// session stops uploading.
+/// session, opened there before it is withdrawn here, with no redial: the
+/// viewer sees the path bounced through the other relay, and a fresh request
+/// reads on there. Once the viewer lets the old read go, the old session
+/// stops uploading.
 #[tokio::test]
 async fn an_offer_moves_between_live_sessions_without_a_redial() {
     let call = Offering::new().await;
@@ -477,7 +497,7 @@ async fn an_offer_moves_between_live_sessions_without_a_redial() {
     );
 
     let broadcast = call.inbound.consume().routed_broadcast(PATH).await.unwrap();
-    let (mut groups, _reading) = watch_groups(broadcast);
+    let (mut groups, reading) = watch_groups(broadcast);
     let before = groups_past(&mut groups, 0, 3).await;
     let uploading = upload(&call.p_a, Duration::from_millis(500)).await;
 
@@ -487,14 +507,16 @@ async fn an_offer_moves_between_live_sessions_without_a_redial() {
     assert_eq!(at_relay.route.hops.as_slice(), [call.outbound.hop()], "one publisher identity across gates");
     drop(offer_a);
 
-    let update = update_within(&mut announced, PATIENCE).await.expect("the route moves");
-    assert_eq!(update.kind, announce::Kind::Updated);
+    let update = bounced(&mut announced, PATIENCE).await;
     assert_eq!(through(&update.route), call.b.hop());
     let took = moved.elapsed();
-    // Most of this is the announce cursor holding a changed route back
-    // (`origin::DEFAULT_UPDATE_HOLD`); the data path does not wait for it.
     assert!(took < Duration::from_secs(2), "the move took {took:?}");
+    eprintln!("offer moved: bounced after {took:?}");
 
+    // As the call's readers do on a bounce: the old read goes, a fresh one starts.
+    drop(reading);
+    let again = call.inbound.consume().routed_broadcast(PATH).await.unwrap();
+    let (mut groups, _reading) = watch_groups(again);
     groups_past(&mut groups, before, 5).await;
     let after = upload(&call.p_a, Duration::from_millis(500)).await;
     assert!(after * 5 < uploading, "the old session still uploads {after} B/s, was {uploading} B/s");

@@ -1,18 +1,24 @@
 //! Reading what someone offers -- their video, their voice, their screen --
 //! for as long as they are here, whichever way it comes.
 //!
-//! **A read can end while its path stays announced.** A room reached through
-//! several sessions changes the route to a peer whenever the call moves or a
-//! session goes, and the library carries a read across that only sometimes:
-//! it re-splices at a group boundary when the new route names the same
-//! publisher, and otherwise ends the broadcast it served, leaving each track
-//! to end with the session it came through ("dropped", "connection error").
-//! The announcement only changes route, or does not change at all, so nothing
-//! in the attendance loop would ever start a new reader, and whatever the
-//! peer did next was lost for the rest of the call: a camera turned on after
-//! a move stayed blank. The library says what to do: the next request serves
-//! the path again. So a reader that ends asks for the broadcast again, until
-//! it is back or the retraction (their leave) aborts it.
+//! **A read ends whenever its route changes.** A room reached through several
+//! sessions changes the route to a peer whenever the call moves or a session
+//! goes, and the library never carries a read across that: two routes to one
+//! path may carry two different broadcasts, so it ends the broadcast it
+//! served and bounces the path's announcement (retracted, then announced
+//! again). The attendance loop takes the bounce as a change of route and
+//! starts the readers again on the fresh broadcast at once (`grace.rs`).
+//! Readers here also ask again by themselves when a read ends, for the
+//! cases no bounce reaches us: an older relay that still carries reads
+//! across, or a single track ended while its broadcast stays.
+//!
+//! **Asking again backs off while the broadcast is still open.** A read that
+//! ends with its broadcast closed is a route that changed, and the next ask
+//! is answered by the new one, so it is asked at once. A read that ends with
+//! its broadcast open will most likely end the same way if asked straight
+//! away (the library ends a track whose peer copy died, and a returning
+//! reader of it gets nothing until the broadcast itself ends), so the wait
+//! doubles up to [`AGAIN_MAX`], and is cut short when the broadcast closes.
 //!
 //! **The catalog and the media are read apart.** The catalog is followed for
 //! the whole call, not read once until something is offered, so a rendition
@@ -33,10 +39,11 @@
 //! catalog's newest group is there for any new reader, so a first one that
 //! has not come within [`PATIENCE`] is not coming on this read: the route
 //! it was given is waiting on a group that does not exist yet, as one
-//! carried across a change of route does. Asking again may be answered by a
-//! better route; the publisher writing its catalog again ends the wait
-//! either way. Only the first catalog of a read is waited for like this:
-//! after it, a catalog that is quiet has simply not changed.
+//! carried across a change of route by an older relay does. Asking again
+//! may be answered by a better route; the publisher writing its catalog
+//! again ends the wait either way. Only the first catalog of a read is
+//! waited for like this: after it, a catalog that is quiet has simply not
+//! changed.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -47,6 +54,71 @@ use moq_mux::catalog::Stream as _;
 /// How long a reader waits before asking again for a broadcast it lost: the
 /// time a route takes to settle after a session goes, near enough.
 pub(in crate::net) const AGAIN: Duration = Duration::from_millis(250);
+
+/// The longest a reader waits before asking again for a broadcast whose
+/// reads keep ending while it stays open: long enough that a track the
+/// library will not serve again costs a request every few seconds, not four
+/// a second; short enough that a read that could come back is not left long.
+pub(in crate::net) const AGAIN_MAX: Duration = Duration::from_secs(4);
+
+/// How long a read has to have lasted to count as a good one, after which
+/// the wait starts again from [`AGAIN`]. By how long it lasted, not by
+/// whether it delivered anything: a read the library will not serve again
+/// still hears its catalog or presence every time, so having heard something
+/// says nothing, while a read that keeps ending lasts milliseconds.
+const GOOD: Duration = AGAIN_MAX;
+
+/// How long to wait before asking again for a broadcast, by how the last
+/// read of it ended.
+#[derive(Debug)]
+pub(in crate::net) struct Again {
+    wait: Duration,
+    /// When the current read began.
+    began: Option<tokio::time::Instant>,
+}
+
+impl Default for Again {
+    fn default() -> Self {
+        Self { wait: AGAIN, began: None }
+    }
+}
+
+impl Again {
+    /// A read began now.
+    pub(in crate::net) fn began(&mut self) {
+        self.began = Some(tokio::time::Instant::now());
+    }
+
+    /// Waits before the next ask. `ended` is the broadcast whose read just
+    /// ended, or `None` when there was no read to judge by (an ask that was
+    /// refused, a catalog that never came), which waits [`AGAIN`].
+    pub(in crate::net) async fn wait(&mut self, ended: Option<&moq_net::broadcast::Consumer>) {
+        let lasted = self.began.take().map(|at| at.elapsed());
+        match ended {
+            // Its route changed: the next ask is the new route's.
+            Some(ended) if ended.is_closed() => self.wait = AGAIN,
+            Some(ended) => {
+                let wait = self.after(lasted);
+                tokio::select! {
+                    _ = ended.closed() => self.wait = AGAIN,
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            }
+            None => tokio::time::sleep(AGAIN).await,
+        }
+    }
+
+    /// The wait for a read that ended with its broadcast open after
+    /// `lasted`, doubling the one after it unless the read was a good one.
+    fn after(&mut self, lasted: Option<Duration>) -> Duration {
+        if lasted.is_some_and(|lasted| lasted >= GOOD) {
+            self.wait = AGAIN;
+        }
+        let wait = self.wait;
+        self.wait = (self.wait * 2).min(AGAIN_MAX);
+        wait
+    }
+}
 
 /// How long a picture whose read ended is left up before it is taken down,
 /// if no player has taken over by then. Longer than a route change takes to
@@ -188,17 +260,24 @@ pub(in crate::net) async fn follow<R: Reader>(
     let mut first = true;
     let mut playing: Option<(Rendition, Task)> = None;
     let mut failed: Option<Rendition> = None;
-    // When a picture left up by a player that ended comes down.
-    let mut held: Option<tokio::time::Instant> = None;
     // Only with somewhere to ask again: the loopback's catalog is in this
     // process and has no route to wait on.
     let mut overdue = Overdue::default();
+    // A follower that is asked to read again (a change of route, see
+    // `grace.rs`) may take over a tile still showing the last picture: it
+    // comes down within [`HOLD`] unless this follower plays something, so a
+    // camera turned off across the change is not left frozen on screen.
+    let mut held: Option<tokio::time::Instant> = asking.as_ref().map(|_| tokio::time::Instant::now() + HOLD);
+    let mut again = Again::default();
+    // The broadcast whose read just ended, when one did: how long to wait
+    // before asking again depends on whether it has closed.
+    let mut ended: Option<moq_net::broadcast::Consumer> = None;
     loop {
         let broadcast = match next.take() {
             Some(broadcast) => broadcast,
             None => {
                 let Some(asking) = &asking else { return };
-                tokio::time::sleep(AGAIN).await;
+                again.wait(ended.take().as_ref()).await;
                 if held.is_some_and(|at| at <= tokio::time::Instant::now()) {
                     held = None;
                     if playing.is_none() {
@@ -217,6 +296,7 @@ pub(in crate::net) async fn follow<R: Reader>(
         if asking.is_some() {
             overdue.began(tokio::time::Instant::now());
         }
+        again.began();
         // The subscribe is waited on with the same patience as what it
         // brings: a route with nothing behind it can hold either.
         let subscribing = moq_mux::catalog::Consumer::<()>::new(&broadcast, moq_mux::catalog::CatalogFormat::Hang);
@@ -228,6 +308,7 @@ pub(in crate::net) async fn follow<R: Reader>(
             Some(Ok(catalog)) => catalog,
             Some(Err(error)) => {
                 lose(&mut lost, &peer, what, &format!("no catalog: {error:#}"));
+                ended = Some(broadcast);
                 continue;
             }
             None => {
@@ -236,7 +317,7 @@ pub(in crate::net) async fn follow<R: Reader>(
             }
         };
         loop {
-            let ended = async {
+            let finished = async {
                 match playing.as_mut() {
                     Some((_, task)) => (&mut task.0).await,
                     None => std::future::pending().await,
@@ -266,8 +347,11 @@ pub(in crate::net) async fn follow<R: Reader>(
                         match wanted {
                             None => {
                                 failed = None;
-                                if playing.take().is_some() || held.take().is_some() {
-                                    tracing::info!("{peer} stopped offering {what}");
+                                let was_playing = playing.take().is_some();
+                                if was_playing || held.take().is_some() {
+                                    if was_playing {
+                                        tracing::info!("{peer} stopped offering {what}");
+                                    }
                                     reader.stopped();
                                 }
                             }
@@ -286,10 +370,12 @@ pub(in crate::net) async fn follow<R: Reader>(
                     }
                     Ok(None) => {
                         lose(&mut lost, &peer, what, "its catalog ended");
+                        ended = Some(broadcast.clone());
                         break;
                     }
                     Err(error) if crate::net::call::catalog_cut_off(&error) => {
                         lose(&mut lost, &peer, what, &format!("catalog cut off: {error:#}"));
+                        ended = Some(broadcast.clone());
                         break;
                     }
                     Err(error) => {
@@ -297,7 +383,7 @@ pub(in crate::net) async fn follow<R: Reader>(
                         return;
                     }
                 },
-                played = ended => {
+                played = finished => {
                     let rendition = playing.take().map(|(rendition, _)| rendition);
                     match played {
                         Ok(Played::Failed) => {
@@ -309,6 +395,7 @@ pub(in crate::net) async fn follow<R: Reader>(
                         Ok(Played::Lost) | Err(_) => {
                             held.get_or_insert(tokio::time::Instant::now() + HOLD);
                             lose(&mut lost, &peer, what, "its read ended");
+                            ended = Some(broadcast.clone());
                             break;
                         }
                     }
@@ -459,6 +546,81 @@ mod tests {
         }
         assert_eq!(counted.plays.load(std::sync::atomic::Ordering::Relaxed), 1, "one player, never replaced");
         following.abort();
+    }
+
+    #[test]
+    fn asking_again_doubles_up_to_its_cap() {
+        let mut again = super::Again::default();
+        let waits: Vec<Duration> = (0..8).map(|_| again.after(Some(Duration::from_millis(5)))).collect();
+        assert_eq!(waits[0], super::AGAIN);
+        assert_eq!(waits[1], super::AGAIN * 2);
+        assert!(waits.windows(2).all(|pair| pair[1] >= pair[0]));
+        assert_eq!(*waits.last().unwrap(), super::AGAIN_MAX);
+    }
+
+    /// A read that lasted, lost after a long call, is asked for again at
+    /// once-a-quarter-second pace, not at the cap the bad reads before it
+    /// climbed to.
+    #[test]
+    fn a_good_read_starts_the_wait_again() {
+        let mut again = super::Again::default();
+        let short = Some(Duration::from_millis(5));
+        for _ in 0..6 {
+            again.after(short);
+        }
+        assert_eq!(again.after(short), super::AGAIN_MAX, "climbed to the cap");
+        assert_eq!(again.after(Some(super::GOOD)), super::AGAIN, "a good read resets it");
+        assert_eq!(again.after(short), super::AGAIN * 2);
+    }
+
+    /// A player whose read ends at once, every time, as one reading a track
+    /// the library ended while its broadcast stays.
+    #[derive(Clone, Default)]
+    struct Ending {
+        plays: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl super::Reader for Ending {
+        const WHAT: &'static str = "video";
+
+        fn pick(&self, catalog: &super::Catalog) -> Option<Rendition> {
+            let (name, config) = catalog.video.renditions.iter().next()?;
+            Some(Rendition::new(name, config))
+        }
+
+        fn play(&mut self, _: &moq_net::broadcast::Consumer, _: &super::Catalog, _: &Rendition) -> super::Playing {
+            self.plays.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { super::Played::Lost })
+        }
+    }
+
+    /// A read that keeps ending while its broadcast stays open is asked for
+    /// again ever more slowly, not four times a second for ever.
+    #[tokio::test]
+    async fn a_read_that_keeps_ending_on_an_open_broadcast_backs_off() {
+        let origin = moq_tokio::origin::spawn();
+        let mut broadcast = origin.create_broadcast("ending").unwrap();
+        let catalog = super::super::fresh::catalog(&mut broadcast).unwrap();
+        let mut config = moq_video::encode::Config::new(160, 90, moq_video::Rate::new(30, 1).unwrap());
+        config.kind = moq_video::encode::Kind::Software;
+        let rendition = config.probe().await.unwrap();
+        let track = broadcast.create_track("video.avc3", catalog.track_info(60)).unwrap();
+        let _video = super::super::fresh::Video::with_track(track, catalog.clone(), rendition).unwrap();
+        broadcast.announce(moq_net::origin::Route::default()).unwrap();
+
+        let reading = origin.consume().request_broadcast("ending").await.unwrap();
+        let ending = Ending::default();
+        let asking = super::Asking {
+            inbound: origin.consume(),
+            path: "ending".to_string(),
+        };
+        let following = tokio::spawn(super::follow(Some(asking), reading, "someone".into(), ending.clone()));
+        // Without the back-off: a play every AGAIN and a round trip, about
+        // nine. With it: at 0, 0.25, 0.75 and 1.75 s.
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        let plays = ending.plays.load(std::sync::atomic::Ordering::Relaxed);
+        following.abort();
+        assert!((2..=5).contains(&plays), "{plays} plays in 2.2 s");
     }
 
     #[test]
