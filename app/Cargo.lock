@@ -2167,7 +2167,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3054,9 +3054,9 @@ dependencies = [
 
 [[package]]
 name = "hang"
-version = "0.21.22"
+version = "0.21.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a3e87bc81c72f2d648490a54b4fe16e0e81604493a437c646470d4d7af42a22"
+checksum = "a700cf8926b39915fe95cadafb435c4af1fd5d96eacb7f6fc1eaf783fb22b279"
 dependencies = [
  "bytes",
  "derive_more",
@@ -3397,7 +3397,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4702,9 +4702,9 @@ dependencies = [
 
 [[package]]
 name = "moq-binary"
-version = "0.1.21"
+version = "0.1.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fea7beba2a385f47b536aedc0e3799544d5442f7643f3cde9cf9133c56f12e2"
+checksum = "9512910bdb8603d3378ce600204284cbde1f6748d9f188f669d8b61849cd3689"
 dependencies = [
  "bytes",
  "kio 0.6.4",
@@ -4727,9 +4727,9 @@ dependencies = [
 
 [[package]]
 name = "moq-json"
-version = "0.5.19"
+version = "0.5.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95bde5d77d2ddc9ab0c4d5f0cc26ac98f22393fa979ef2db73228b892061cedf"
+checksum = "94e57513704c6de18daeda9706f13d632117f6d199bd2947a2840510d940de5d"
 dependencies = [
  "bytes",
  "kio 0.6.4",
@@ -4744,9 +4744,9 @@ dependencies = [
 
 [[package]]
 name = "moq-loc"
-version = "0.2.30"
+version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9a1077910632796282e0087d9f11cbcee94dd19aed58dcbdecd8d913f82c67a"
+checksum = "1a17ceba908b3f1516db66ec6e984b77ba397d60cf66ce654741c5a5b0b24a23"
 dependencies = [
  "bytes",
  "moq-net",
@@ -4766,9 +4766,9 @@ dependencies = [
 
 [[package]]
 name = "moq-mux"
-version = "0.10.22"
+version = "0.10.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1722814e4dec8ccdd12711fbe0eece0deedd002ab3050a59baed48c0607987db"
+checksum = "328dd8f4334783e7121e54003290634f26d1b57ef8f99e738e92243369573e53"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4802,9 +4802,9 @@ dependencies = [
 
 [[package]]
 name = "moq-net"
-version = "0.3.21"
+version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e069329fa033f1a336e61f3cff8042860b5108deb9a460c9d3f557cd831a21df"
+checksum = "9061a22197eabea42cf9d99dbc870807190b7a75912a48365b6b5d45764e861f"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -4921,9 +4921,9 @@ dependencies = [
 
 [[package]]
 name = "moq-tokio"
-version = "0.19.34"
+version = "0.19.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c06b212a12ed6defbcfe386332446fd55ba2e183162e334c2e3b02276fc91be"
+checksum = "50c46d6dc5ed525d9b99eb2f22011fa6f79dee13c9b252470b0ca46bd495bb28"
 dependencies = [
  "bytes",
  "dns-lookup",
@@ -5509,7 +5509,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7252,7 +7252,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8456,7 +8456,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8c27177b12a6399ffc08b98f76f7c9a1f4fe9fc967c784c5a071fa8d93cf7e1"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10389,15 +10389,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]
