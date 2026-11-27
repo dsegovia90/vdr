@@ -2412,6 +2412,16 @@ async fn attend(
                 if let Some(old) = here.listening.remove(&id) {
                     old.stop().await;
                 }
+                // Their routes are read again too, while our map is open. The
+                // old read is of the broadcast that ended, but a track in
+                // flight outlives it, and an older relay carries such a read
+                // across to whatever route it has left: seen pulling someone's
+                // routes through the relay from the host, after the call had
+                // moved there, for as long as the map stayed open.
+                if let Some(old) = following.remove(&id) {
+                    old.stop().await;
+                    following.insert(id.clone(), Abort(tokio::spawn(follow_routes(inbound.clone(), id.clone(), stats.clone()))));
+                }
                 here.listening.insert(
                     id.clone(),
                     Abort(tokio::spawn(listen(
@@ -5709,5 +5719,35 @@ mod grace_tests {
         let (told, at) = w.next(GRACE + Duration::from_secs(1)).await;
         assert_eq!(told, Told::Left(Feed::Camera));
         assert!(at - withdrawn >= GRACE - Duration::from_millis(50), "a goodbye was remembered past their leave");
+    }
+
+    /// With the map open, a bounce of someone's presence reads their routes
+    /// again from the fresh broadcast: the old read, a track in flight, would
+    /// otherwise go on through whatever carried it before, an older relay
+    /// included.
+    #[tokio::test]
+    async fn a_bounce_reads_their_routes_again() {
+        let origin = moq_tokio::origin::spawn();
+        let w = watching(&origin, true);
+        w.local.set_map_open(true);
+        let routed = |origin: &moq_net::origin::Producer| {
+            let (control, said) = present(origin, "them");
+            let routes = control.create_track(ROUTES, None).unwrap();
+            (control, said, routes)
+        };
+        let first = routed(&origin);
+        read(&first.0, true, "their presence was never read").await;
+        // The routes reader starts at the next once-a-second look.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !first.2.is_used() {
+            assert!(Instant::now() < deadline, "their routes were never read");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let again = routed(&origin);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while first.2.is_used() || !again.2.is_used() {
+            assert!(Instant::now() < deadline, "their routes were still read from the old broadcast ({}) or never from the new ({})", first.2.is_used(), again.2.is_used());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
