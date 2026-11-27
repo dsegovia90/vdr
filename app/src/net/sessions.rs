@@ -777,6 +777,11 @@ pub(super) struct Join {
     pub(super) bounce: Option<Duration>,
     /// What presence says about the room's hosts from now on.
     pub(super) learned: futures_channel::mpsc::UnboundedReceiver<Learned>,
+    /// Whether we dial only the hosts below our id, as a host does: the same
+    /// answer [`targets`] was given, so a host heard of later is judged as
+    /// one known at join. Not `hosting`: a join wired to host whose door
+    /// failed to open is no host to anyone, and dials every host.
+    pub(super) dials_below: bool,
 }
 
 /// One session of the set.
@@ -1038,6 +1043,7 @@ pub(super) fn join(args: Join) -> Peer {
         room,
         bounce,
         learned,
+        dials_below,
     } = args;
     let mut learned = Some(learned);
     let relay_url = targets[0].url.clone();
@@ -1254,7 +1260,7 @@ pub(super) fn join(args: Join) -> Peer {
                     } => match news {
                         None => learned = None,
                         // The same rule as at join: a host dials only below.
-                        Some(Learned::Host(target)) if !target.host.as_deref().is_some_and(|id| dials(id, &relay_url, &me, hosting)) => {}
+                        Some(Learned::Host(target)) if !target.host.as_deref().is_some_and(|id| dials(id, &relay_url, &me, dials_below)) => {}
                         Some(news) => {
                             hosts_wanted.learn(news, Instant::now());
                         }
@@ -2204,6 +2210,7 @@ mod socket_tests {
             room: "room team".to_string(),
             bounce: None,
             learned,
+            dials_below: false,
         });
         let (end, ended) = tokio::sync::oneshot::channel();
         let joined = Abort(tokio::spawn(async move {
@@ -3568,6 +3575,7 @@ mod socket_tests {
             room: "room team".to_string(),
             bounce: None,
             learned,
+            dials_below: true,
         });
         let joined = Abort(tokio::spawn(async move {
             let _ = host.closed.await;

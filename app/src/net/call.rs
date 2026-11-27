@@ -1540,6 +1540,7 @@ async fn run(
                     room,
                     bounce: crate::args::Args::get().bounce,
                     learned: learned.take().unwrap_or_else(|| futures_channel::mpsc::unbounded().1),
+                    dials_below: alongside.is_some(),
                 })
             }
             Peering::Listen => {
