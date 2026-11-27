@@ -282,7 +282,10 @@ focus.
   join (`net/sessions.rs`, `Learned`): presence's door goes to the join as well
   as to `rooms.json`. Two hosts that have not dialled each other make two
   rooms when the relay stops, so a host dials every host below its id,
-  whichever joined first. The session is hung up when presence says the host stopped or
+  whichever joined first. Every join therefore holds a set of sessions, the
+  relay alone until a host is heard; on the wire that differs from the old
+  single session only by our gate's hop in our routes and `"relay"` in
+  `held`. The session is hung up when presence says the host stopped or
   names a new door. **A leave is not enough to hang up**: a host's leave is
   read off its presence going, which is also what our only link to it
   failing looks like, so a host that left is let go only once its session has
@@ -438,7 +441,7 @@ focus.
 | `net/call.rs` | a call over iroh + MoQ: rooms on a relay, direct calls, hosting a room (`--host`), presence |
 | `net/follow.rs` | reading what a peer offers (video, voice, screen) for as long as they are here: follows the catalog, asks again for a broadcast whose read ended (at once once it has closed, backing off while it stays open) |
 | `net/grace.rs` | withdrawals waiting out their grace, per person and strand (presence, camera, screen): which are a change of route and which a leave (pure) |
-| `net/sessions.rs` | a join that dials the relay and the room's hosts together, those saved and those heard of during the call (`Hosts`, at most eight, the lowest ids): which session carries our media, and moving it; a change of route reaches viewers as a bounce of the path, read again from the newest group |
+| `net/sessions.rs` | every join: the relay and the room's hosts dialled together, those saved and those heard of during the call (`Hosts`, at most eight, the lowest ids): which session carries our media, and moving it; a change of route reaches viewers as a bounce of the path, read again from the newest group |
 | `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes, for the log and the host borders on tiles (`read` and `through` are pure) |
 | `net/moves.rs` | moving the call to a host, an experiment: the presence field, which choice wins, the bounce order (pure) |
 | `net/web.rs` | the room as a web of nodes for the Topology tab: the `via`/`held` presence fields and the `routes.json` document (wire form, lenient reading, cleaning, id prefixes), naming hops from everyone's claims, and the pure graph built from every entry, with each link's streams counted per direction and where a sender's word and its receivers part |

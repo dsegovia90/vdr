@@ -19,9 +19,10 @@
 //! [`super::door`]); and it is a room, not a call with one peer. Its guests
 //! join it as they would a relay's room, which is why they need nothing new.
 //!
-//! **A join with somewhere else to meet holds several sessions**: the relay
-//! and the room's hosts together, through [`sessions`]. A join with no hosts
-//! and hosting off is the one session through [`connect`] it always was.
+//! **Every join holds a set of sessions**: the relay and the room's hosts
+//! together, through [`sessions`], so that a host heard of during the call
+//! can be dialled then. A join with no hosts and hosting off is a set of one,
+//! the relay, until someone in the room says they host it.
 //!
 //! Every arm converges on [`Peer`], so the claim above is structural rather
 //! than a description: anything per-connection is reached the same way
@@ -1374,14 +1375,14 @@ async fn run(
         let forwarded = shared.then(|| Forwarded::new(me.to_string()));
         let inbound = inbound_for(&outbound, shared);
         // Where else the room can meet, as the interface put it with the
-        // decision. A join with somewhere else to go, or one we host, holds
-        // several sessions (see `sessions`); any other is the one session it
-        // always was.
+        // decision. Every join holds a set of sessions (see `sessions`), the
+        // relay alone when no hosts are known and we do not host, so that a
+        // host heard of during the call is dialled then.
         let known = match &peering {
             Peering::Join(url) => doors.hosts(&crate::recent::identity(url)),
             _ => Vec::new(),
         };
-        let several = dials_several(&peering, host_rooms, !known.is_empty());
+        let several = dials_several(&peering);
         // Where what we hear about hosts goes: only a join has a remembered
         // room to keep them with, and a join over several sessions also dials
         // them as the call goes on.
@@ -1411,7 +1412,9 @@ async fn run(
         // over plain QUIC, and the endpoint's counters would only ever say
         // "nothing moved".
         let over_iroh = match &peering {
-            Peering::Join(url) => url.scheme() == "iroh" || several,
+            // As before every join went through the set: a room on an
+            // `https://` relay with no hosts known stays without one.
+            Peering::Join(url) => url.scheme() == "iroh" || host_rooms || !known.is_empty(),
             Peering::Dial(_) | Peering::Listen | Peering::Host(_) => true,
             Peering::Loopback | Peering::Idle => false,
         };
@@ -3496,11 +3499,11 @@ fn heard_hosting(
     }
 }
 
-/// Whether a join holds several sessions: when the room has hosts to dial
-/// beside its relay, or when we host it. Never anything else, and never a
-/// join with neither, which stays the one session it always was.
-fn dials_several(peering: &Peering, host_rooms: bool, has_hosts: bool) -> bool {
-    matches!(peering, Peering::Join(_)) && (host_rooms || has_hosts)
+/// Whether an attempt goes through the set of sessions: every join, even
+/// one with no hosts known and hosting off, so that a host heard of during
+/// the call can be dialled then. Never anything else.
+fn dials_several(peering: &Peering) -> bool {
+    matches!(peering, Peering::Join(_))
 }
 
 /// Whether an attempt's inbound is its outbound: always for a room hosted
@@ -4673,8 +4676,8 @@ mod presence_tests {
     }
 
     /// The wiring table: whether the origins are shared, and whether a join
-    /// holds several sessions. A join with no hosts and hosting off is the
-    /// one session over two origins it always was.
+    /// holds several sessions. Every join does, over two origins unless it
+    /// hosts.
     #[test]
     fn only_a_hosting_join_or_a_hosted_room_shares_one_origin() {
         let url: url::Url = "https://relay.example.com/team".parse().unwrap();
@@ -4687,18 +4690,12 @@ mod presence_tests {
             }
         }
         let join = Peering::Join(url);
-        assert!(!dials_several(&join, false, false), "no hosts, not hosting: as before");
-        // The spare route lives only in the set, so it cannot touch a join
-        // that never reaches it; and a host's join keeps none.
-        assert!(super::sessions::keeps_spare(false, true), "on by default for a member of a room with hosts");
+        assert!(dials_several(&join), "every join, hosts known or not");
+        // A host's join keeps no spare.
+        assert!(super::sessions::keeps_spare(false, true), "on by default for a member of a room");
         assert!(!super::sessions::keeps_spare(true, true), "a hosting join offers everything everywhere already");
-        assert!(dials_several(&join, false, true), "a room with hosts");
-        assert!(dials_several(&join, true, false), "a room we host");
-        assert!(dials_several(&join, true, true));
         for other in [Peering::Host("team".into()), Peering::Dial(peer), Peering::Listen, Peering::Loopback, Peering::Idle] {
-            for (host_rooms, has_hosts) in [(false, false), (true, true)] {
-                assert!(!dials_several(&other, host_rooms, has_hosts), "{other:?}");
-            }
+            assert!(!dials_several(&other), "{other:?}");
         }
     }
 

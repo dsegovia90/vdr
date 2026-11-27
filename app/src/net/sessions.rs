@@ -4236,4 +4236,40 @@ mod socket_tests {
         let _ = g.learn.unbounded_send(Learned::Host(behind(&right)));
         holding(&local, &['e'], true, "the host was not dialled with its own door").await;
     }
+
+    /// Every join now goes through the set, the relay alone when no hosts
+    /// are known. What the relay is offered by such a join, beside a join
+    /// wired as one was before: the same broadcasts at the same price, each
+    /// naming its publisher first, and one hop longer, the gate's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_join_of_the_relay_alone_offers_it_what_a_plain_join_did_one_gate_hop_apart() {
+        let relay = Meeting::older().await;
+        let through_set = moq_tokio::origin::spawn();
+        let _set = member_from("s", vec![relay_at(relay.url())], client(), Arc::new(PeerStats::default()), through_set.clone());
+        let plain = moq_tokio::origin::spawn();
+        let _camera = publishing("p", &plain);
+        let _plain = client()
+            .with_publisher(plain.consume())
+            .with_subscriber(moq_tokio::origin::spawn())
+            .connect(relay.url());
+        let (s, p) = (camera_path("s"), camera_path("p"));
+        becomes(&relay.origin, &s, true).await;
+        becomes(&relay.origin, &p, true).await;
+        // Nothing else is offered: only what each publishes.
+        let mut announced = relay.origin.consume().announced();
+        let mut paths = Vec::new();
+        while let Ok(Some(update)) = tokio::time::timeout(Duration::from_millis(500), announced.next()).await {
+            if update.kind.is_active() {
+                paths.push(update.prefix.as_str().to_string());
+            }
+        }
+        paths.sort();
+        assert_eq!(paths, [p.clone(), s.clone()]);
+        let by_set = route_within(&relay.origin, &s).await.expect("the set's route");
+        let by_plain = route_within(&relay.origin, &p).await.expect("the plain route");
+        assert_eq!(by_set.hops.as_slice().first(), Some(&through_set.hop()), "{by_set:?}");
+        assert_eq!(by_plain.hops.as_slice().first(), Some(&plain.hop()), "{by_plain:?}");
+        assert_eq!(by_set.hops.len(), by_plain.hops.len() + 1, "{by_set:?} beside {by_plain:?}");
+        assert_eq!(by_set.cost, by_plain.cost);
+    }
 }
