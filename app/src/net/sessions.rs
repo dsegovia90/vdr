@@ -2713,6 +2713,14 @@ mod socket_tests {
         of.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Waits out the attendance loop's grace from `from`, the last moment a
+    /// withdrawal could have happened, with a margin: a withdrawal that was
+    /// going to be a leave has been told by then, so asserting no leave
+    /// earlier would race the very failure it is there to catch.
+    async fn past_the_grace(from: Instant) {
+        tokio::time::sleep_until((from + super::super::super::grace::GRACE + Duration::from_millis(500)).into()).await;
+    }
+
     /// The longest a viewer may go without a frame when a spare takes over
     /// from a carrier that stopped cleanly. The library ends the viewer's
     /// read as soon as the carrier's route goes and bounces the path through
@@ -2747,9 +2755,12 @@ mod socket_tests {
         let stopped = Instant::now();
         w.room.relay.stop().await;
         routed_through(&w.v.inbound, &camera_path("m"), w.room.host.origin.hop(), "m never came through the host").await;
-        // Past the library's hold on a re-announcement, so a leave would show.
+        let flipped = Instant::now();
         w.arrivals.more(75, "video stopped when the relay did").await;
         let gap = w.arrivals.longest_gap(stopped);
+        // Past the grace on the withdrawal, so a leave would have shown.
+        past_the_grace(flipped).await;
+        w.arrivals.more(10, "video stopped after the relay did").await;
         assert_eq!(w.arrivals.left(), 0, "the viewer's tile for m left");
         eprintln!("relay stopped: gap {gap:?}, {} withdrawals", count(&retracted));
         assert!(gap < SPLICE, "video was gone {gap:?} when the relay stopped");
@@ -2792,16 +2803,22 @@ mod socket_tests {
         w.camera.turn_on();
         w.arrivals.more(30, "no video through the relay").await;
         let (_watching, retracted) = retractions(&w.v.inbound, &camera_path("m"));
+        let mut settled = Instant::now();
         for round in 0..2 {
             for host in [true, false] {
                 let moved = Instant::now();
                 w.to(host, &format!("the call never moved, round {round}")).await;
+                settled = Instant::now();
                 w.arrivals.more(30, &format!("video stopped after a move, round {round}")).await;
                 let gap = w.arrivals.longest_gap(moved);
                 eprintln!("moved to the {}, round {round}: gap {gap:?}", if host { "host" } else { "relay" });
                 assert!(gap < GAP, "video was gone {gap:?} moving to the {}, round {round}", if host { "host" } else { "relay" });
             }
         }
+        // The last move's old offer goes a moment after it settles; earlier
+        // moves' graces ran out during the moves after them.
+        past_the_grace(settled).await;
+        w.arrivals.more(10, "video stopped after the last move").await;
         eprintln!("moves: {} withdrawals", count(&retracted));
         assert_eq!(w.arrivals.left(), 0, "the viewer's tile for m left across a move");
     }
@@ -2849,8 +2866,11 @@ mod socket_tests {
         let cut = Instant::now();
         to_relay.abort(moq_net::Error::Cancel);
         routed_through(&inbound, &camera_path("m"), room.host.origin.hop(), "m never came through the host").await;
+        let flipped = Instant::now();
         arrivals.more(75, "video stopped when we hung up on the relay").await;
         let gap = arrivals.longest_gap(cut);
+        past_the_grace(flipped).await;
+        arrivals.more(10, "video stopped after we hung up on the relay").await;
         assert_eq!(arrivals.left(), 0, "the viewer's tile for m left");
         eprintln!("hung up: {} withdrawals", count(&retracted));
         // Nobody asks m for a keyframe here: the read picks up at m's next group.
@@ -3101,8 +3121,11 @@ mod socket_tests {
         let cut = Instant::now();
         r.to_relay.set(DROP);
         routed_through(&r.v.inbound, &camera_path("m"), r.host.origin.hop(), "m never came through the host").await;
+        let flipped = Instant::now();
         r.arrivals.more(60, "video stopped when the relay went silent").await;
         let gap = r.arrivals.longest_gap(cut);
+        past_the_grace(flipped).await;
+        r.arrivals.more(10, "video stopped after the relay went silent").await;
         assert_eq!(r.arrivals.left(), 0, "the viewer's tile for m left");
         eprintln!("silent relay: {} withdrawals", count(&retracted));
         assert_eq!(r.on_m.sending(), Some(super::super::super::arrival::Sending::Host(id('c'))), "m's media never left the relay");
@@ -3213,6 +3236,9 @@ mod socket_tests {
         let moved = said.elapsed();
         tokio::time::sleep_until((said + DRAIN + Duration::from_secs(2)).into()).await;
         let gap = arrivals.longest_gap(said);
+        // The relay closes at its deadline, the last withdrawal there is.
+        past_the_grace(said + DRAIN).await;
+        arrivals.more(10, "video stopped after the relay went").await;
         assert_eq!(arrivals.left(), 0, "the viewer's tile for m left");
         eprintln!("going away: {} withdrawals", count(&retracted));
         assert!(gap < Duration::from_secs(1), "video was gone {gap:?} across the relay going away");
@@ -3416,6 +3442,9 @@ mod socket_tests {
         of_host.more(75, "the host's video stopped when the relay did").await;
         of_member.more(75, "the host's view of m stopped when the relay did").await;
         let (host_gap, member_gap) = (of_host.longest_gap(stopped), of_member.longest_gap(stopped));
+        past_the_grace(stopped + Duration::from_millis(500)).await;
+        of_host.more(10, "the host's video stopped after the relay did").await;
+        of_member.more(10, "the host's view of m stopped after the relay did").await;
         assert_eq!(of_host.left(), 0, "the viewer's tile for the host left");
         assert_eq!(of_member.left(), 0, "the host's tile for m left");
         eprintln!(
