@@ -3028,9 +3028,9 @@ dependencies = [
 
 [[package]]
 name = "hang"
-version = "0.21.24"
+version = "0.21.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a700cf8926b39915fe95cadafb435c4af1fd5d96eacb7f6fc1eaf783fb22b279"
+checksum = "b1769a1a52c4fb2a2006ee80ced890b9f005ec2a9442f1ca7c228bf6f7f08662"
 dependencies = [
  "bytes",
  "derive_more",
@@ -3294,7 +3294,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4588,9 +4588,9 @@ dependencies = [
 
 [[package]]
 name = "moq-binary"
-version = "0.1.23"
+version = "0.1.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9512910bdb8603d3378ce600204284cbde1f6748d9f188f669d8b61849cd3689"
+checksum = "c326b80c27af7815a5a79870fe98a93cfa544501d29d57bc10ab06d89d459c87"
 dependencies = [
  "bytes",
  "kio 0.6.4",
@@ -4613,9 +4613,9 @@ dependencies = [
 
 [[package]]
 name = "moq-json"
-version = "0.5.21"
+version = "0.5.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94e57513704c6de18daeda9706f13d632117f6d199bd2947a2840510d940de5d"
+checksum = "77f9e16d3455afd004eb83b5a6662cb65fa6325b65d7daeae702f71cbad08a27"
 dependencies = [
  "bytes",
  "kio 0.6.4",
@@ -4630,9 +4630,9 @@ dependencies = [
 
 [[package]]
 name = "moq-loc"
-version = "0.2.32"
+version = "0.2.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a17ceba908b3f1516db66ec6e984b77ba397d60cf66ce654741c5a5b0b24a23"
+checksum = "ddec3fc03ae33a9b3972582c665f8f00bc070d289ad5b92699d40483729aebc9"
 dependencies = [
  "bytes",
  "moq-net",
@@ -4641,9 +4641,9 @@ dependencies = [
 
 [[package]]
 name = "moq-msf"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8443a5aa0eab90c261afa45e565b2ff3863ec61c8f8beccb0779968427dc7914"
+checksum = "56d5b215b5576ccdd2a2c6cb74a1b1ff5b6f444a44c364414dafcdf08ba5e596"
 dependencies = [
  "serde",
  "serde_json",
@@ -4652,9 +4652,9 @@ dependencies = [
 
 [[package]]
 name = "moq-mux"
-version = "0.10.23"
+version = "0.10.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "328dd8f4334783e7121e54003290634f26d1b57ef8f99e738e92243369573e53"
+checksum = "49623b428d0a787d546b27bd6016c63efffb2cdb69807b3d29faaf45eaf544be"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4688,9 +4688,9 @@ dependencies = [
 
 [[package]]
 name = "moq-net"
-version = "0.3.23"
+version = "0.3.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9061a22197eabea42cf9d99dbc870807190b7a75912a48365b6b5d45764e861f"
+checksum = "cfa16dd464a514a51f04fd833addb027c1e87d6b67e3d7df4036eed64b6583c1"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -4807,9 +4807,9 @@ dependencies = [
 
 [[package]]
 name = "moq-tokio"
-version = "0.19.37"
+version = "0.19.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50c46d6dc5ed525d9b99eb2f22011fa6f79dee13c9b252470b0ca46bd495bb28"
+checksum = "a86a6047f69a3b5e072c6136b26cb4a516baf297f22f9bbcfe36b88fb532d100"
 dependencies = [
  "bytes",
  "dns-lookup",
@@ -8226,7 +8226,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
