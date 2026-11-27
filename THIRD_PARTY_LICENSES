@@ -12185,7 +12185,7 @@ Used by:
   ebml-iterable-specification 0.4.0  https://github.com/austinleroy/ebml-iterable
   enum-assoc 1.4.1  https://github.com/Eolu/enum-assoc
   generational-box 0.7.10  https://github.com/DioxusLabs/dioxus/
-  hang 0.21.24  https://github.com/moq-dev/moq
+  hang 0.21.25  https://github.com/moq-dev/moq
   iroh-base 1.5.0  https://github.com/n0-computer/iroh
   iroh-dns 1.5.0  https://github.com/n0-computer/iroh
   iroh-metrics-derive 1.0.1  https://github.com/n0-computer/iroh-metrics
@@ -12197,16 +12197,16 @@ Used by:
   manganis-core 0.7.10  https://github.com/DioxusLabs/dioxus/tree/main/packages/manganis/manganis-core
   manganis-macro 0.7.10  https://github.com/DioxusLabs/dioxus/tree/main/packages/manganis/manganis-macro
   manganis 0.7.10  https://github.com/DioxusLabs/dioxus/tree/main/packages/manganis/manganis
-  moq-binary 0.1.23  https://github.com/moq-dev/moq
+  moq-binary 0.1.24  https://github.com/moq-dev/moq
   moq-flate 0.2.0  https://github.com/moq-dev/moq
-  moq-json 0.5.21  https://github.com/moq-dev/moq
-  moq-loc 0.2.32  https://github.com/moq-dev/moq
-  moq-msf 0.5.1  https://github.com/moq-dev/moq
-  moq-mux 0.10.23  https://github.com/moq-dev/moq
-  moq-net 0.3.23  https://github.com/moq-dev/moq
+  moq-json 0.5.22  https://github.com/moq-dev/moq
+  moq-loc 0.2.33  https://github.com/moq-dev/moq
+  moq-msf 0.5.2  https://github.com/moq-dev/moq
+  moq-mux 0.10.25  https://github.com/moq-dev/moq
+  moq-net 0.3.24  https://github.com/moq-dev/moq
   moq-pattern 0.1.4  https://github.com/moq-dev/moq
   moq-sock 0.2.0  https://github.com/moq-dev/moq
-  moq-tokio 0.19.37  https://github.com/moq-dev/moq
+  moq-tokio 0.19.38  https://github.com/moq-dev/moq
   n0-error-macros 1.0.1  https://github.com/n0-computer/n0-error
   netlink-packet-core 0.9.0  https://github.com/rust-netlink/netlink-packet-core
   netlink-proto 0.13.0  https://github.com/rust-netlink/netlink-proto
