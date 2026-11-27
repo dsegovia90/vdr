@@ -27,8 +27,18 @@ use std::time::{Duration, Instant};
 /// two halves arrive together, a relay's forwarded one a round trip later,
 /// but a route that ranks worse than the one lost is held back by the
 /// library for two seconds after a retraction (its quarantine of a stale
-/// path, read in moq-net's source): this outlasts that, so even then the
-/// route change is a freeze, not a leave.
+/// path): this outlasts that, so even then the route change is a freeze, not
+/// a leave.
+///
+/// **The holds of several hops overlap rather than add**, read in moq-net's
+/// source: each announce cursor starts its quarantine when it delivers the
+/// retraction, and retractions are never held, so every hop's starts within
+/// the path's delay of the first. The worse route a relay releases after its
+/// two seconds reaches us when our own quarantine, started as long after
+/// theirs as the retraction took to come, ends too. So the longest wait is
+/// two seconds plus the path's delay, and the half second over that covers
+/// paths up to about that long. Longer would cost every abrupt leave the
+/// same again, on top of the session's linger.
 pub(super) const GRACE: Duration = Duration::from_millis(2500);
 
 /// What of a person's a retraction was for.
