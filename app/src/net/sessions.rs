@@ -4249,6 +4249,23 @@ mod socket_tests {
     /// as they were heard of, this split the room.
     #[tokio::test(flavor = "multi_thread")]
     async fn two_hosts_heard_of_during_the_call_keep_the_room_whole_when_the_relay_stops() {
+        let lost = two_hosts_and_two_guests_through_a_relay_stop(true).await;
+        assert!(lost.is_empty(), "{lost:?}");
+    }
+
+    /// The control: the same room, nobody told of the hosts, so nobody
+    /// dials them and the stop splits it. Without this the check above could
+    /// pass by seeing no loss at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_hosts_nobody_is_told_of_split_the_room_when_the_relay_stops() {
+        let lost = two_hosts_and_two_guests_through_a_relay_stop(false).await;
+        assert!(!lost.is_empty(), "nobody lost anybody, so the check cannot see a split");
+    }
+
+    /// Two hosts and two guests, all on the relay alone at join, each told
+    /// of both hosts (`told`) during the call; then the relay stops. Who lost
+    /// whom for as long as a leave takes.
+    async fn two_hosts_and_two_guests_through_a_relay_stop(told: bool) -> Vec<String> {
         use super::super::super::arrival::Sending;
         let relay = Meeting::older().await;
         let p = hosted_as('c', vec![relay_at(relay.url())]).await;
@@ -4265,13 +4282,15 @@ mod socket_tests {
             Absences::of(&p.origin, &others("p", &everyone), "p").await,
             Absences::of(&h.origin, &others("h", &everyone), "h").await,
         ];
-        let hosts = [('c', p.port), ('e', h.port)];
-        for learn in [&a.learn, &b.learn, &p.learn, &h.learn] {
-            tell(learn, &hosts);
+        if told {
+            let hosts = [('c', p.port), ('e', h.port)];
+            for learn in [&a.learn, &b.learn, &p.learn, &h.learn] {
+                tell(learn, &hosts);
+            }
+            holding(&on_a, &['c', 'e'], true, "a never dialled both hosts").await;
+            holding(&on_b, &['c', 'e'], true, "b never dialled both hosts").await;
+            holding(&h.local, &['c'], true, "the higher host never dialled the lower").await;
         }
-        holding(&on_a, &['c', 'e'], true, "a never dialled both hosts").await;
-        holding(&on_b, &['c', 'e'], true, "b never dialled both hosts").await;
-        holding(&h.local, &['c'], true, "the higher host never dialled the lower").await;
         // Spares offered, routes ranked.
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!p.local.held().contains(&id('e')), "the lower host dialled the higher too");
@@ -4279,12 +4298,18 @@ mod socket_tests {
         let stopped = Instant::now();
         relay.stop().await;
         past_the_grace(stopped + Duration::from_secs(1)).await;
+        let mut lost = Vec::new();
         for (who, view) in everyone.iter().zip(&views) {
             let gone = view.over(super::super::super::grace::GRACE);
-            assert!(gone.is_empty(), "{who} lost {gone:?}");
+            if !gone.is_empty() {
+                lost.push(format!("{who} lost {gone:?}"));
+            }
         }
-        assert_eq!(on_a.sending(), Some(Sending::Host(id('c'))), "a's media is not at the lower host");
-        assert_eq!(on_b.sending(), Some(Sending::Host(id('c'))), "b's media is not at the lower host");
+        if told {
+            assert_eq!(on_a.sending(), Some(Sending::Host(id('c'))), "a's media is not at the lower host");
+            assert_eq!(on_b.sending(), Some(Sending::Host(id('c'))), "b's media is not at the lower host");
+        }
+        lost
     }
 
     /// A guest as a call wires one, on the relay alone at join: its presence
@@ -4412,10 +4437,11 @@ mod socket_tests {
         let view = Absences::of(&g.member.inbound, &[camera_path(&host)], "g").await;
         holding(&g.local, &['e'], true, "g never dialled the host it heard of").await;
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let stopped = Instant::now();
         h.host.local.set_offer(None);
         holding(&g.local, &['e'], false, "g kept its session to a host that stopped hosting").await;
-        past_the_grace(stopped).await;
+        // From the hang-up itself, which comes an overlap after the session
+        // is let go: a loss it caused for good has outlasted the grace by then.
+        past_the_grace(Instant::now() + MOVE_OVERLAP).await;
         let gone = view.over(super::super::super::grace::GRACE);
         assert!(gone.is_empty(), "g lost {gone:?}");
         assert!(g.member.ended.try_recv().is_err(), "the join ended");
