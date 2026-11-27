@@ -353,6 +353,24 @@ pub(super) fn carries_price(version: moq_net::Version) -> bool {
     name.starts_with("moq-lite-") && !matches!(name, "moq-lite-01" | "moq-lite-02" | "moq-lite-03" | "moq-lite-04" | "moq-lite-05")
 }
 
+/// Where we say our media goes (`via` in presence), given the host the
+/// session carrying it reaches (`None` for the relay).
+///
+/// **A host the call has moved to says its guests**, though it still offers
+/// on the relay: everyone who follows the move reads it directly, so saying
+/// "relay" drew it on the room's map as sending to a relay nobody pulled
+/// from. Anyone who does not follow the move and does read it through the
+/// relay says so in their own report of routes, which the map draws as it
+/// is. The session to the relay stays in what we say we hold.
+pub(super) fn says(carrier_host: Option<&str>, serving: bool, call_host: Option<&str>, me: &str) -> super::super::arrival::Sending {
+    use super::super::arrival::Sending;
+    match carrier_host {
+        _ if serving && call_host == Some(me) => Sending::Guests,
+        None => Sending::Relay,
+        Some(id) => Sending::Host(id.to_string()),
+    }
+}
+
 /// Whether a join keeps a spare offer at all: only with the switch on, and
 /// never while hosting, whose one origin is offered whole on every session.
 pub(super) fn keeps_spare(hosting: bool, switch: bool) -> bool {
@@ -1029,10 +1047,6 @@ pub(super) fn join(args: Join) -> Peer {
                         None => tracing::info!("our media goes through the relay"),
                         Some(id) => tracing::info!("our media goes through host {id}"),
                     }
-                    local.set_sending(Some(match &member.target.host {
-                        None => super::super::arrival::Sending::Relay,
-                        Some(id) => super::super::arrival::Sending::Host(id.clone()),
-                    }));
                     if let Some(session) = &member.session {
                         _following = Some(follow(session, &estimate, &metrics));
                     }
@@ -1056,6 +1070,19 @@ pub(super) fn join(args: Join) -> Peer {
                     keyframe.ask();
                     carrier = None;
                     on_guests = true;
+                }
+
+                // Said again whenever the carrier or the call's place changes;
+                // set only on a change, since the announcer acts on it.
+                if let Some(carrier) = carrier.filter(|_| !on_guests) {
+                    let call_host = local.call_host();
+                    let now = says(members[carrier].target.host.as_deref(), serving, call_host.as_deref(), &me);
+                    if local.sending().as_ref() != Some(&now) {
+                        if now == super::super::arrival::Sending::Guests {
+                            tracing::info!("the call is on us: our media goes to our guests");
+                        }
+                        local.set_sending(Some(now));
+                    }
                 }
 
                 let now_via = via(&states, serving);
@@ -1340,6 +1367,18 @@ mod tests {
         for newer in ["moq-lite-06", "moq-lite-07-wip"] {
             assert!(carries_price(version(newer)), "{newer}");
         }
+    }
+
+    #[test]
+    fn a_host_the_call_is_on_says_its_guests_and_everyone_else_their_carrier() {
+        use super::super::super::arrival::Sending;
+        let (me, other) = (id('c'), id('d'));
+        assert_eq!(says(None, true, Some(&me), &me), Sending::Guests, "the call is on us");
+        assert_eq!(says(None, true, None, &me), Sending::Relay, "the call is on the relay");
+        assert_eq!(says(None, true, Some(&other), &me), Sending::Relay, "the call is on another host we reach through the relay");
+        assert_eq!(says(Some(&other), true, Some(&other), &me), Sending::Host(other.clone()));
+        assert_eq!(says(None, false, Some(&me), &me), Sending::Relay, "not serving: nobody reads us as a host");
+        assert_eq!(says(Some(&other), false, None, &me), Sending::Host(other.clone()));
     }
 
     #[test]

@@ -4425,6 +4425,24 @@ mod presence_tests {
         assert!(!heard.mic);
     }
 
+    /// A host the call has moved to says its guests and still holds the
+    /// relay: both words go out, come back, and leave an older reader able
+    /// to read the rest.
+    #[test]
+    fn a_host_the_call_is_on_says_its_guests_and_holds_the_relay() {
+        let local = crate::net::PeerStats::default();
+        local.set_name(Some("Ada".into()));
+        local.set_sending(Some(super::arrival::Sending::Guests));
+        local.set_held(vec![crate::net::web::HELD_RELAY.to_string()]);
+        let said = Presence::here(&local);
+        let json = serde_json::to_string(&said).unwrap();
+        assert!(json.contains(r#""via":"guests""#) && json.contains(r#""held":["relay"]"#), "{json}");
+        let heard: Presence = serde_json::from_str(&json).unwrap();
+        assert_eq!((heard.via, heard.held), (Some(super::arrival::Sending::Guests), vec!["relay".to_string()]));
+        let older: Unwoven = serde_json::from_str(&json).unwrap();
+        assert_eq!(older.name.as_deref(), Some("Ada"));
+    }
+
     #[test]
     fn an_older_peer_reads_a_document_that_says_where_we_send() {
         let json = serde_json::to_string(&Presence::here(&woven())).unwrap();
