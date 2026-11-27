@@ -1332,9 +1332,11 @@ async fn run(
         // linger that closes it on the spot: our decoder's read ends, the task
         // returns, the tile goes black -- and nothing ever re-subscribes, so the
         // transport quietly redialling underneath changes nothing. A linger
-        // keeps the path announced instead, and a session re-attaching within
-        // the window splices into the same broadcast, so the gap is never
-        // observed above this line.
+        // keeps the path announced instead. A session re-attaching within the
+        // window is a new route to the same path, which the library takes as
+        // the end of the old broadcast and a bounce of the path (inferred
+        // from moq-net's source, not seen here): the attendance loop reads
+        // that as a change of route, never a leave (`grace.rs`).
         //
         // **A host has one origin, not two.** What its guests publish is
         // offered back out to every other guest, which is what lets them see

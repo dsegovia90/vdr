@@ -3,7 +3,8 @@
 //!
 //! **A reader carried to a new route waits for a group that may never come.**
 //! When our offer moves (the call moving between the relay and a host, a
-//! spare taking over, a session coming or going), the library carries a
+//! spare taking over, a session coming or going), an older relay (one on
+//! moq-net before 0.3.24), or a peer on an older build of ours, carries a
 //! reader's subscription across by resuming on the new route just past the
 //! last group it had. Media has a next group within a second or two; a
 //! catalog gets one only when it changes, which may be never. A relay that
@@ -13,6 +14,10 @@
 //! blank (seen for 19 s, until a camera was toggled). That the relay keeps
 //! the empty copy for later subscribers is read from its source, not seen
 //! inside it.
+//!
+//! A current library never carries a read across: it ends the read, which
+//! is asked for again and starts at the newest group. In a room of current
+//! builds on a current relay this is redundant; it stays for the rest.
 //!
 //! **So a catalog is written again, unchanged in substance.** The library
 //! writes nothing for a catalog equal to the last one, so what is written is
