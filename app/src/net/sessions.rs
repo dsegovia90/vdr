@@ -3294,21 +3294,44 @@ mod socket_tests {
     /// Bytes a second a host receives over every session it accepted,
     /// measured over `over`: what its guests upload to it.
     async fn received(host: &Meeting, over: Duration) -> u64 {
-        let total = || -> u64 {
-            host.sessions.lock().unwrap().iter().map(|session| session.stats().bytes_received.unwrap_or(0)).sum()
-        };
-        let start = total();
-        tokio::time::sleep(over).await;
-        (total() - start) * 1000 / over.as_millis() as u64
+        rate(over, || host.sessions.lock().unwrap().iter().map(|session| session.stats().bytes_received.unwrap_or(0)).sum()).await
     }
 
     /// Bytes a second a connection sends, measured over `over`.
     async fn sent(connection: &moq_tokio::Connection, over: Duration) -> u64 {
         let monitor = connection.monitor();
-        let total = || monitor.stats().and_then(|stats| stats.bytes_sent).unwrap_or(0);
-        let start = total();
-        tokio::time::sleep(over).await;
-        (total() - start) * 1000 / over.as_millis() as u64
+        rate(over, || monitor.stats().and_then(|stats| stats.bytes_sent).unwrap_or(0)).await
+    }
+
+    /// How often a session's counters are sampled while someone reads them
+    /// (moq-net's `POLL_INTERVAL`, read in its source), and a margin.
+    const SAMPLED: Duration = Duration::from_millis(150);
+
+    /// The rate of a byte counter over `over`.
+    ///
+    /// **A session's counters are a sample, taken when they are asked for.**
+    /// A read returns the last sample and asks for the next, and sampling
+    /// pauses once nobody has asked for a while. So the first read after a
+    /// pause is as old as the last read before it: read once at each end, a
+    /// window measured what the counters did since the previous measurement,
+    /// seconds earlier, rather than over `over`. After a relay stop that
+    /// counted the half-second before the spare carried, and the rate came out
+    /// at half the stream. Asked for throughout instead, both ends are at most
+    /// one sample old.
+    async fn rate(over: Duration, total: impl Fn() -> u64) -> u64 {
+        let ask = |until: Instant| {
+            let total = &total;
+            async move {
+                while Instant::now() < until {
+                    total();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                total()
+            }
+        };
+        let start = ask(Instant::now() + SAMPLED).await;
+        let end = ask(Instant::now() + over).await;
+        end.saturating_sub(start) * 1000 / over.as_millis() as u64
     }
 
     /// What the member sends: 2000 bytes every 20 ms, 100 kB/s.
