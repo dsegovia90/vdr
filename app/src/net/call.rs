@@ -77,6 +77,16 @@ impl Drop for Abort {
     }
 }
 
+impl Abort {
+    /// Aborts the task and waits until it has stopped: an abort only asks,
+    /// and the task's own drops (an invite it clears on the way out) would
+    /// otherwise run whenever it is next polled, after whatever replaces it.
+    async fn stop(mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
+
 /// What a connected peer is, whichever side established it.
 ///
 /// The two arms differ only in how they reach this: one dials a client, the
@@ -2399,7 +2409,12 @@ async fn attend(
         match strand {
             Strand::Presence => {
                 here.present.insert(id.clone());
-                // Replaces the reader of the broadcast that ended, if any.
+                // The reader of the broadcast that ended, if any, is stopped
+                // before the new one starts: on its way out it drops their
+                // invite, which must not undo what the new one hears.
+                if let Some(old) = here.listening.remove(&id) {
+                    old.stop().await;
+                }
                 here.listening.insert(
                     id.clone(),
                     Abort(tokio::spawn(listen(
@@ -5345,12 +5360,14 @@ mod grace_tests {
     struct Watching {
         events: futures_channel::mpsc::UnboundedReceiver<ParticipantEvent>,
         hangups: futures_channel::mpsc::UnboundedReceiver<String>,
+        local: Arc<PeerStats>,
         _attending: Abort,
     }
 
     fn watching(origin: &moq_net::origin::Producer, in_room: bool) -> Watching {
         let (participants, events) = futures_channel::mpsc::unbounded();
         let (hangup, hangups) = futures_channel::mpsc::unbounded();
+        let local = Arc::new(PeerStats::default());
         let reports = Reports {
             status: futures_channel::mpsc::unbounded().0,
             participants,
@@ -5358,7 +5375,7 @@ mod grace_tests {
             metrics: Arc::new(Metrics::default()),
             in_room,
             rooms: audio::Rooms {
-                local: Arc::new(PeerStats::default()),
+                local: local.clone(),
                 controls: Arc::default(),
             },
             news: None,
@@ -5372,6 +5389,7 @@ mod grace_tests {
         Watching {
             events,
             hangups,
+            local,
             _attending: attending,
         }
     }
@@ -5593,5 +5611,42 @@ mod grace_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(withdrawn.elapsed() >= GRACE - Duration::from_millis(50));
+    }
+
+    /// An invite heard before a bounce of the inviter's presence stands
+    /// after it: the reader of the ended broadcast, which drops the invite on
+    /// its way out, is gone before the new one hears it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invite_survives_a_bounce_of_its_presence() {
+        let origin = moq_tokio::origin::spawn();
+        let w = watching(&origin, true);
+        let inviting = Presence {
+            room: Some("side".to_string()),
+            requests: vec![Request {
+                to: "me".to_string(),
+                kind: Ask::Invite,
+                nonce: 1,
+            }],
+            ..Presence::default()
+        };
+        let (first, said) = present(&origin, "them");
+        say(&said, inviting.clone());
+        let invited = |w: &Watching| w.local.invites().contains_key("them");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !invited(&w) {
+            assert!(Instant::now() < deadline, "the invite never arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for _ in 0..5 {
+            let (again, said_again) = present(&origin, "them");
+            say(&said_again, inviting.clone());
+            read(&first, false, "the old presence was still read").await;
+            read(&again, true, "the new presence was never read").await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(invited(&w), "a bounce dropped the invite");
+            drop(again);
+            drop(said_again);
+        }
+        drop(first);
     }
 }
