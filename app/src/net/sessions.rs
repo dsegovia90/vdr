@@ -3534,6 +3534,11 @@ mod socket_tests {
 
     /// The same, letting in only guests who present `door`'s, when given.
     async fn hosted_behind(me: char, targets: Vec<Target>, door: Option<door::Hosting>) -> Hosted {
+        hosted_through(me, targets, door, client()).await
+    }
+
+    /// The same, dialling with `client`.
+    async fn hosted_through(me: char, targets: Vec<Target>, door: Option<door::Hosting>, client: moq_tokio::Client) -> Hosted {
         crypto();
         let shared = moq_tokio::origin::spawn();
         let mut config = moq_tokio::server::Config::default();
@@ -3554,7 +3559,7 @@ mod socket_tests {
         local.set_offer(Some(offer));
         let (learn, learned) = futures_channel::mpsc::unbounded();
         let host = join(Join {
-            client: client(),
+            client,
             me: id(me),
             targets,
             outbound: shared.clone(),
@@ -4640,5 +4645,183 @@ mod socket_tests {
         tokio::time::sleep(MOVE_OVERLAP + Duration::from_secs(1)).await;
         let dialled = room.host.sessions.lock().unwrap().len();
         assert_eq!(dialled, 1, "the host was dialled {dialled} times");
+    }
+
+    /// Two hosts and two guests holding sessions to both, as in a room where
+    /// everyone heard of both hosts. The relay stops, the guests' media goes
+    /// to the lower host, the relay comes back, and the guests' media moves
+    /// back to it once it has held. The higher host, which reads the guests
+    /// the way the call does, must still be getting every guest's frames
+    /// well past that move. This stand-in relay follows route changes, and
+    /// the room passes on it; stock moq-relay 0.14 does not (the test below).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_host_keeps_seeing_the_guests_after_the_relay_comes_back() {
+        use super::super::super::arrival::Sending;
+        let relay = Meeting::older().await;
+        let port = relay.port;
+        let h = hosted_through('c', vec![relay_at(at(port))], None, patient_client()).await;
+        let d = hosted_through('e', vec![relay_at(at(port)), host_at('c', at(h.port))], None, patient_client()).await;
+        let targets = || vec![relay_at(at(port)), host_at('c', at(h.port)), host_at('e', at(d.port))];
+        let mut guests = Vec::new();
+        for me in ["a", "b"] {
+            let local = Arc::new(PeerStats::default());
+            let outbound = moq_tokio::origin::spawn();
+            let mut camera = camera(me, &outbound);
+            let member = joined_asking(me, targets(), patient_client(), local.clone(), outbound, camera.keyframe.clone());
+            camera.turn_on();
+            guests.push((me, local, camera, member));
+        }
+        let views: Vec<(&str, (Abort, Abort, Arrivals))> =
+            ["a", "b"].into_iter().map(|who| (who, viewing_of(&id('e'), &d.origin, Some(who)))).collect();
+        for (who, (_, _, arrivals)) in &views {
+            arrivals.more(30, &format!("the second host never saw {who}")).await;
+        }
+
+        relay.stop().await;
+        for (who, (_, _, arrivals)) in &views {
+            arrivals.more(30, &format!("the second host lost {who} when the relay stopped")).await;
+        }
+        let relay = relay_again(port).await;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        for (me, local, _, _) in &guests {
+            while local.sending() != Some(Sending::Relay) {
+                assert!(Instant::now() < deadline, "{me}'s media never went back to the relay");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        // Well past the move, its overlap and the grace.
+        tokio::time::sleep(MOVE_OVERLAP + super::super::super::grace::GRACE + Duration::from_secs(1)).await;
+        for (who, (_, _, arrivals)) in &views {
+            let from = arrivals.count();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let got = arrivals.count() - from;
+            assert!(got >= 30, "the second host got {got} of {who}'s frames in 2 s after the guests moved back");
+        }
+        drop(relay);
+    }
+
+    /// A moq-relay process run from its binary, for what only a real relay
+    /// shows: `VDR_TEST_RELAY_BIN` names the binary, and the relay listens on
+    /// `port` with anonymous access and a self-signed certificate.
+    struct Process {
+        child: std::process::Child,
+    }
+
+    impl Process {
+        fn start(port: u16) -> Option<Process> {
+            let bin = std::env::var("VDR_TEST_RELAY_BIN").ok()?;
+            let dir = std::env::temp_dir().join(format!("vdr-test-relay-{port}"));
+            std::fs::create_dir_all(&dir).ok()?;
+            let toml = format!(
+                "[log]\nlevel = \"debug\"\n[server]\nlisten = \"127.0.0.1:{port}\"\ntls.generate = [\"localhost\"]\n[auth]\npublic = \"\"\n"
+            );
+            std::fs::write(dir.join("relay.toml"), toml).ok()?;
+            let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("relay.log")).ok()?;
+            let child = std::process::Command::new(bin)
+                .arg("relay.toml")
+                .current_dir(&dir)
+                .stdout(log.try_clone().ok()?)
+                .stderr(log)
+                .spawn()
+                .ok()?;
+            Some(Process { child })
+        }
+
+        /// A polite stop, as SIGTERM gives one: the relay says it is going
+        /// away, then exits.
+        fn stop(mut self) {
+            let _ = std::process::Command::new("kill").args(["-TERM", &self.child.id().to_string()]).status();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The hand test's room on a real moq-relay: two hosts, two guests
+    /// holding sessions to both, a polite stop, the relay back, the guests'
+    /// media back on it. The higher host must still get every guest's
+    /// frames. On moq-relay 0.14 its reads of the guests, open across the
+    /// guests' move back, froze for good (on master too) with no bounce
+    /// reaching it; a plain member in its place did not. With the watch in
+    /// `follow` they are asked for again, a freeze of about six seconds.
+    /// Needs `VDR_TEST_RELAY_BIN`; run with `--ignored`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn on_a_real_relay_a_second_host_keeps_seeing_the_guests_after_the_relay_comes_back() {
+        on_a_real_relay(true).await;
+    }
+
+    /// The same with a plain member in the second host's place.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn on_a_real_relay_a_member_keeps_seeing_the_guests_after_the_relay_comes_back() {
+        on_a_real_relay(false).await;
+    }
+
+    async fn on_a_real_relay(second_host: bool) {
+        use super::super::super::arrival::Sending;
+        let port = Reserved::new().release();
+        let Some(relay) = Process::start(port) else {
+            eprintln!("VDR_TEST_RELAY_BIN is not set; nothing to run");
+            return;
+        };
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let h = hosted_through('c', vec![relay_at(at(port))], None, patient_client()).await;
+        let d = hosted_through('e', vec![relay_at(at(port)), host_at('c', at(h.port))], None, patient_client()).await;
+        let targets = || match second_host {
+            true => vec![relay_at(at(port)), host_at('c', at(h.port)), host_at('e', at(d.port))],
+            false => vec![relay_at(at(port)), host_at('c', at(h.port))],
+        };
+        let v = joined("v", vec![relay_at(at(port)), host_at('c', at(h.port))], patient_client(), Arc::new(PeerStats::default()), moq_tokio::origin::spawn());
+        let watched = if second_host { d.origin.clone() } else { v.inbound.clone() };
+        let mut guests = Vec::new();
+        for me in ["a", "b"] {
+            let local = Arc::new(PeerStats::default());
+            let outbound = moq_tokio::origin::spawn();
+            let mut camera = camera(me, &outbound);
+            let member = joined_asking(me, targets(), patient_client(), local.clone(), outbound, camera.keyframe.clone());
+            camera.turn_on();
+            guests.push((me, local, camera, member));
+        }
+        let views: Vec<(&str, (Abort, Abort, Arrivals))> =
+            ["a", "b"].into_iter().map(|who| (who, viewing_of(&id('e'), &watched, Some(who)))).collect();
+        for (who, (_, _, arrivals)) in &views {
+            arrivals.more(30, &format!("the second host never saw {who}")).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        relay.stop();
+        for (who, (_, _, arrivals)) in &views {
+            arrivals.more(30, &format!("the second host lost {who} when the relay stopped")).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _relay = Process::start(port).expect("the relay again");
+        let back = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for (me, local, _, _) in &guests {
+            while local.sending() != Some(Sending::Relay) {
+                assert!(Instant::now() < deadline, "{me}'s media never went back to the relay");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        // Past the move, and past what it takes a frozen read to be noticed
+        // and asked for again (`follow::STALLED`), so a read the watch had
+        // to rescue counts, but one left frozen does not.
+        tokio::time::sleep(MOVE_OVERLAP + super::super::super::follow::STALLED + super::super::super::follow::AGAIN_MAX + Duration::from_secs(2)).await;
+        let mut stuck = Vec::new();
+        for (who, (_, _, arrivals)) in &views {
+            eprintln!("{who}: longest gap since the relay came back {:?}", arrivals.longest_gap(back));
+            let from = arrivals.count();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let got = arrivals.count() - from;
+            if got < 30 {
+                stuck.push(format!("{who}: {got} frames in 2 s"));
+            }
+        }
+        assert!(stuck.is_empty(), "the second host after the guests moved back: {stuck:?}");
     }
 }
