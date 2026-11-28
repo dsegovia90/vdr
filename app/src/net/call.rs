@@ -4017,6 +4017,12 @@ impl follow::Reader for Video {
         })
     }
 
+    /// Frames put on the tile so far, and whether their presence says the
+    /// camera is on: what the watch against a frozen read counts.
+    fn delivered(&self) -> Option<(u64, bool)> {
+        Some((self.slot.published(), self.stats.camera_on()))
+    }
+
     /// The producer is gone, so the last frame must come off the screen
     /// rather than sit there looking live.
     fn stopped(&mut self) {

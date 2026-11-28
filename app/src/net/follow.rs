@@ -44,6 +44,15 @@
 //! again ends the wait either way. Only the first catalog of a read is
 //! waited for like this: after it, a catalog that is quiet has simply not
 //! changed.
+//!
+//! **A player that delivers nothing while its sender says it sends is
+//! replaced** ([`STALLED`]): a read can be left on a copy whose source has
+//! gone quiet without ending, and no bounce reaches us to say so, as a relay
+//! that carries reads across a change of route leaves one. The picture then
+//! freezes for good, with nothing in the log. So a reader that can count
+//! what it delivered ([`Reader::delivered`]) is watched: no frame for that
+//! long, with the sender's camera on, and the player is dropped and the
+//! broadcast asked for again as if its read had ended.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -133,6 +142,42 @@ const HOLD: Duration = Duration::from_millis(2500);
 /// this route. Shorter than the publisher's own rewrite (`fresh.rs`), so a
 /// better route, if asking again finds one, is not left waiting on it.
 pub(in crate::net) const PATIENCE: Duration = Duration::from_secs(3);
+
+/// How long a watched player may deliver nothing while its sender says it
+/// is sending before it is replaced. Well past any freeze a change of route
+/// makes (a group, two seconds) and a sender at its link's floor, which
+/// still sends a frame every second or so; short enough that a frozen tile is
+/// back within seconds.
+pub(in crate::net) const STALLED: Duration = Duration::from_secs(5);
+
+/// How often a watched player's count is looked at.
+const WATCH_EVERY: Duration = Duration::from_secs(1);
+
+/// Whether a watched player has gone quiet: the count it was last seen at,
+/// and since when.
+#[derive(Debug, Default)]
+struct Quiet {
+    seen: Option<(u64, tokio::time::Instant)>,
+}
+
+impl Quiet {
+    /// Looks at `count` at `now`, `sending` whether the sender says it
+    /// sends. Whether it has delivered nothing for [`STALLED`] while sending.
+    fn stalled(&mut self, count: u64, sending: bool, now: tokio::time::Instant) -> bool {
+        match self.seen {
+            Some((seen, since)) if seen == count && sending => now.duration_since(since) >= STALLED,
+            _ => {
+                self.seen = Some((count, now));
+                false
+            }
+        }
+    }
+
+    /// A new player, or none: start counting afresh.
+    fn reset(&mut self) {
+        self.seen = None;
+    }
+}
 
 /// Whether the first catalog of a read is late, and whether that has been
 /// said: once an outage, however many reads it takes.
@@ -236,6 +281,14 @@ pub(in crate::net) trait Reader: Send {
     /// Nothing is playing any more: the rendition was withdrawn, or the read
     /// ended and nothing took over within [`HOLD`].
     fn stopped(&mut self) {}
+
+    /// How many things its player has delivered so far, and whether the
+    /// sender says it is sending them, for the watch against a player that
+    /// goes quiet without ending ([`STALLED`]). `None`, the default, for a
+    /// reader that is not watched.
+    fn delivered(&self) -> Option<(u64, bool)> {
+        None
+    }
 }
 
 /// Where to ask for a peer's broadcast again.
@@ -272,6 +325,7 @@ pub(in crate::net) async fn follow<R: Reader>(
     // The broadcast whose read just ended, when one did: how long to wait
     // before asking again depends on whether it has closed.
     let mut ended: Option<moq_net::broadcast::Consumer> = None;
+    let mut quiet = Quiet::default();
     loop {
         let broadcast = match next.take() {
             Some(broadcast) => broadcast,
@@ -317,6 +371,7 @@ pub(in crate::net) async fn follow<R: Reader>(
             }
         };
         loop {
+            let watched = playing.is_some() && reader.delivered().is_some();
             let finished = async {
                 match playing.as_mut() {
                     Some((_, task)) => (&mut task.0).await,
@@ -333,6 +388,12 @@ pub(in crate::net) async fn follow<R: Reader>(
                 match overdue.due {
                     Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending().await,
+                }
+            };
+            let watch = async move {
+                match watched {
+                    true => tokio::time::sleep(WATCH_EVERY).await,
+                    false => std::future::pending().await,
                 }
             };
             tokio::select! {
@@ -364,6 +425,7 @@ pub(in crate::net) async fn follow<R: Reader>(
                                     failed = None;
                                     let task = Task(tokio::spawn(reader.play(&broadcast, &snapshot, &wanted)));
                                     playing = Some((wanted, task));
+                                    quiet.reset();
                                 }
                             }
                         }
@@ -410,6 +472,19 @@ pub(in crate::net) async fn follow<R: Reader>(
                     late(&mut overdue, &mut lost, &peer, what);
                     break;
                 }
+                _ = watch => {
+                    let Some((count, sending)) = reader.delivered() else { continue };
+                    if quiet.stalled(count, sending, tokio::time::Instant::now()) {
+                        // Dropped, not left: a player on a read that has gone
+                        // quiet would be kept by the next catalog as healthy.
+                        playing = None;
+                        quiet.reset();
+                        held.get_or_insert(tokio::time::Instant::now() + HOLD);
+                        lose(&mut lost, &peer, what, &format!("nothing for {}s while they say it is on", STALLED.as_secs()));
+                        ended = Some(broadcast.clone());
+                        break;
+                    }
+                }
             }
         }
     }
@@ -443,7 +518,7 @@ impl Drop for Task {
 
 #[cfg(test)]
 mod tests {
-    use super::{Overdue, Rendition, PATIENCE};
+    use super::{Overdue, Quiet, Rendition, PATIENCE, STALLED};
     use serde_json::json;
     use std::time::Duration;
 
@@ -475,6 +550,23 @@ mod tests {
         overdue.heard();
         overdue.began(start + PATIENCE * 10);
         assert!(overdue.lapsed());
+    }
+
+    #[test]
+    fn a_player_is_stalled_only_after_delivering_nothing_for_long_while_sending() {
+        let start = tokio::time::Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut quiet = Quiet::default();
+        assert!(!quiet.stalled(10, true, at(0)));
+        assert!(!quiet.stalled(10, true, at(4000)), "not yet");
+        assert!(!quiet.stalled(11, true, at(4500)), "a frame resets it");
+        assert!(!quiet.stalled(11, true, at(4500 + 4900)));
+        assert!(quiet.stalled(11, true, at(4500 + STALLED.as_millis() as u64)), "nothing for the whole of it");
+        let mut quiet = Quiet::default();
+        assert!(!quiet.stalled(3, false, at(0)));
+        assert!(!quiet.stalled(3, false, at(60_000)), "a camera said to be off is never stalled");
+        assert!(!quiet.stalled(3, true, at(60_000)), "counted from when it says it is on again");
+        assert!(quiet.stalled(3, true, at(60_000 + STALLED.as_millis() as u64)));
     }
 
     #[test]
@@ -621,6 +713,65 @@ mod tests {
         let plays = ending.plays.load(std::sync::atomic::Ordering::Relaxed);
         following.abort();
         assert!((2..=5).contains(&plays), "{plays} plays in 2.2 s");
+    }
+
+    /// A player that never delivers and never ends, while its sender says
+    /// it sends: what a read left on a copy that went quiet looks like.
+    #[derive(Clone, Default)]
+    struct Frozen {
+        plays: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        off: bool,
+    }
+
+    impl super::Reader for Frozen {
+        const WHAT: &'static str = "video";
+
+        fn pick(&self, catalog: &super::Catalog) -> Option<Rendition> {
+            let (name, config) = catalog.video.renditions.iter().next()?;
+            Some(Rendition::new(name, config))
+        }
+
+        fn play(&mut self, _: &moq_net::broadcast::Consumer, _: &super::Catalog, _: &Rendition) -> super::Playing {
+            self.plays.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(std::future::pending())
+        }
+
+        fn delivered(&self) -> Option<(u64, bool)> {
+            Some((0, !self.off))
+        }
+    }
+
+    /// The frozen player is replaced and the broadcast asked for again once
+    /// it has delivered nothing for [`STALLED`]; one whose sender says the
+    /// camera is off is left alone.
+    #[tokio::test]
+    async fn a_player_that_delivers_nothing_while_its_sender_sends_is_replaced() {
+        for off in [false, true] {
+            let origin = moq_tokio::origin::spawn();
+            let mut broadcast = origin.create_broadcast("frozen").unwrap();
+            let catalog = super::super::fresh::catalog(&mut broadcast).unwrap();
+            let mut config = moq_video::encode::Config::new(160, 90, moq_video::Rate::new(30, 1).unwrap());
+            config.kind = moq_video::encode::Kind::Software;
+            let rendition = config.probe().await.unwrap();
+            let track = broadcast.create_track("video.avc3", catalog.track_info(60)).unwrap();
+            let _video = super::super::fresh::Video::with_track(track, catalog.clone(), rendition).unwrap();
+            broadcast.announce(moq_net::origin::Route::default()).unwrap();
+
+            let reading = origin.consume().request_broadcast("frozen").await.unwrap();
+            let frozen = Frozen { off, ..Frozen::default() };
+            let asking = super::Asking {
+                inbound: origin.consume(),
+                path: "frozen".to_string(),
+            };
+            let following = tokio::spawn(super::follow(Some(asking), reading, "someone".into(), frozen.clone()));
+            tokio::time::sleep(STALLED + super::AGAIN_MAX + Duration::from_secs(2)).await;
+            let plays = frozen.plays.load(std::sync::atomic::Ordering::Relaxed);
+            following.abort();
+            match off {
+                false => assert!(plays >= 2, "a frozen player was never replaced ({plays} plays)"),
+                true => assert_eq!(plays, 1, "a player whose camera is said to be off was replaced"),
+            }
+        }
     }
 
     #[test]

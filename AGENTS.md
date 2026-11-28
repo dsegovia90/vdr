@@ -248,6 +248,14 @@ focus.
   of the session's linger. Readers that lose a read with the broadcast still
   open ask again on a doubling wait (`follow::Again`), never four times a
   second for ever.
+- **A video tile with no frame for five seconds, while that person's
+  presence says the camera is on, asks for their broadcast again**
+  (`follow::STALLED`). A read can be left on a copy that went quiet without
+  ending and without a bounce: seen on a second host's reads of guests after
+  stock moq-relay 0.14 came back and the guests moved their media back to it
+  (frozen for good before; on master too). Why that read strands is not
+  established; `sessions.rs` has the test, ignored unless
+  `VDR_TEST_RELAY_BIN` names a moq-relay binary.
 - **Audio is not video's shape.** Video is newest-wins end to end; audio is
   buffered and loss-tolerant, and the two are never aligned to each other.
   `net/audio.rs` sets the decoder's `max_age` explicitly because the default
@@ -439,7 +447,7 @@ focus.
 | `camera/frames.rs` | `FrameSlot`: newest-wins handoff, with its own neutral `Frame`/`Pixels` |
 | `camera/paint/` | `VideoPaintSource` (a blitz `Widget`), wgpu upload, fit math |
 | `net/call.rs` | a call over iroh + MoQ: rooms on a relay, direct calls, hosting a room (`--host`), presence |
-| `net/follow.rs` | reading what a peer offers (video, voice, screen) for as long as they are here: follows the catalog, asks again for a broadcast whose read ended (at once once it has closed, backing off while it stays open) |
+| `net/follow.rs` | reading what a peer offers (video, voice, screen) for as long as they are here: follows the catalog, asks again for a broadcast whose read ended (at once once it has closed, backing off while it stays open), and replaces a video player that delivers nothing for `STALLED` while their camera is said to be on |
 | `net/grace.rs` | withdrawals waiting out their grace, per person and strand (presence, camera, screen): which are a change of route and which a leave (pure) |
 | `net/sessions.rs` | every join: the relay and the room's hosts dialled together, those saved and those heard of during the call (`Hosts`, at most eight: those whose session works, then the lowest ids): which session carries our media, and moving it; a change of route reaches viewers as a bounce of the path, read again from the newest group |
 | `net/arrival.rs` | through whom each person's video arrives, read off its route's hop chain, and where ours goes, for the log and the host borders on tiles (`read` and `through` are pure) |
