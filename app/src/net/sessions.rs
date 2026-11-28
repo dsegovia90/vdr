@@ -47,9 +47,19 @@
 //! the bridge between its guests and the rest of the room, and a guest's
 //! broadcast has to reach the relay through it with its own route intact,
 //! which an offer re-made through a gate would lose. Pricing keeps the extra
-//! routes unused while a cheaper one exists. A host dials only the saved hosts
+//! routes unused while a cheaper one exists. A host dials only the hosts
 //! whose id sorts below its own, so two hosts hold one session between them,
 //! not two.
+//!
+//! **A host heard of during the call is dialled then** ([`Learned`],
+//! [`Hosts`]), by the same rules as one known at join: its door, its price,
+//! the spare. Two hosts that have not dialled each other make two rooms when
+//! the relay goes, each with whoever reaches it, so the rule above has to
+//! hold whichever of them joined first. A session is added at the end of the
+//! list but ranked by id ([`ranked`]), so our media still goes where
+//! everyone else's does. It is hung up when the host's presence says it no
+//! longer hosts, or names another door; a host that left is let go only once
+//! its session has ended, never on the word alone (see [`Hosts`]).
 //!
 //! **Known limit: a partition.** A guest who can reach only a host, while that
 //! host cannot reach a relay everyone else is on, loses whoever offers on the
@@ -220,28 +230,197 @@ impl std::fmt::Debug for Target {
 /// the relay we were given, and a host whose door is not one. A host (`hosting`)
 /// dials only hosts below its own id: the one above dials it.
 pub(super) fn targets(relay: &url::Url, hosts: &[door::Known], me: &str, hosting: bool) -> Vec<Target> {
-    let mut ids: Vec<&door::Known> = hosts
-        .iter()
-        .filter(|host| host.id != me && Some(host.id.as_str()) != relay.host_str())
-        .filter(|host| !hosting || host.id.as_str() < me)
-        .filter(|host| door::is_door(&host.door))
-        .collect();
+    let mut ids: Vec<&door::Known> = hosts.iter().filter(|host| dials(&host.id, relay, me, hosting)).collect();
     ids.sort_by(|a, b| a.id.cmp(&b.id));
     ids.dedup_by(|a, b| a.id == b.id);
     let mut targets = vec![Target {
         host: None,
         url: relay.clone(),
     }];
-    for host in ids {
-        let Ok(mut url) = url::Url::parse(&format!("iroh://{}", host.id)) else { continue };
-        url.set_path(relay.path());
-        url.query_pairs_mut().append_pair(door::PARAM, &host.door);
-        targets.push(Target {
-            host: Some(host.id.clone()),
-            url,
-        });
-    }
+    targets.extend(ids.into_iter().filter_map(|host| target(relay, host)).take(HOSTS_DIALLED));
     targets
+}
+
+/// Whether a join dials the host `id`: never ourselves or the relay we were
+/// given, and from a host only a host below it, so two hosts hold one
+/// session between them, whichever of them heard of the other first.
+pub(super) fn dials(id: &str, relay: &url::Url, me: &str, hosting: bool) -> bool {
+    id != me && Some(id) != relay.host_str() && (!hosting || id < me)
+}
+
+/// Where a host is dialled: its endpoint, at the relay room's path, with its
+/// door. `None` for a door that is not one.
+pub(super) fn target(relay: &url::Url, host: &door::Known) -> Option<Target> {
+    if !door::is_door(&host.door) {
+        return None;
+    }
+    let mut url = url::Url::parse(&format!("iroh://{}", host.id)).ok()?;
+    url.set_path(relay.path());
+    url.query_pairs_mut().append_pair(door::PARAM, &host.door);
+    Some(Target {
+        host: Some(host.id.clone()),
+        url,
+    })
+}
+
+/// The most hosts a join holds sessions to: as many as a room keeps.
+pub(super) const HOSTS_DIALLED: usize = crate::recent::HOSTS_KEPT;
+
+/// What the room's presence tells a join about a host as the call goes on.
+#[derive(Debug)]
+pub(super) enum Learned {
+    /// It hosts the room, dialled at this target (which carries its door).
+    Host(Target),
+    /// Its presence says it no longer hosts the room.
+    Stopped(String),
+    /// It left the room: its presence went for longer than a bounce's grace,
+    /// or it said goodbye.
+    Left(String),
+}
+
+/// The hosts a join wants a session to: those known at join and those heard
+/// since, less any that stopped hosting.
+///
+/// **The lowest ids are dialled, not the latest heard**, past
+/// [`HOSTS_DIALLED`] ([`kept`]): everyone who hears the same hosts then holds
+/// the same ones whatever order they heard them in, and our media goes to the
+/// lowest one when the relay is down, so everyone meets there.
+///
+/// **A host that left is kept until its session ends.** Its leave is read
+/// off its presence going, which is also what our own link failing looks
+/// like when that session was the only way to it; cutting a session that
+/// still works, or one the stack is still redialling, on that word could end
+/// a call that would have carried on. A host whose session gave up after it
+/// left is let go, and found again if its presence is heard again.
+///
+/// **A host's door is acted on at most once per [`DOOR_SETTLE`]**, the
+/// latest heard winning: each change of door can mean a dial, ours and
+/// everyone's, and a door is whatever someone's presence says.
+#[derive(Debug, Default)]
+pub(super) struct Hosts {
+    wanted: std::collections::BTreeMap<String, Target>,
+    left: std::collections::BTreeSet<String>,
+    /// A door heard while the last one acted on was still settling.
+    pending: std::collections::BTreeMap<String, Target>,
+    /// When each host's door was last acted on.
+    changed: std::collections::BTreeMap<String, Instant>,
+}
+
+/// How long a host's door is held before another change of it is acted on.
+pub(super) const DOOR_SETTLE: Duration = Duration::from_secs(5);
+
+impl Hosts {
+    pub(super) fn new(known: impl IntoIterator<Item = Target>) -> Self {
+        let mut hosts = Self::default();
+        for target in known {
+            if let Some(id) = target.host.clone() {
+                hosts.wanted.insert(id, target);
+            }
+        }
+        hosts
+    }
+
+    /// Takes in what presence said `now`. Whether it changed what is wanted;
+    /// a door changed too soon after the last waits for [`Self::settle`].
+    pub(super) fn learn(&mut self, learned: Learned, now: Instant) -> bool {
+        match learned {
+            Learned::Host(target) => {
+                let Some(id) = target.host.clone() else { return false };
+                let back = self.left.remove(&id);
+                self.pending.remove(&id);
+                match self.wanted.get(&id) {
+                    Some(had) if *had == target => back,
+                    Some(_) if self.changed.get(&id).is_some_and(|at| now.duration_since(*at) < DOOR_SETTLE) => {
+                        self.pending.insert(id, target);
+                        back
+                    }
+                    _ => {
+                        self.changed.insert(id.clone(), now);
+                        self.wanted.insert(id, target);
+                        true
+                    }
+                }
+            }
+            Learned::Stopped(id) => {
+                self.left.remove(&id);
+                self.pending.remove(&id);
+                self.changed.remove(&id);
+                self.wanted.remove(&id).is_some()
+            }
+            Learned::Left(id) => self.wanted.contains_key(&id) && self.left.insert(id),
+        }
+    }
+
+    /// Acts on each door that waited out [`DOOR_SETTLE`]. Whether any did.
+    pub(super) fn settle(&mut self, now: Instant) -> bool {
+        let due: Vec<String> = self
+            .pending
+            .keys()
+            .filter(|id| self.changed.get(*id).is_none_or(|at| now.duration_since(*at) >= DOOR_SETTLE))
+            .cloned()
+            .collect();
+        for id in &due {
+            if let Some(target) = self.pending.remove(id) {
+                self.changed.insert(id.clone(), now);
+                self.wanted.insert(id.clone(), target);
+            }
+        }
+        !due.is_empty()
+    }
+
+    /// Whether `id` has left the room since it was last heard hosting.
+    pub(super) fn has_left(&self, id: &str) -> bool {
+        self.left.contains(id)
+    }
+
+    /// Lets a host that left go, once its session has ended.
+    pub(super) fn let_go(&mut self, id: &str) {
+        if self.left.remove(id) {
+            self.wanted.remove(id);
+            self.pending.remove(id);
+            self.changed.remove(id);
+        }
+    }
+
+    /// Every host wanted, by id; [`kept`] says which to hold.
+    pub(super) fn want(&self) -> Vec<&Target> {
+        self.wanted.values().collect()
+    }
+}
+
+/// Which of the `wanted` hosts, sorted by id, to hold a session to: every one
+/// whose session already works (`working`), then the lowest of the rest, up
+/// to [`HOSTS_DIALLED`] in all.
+///
+/// **A session that works is never given up for a lower id.** A door is
+/// whatever someone's presence says, so eight made-up hosts with low ids
+/// would otherwise push out every real one and split the room again when the
+/// relay goes. The price: past eight hosts, members who heard them in
+/// different orders can hold slightly different sets, and some media may
+/// cross between hosts. That is the safer side: a host that bridges is
+/// slower, a host nobody holds a session to is a split.
+pub(super) fn kept(wanted: &[&str], working: &[&str]) -> Vec<String> {
+    let mut kept: Vec<String> = wanted.iter().filter(|id| working.contains(id)).map(|id| id.to_string()).collect();
+    for id in wanted {
+        if kept.len() >= HOSTS_DIALLED {
+            break;
+        }
+        if !kept.iter().any(|held| held == id) {
+            kept.push(id.to_string());
+        }
+    }
+    kept
+}
+
+/// The order of `members` our media prefers: the relay, then the hosts by
+/// endpoint id, whatever order they were added in, with any retired last.
+fn ranked(members: &[Member]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..members.len()).collect();
+    order.sort_by(|&a, &b| {
+        let key = |at: usize| (members[at].state == State::Retired, members[at].target.host.clone());
+        key(a).cmp(&key(b))
+    });
+    order
 }
 
 /// Where one session is.
@@ -262,6 +441,10 @@ pub(super) enum State {
     Resting(Instant),
     /// Turned away; not dialled again this call.
     Refused,
+    /// A host no longer wanted: it stopped hosting, its door changed, or it
+    /// left and its session ended. Never dialled again; a host heard again
+    /// gets a session of its own.
+    Retired,
 }
 
 impl State {
@@ -393,7 +576,7 @@ pub(super) fn ended(states: &[State], hosting: bool, errors: &[Option<String>]) 
     if hosting || states.iter().any(|state| state.up() || state.trying()) {
         return None;
     }
-    if states.iter().all(|state| *state == State::Refused) {
+    if states.iter().filter(|state| **state != State::Retired).all(|state| *state == State::Refused) {
         return Some(TURNED_AWAY.to_string());
     }
     Some(
@@ -592,6 +775,13 @@ pub(super) struct Join {
     /// Move the call round the relay and every host this often
     /// (`--bounce`), to test moving it.
     pub(super) bounce: Option<Duration>,
+    /// What presence says about the room's hosts from now on.
+    pub(super) learned: futures_channel::mpsc::UnboundedReceiver<Learned>,
+    /// Whether we dial only the hosts below our id, as a host does: the same
+    /// answer [`targets`] was given, so a host heard of later is judged as
+    /// one known at join. Not `hosting`: a join wired to host whose door
+    /// failed to open is no host to anyone, and dials every host.
+    pub(super) dials_below: bool,
 }
 
 /// One session of the set.
@@ -614,9 +804,41 @@ struct Member {
     hold: quiet::Hold,
     /// How long it may hear nothing before it counts as quiet.
     limit: Duration,
+    /// Which dialling of this slot its session's events come from, so one
+    /// from a session it no longer holds is not taken for its own.
+    generation: u64,
+    /// When it was retired, after which its slot may go to another host
+    /// once what it kept for the overlap has gone.
+    retired: Option<Instant>,
+    /// Whether the log has said its host has a new door, while its session
+    /// keeps the old one.
+    door_noted: bool,
+    /// Whether its session was dialled free, to the host the call is on.
+    free: bool,
 }
 
 impl Member {
+    /// A session to `target`, not dialled yet.
+    fn new(target: Target, hosting: bool, outbound: &moq_net::origin::Producer) -> Self {
+        Member {
+            limit: quiet::limit(&target.url, hosting),
+            gate: (!hosting).then(|| Gate::new(outbound)),
+            state: State::Dialing,
+            error: None,
+            joined: false,
+            redialled: false,
+            session: None,
+            priced: false,
+            offer: None,
+            hold: quiet::Hold::new(),
+            generation: 0,
+            retired: None,
+            door_noted: false,
+            free: false,
+            target,
+        }
+    }
+
     /// Gives this session up: hangs it up, so its routes go here and at the
     /// far side as a lost session's do (marking nothing stale), and rests it
     /// before it is dialled again. The next pass moves our media to the spare
@@ -631,6 +853,142 @@ impl Member {
         self.error = Some(error);
         self.state = State::Resting(Instant::now() + REST);
     }
+
+    /// Retires a host session for good. Its session, offer and gate are kept
+    /// a moment, as an old offer is, so that if it carried our media the next
+    /// pass moves it before the old one goes; then hung up as a lost session
+    /// is, so its routes go without marking anything stale, and everything it
+    /// ran is dropped. The slot keeps nothing live.
+    fn retire(&mut self, now: Instant) {
+        self.state = State::Retired;
+        self.retired = Some(now);
+        let session = self.session.take();
+        let offer = self.offer.take();
+        let gate = self.gate.take();
+        tokio::spawn(async move {
+            tokio::time::sleep(MOVE_OVERLAP).await;
+            if let Some(session) = session {
+                session.connection.abort(moq_net::Error::Cancel);
+            }
+            drop(offer);
+            drop(gate);
+        });
+    }
+
+    /// Whether this slot may be given to another host: retired, and past
+    /// the overlap its old session and offer were kept for.
+    fn free(&self, now: Instant) -> bool {
+        self.retired.is_some_and(|at| now.duration_since(at) >= MOVE_OVERLAP)
+    }
+}
+
+/// Holds a session to every host `hosts` wants and to no other: retires the
+/// rest, and dials each one wanted that has none, in a retired slot when one
+/// is free so the list stays as long as the most hosts held at once. Whether
+/// any session was added or retired, so our gates are said again.
+fn reconcile(
+    members: &mut Vec<Member>,
+    hosts: &mut Hosts,
+    now: Instant,
+    new: &dyn Fn(Target) -> Member,
+    quiet: &mut Quiet,
+    call_host: Option<&str>,
+    dial: &mut dyn FnMut(usize, &Member, bool) -> Session,
+) -> bool {
+    hosts.settle(now);
+    for id in members
+        .iter()
+        .filter(|member| matches!(member.state, State::Resting(_) | State::Refused))
+        .filter_map(|member| member.target.host.clone())
+        .filter(|id| hosts.has_left(id))
+        .collect::<Vec<_>>()
+    {
+        tracing::info!("host {id} left the room and its session ended; not dialling it again");
+        hosts.let_go(&id);
+    }
+    let wanted: Vec<Target> = hosts.want().into_iter().cloned().collect();
+    let ids: Vec<&str> = wanted.iter().filter_map(|target| target.host.as_deref()).collect();
+    let working: Vec<String> = members
+        .iter()
+        .filter(|member| member.state != State::Retired && member.state.up())
+        .filter_map(|member| member.target.host.clone())
+        .collect();
+    let working: Vec<&str> = working.iter().map(String::as_str).collect();
+    let kept = kept(&ids, &working);
+    let want: Vec<Target> = wanted.iter().filter(|target| target.host.as_ref().is_some_and(|id| kept.contains(id))).cloned().collect();
+    let mut changed = false;
+    for (index, member) in members.iter_mut().enumerate() {
+        if member.state == State::Retired {
+            continue;
+        }
+        let Some(id) = member.target.host.clone() else { continue };
+        match want.iter().find(|target| target.host.as_deref() == Some(id.as_str())) {
+            None => {
+                if ids.contains(&id.as_str()) {
+                    tracing::info!("letting {} go: more hosts than we hold, and its session is not up", spoken(member));
+                } else {
+                    tracing::info!("hanging up {}: it no longer hosts the room", spoken(member));
+                }
+                member.retire(now);
+                changed = true;
+            }
+            Some(target) if *target == member.target => {}
+            // **A new door does not hang up a session that works**: the host
+            // let us in with the old one, and that session stays good. The
+            // new one is for the next dial, which is when this session is
+            // next not up.
+            Some(_) if member.state.up() => {
+                if !std::mem::replace(&mut member.door_noted, true) {
+                    tracing::info!("{} has a new door; keeping the session it let us in with until it next drops", spoken(member));
+                }
+            }
+            Some(target) => {
+                tracing::info!("dialling {} again, at its new door", spoken(member));
+                if let Some(old) = member.session.take() {
+                    old.connection.abort(moq_net::Error::Cancel);
+                }
+                member.target = target.clone();
+                member.generation += 1;
+                member.state = State::Dialing;
+                member.error = None;
+                member.redialled = false;
+                member.door_noted = false;
+                member.free = call_host == Some(id.as_str());
+                member.session = Some(dial(index, member, member.free));
+            }
+        }
+    }
+    for target in want {
+        if members
+            .iter()
+            .any(|member| member.state != State::Retired && member.target.host == target.host)
+        {
+            continue;
+        }
+        let mut member = new(target);
+        // At its price from the start when the call is already on it, rather
+        // than dialled at the usual price and again, free, a pass later.
+        member.free = call_host.is_some() && member.target.host.as_deref() == call_host;
+        let index = match members.iter().position(|slot| slot.free(now)) {
+            Some(at) => {
+                member.generation = members[at].generation + 1;
+                at
+            }
+            None => members.len(),
+        };
+        tracing::info!("dialling {}, heard of during the call", spoken(&member));
+        member.session = Some(dial(index, &member, member.free));
+        // A slot new to this host: its history, or our guests' when it is
+        // one past the end, is not this session's.
+        quiet.forget(index);
+        if index == members.len() {
+            members.push(member);
+        } else {
+            members[index] = member;
+        }
+        changed = true;
+    }
+    changed
 }
 
 /// How the log names a session: the relay by its address, a host by its id.
@@ -684,8 +1042,13 @@ pub(super) fn join(args: Join) -> Peer {
         keyframe,
         room,
         bounce,
+        learned,
+        dials_below,
     } = args;
-    let (events, mut heard) = futures_channel::mpsc::unbounded::<(usize, Event)>();
+    let mut learned = Some(learned);
+    let relay_url = targets[0].url.clone();
+    let mut hosts_wanted = Hosts::new(targets.iter().cloned());
+    let (events, mut heard) = futures_channel::mpsc::unbounded::<(usize, u64, Event)>();
     let dial = {
         let inbound = inbound.clone();
         let outbound = outbound.clone();
@@ -710,9 +1073,10 @@ pub(super) fn join(args: Join) -> Peer {
             let monitor = connection.monitor();
             let mut refusals = Refusals::for_url(&member.target.url);
             let events = events.clone();
+            let generation = member.generation;
             let running = Abort(tokio::spawn(async move {
                 let say = |event| {
-                    let _ = events.unbounded_send((index, event));
+                    let _ = events.unbounded_send((index, generation, event));
                 };
                 // The live session's going-away notice. Under `Restart::Wait`
                 // one naming no other address changes no status, so it is
@@ -777,34 +1141,19 @@ pub(super) fn join(args: Join) -> Peer {
         }
     };
 
-    let mut members: Vec<Member> = targets
-        .into_iter()
-        .map(|target| Member {
-            limit: quiet::limit(&target.url, hosting),
-            gate: (!hosting).then(|| Gate::new(&outbound)),
-            state: State::Dialing,
-            error: None,
-            joined: false,
-            redialled: false,
-            session: None,
-            priced: false,
-            offer: None,
-            hold: quiet::Hold::new(),
-            target,
-        })
-        .collect();
+    let mut members: Vec<Member> = targets.into_iter().map(|target| Member::new(target, hosting, &outbound)).collect();
     let hosts = members.len() - 1;
     tracing::info!("dialling the relay and {hosts} saved hosts");
     // Said in our `routes.json`, so whoever reads it can tell our gates from
     // a relay in the chains of our media: to anyone else they look alike.
-    local.set_gates(members.iter().filter_map(|member| member.gate.as_ref()).map(|gate| gate.origin.hop().id()).collect());
+    local.set_gates(gates(&members));
     // Where the call is said to be as we join, so its host is dialled at its
     // price from the start rather than dialled twice.
     let mut chosen = chosen_member(&members, &local);
     for (index, member) in members.iter_mut().enumerate() {
-        member.session = Some(dial(index, member, chosen == Some(index)));
+        member.free = chosen == Some(index);
+        member.session = Some(dial(index, member, member.free));
     }
-    let stops: Vec<Option<String>> = members.iter().map(|member| member.target.host.clone()).collect();
     if let Some(every) = bounce {
         tracing::info!("bouncing every {}s between the relay and {hosts} hosts", every.as_secs());
     }
@@ -824,13 +1173,17 @@ pub(super) fn join(args: Join) -> Peer {
             // Each session's history of hearing anything, and our guests'
             // one past them, for leaving a session that went quiet.
             let mut quiet = Quiet::default();
-            let guests_at = members.len();
             let mut ticker = tokio::time::interval(TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     event = heard.next() => {
-                        let Some((index, event)) = event else { return "the sessions stopped".to_string() };
+                        let Some((index, generation, event)) = event else { return "the sessions stopped".to_string() };
+                        // A session let go, or one its slot no longer holds,
+                        // may still have been heard from.
+                        if members[index].state == State::Retired || members[index].generation != generation {
+                            continue;
+                        }
                         // Whether the call goes on elsewhere, so an ending here
                         // is said as a retry or as what it is.
                         let elsewhere = (hosting && local.offer().is_some())
@@ -899,8 +1252,32 @@ pub(super) fn join(args: Join) -> Peer {
                         // through it, so our catalogs are written again.
                         keyframe.rerouted();
                     }
+                    news = async {
+                        match learned.as_mut() {
+                            Some(learned) => learned.next().await,
+                            None => std::future::pending().await,
+                        }
+                    } => match news {
+                        None => learned = None,
+                        // The same rule as at join: a host dials only below.
+                        Some(Learned::Host(target)) if !target.host.as_deref().is_some_and(|id| dials(id, &relay_url, &me, dials_below)) => {}
+                        Some(news) => {
+                            hosts_wanted.learn(news, Instant::now());
+                        }
+                    },
                     _ = ticker.tick() => {}
                 }
+
+                // Hosts heard of, or let go, since the last pass: a session
+                // to each one wanted and to no other.
+                let call_host = local.call_host();
+                let new = |target| Member::new(target, hosting, &outbound);
+                if reconcile(&mut members, &mut hosts_wanted, Instant::now(), &new, &mut quiet, call_host.as_deref(), &mut |index, member, chosen| {
+                    dial(index, member, chosen)
+                }) {
+                    local.set_gates(gates(&members));
+                }
+                let guests_at = members.len();
 
                 let now = Instant::now();
                 let serving = hosting && local.offer().is_some();
@@ -917,7 +1294,8 @@ pub(super) fn join(args: Join) -> Peer {
                     if let State::Resting(until) = member.state {
                         if going && now >= until {
                             member.state = State::Dialing;
-                            member.session = Some(dial(index, member, chosen == Some(index)));
+                            member.free = chosen == Some(index);
+                            member.session = Some(dial(index, member, member.free));
                         }
                     }
                 }
@@ -985,6 +1363,11 @@ pub(super) fn join(args: Join) -> Peer {
                 // what follows below applies it here like any other move.
                 if next_bounce.is_some_and(|due| now >= due) {
                     if local.move_calls() {
+                        let stops: Vec<Option<String>> = ranked(&members)
+                            .into_iter()
+                            .filter(|&at| members[at].state != State::Retired)
+                            .map(|at| members[at].target.host.clone())
+                            .collect();
                         let on = local.call_host();
                         local.move_call(super::super::moves::next_stop(&stops, on.as_deref()), &me);
                     }
@@ -999,7 +1382,8 @@ pub(super) fn join(args: Join) -> Peer {
                     for index in [chosen, now_chosen].into_iter().flatten() {
                         let free = now_chosen == Some(index);
                         let member = &mut members[index];
-                        if member.session.is_none() {
+                        // Not up to redial, or dialled at this price already.
+                        if member.session.is_none() || member.free == free {
                             continue;
                         }
                         let id = member.target.host.clone().unwrap_or_default();
@@ -1008,6 +1392,7 @@ pub(super) fn join(args: Join) -> Peer {
                         } else {
                             tracing::info!("the call left host {id}; dialling it again at the usual price");
                         }
+                        member.free = free;
                         let fresh = dial(index, member, free);
                         member.redialled = member.state.live();
                         if let Some(old) = member.session.replace(fresh) {
@@ -1027,15 +1412,23 @@ pub(super) fn join(args: Join) -> Peer {
                     chosen = now_chosen;
                 }
 
-                let next = pick(&states, carrier, now, started, chosen, &holds);
+                // Ranked by id, so a host added late takes its place in the
+                // order everyone shares rather than the end.
+                let rank = ranked(&members);
+                let ranked_at = |index: usize| rank.iter().position(|&at| at == index);
+                let ranked_states: Vec<State> = rank.iter().map(|&at| states[at]).collect();
+                let ranked_holds: Vec<Duration> = rank.iter().map(|&at| holds[at]).collect();
+                let ranked_chosen = chosen.and_then(ranked_at);
+                let next = pick(&ranked_states, carrier.and_then(ranked_at), now, started, ranked_chosen, &ranked_holds).map(|at| rank[at]);
                 // With nothing live, every offer stays as it is: a session
                 // that died carries nothing, and one that comes back finds
                 // it still offered.
                 if let Some(next) = next {
-                    let priced: Vec<bool> = members.iter().map(|member| member.priced).collect();
+                    let priced: Vec<bool> = rank.iter().map(|&at| members[at].priced).collect();
                     let spare_at = keeps_spare(hosting, local.spare_route())
-                        .then(|| spare(&states, &priced, next, chosen))
-                        .flatten();
+                        .then(|| ranked_at(next).and_then(|next| spare(&ranked_states, &priced, next, ranked_chosen)))
+                        .flatten()
+                        .map(|at| rank[at]);
                     if arrange(&mut members, next, spare_at, &outbound, &me, &relay_label) {
                         keyframe.rerouted();
                     }
@@ -1181,7 +1574,20 @@ fn arrange(
 /// moves and hold one to it.
 fn chosen_member(members: &[Member], local: &PeerStats) -> Option<usize> {
     let host = local.call_host()?;
-    members.iter().position(|member| member.target.host.as_deref() == Some(host.as_str()))
+    members
+        .iter()
+        .position(|member| member.state != State::Retired && member.target.host.as_deref() == Some(host.as_str()))
+}
+
+/// Our gates' hops, said in our `routes.json`, so whoever reads it can tell
+/// them from a relay in the chains of our media.
+fn gates(members: &[Member]) -> Vec<u64> {
+    members
+        .iter()
+        .filter(|member| member.state != State::Retired)
+        .filter_map(|member| member.gate.as_ref())
+        .map(|gate| gate.origin.hop().id())
+        .collect()
 }
 
 /// Follows one session: its estimate into the call's, its figures into the
@@ -1258,6 +1664,98 @@ mod tests {
         };
         let found = targets(&relay, &[known('a'), known('b'), known('c'), bad], &id('c'), false);
         assert_eq!(hosts_of(&found), [None, Some("a".into())]);
+    }
+
+    /// Nine hosts heard in two different orders, before any session to
+    /// them is up: the same eight kept, the lowest ids, so everyone holds the
+    /// same ones.
+    #[test]
+    fn the_same_nine_hosts_heard_in_any_order_keep_the_same_lowest_eight() {
+        let nine: Vec<char> = "123456789".chars().collect();
+        let heard = |order: &[char]| {
+            let mut hosts = Hosts::default();
+            for c in order {
+                hosts.learn(Learned::Host(target(&relay(), &known(*c)).unwrap()), Instant::now());
+            }
+            let ids: Vec<String> = hosts.want().into_iter().map(|target| target.host.clone().unwrap()).collect();
+            kept(&ids.iter().map(String::as_str).collect::<Vec<_>>(), &[])
+        };
+        let forwards = heard(&nine);
+        let mut shuffled = nine.clone();
+        shuffled.reverse();
+        shuffled.swap(0, 4);
+        assert_eq!(forwards, heard(&shuffled));
+        assert_eq!(forwards, "12345678".chars().map(id).collect::<Vec<_>>());
+    }
+
+    /// Eight hosts held and working, then eight more claiming lower ids: none
+    /// of the working ones is given up. A slot opens only when one of them
+    /// stops working, and then the lowest newcomer takes it.
+    #[test]
+    fn hosts_with_lower_ids_never_evict_sessions_that_work() {
+        let all: Vec<String> = "0123456789abcdef".chars().map(id).collect();
+        let wanted: Vec<&str> = all.iter().map(String::as_str).collect();
+        let held: Vec<&str> = wanted[8..].to_vec();
+        let mut kept_now = kept(&wanted, &held);
+        kept_now.sort();
+        assert_eq!(kept_now, all[8..].to_vec(), "a lower id evicted a working session");
+        let mut kept_now = kept(&wanted, &held[..7]);
+        kept_now.sort();
+        let mut expected = vec![id('0')];
+        expected.extend(all[8..15].iter().cloned());
+        assert_eq!(kept_now, expected);
+    }
+
+    /// What presence says changes what is wanted: a new host or a new door
+    /// does, the same again does not, a stop takes it out, and a leave only
+    /// marks it until its session ends, unless it is heard again first.
+    #[test]
+    fn hosts_follow_what_presence_says() {
+        let now = Instant::now();
+        let mut hosts = Hosts::new(targets(&relay(), &[known('a')], &id('z'), false));
+        let a = || target(&relay(), &known('a')).unwrap();
+        assert!(!hosts.learn(Learned::Host(a()), now), "heard again as it was known");
+        let mut moved = a();
+        moved.url.set_query(Some("door=ffeeddccbbaa99887766554433221100"));
+        assert!(hosts.learn(Learned::Host(moved.clone()), now), "a new door");
+        assert_eq!(hosts.want(), vec![&moved]);
+        assert!(hosts.learn(Learned::Left(id('a')), now));
+        assert!(hosts.has_left(&id('a')));
+        assert_eq!(hosts.want().len(), 1, "a leave alone cuts nothing");
+        assert!(hosts.learn(Learned::Host(moved.clone()), now), "back before its session ended");
+        assert!(!hosts.has_left(&id('a')));
+        hosts.learn(Learned::Left(id('a')), now);
+        hosts.let_go(&id('a'));
+        assert!(hosts.want().is_empty(), "let go once its session ended");
+        assert!(!hosts.learn(Learned::Left(id('b')), now), "a leave of someone not hosting");
+        hosts.learn(Learned::Host(a()), now);
+        assert!(hosts.learn(Learned::Stopped(id('a')), now));
+        assert!(hosts.want().is_empty());
+    }
+
+    /// A burst of doors for one host: the first change is acted on, the rest
+    /// wait out the settle, and then only the latest is, once.
+    #[test]
+    fn a_burst_of_doors_is_acted_on_once_and_the_latest_wins() {
+        let start = Instant::now();
+        let mut hosts = Hosts::new(targets(&relay(), &[known('a')], &id('z'), false));
+        let door = |n: u8| {
+            let mut at = target(&relay(), &known('a')).unwrap();
+            at.url.set_query(Some(&format!("door={}", format!("{n:02x}").repeat(16))));
+            at
+        };
+        assert!(hosts.learn(Learned::Host(door(1)), start), "the first change");
+        let mut acted = 0;
+        for n in 2..=40u8 {
+            let now = start + Duration::from_millis(100) * u32::from(n);
+            acted += usize::from(hosts.learn(Learned::Host(door(n)), now));
+            acted += usize::from(hosts.settle(now));
+        }
+        assert_eq!(acted, 0, "a change acted on within the settle");
+        assert_eq!(hosts.want(), vec![&door(1)]);
+        assert!(hosts.settle(start + DOOR_SETTLE));
+        assert_eq!(hosts.want(), vec![&door(40)], "the latest wins");
+        assert!(!hosts.settle(start + DOOR_SETTLE * 3), "and only once");
     }
 
     #[test]
@@ -1399,6 +1897,8 @@ mod tests {
         assert_eq!(ended(&[Resting(now), Refused], true, &errors), None, "a host stays");
         assert_eq!(ended(&[Resting(now), Refused], false, &errors).as_deref(), Some("relay gone"));
         assert_eq!(ended(&[Refused, Refused], false, &errors).as_deref(), Some(TURNED_AWAY));
+        assert_eq!(ended(&[Refused, Retired], false, &errors).as_deref(), Some(TURNED_AWAY), "a host let go is no way in");
+        assert_eq!(ended(&[Live(now), Retired], false, &errors), None);
     }
 
     #[test]
@@ -1598,6 +2098,8 @@ mod socket_tests {
         _camera: Option<moq_net::broadcast::Producer>,
         _writing: Option<Abort>,
         _joined: Abort,
+        /// What its presence readers would tell it of the room's hosts.
+        learn: futures_channel::mpsc::UnboundedSender<Learned>,
     }
 
     fn member(me: &str, targets: Vec<Target>) -> Member {
@@ -1690,6 +2192,7 @@ mod socket_tests {
     ) -> Member {
         let inbound = moq_tokio::origin::spawn();
         let (status, statuses) = futures_channel::mpsc::unbounded();
+        let (learn, learned) = futures_channel::mpsc::unbounded();
         let peer = join(Join {
             client,
             me: me.to_string(),
@@ -1706,6 +2209,8 @@ mod socket_tests {
             keyframe,
             room: "room team".to_string(),
             bounce: None,
+            learned,
+            dials_below: false,
         });
         let (end, ended) = tokio::sync::oneshot::channel();
         let joined = Abort(tokio::spawn(async move {
@@ -1718,6 +2223,7 @@ mod socket_tests {
             _camera: None,
             _writing: None,
             _joined: joined,
+            learn,
         }
     }
 
@@ -2074,6 +2580,11 @@ mod socket_tests {
 
     /// The call's own reader of everyone announced at `inbound`.
     fn attending(me: &str, inbound: &moq_net::origin::Producer, local: &Arc<PeerStats>) -> Abort {
+        attending_with(me, inbound, local, None)
+    }
+
+    /// The same, telling `news` of the hosts it hears.
+    fn attending_with(me: &str, inbound: &moq_net::origin::Producer, local: &Arc<PeerStats>, news: Option<super::super::RoomNews>) -> Abort {
         use super::super::{Reports, Routing, attend};
         let reports = Reports {
             status: futures_channel::mpsc::unbounded().0,
@@ -2085,7 +2596,7 @@ mod socket_tests {
                 local: local.clone(),
                 controls: Arc::default(),
             },
-            news: None,
+            news,
             routing: Routing {
                 guests: Arc::default(),
                 ours: inbound.hop().id(),
@@ -3008,9 +3519,26 @@ mod socket_tests {
         local: Arc<PeerStats>,
         _accepting: Abort,
         _joined: Abort,
+        learn: futures_channel::mpsc::UnboundedSender<Learned>,
     }
 
     async fn hosted(relay: url::Url) -> Hosted {
+        hosted_as('c', vec![relay_at(relay)]).await
+    }
+
+    /// A member hosting the room as `me`, joined to `targets`, the first of
+    /// which is the relay.
+    async fn hosted_as(me: char, targets: Vec<Target>) -> Hosted {
+        hosted_behind(me, targets, None).await
+    }
+
+    /// The same, letting in only guests who present `door`'s, when given.
+    async fn hosted_behind(me: char, targets: Vec<Target>, door: Option<door::Hosting>) -> Hosted {
+        hosted_through(me, targets, door, client()).await
+    }
+
+    /// The same, dialling with `client`.
+    async fn hosted_through(me: char, targets: Vec<Target>, door: Option<door::Hosting>, client: moq_tokio::Client) -> Hosted {
         crypto();
         let shared = moq_tokio::origin::spawn();
         let mut config = moq_tokio::server::Config::default();
@@ -3022,16 +3550,18 @@ mod socket_tests {
         let port = server.local_addr().unwrap().port();
         let heard = Arc::new(quiet::Heard::default());
         let estimates = adapt::Estimates::new(moq_net::bandwidth::Producer::new());
-        let (accepting, _) = accept(server, None, Some(estimates), Arc::new(Metrics::default()), None, None, Some(heard.clone()));
+        let offer = match &door {
+            Some(door) => door.offer(shared.hop().id()),
+            None => door::Hosting::open("team".to_string()).unwrap().offer(shared.hop().id()),
+        };
+        let (accepting, _) = accept(server, door, Some(estimates), Arc::new(Metrics::default()), None, None, Some(heard.clone()));
         let local = Arc::new(PeerStats::default());
-        local.set_offer(Some(door::Offer {
-            door: "door".to_string(),
-            hop: shared.hop().id(),
-        }));
+        local.set_offer(Some(offer));
+        let (learn, learned) = futures_channel::mpsc::unbounded();
         let host = join(Join {
-            client: client(),
-            me: id('c'),
-            targets: vec![relay_at(relay)],
+            client,
+            me: id(me),
+            targets,
             outbound: shared.clone(),
             inbound: shared.clone(),
             hosting: true,
@@ -3044,6 +3574,8 @@ mod socket_tests {
             keyframe: Arc::new(Keyframes::default()),
             room: "room team".to_string(),
             bounce: None,
+            learned,
+            dials_below: true,
         });
         let joined = Abort(tokio::spawn(async move {
             let _ = host.closed.await;
@@ -3059,6 +3591,7 @@ mod socket_tests {
             local,
             _accepting: accepting,
             _joined: joined,
+            learn,
         }
     }
 
@@ -3602,5 +4135,693 @@ mod socket_tests {
             assert!(gone.elapsed() < WITHIN, "the guest was never turned away");
         }
         assert!(guests.hops().is_empty(), "a guest turned away is still counted as one");
+    }
+
+    /// A camera of `me`'s on `origin`, a small frame every 20 ms.
+    fn publishing(me: &str, origin: &moq_net::origin::Producer) -> (moq_net::broadcast::Producer, Abort) {
+        let camera = origin.create_broadcast(camera_path(me)).unwrap();
+        let mut track = camera.create_track("video", None).unwrap();
+        camera.announce(moq_net::origin::Route::default()).unwrap();
+        let writing = Abort(tokio::spawn(async move {
+            for n in 0u64.. {
+                if track.write_frame(moq_net::Timestamp::from_millis(n * 20).unwrap(), vec![0u8; 100]).is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }));
+        (camera, writing)
+    }
+
+    /// How long each of some paths has gone unannounced at one origin, at
+    /// most, from when they were all first there: what the attendance loop
+    /// takes for a leave once it outlasts the grace.
+    struct Absences {
+        gaps: Arc<std::sync::Mutex<Gaps>>,
+        _watching: Abort,
+    }
+
+    /// Each path's withdrawal in progress, if any, and its longest yet.
+    type Gaps = std::collections::HashMap<String, (Option<Instant>, Duration)>;
+
+    impl Absences {
+        /// Waits until every one of `paths` is announced at `origin`, then
+        /// watches them.
+        async fn of(origin: &moq_net::origin::Producer, paths: &[String], what: &str) -> Absences {
+            for path in paths {
+                assert!(heard_within(origin, path, Duration::from_secs(10)).await, "{what}: {path} never arrived");
+            }
+            let gaps: Gaps = paths.iter().map(|path| (path.clone(), (None, Duration::ZERO))).collect();
+            let gaps = Arc::new(std::sync::Mutex::new(gaps));
+            let writing = gaps.clone();
+            let mut announced = origin.consume().announced();
+            let watching = Abort(tokio::spawn(async move {
+                while let Some(update) = announced.next().await {
+                    let mut gaps = writing.lock().unwrap();
+                    let Some((since, longest)) = gaps.get_mut(update.prefix.as_str()) else { continue };
+                    match (update.kind.is_active(), *since) {
+                        (true, Some(at)) => {
+                            *longest = (*longest).max(at.elapsed());
+                            *since = None;
+                        }
+                        (false, None) => *since = Some(Instant::now()),
+                        _ => {}
+                    }
+                }
+            }));
+            Absences { gaps, _watching: watching }
+        }
+
+        /// Each path that has been gone for `limit` or longer, and for how long.
+        fn over(&self, limit: Duration) -> Vec<(String, Duration)> {
+            let gaps = self.gaps.lock().unwrap();
+            let mut over: Vec<(String, Duration)> = gaps
+                .iter()
+                .map(|(path, (since, longest))| (path.clone(), (*longest).max(since.map(|at| at.elapsed()).unwrap_or_default())))
+                .filter(|(_, gap)| *gap >= limit)
+                .collect();
+            over.sort();
+            over
+        }
+    }
+
+    /// Everyone's camera but `me`'s, of `everyone`.
+    fn others(me: &str, everyone: &[&str]) -> Vec<String> {
+        everyone.iter().filter(|who| **who != me).map(|who| camera_path(who)).collect()
+    }
+
+    /// Two hosts that know each other from the start, each with a guest who
+    /// knows only that host, all on the relay. The relay stops: the two hosts'
+    /// session to each other carries each side's guest across, and nobody is
+    /// gone from anybody's view for as long as a leave takes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_hosts_that_know_each_other_keep_the_room_whole_when_the_relay_stops() {
+        let relay = Meeting::older().await;
+        let p = hosted_as('c', vec![relay_at(relay.url())]).await;
+        let h = hosted_as('h', vec![relay_at(relay.url()), host_at('c', at(p.port))]).await;
+        let _p_camera = publishing("p", &p.origin);
+        let _h_camera = publishing("h", &h.origin);
+        let a = member("a", vec![relay_at(relay.url()), host_at('c', at(p.port))]);
+        let b = member("b", vec![relay_at(relay.url()), host_at('h', at(h.port))]);
+        let everyone = ["a", "b", "p", "h"];
+        let views = [
+            Absences::of(&a.inbound, &others("a", &everyone), "a").await,
+            Absences::of(&b.inbound, &others("b", &everyone), "b").await,
+            Absences::of(&p.origin, &others("p", &everyone), "p").await,
+            Absences::of(&h.origin, &others("h", &everyone), "h").await,
+        ];
+        // Every spare offered and every route ranked.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let stopped = Instant::now();
+        relay.stop().await;
+        past_the_grace(stopped + Duration::from_secs(1)).await;
+        for (who, view) in everyone.iter().zip(&views) {
+            let gone = view.over(super::super::super::grace::GRACE);
+            assert!(gone.is_empty(), "{who} lost {gone:?}");
+        }
+    }
+
+    /// Waits until `local` says it holds a session to every one of `hosts`
+    /// (`held`), or to none of them.
+    async fn holding(local: &PeerStats, hosts: &[char], held: bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let now = local.held();
+            if hosts.iter().all(|c| now.contains(&id(*c)) == held) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{what}: holding {now:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Tells a join that each of `hosts`, a letter and a port, hosts the room.
+    fn tell(learn: &futures_channel::mpsc::UnboundedSender<Learned>, hosts: &[(char, u16)]) {
+        for (c, port) in hosts {
+            let _ = learn.unbounded_send(Learned::Host(host_at(*c, at(*port))));
+        }
+    }
+
+    /// The fault as it was seen: two hosts, and two guests on the relay, who
+    /// all hear of both hosts during the call rather than at join. The relay
+    /// stops: the higher host has dialled the lower, each guest holds both,
+    /// everyone's media meets at the lower host, and nobody is gone from
+    /// anybody's view for as long as a leave takes. Before hosts were dialled
+    /// as they were heard of, this split the room.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_hosts_heard_of_during_the_call_keep_the_room_whole_when_the_relay_stops() {
+        let lost = two_hosts_and_two_guests_through_a_relay_stop(true).await;
+        assert!(lost.is_empty(), "{lost:?}");
+    }
+
+    /// The control: the same room, nobody told of the hosts, so nobody
+    /// dials them and the stop splits it. Without this the check above could
+    /// pass by seeing no loss at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_hosts_nobody_is_told_of_split_the_room_when_the_relay_stops() {
+        let lost = two_hosts_and_two_guests_through_a_relay_stop(false).await;
+        assert!(!lost.is_empty(), "nobody lost anybody, so the check cannot see a split");
+    }
+
+    /// Two hosts and two guests, all on the relay alone at join, each told
+    /// of both hosts (`told`) during the call; then the relay stops. Who lost
+    /// whom for as long as a leave takes.
+    async fn two_hosts_and_two_guests_through_a_relay_stop(told: bool) -> Vec<String> {
+        use super::super::super::arrival::Sending;
+        let relay = Meeting::older().await;
+        let p = hosted_as('c', vec![relay_at(relay.url())]).await;
+        let h = hosted_as('e', vec![relay_at(relay.url())]).await;
+        let _p_camera = publishing("p", &p.origin);
+        let _h_camera = publishing("h", &h.origin);
+        let (on_a, on_b) = (Arc::new(PeerStats::default()), Arc::new(PeerStats::default()));
+        let a = member_as("a", vec![relay_at(relay.url())], client(), on_a.clone());
+        let b = member_as("b", vec![relay_at(relay.url())], client(), on_b.clone());
+        let everyone = ["a", "b", "p", "h"];
+        let views = [
+            Absences::of(&a.inbound, &others("a", &everyone), "a").await,
+            Absences::of(&b.inbound, &others("b", &everyone), "b").await,
+            Absences::of(&p.origin, &others("p", &everyone), "p").await,
+            Absences::of(&h.origin, &others("h", &everyone), "h").await,
+        ];
+        if told {
+            let hosts = [('c', p.port), ('e', h.port)];
+            for learn in [&a.learn, &b.learn, &p.learn, &h.learn] {
+                tell(learn, &hosts);
+            }
+            holding(&on_a, &['c', 'e'], true, "a never dialled both hosts").await;
+            holding(&on_b, &['c', 'e'], true, "b never dialled both hosts").await;
+            holding(&h.local, &['c'], true, "the higher host never dialled the lower").await;
+        }
+        // Spares offered, routes ranked.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!p.local.held().contains(&id('e')), "the lower host dialled the higher too");
+
+        let stopped = Instant::now();
+        relay.stop().await;
+        past_the_grace(stopped + Duration::from_secs(1)).await;
+        let mut lost = Vec::new();
+        for (who, view) in everyone.iter().zip(&views) {
+            let gone = view.over(super::super::super::grace::GRACE);
+            if !gone.is_empty() {
+                lost.push(format!("{who} lost {gone:?}"));
+            }
+        }
+        if told {
+            assert_eq!(on_a.sending(), Some(Sending::Host(id('c'))), "a's media is not at the lower host");
+            assert_eq!(on_b.sending(), Some(Sending::Host(id('c'))), "b's media is not at the lower host");
+        }
+        lost
+    }
+
+    /// A guest as a call wires one, on the relay alone at join: its presence
+    /// said, everyone's read, and each host it hears of told to its join,
+    /// dialled at the port `hosts` gives that host's id. Counts the leaves
+    /// told to the join.
+    struct Guest {
+        member: Member,
+        local: Arc<PeerStats>,
+        lefts: Arc<std::sync::atomic::AtomicUsize>,
+        _control: moq_net::broadcast::Producer,
+        _announcing: Abort,
+        _attending: Abort,
+        _forwarding: Abort,
+    }
+
+    fn guest_hearing(me: &str, relay: url::Url, hosts: Vec<(String, u16)>) -> Guest {
+        use super::super::{Dial, RoomNews};
+        let local = Arc::new(PeerStats::default());
+        let outbound = moq_tokio::origin::spawn();
+        let (control, announcing) = saying(me, &outbound, &local);
+        let member = member_from(me, vec![relay_at(relay)], client(), local.clone(), outbound);
+        let (to, mut from) = futures_channel::mpsc::unbounded::<Learned>();
+        let lefts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counting, learn) = (lefts.clone(), member.learn.clone());
+        let forwarding = Abort(tokio::spawn(async move {
+            while let Some(learned) = from.next().await {
+                if matches!(learned, Learned::Left(_)) {
+                    counting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let _ = learn.unbounded_send(learned);
+            }
+        }));
+        let ports: std::collections::HashMap<String, u16> = hosts.into_iter().collect();
+        let locate = move |known: &door::Known| {
+            let mut url = at(*ports.get(&known.id)?);
+            url.query_pairs_mut().append_pair(door::PARAM, &known.door);
+            Some(Target {
+                host: Some(known.id.clone()),
+                url,
+            })
+        };
+        let news = RoomNews {
+            room: "team".to_string(),
+            to: futures_channel::mpsc::unbounded().0,
+            dial: Some(Dial {
+                to,
+                locate: Arc::new(locate),
+            }),
+        };
+        let attending = attending_with(me, &member.inbound, &local, Some(news));
+        Guest {
+            member,
+            local,
+            lefts,
+            _control: control,
+            _announcing: announcing,
+            _attending: attending,
+            _forwarding: forwarding,
+        }
+    }
+
+    /// A host that says so in presence, with a camera of its own.
+    struct Saying {
+        host: Hosted,
+        _control: moq_net::broadcast::Producer,
+        _announcing: Abort,
+        _camera: (moq_net::broadcast::Producer, Abort),
+    }
+
+    async fn saying_host(me: char, relay: url::Url) -> Saying {
+        let host = hosted_as(me, vec![relay_at(relay)]).await;
+        let (control, announcing) = saying(&id(me), &host.origin, &host.local);
+        let camera = publishing(&id(me), &host.origin);
+        Saying {
+            host,
+            _control: control,
+            _announcing: announcing,
+            _camera: camera,
+        }
+    }
+
+    /// One host, and two guests who joined on the relay alone before it
+    /// said it hosts: each hears it in presence and dials it then. The relay
+    /// stops: the guests still see the host and each other. And the bounce
+    /// of the host's presence that the stop makes is not a leave, so each
+    /// guest keeps its session to the host. Before hosts were dialled as they
+    /// were heard of, both guests were cut off.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guests_who_hear_of_a_host_during_the_call_keep_it_when_the_relay_stops() {
+        let relay = Meeting::older().await;
+        let h = saying_host('e', relay.url()).await;
+        let hosts = || vec![(id('e'), h.host.port)];
+        let g = guest_hearing("g", relay.url(), hosts());
+        let m = guest_hearing("m", relay.url(), hosts());
+        let host = id('e');
+        let g_view = Absences::of(&g.member.inbound, &[camera_path(&host), camera_path("m")], "g").await;
+        let h_view = Absences::of(&h.host.origin, &[camera_path("g"), camera_path("m")], "the host").await;
+        holding(&g.local, &['e'], true, "g never dialled the host it heard of").await;
+        holding(&m.local, &['e'], true, "m never dialled the host it heard of").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let stopped = Instant::now();
+        relay.stop().await;
+        past_the_grace(stopped + Duration::from_secs(1)).await;
+        let gone = g_view.over(super::super::super::grace::GRACE);
+        assert!(gone.is_empty(), "g lost {gone:?}");
+        let gone = h_view.over(super::super::super::grace::GRACE);
+        assert!(gone.is_empty(), "the host lost {gone:?}");
+        for guest in [&g, &m] {
+            assert_eq!(count(&guest.lefts), 0, "a bounce was told as a leave");
+            assert!(guest.local.held().contains(&host), "a guest let go of the host after a bounce");
+        }
+    }
+
+    /// A host that stops hosting during the call: its presence says so, and
+    /// each guest that dialled it hangs that session up, while the room goes
+    /// on through the relay with nobody gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_that_stops_hosting_is_hung_up_and_nobody_leaves() {
+        let relay = Meeting::older().await;
+        let h = saying_host('e', relay.url()).await;
+        let mut g = guest_hearing("g", relay.url(), vec![(id('e'), h.host.port)]);
+        let host = id('e');
+        let view = Absences::of(&g.member.inbound, &[camera_path(&host)], "g").await;
+        holding(&g.local, &['e'], true, "g never dialled the host it heard of").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        h.host.local.set_offer(None);
+        holding(&g.local, &['e'], false, "g kept its session to a host that stopped hosting").await;
+        // From the hang-up itself, which comes an overlap after the session
+        // is let go: a loss it caused for good has outlasted the grace by then.
+        past_the_grace(Instant::now() + MOVE_OVERLAP).await;
+        let gone = view.over(super::super::super::grace::GRACE);
+        assert!(gone.is_empty(), "g lost {gone:?}");
+        assert!(g.member.ended.try_recv().is_err(), "the join ended");
+    }
+
+    /// A host heard of with a door it does not open: turned away, the call
+    /// goes on through the relay, and no session to it is held. Heard again
+    /// with its own door, it is dialled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_heard_of_with_the_wrong_door_is_turned_away_and_dialled_again_with_the_right_one() {
+        let relay = Meeting::older().await;
+        let door = door::Hosting::open("team".to_string()).unwrap();
+        let right = door.offer(1).door;
+        let h = hosted_behind('e', vec![relay_at(relay.url())], Some(door)).await;
+        let local = Arc::new(PeerStats::default());
+        let mut g = member_as("g", vec![relay_at(relay.url())], client(), local.clone());
+        becomes(&h.origin, &camera_path("g"), true).await;
+        let behind = |door: &str| {
+            let mut url = at(h.port);
+            url.query_pairs_mut().append_pair(door::PARAM, door);
+            host_at('e', url)
+        };
+        let _ = g.learn.unbounded_send(Learned::Host(behind(&door::fresh().unwrap())));
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until {
+            assert!(!local.held().contains(&id('e')), "a session held through the wrong door");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(g.ended.try_recv().is_err(), "the join ended when a host turned it away");
+        let _ = g.learn.unbounded_send(Learned::Host(behind(&right)));
+        holding(&local, &['e'], true, "the host was not dialled with its own door").await;
+    }
+
+    /// Every join now goes through the set, the relay alone when no hosts
+    /// are known. What the relay is offered by such a join, beside a join
+    /// wired as one was before: the same broadcasts at the same price, each
+    /// naming its publisher first, and one hop longer, the gate's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_join_of_the_relay_alone_offers_it_what_a_plain_join_did_one_gate_hop_apart() {
+        let relay = Meeting::older().await;
+        let through_set = moq_tokio::origin::spawn();
+        let _set = member_from("s", vec![relay_at(relay.url())], client(), Arc::new(PeerStats::default()), through_set.clone());
+        let plain = moq_tokio::origin::spawn();
+        let _camera = publishing("p", &plain);
+        let _plain = client()
+            .with_publisher(plain.consume())
+            .with_subscriber(moq_tokio::origin::spawn())
+            .connect(relay.url());
+        let (s, p) = (camera_path("s"), camera_path("p"));
+        becomes(&relay.origin, &s, true).await;
+        becomes(&relay.origin, &p, true).await;
+        // Nothing else is offered: only what each publishes.
+        let mut announced = relay.origin.consume().announced();
+        let mut paths = Vec::new();
+        while let Ok(Some(update)) = tokio::time::timeout(Duration::from_millis(500), announced.next()).await {
+            if update.kind.is_active() {
+                paths.push(update.prefix.as_str().to_string());
+            }
+        }
+        paths.sort();
+        assert_eq!(paths, [p.clone(), s.clone()]);
+        let by_set = route_within(&relay.origin, &s).await.expect("the set's route");
+        let by_plain = route_within(&relay.origin, &p).await.expect("the plain route");
+        assert_eq!(by_set.hops.as_slice().first(), Some(&through_set.hop()), "{by_set:?}");
+        assert_eq!(by_plain.hops.as_slice().first(), Some(&plain.hop()), "{by_plain:?}");
+        assert_eq!(by_set.hops.len(), by_plain.hops.len() + 1, "{by_set:?} beside {by_plain:?}");
+        assert_eq!(by_set.cost, by_plain.cost);
+    }
+
+    /// A session to nowhere, as a dial makes one: what `reconcile` is
+    /// handed in a test that counts dials rather than making them.
+    fn nowhere(down: &Reserved) -> Session {
+        let connection = client().connect(down.url());
+        Session {
+            _running: Abort(tokio::spawn(std::future::pending())),
+            bandwidth: connection.send_bandwidth(),
+            monitor: connection.monitor(),
+            connection,
+        }
+    }
+
+    /// A host whose door changes again and again while its session is not
+    /// up: the list of sessions stays as long as the most held at once, no
+    /// retired slot keeps a session, offer or gate once its overlap is over,
+    /// and a burst of doors within the settle dials once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn many_doors_for_one_host_keep_the_set_bounded_and_dial_once_per_settle() {
+        let down = Reserved::new();
+        let outbound = moq_tokio::origin::spawn();
+        let new = |target| super::Member::new(target, false, &outbound);
+        let mut members = vec![new(relay_at(down.url()))];
+        let mut hosts = Hosts::default();
+        let mut quiet = Quiet::default();
+        let dials = std::cell::Cell::new(0usize);
+        let mut dial = |_: usize, _: &super::Member, _: bool| {
+            dials.set(dials.get() + 1);
+            nowhere(&down)
+        };
+        let door = |n: u32| {
+            let mut url = down.url();
+            url.set_query(Some(&format!("door={n:032x}")));
+            host_at('a', url)
+        };
+        let start = Instant::now();
+        for n in 0..30 {
+            let now = start + (DOOR_SETTLE + MOVE_OVERLAP) * n;
+            hosts.learn(Learned::Host(door(n)), now);
+            reconcile(&mut members, &mut hosts, now, &new, &mut quiet, None, &mut dial);
+        }
+        assert_eq!(dials.get(), 30, "each settled door dialled once");
+        assert!(members.len() <= 3, "{} slots for one host", members.len());
+        // Past the last overlap, every retired slot has let go of all it held.
+        tokio::time::sleep(MOVE_OVERLAP + Duration::from_millis(200)).await;
+        for member in members.iter().filter(|member| member.state == State::Retired) {
+            assert!(member.session.is_none() && member.offer.is_none() && member.gate.is_none(), "a retired slot keeps something live");
+        }
+        let live = members.iter().filter(|member| member.state != State::Retired && member.gate.is_some()).count();
+        assert_eq!(live, 2, "the relay's gate and the host's");
+
+        let burst = start + (DOOR_SETTLE + MOVE_OVERLAP) * 30;
+        let before = dials.get();
+        for n in 0..20 {
+            let now = burst + Duration::from_millis(100) * n;
+            hosts.learn(Learned::Host(door(100 + n)), now);
+            reconcile(&mut members, &mut hosts, now, &new, &mut quiet, None, &mut dial);
+        }
+        assert_eq!(dials.get(), before + 1, "a burst dialled more than once");
+        reconcile(&mut members, &mut hosts, burst + DOOR_SETTLE * 2, &new, &mut quiet, None, &mut dial);
+        assert_eq!(dials.get(), before + 2, "the latest door of the burst was never dialled");
+    }
+
+    /// The host carrying our media, with the relay gone, says a new door.
+    /// The session it let us in with stays good, so it is kept: nobody there
+    /// loses our media, and the new door waits for the next dial. This host
+    /// still opens only its first door, so a session redialled with the new
+    /// one would be turned away: hanging up the working one loses m.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_door_from_the_host_carrying_our_media_keeps_its_session() {
+        use super::super::super::arrival::Sending;
+        let relay = Meeting::older().await;
+        let first = door::fresh().unwrap();
+        let h = hosted_behind('e', vec![relay_at(relay.url())], Some(door::Hosting::with_door("team".to_string(), first.clone()))).await;
+        let on_m = Arc::new(PeerStats::default());
+        let m = member_as("m", vec![relay_at(relay.url())], client(), on_m.clone());
+        let door = |door: &str| {
+            let mut url = at(h.port);
+            url.query_pairs_mut().append_pair(door::PARAM, door);
+            host_at('e', url)
+        };
+        let _ = m.learn.unbounded_send(Learned::Host(door(&first)));
+        holding(&on_m, &['e'], true, "m never dialled the host").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        relay.stop().await;
+        let deadline = Instant::now() + WITHIN;
+        while on_m.sending() != Some(Sending::Host(id('e'))) {
+            assert!(Instant::now() < deadline, "m's media never moved to the host");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let view = Absences::of(&h.origin, &[camera_path("m")], "the host").await;
+        let changed = Instant::now();
+        let _ = m.learn.unbounded_send(Learned::Host(door(&door::fresh().unwrap())));
+        past_the_grace(changed + MOVE_OVERLAP + Duration::from_secs(1)).await;
+        let gone = view.over(super::super::super::grace::GRACE);
+        assert!(gone.is_empty(), "the host lost {gone:?}");
+        assert!(on_m.held().contains(&id('e')), "m hung up the host");
+        assert_eq!(on_m.sending(), Some(Sending::Host(id('e'))));
+    }
+
+    /// A host heard of after the call was moved to it: dialled once, free,
+    /// not at the usual price and then again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_heard_of_after_the_call_moved_to_it_is_dialled_once() {
+        let room = bridged().await;
+        let on_m = following();
+        on_m.move_call(Some(id('c')), "m");
+        let m = member_as("m", vec![relay_at(room.relay.url())], client(), on_m.clone());
+        becomes(&room.relay.origin, &camera_path("m"), true).await;
+        let _ = m.learn.unbounded_send(Learned::Host(host_at('c', room.host.url())));
+        holding(&on_m, &['c'], true, "m never dialled the host the call is on").await;
+        tokio::time::sleep(MOVE_OVERLAP + Duration::from_secs(1)).await;
+        let dialled = room.host.sessions.lock().unwrap().len();
+        assert_eq!(dialled, 1, "the host was dialled {dialled} times");
+    }
+
+    /// Two hosts and two guests holding sessions to both, as in a room where
+    /// everyone heard of both hosts. The relay stops, the guests' media goes
+    /// to the lower host, the relay comes back, and the guests' media moves
+    /// back to it once it has held. The higher host, which reads the guests
+    /// the way the call does, must still be getting every guest's frames
+    /// well past that move. This stand-in relay follows route changes, and
+    /// the room passes on it; stock moq-relay 0.14 does not (the test below).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_host_keeps_seeing_the_guests_after_the_relay_comes_back() {
+        use super::super::super::arrival::Sending;
+        let relay = Meeting::older().await;
+        let port = relay.port;
+        let h = hosted_through('c', vec![relay_at(at(port))], None, patient_client()).await;
+        let d = hosted_through('e', vec![relay_at(at(port)), host_at('c', at(h.port))], None, patient_client()).await;
+        let targets = || vec![relay_at(at(port)), host_at('c', at(h.port)), host_at('e', at(d.port))];
+        let mut guests = Vec::new();
+        for me in ["a", "b"] {
+            let local = Arc::new(PeerStats::default());
+            let outbound = moq_tokio::origin::spawn();
+            let mut camera = camera(me, &outbound);
+            let member = joined_asking(me, targets(), patient_client(), local.clone(), outbound, camera.keyframe.clone());
+            camera.turn_on();
+            guests.push((me, local, camera, member));
+        }
+        let views: Vec<(&str, (Abort, Abort, Arrivals))> =
+            ["a", "b"].into_iter().map(|who| (who, viewing_of(&id('e'), &d.origin, Some(who)))).collect();
+        for (who, (_, _, arrivals)) in &views {
+            arrivals.more(30, &format!("the second host never saw {who}")).await;
+        }
+
+        relay.stop().await;
+        for (who, (_, _, arrivals)) in &views {
+            arrivals.more(30, &format!("the second host lost {who} when the relay stopped")).await;
+        }
+        let relay = relay_again(port).await;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        for (me, local, _, _) in &guests {
+            while local.sending() != Some(Sending::Relay) {
+                assert!(Instant::now() < deadline, "{me}'s media never went back to the relay");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        // Well past the move, its overlap and the grace.
+        tokio::time::sleep(MOVE_OVERLAP + super::super::super::grace::GRACE + Duration::from_secs(1)).await;
+        for (who, (_, _, arrivals)) in &views {
+            let from = arrivals.count();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let got = arrivals.count() - from;
+            assert!(got >= 30, "the second host got {got} of {who}'s frames in 2 s after the guests moved back");
+        }
+        drop(relay);
+    }
+
+    /// A moq-relay process run from its binary, for what only a real relay
+    /// shows: `VDR_TEST_RELAY_BIN` names the binary, and the relay listens on
+    /// `port` with anonymous access and a self-signed certificate.
+    struct Process {
+        child: std::process::Child,
+    }
+
+    impl Process {
+        fn start(port: u16) -> Option<Process> {
+            let bin = std::env::var("VDR_TEST_RELAY_BIN").ok()?;
+            let dir = std::env::temp_dir().join(format!("vdr-test-relay-{port}"));
+            std::fs::create_dir_all(&dir).ok()?;
+            let toml = format!(
+                "[log]\nlevel = \"debug\"\n[server]\nlisten = \"127.0.0.1:{port}\"\ntls.generate = [\"localhost\"]\n[auth]\npublic = \"\"\n"
+            );
+            std::fs::write(dir.join("relay.toml"), toml).ok()?;
+            let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("relay.log")).ok()?;
+            let child = std::process::Command::new(bin)
+                .arg("relay.toml")
+                .current_dir(&dir)
+                .stdout(log.try_clone().ok()?)
+                .stderr(log)
+                .spawn()
+                .ok()?;
+            Some(Process { child })
+        }
+
+        /// A polite stop, as SIGTERM gives one: the relay says it is going
+        /// away, then exits.
+        fn stop(mut self) {
+            let _ = std::process::Command::new("kill").args(["-TERM", &self.child.id().to_string()]).status();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The hand test's room on a real moq-relay: two hosts, two guests
+    /// holding sessions to both, a polite stop, the relay back, the guests'
+    /// media back on it. The higher host must still get every guest's
+    /// frames. On moq-relay 0.14 its reads of the guests, open across the
+    /// guests' move back, froze for good (on master too) with no bounce
+    /// reaching it; a plain member in its place did not. With the watch in
+    /// `follow` they are asked for again, a freeze of about six seconds.
+    /// Needs `VDR_TEST_RELAY_BIN`; run with `--ignored`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn on_a_real_relay_a_second_host_keeps_seeing_the_guests_after_the_relay_comes_back() {
+        on_a_real_relay(true).await;
+    }
+
+    /// The same with a plain member in the second host's place.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn on_a_real_relay_a_member_keeps_seeing_the_guests_after_the_relay_comes_back() {
+        on_a_real_relay(false).await;
+    }
+
+    async fn on_a_real_relay(second_host: bool) {
+        use super::super::super::arrival::Sending;
+        let port = Reserved::new().release();
+        let Some(relay) = Process::start(port) else {
+            eprintln!("VDR_TEST_RELAY_BIN is not set; nothing to run");
+            return;
+        };
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let h = hosted_through('c', vec![relay_at(at(port))], None, patient_client()).await;
+        let d = hosted_through('e', vec![relay_at(at(port)), host_at('c', at(h.port))], None, patient_client()).await;
+        let targets = || match second_host {
+            true => vec![relay_at(at(port)), host_at('c', at(h.port)), host_at('e', at(d.port))],
+            false => vec![relay_at(at(port)), host_at('c', at(h.port))],
+        };
+        let v = joined("v", vec![relay_at(at(port)), host_at('c', at(h.port))], patient_client(), Arc::new(PeerStats::default()), moq_tokio::origin::spawn());
+        let watched = if second_host { d.origin.clone() } else { v.inbound.clone() };
+        let mut guests = Vec::new();
+        for me in ["a", "b"] {
+            let local = Arc::new(PeerStats::default());
+            let outbound = moq_tokio::origin::spawn();
+            let mut camera = camera(me, &outbound);
+            let member = joined_asking(me, targets(), patient_client(), local.clone(), outbound, camera.keyframe.clone());
+            camera.turn_on();
+            guests.push((me, local, camera, member));
+        }
+        let views: Vec<(&str, (Abort, Abort, Arrivals))> =
+            ["a", "b"].into_iter().map(|who| (who, viewing_of(&id('e'), &watched, Some(who)))).collect();
+        for (who, (_, _, arrivals)) in &views {
+            arrivals.more(30, &format!("the second host never saw {who}")).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        relay.stop();
+        for (who, (_, _, arrivals)) in &views {
+            arrivals.more(30, &format!("the second host lost {who} when the relay stopped")).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _relay = Process::start(port).expect("the relay again");
+        let back = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for (me, local, _, _) in &guests {
+            while local.sending() != Some(Sending::Relay) {
+                assert!(Instant::now() < deadline, "{me}'s media never went back to the relay");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        // Past the move, and past what it takes a frozen read to be noticed
+        // and asked for again (`follow::STALLED`), so a read the watch had
+        // to rescue counts, but one left frozen does not.
+        tokio::time::sleep(MOVE_OVERLAP + super::super::super::follow::STALLED + super::super::super::follow::AGAIN_MAX + Duration::from_secs(2)).await;
+        let mut stuck = Vec::new();
+        for (who, (_, _, arrivals)) in &views {
+            eprintln!("{who}: longest gap since the relay came back {:?}", arrivals.longest_gap(back));
+            let from = arrivals.count();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let got = arrivals.count() - from;
+            if got < 30 {
+                stuck.push(format!("{who}: {got} frames in 2 s"));
+            }
+        }
+        assert!(stuck.is_empty(), "the second host after the guests moved back: {stuck:?}");
     }
 }
